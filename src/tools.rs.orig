@@ -22,8 +22,8 @@ pub enum ToolError {
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> String;
-    fn description(&self) -> String;
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
     fn parameters_schema(&self) -> serde_json::Value;
     async fn execute(&self, args: Value) -> Result<String, ToolError>;
 }
@@ -47,12 +47,12 @@ impl BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
-    fn name(&self) -> String {
-        "execute_bash".to_string()
+    fn name(&self) -> &'static str {
+        "execute_bash"
     }
 
-    fn description(&self) -> String {
-        "Executes a bash command. Returns stdout and stderr. Use carefully.".to_string()
+    fn description(&self) -> &'static str {
+        "Executes a bash command. Returns stdout and stderr. Use carefully."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -159,12 +159,12 @@ impl ReadMemoryTool {
 
 #[async_trait]
 impl Tool for ReadMemoryTool {
-    fn name(&self) -> String {
-        "read_workspace_memory".to_string()
+    fn name(&self) -> &'static str {
+        "read_workspace_memory"
     }
 
-    fn description(&self) -> String {
-        "Reads the long-term workspace memory (MEMORY.md).".to_string()
+    fn description(&self) -> &'static str {
+        "Reads the long-term workspace memory (MEMORY.md)."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -214,12 +214,12 @@ impl WriteMemoryTool {
 
 #[async_trait]
 impl Tool for WriteMemoryTool {
-    fn name(&self) -> String {
-        "write_workspace_memory".to_string()
+    fn name(&self) -> &'static str {
+        "write_workspace_memory"
     }
 
-    fn description(&self) -> String {
-        "Overwrites the entire workspace long-term memory (MEMORY.md) with new content.".to_string()
+    fn description(&self) -> &'static str {
+        "Overwrites the entire workspace long-term memory (MEMORY.md) with new content."
     }
 
     fn parameters_schema(&self) -> Value {

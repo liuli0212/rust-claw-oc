@@ -124,3 +124,26 @@ impl AgentContext {
         (messages, Some(system_msg))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_context_turn_management() {
+        let mut ctx = AgentContext::new();
+        ctx.start_turn("Hello".to_string());
+        assert!(ctx.current_turn.is_some());
+        assert_eq!(ctx.current_turn.as_ref().unwrap().user_message, "Hello");
+        
+        ctx.add_message_to_current_turn(Message {
+            role: "model".to_string(),
+            parts: vec![Part { text: Some("Hi there".to_string()), function_call: None, function_response: None }]
+        });
+        
+        ctx.end_turn();
+        assert!(ctx.current_turn.is_none());
+        assert_eq!(ctx.dialogue_history.len(), 1);
+        assert_eq!(ctx.dialogue_history[0].messages.len(), 2);
+    }
+}

@@ -3,13 +3,11 @@ mod core;
 mod llm_client;
 mod memory;
 mod tools;
-mod skills;
 
 use crate::context::AgentContext;
 use crate::core::AgentLoop;
 use crate::llm_client::GeminiClient;
 use crate::memory::WorkspaceMemory;
-use crate::skills::load_skills;
 use crate::tools::{BashTool, ReadMemoryTool, WriteMemoryTool};
 use dotenvy::dotenv;
 use rustyline::error::ReadlineError;
@@ -34,21 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
 
-    // Load dynamic skills
-    let loaded_skills = load_skills("skills");
-    let loaded_count = loaded_skills.len();
-    for skill in loaded_skills {
-        tools.push(Arc::new(skill));
-    }
-
     let context = AgentContext::new();
     let mut agent = AgentLoop::new(llm, tools, context);
 
     let mut rl = DefaultEditor::new()?;
     println!("Welcome to Rusty-Claw! (type 'exit' to quit)");
-    if loaded_count > 0 {
-        println!("Loaded {} dynamic skills from 'skills/' directory.", loaded_count);
-    }
 
     loop {
         let readline = rl.readline(">> ");
