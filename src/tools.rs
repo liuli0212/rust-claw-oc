@@ -1,0 +1,250 @@
+use async_trait::async_trait;
+use schemars::{schema_for, JsonSchema};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::process::Stdio;
+use std::time::Duration;
+use thiserror::Error;
+use tokio::process::Command;
+use tokio::time::timeout;
+
+#[derive(Error, Debug)]
+pub enum ToolError {
+    #[error("Execution failed: {0}")]
+    ExecutionFailed(String),
+    #[error("Invalid arguments: {0}")]
+    InvalidArguments(String),
+    #[error("Timeout")]
+    Timeout,
+    #[error("IO error: {0}")]
+    IoError(#[from] std::io::Error),
+}
+
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn description(&self) -> &'static str;
+    fn parameters_schema(&self) -> serde_json::Value;
+    async fn execute(&self, args: Value) -> Result<String, ToolError>;
+}
+
+// Bash Tool
+pub struct BashTool;
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ExecuteCmdArgs {
+    /// The shell command to execute
+    pub command: String,
+    /// Timeout in seconds (default: 30)
+    pub timeout: Option<u64>,
+}
+
+impl BashTool {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl Tool for BashTool {
+    fn name(&self) -> &'static str {
+        "execute_bash"
+    }
+
+    fn description(&self) -> &'static str {
+        "Executes a bash command. Returns stdout and stderr. Use carefully."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        let schema = schema_for!(ExecuteCmdArgs);
+        let mut val = serde_json::to_value(&schema).unwrap();
+        val.as_object_mut().unwrap().remove("$schema");
+        val.as_object_mut().unwrap().remove("title");
+        if let Some(properties) = val.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            if let Some(timeout) = properties.get_mut("timeout").and_then(|t| t.as_object_mut()) {
+                if let Some(type_arr) = timeout.get("type").and_then(|t| t.as_array()) {
+                    if let Some(first) = type_arr.first() {
+                        let f = first.clone();
+                        timeout.insert("type".to_string(), f);
+                    }
+                }
+            }
+        }
+        val
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let parsed_args: ExecuteCmdArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        let timeout_secs = parsed_args.timeout.unwrap_or(30);
+        let cmd_str = parsed_args.command;
+
+        println!(">> [Executing bash]: {}", cmd_str);
+
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg(&cmd_str)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
+            Ok(Ok(output)) => {
+                let mut res = String::new();
+                let stdout_str = String::from_utf8_lossy(&output.stdout);
+                let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+                if !stdout_str.is_empty() {
+                    res.push_str("STDOUT:\n");
+                    res.push_str(&truncate_log(&stdout_str));
+                }
+                if !stderr_str.is_empty() {
+                    if !res.is_empty() {
+                        res.push_str("\n");
+                    }
+                    res.push_str("STDERR:\n");
+                    res.push_str(&truncate_log(&stderr_str));
+                }
+
+                if !output.status.success() {
+                    res.push_str(&format!(
+                        "\nExit code: {}",
+                        output.status.code().unwrap_or(-1)
+                    ));
+                } else if res.is_empty() {
+                    res.push_str("Command executed successfully with no output.");
+                }
+
+                Ok(res)
+            }
+            Ok(Err(e)) => Err(ToolError::ExecutionFailed(e.to_string())),
+            Err(_) => Err(ToolError::Timeout),
+        }
+    }
+}
+
+// Log truncation logic
+fn truncate_log(log: &str) -> String {
+    let lines: Vec<&str> = log.lines().collect();
+    if lines.len() <= 1000 {
+        return log.to_string();
+    }
+
+    let top = lines[0..500].join("\n");
+    let bottom = lines[lines.len() - 500..].join("\n");
+    format!(
+        "{}\n\n[... Truncated {} lines ...]\n\n{}",
+        top,
+        lines.len() - 1000,
+        bottom
+    )
+}
+
+// Read Memory Tool
+pub struct ReadMemoryTool {
+    workspace: std::sync::Arc<crate::memory::WorkspaceMemory>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct EmptyArgs {}
+
+impl ReadMemoryTool {
+    pub fn new(workspace: std::sync::Arc<crate::memory::WorkspaceMemory>) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait]
+impl Tool for ReadMemoryTool {
+    fn name(&self) -> &'static str {
+        "read_workspace_memory"
+    }
+
+    fn description(&self) -> &'static str {
+        "Reads the long-term workspace memory (MEMORY.md)."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        let schema = schema_for!(EmptyArgs);
+        let mut val = serde_json::to_value(&schema).unwrap();
+        val.as_object_mut().unwrap().remove("$schema");
+        val.as_object_mut().unwrap().remove("title");
+        if let Some(properties) = val.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            if let Some(timeout) = properties.get_mut("timeout").and_then(|t| t.as_object_mut()) {
+                if let Some(type_arr) = timeout.get("type").and_then(|t| t.as_array()) {
+                    if let Some(first) = type_arr.first() {
+                        let f = first.clone();
+                        timeout.insert("type".to_string(), f);
+                    }
+                }
+            }
+        }
+        val
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+        let mem = self.workspace.read_memory().await?;
+        if mem.is_empty() {
+            Ok("Memory is empty.".to_string())
+        } else {
+            Ok(mem)
+        }
+    }
+}
+
+// Write Memory Tool
+pub struct WriteMemoryTool {
+    workspace: std::sync::Arc<crate::memory::WorkspaceMemory>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct WriteMemoryArgs {
+    /// The complete content to save as memory. This overwrites the old memory.
+    pub content: String,
+}
+
+impl WriteMemoryTool {
+    pub fn new(workspace: std::sync::Arc<crate::memory::WorkspaceMemory>) -> Self {
+        Self { workspace }
+    }
+}
+
+#[async_trait]
+impl Tool for WriteMemoryTool {
+    fn name(&self) -> &'static str {
+        "write_workspace_memory"
+    }
+
+    fn description(&self) -> &'static str {
+        "Overwrites the entire workspace long-term memory (MEMORY.md) with new content."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        let schema = schema_for!(WriteMemoryArgs);
+        let mut val = serde_json::to_value(&schema).unwrap();
+        val.as_object_mut().unwrap().remove("$schema");
+        val.as_object_mut().unwrap().remove("title");
+        if let Some(properties) = val.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            if let Some(timeout) = properties.get_mut("timeout").and_then(|t| t.as_object_mut()) {
+                if let Some(type_arr) = timeout.get("type").and_then(|t| t.as_array()) {
+                    if let Some(first) = type_arr.first() {
+                        let f = first.clone();
+                        timeout.insert("type".to_string(), f);
+                    }
+                }
+            }
+        }
+        val
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let parsed_args: WriteMemoryArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        self.workspace.write_memory(&parsed_args.content).await?;
+        Ok("Memory updated successfully.".to_string())
+    }
+}
