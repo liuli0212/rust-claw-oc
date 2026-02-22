@@ -4,6 +4,7 @@ mod llm_client;
 mod memory;
 mod tools;
 mod skills;
+pub mod rag;
 
 use crate::context::AgentContext;
 use crate::core::AgentLoop;
