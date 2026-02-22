@@ -63,7 +63,7 @@ impl GeminiClient {
         }
     }
 
-    pub fn _set_model(&mut self, model: String) {
+    pub fn set_model(&mut self, model: String) {
         self.model_name = model;
     }
 

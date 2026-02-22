@@ -1,12 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum Role {
-    User,
-    Model,
-    Function,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Part {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,7 +33,9 @@ pub struct Message {
 
 #[derive(Debug, Clone)]
 pub struct Turn {
+    #[allow(dead_code)]
     pub turn_id: String,
+    #[allow(dead_code)]
     pub user_message: String,
     pub messages: Vec<Message>, // All messages in this turn (including tool calls/responses)
 }

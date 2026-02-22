@@ -26,7 +26,7 @@ impl WorkspaceMemory {
         fs::write(&self.memory_file_path, content).await
     }
 
-    pub async fn _append_memory(&self, content: &str) -> std::io::Result<()> {
+    pub async fn append_memory(&self, content: &str) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
