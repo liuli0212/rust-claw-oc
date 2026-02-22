@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tiktoken_rs::CoreBPE;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Part {
@@ -44,6 +45,7 @@ pub struct AgentContext {
     pub system_prompts: Vec<String>,
     pub dialogue_history: Vec<Turn>,
     pub current_turn: Option<Turn>,
+    pub max_history_tokens: usize,
 }
 
 impl AgentContext {
@@ -58,7 +60,26 @@ impl AgentContext {
             ],
             dialogue_history: Vec::new(),
             current_turn: None,
+            max_history_tokens: 32000,
         }
+    }
+
+    fn estimate_tokens(bpe: &CoreBPE, msg: &Message) -> usize {
+        let mut count = 0;
+        for part in &msg.parts {
+            if let Some(text) = &part.text {
+                count += bpe.encode_with_special_tokens(text).len();
+            }
+            if let Some(fc) = &part.function_call {
+                count += bpe.encode_with_special_tokens(&fc.name).len();
+                count += bpe.encode_with_special_tokens(&fc.args.to_string()).len();
+            }
+            if let Some(fr) = &part.function_response {
+                count += bpe.encode_with_special_tokens(&fr.name).len();
+                count += bpe.encode_with_special_tokens(&fr.response.to_string()).len();
+            }
+        }
+        count
     }
 
     pub fn start_turn(&mut self, text: String) {
@@ -106,11 +127,26 @@ impl AgentContext {
             }],
         };
 
-        for turn in &self.dialogue_history {
-            for msg in &turn.messages {
-                messages.push(msg.clone());
+        let bpe = tiktoken_rs::cl100k_base().unwrap();
+        let mut history_messages = Vec::new();
+        let mut current_tokens = 0;
+        
+        for turn in self.dialogue_history.iter().rev() {
+            let turn_tokens: usize = turn.messages.iter().map(|m| Self::estimate_tokens(&bpe, m)).sum();
+            if current_tokens + turn_tokens > self.max_history_tokens {
+                println!("\n>> [Memory]: Working memory truncated due to token budget ({} / {})", current_tokens, self.max_history_tokens);
+                break;
             }
+            current_tokens += turn_tokens;
+            
+            let mut turn_block = Vec::new();
+            for msg in &turn.messages {
+                turn_block.push(msg.clone());
+            }
+            history_messages.push(turn_block);
         }
+        history_messages.reverse();
+        for block in history_messages { messages.extend(block); }
 
         if let Some(turn) = &self.current_turn {
             for msg in &turn.messages {
@@ -142,5 +178,26 @@ mod tests {
         assert!(ctx.current_turn.is_none());
         assert_eq!(ctx.dialogue_history.len(), 1);
         assert_eq!(ctx.dialogue_history[0].messages.len(), 2);
+    }
+    
+    #[test]
+    fn test_token_budget_truncation() {
+        let mut ctx = AgentContext::new();
+        ctx.max_history_tokens = 10; // Extremely small budget to guarantee cutoff
+        
+        // Turn 1 (Oldest)
+        ctx.start_turn("This is a very long string that should be truncated eventually. It has many many words and will exceed fifty tokens quickly.".to_string());
+        ctx.end_turn();
+        
+        // Turn 2 (Newest)
+        ctx.start_turn("Short message".to_string());
+        ctx.end_turn();
+        
+        let (payload, _) = ctx.build_llm_payload();
+        
+        // Output should have 1 item from Turn 2. The Turn 1 should be dropped.
+        // Actually wait, build_llm_payload also returns the CURRENT turn which is empty if we called end_turn, but let's check length
+        assert!(payload.len() == 1, "Payload length was {}, expected 1", payload.len());
+        assert_eq!(payload.last().unwrap().parts[0].text.as_ref().unwrap(), "Short message");
     }
 }
