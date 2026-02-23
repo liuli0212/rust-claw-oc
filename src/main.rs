@@ -10,8 +10,9 @@ use crate::context::AgentContext;
 use crate::core::AgentLoop;
 use crate::llm_client::GeminiClient;
 use crate::memory::WorkspaceMemory;
+use crate::rag::VectorStore;
 use crate::skills::load_skills;
-use crate::tools::{BashTool, ReadMemoryTool, WriteMemoryTool};
+use crate::tools::{BashTool, ReadMemoryTool, WriteMemoryTool, RagSearchTool, RagInsertTool};
 use dotenvy::dotenv;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -30,10 +31,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let workspace = Arc::new(WorkspaceMemory::new("."));
 
+    let rag_store = match VectorStore::new() {
+        Ok(store) => Some(Arc::new(store)),
+        Err(e) => {
+            println!("WARNING: Failed to initialize VectorStore: {}", e);
+            None
+        }
+    };
+
     let mut tools: Vec<Arc<dyn tools::Tool>> = Vec::new();
     tools.push(Arc::new(BashTool::new()));
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
+
+    if let Some(store) = rag_store {
+        tools.push(Arc::new(RagSearchTool::new(store.clone())));
+        tools.push(Arc::new(RagInsertTool::new(store.clone())));
+    }
 
     // Load dynamic skills
     let loaded_skills = load_skills("skills");

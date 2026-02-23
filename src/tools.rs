@@ -249,6 +249,76 @@ impl Tool for WriteMemoryTool {
     }
 }
 
+// RAG Store Tool
+pub struct RagSearchTool {
+    store: std::sync::Arc<crate::rag::VectorStore>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct RagSearchArgs {
+    /// The semantic query to search for in the long-term knowledge base.
+    pub query: String,
+    /// Maximum number of related snippets to return.
+    pub limit: Option<usize>,
+}
+
+impl RagSearchTool {
+    pub fn new(store: std::sync::Arc<crate::rag::VectorStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl Tool for RagSearchTool {
+    fn name(&self) -> String {
+        "search_knowledge_base".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Semantically searches the long-term knowledge base for related information using vector embeddings. Use this when you need to recall past lessons, code snippets, or project guidelines.".to_string()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        let schema = schema_for!(RagSearchArgs);
+        let mut val = serde_json::to_value(&schema).unwrap();
+        val.as_object_mut().unwrap().remove("$schema");
+        val.as_object_mut().unwrap().remove("title");
+        if let Some(properties) = val.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            if let Some(limit) = properties.get_mut("limit").and_then(|t| t.as_object_mut()) {
+                if let Some(type_arr) = limit.get("type").and_then(|t| t.as_array()) {
+                    if let Some(first) = type_arr.first() {
+                        let f = first.clone();
+                        limit.insert("type".to_string(), f);
+                    }
+                }
+            }
+        }
+        val
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let parsed_args: RagSearchArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        let limit = parsed_args.limit.unwrap_or(3);
+        
+        let results = self.store.search(&parsed_args.query, limit)
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            
+        if results.is_empty() {
+            return Ok("No relevant information found in the knowledge base.".to_string());
+        }
+        
+        let mut res = String::new();
+        res.push_str("Found the following relevant snippets:\n\n");
+        for (content, source, distance) in results {
+            res.push_str(&format!("--- Source: {} (Relevance: {:.2}) ---\n{}\n\n", source, distance, content));
+        }
+        
+        Ok(res)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +355,53 @@ mod tests {
         // Ensure no $schema or title (Gemini bug workaround)
         assert!(schema.get("$schema").is_none());
         assert!(schema.get("title").is_none());
+    }
+}
+
+// RAG Store Insert Tool
+pub struct RagInsertTool {
+    store: std::sync::Arc<crate::rag::VectorStore>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct RagInsertArgs {
+    /// The knowledge or code snippet to save into the long-term semantic memory.
+    pub content: String,
+    /// A brief description or file path indicating where this knowledge came from.
+    pub source: String,
+}
+
+impl RagInsertTool {
+    pub fn new(store: std::sync::Arc<crate::rag::VectorStore>) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl Tool for RagInsertTool {
+    fn name(&self) -> String {
+        "memorize_knowledge".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Saves important concepts, code patterns, or project lessons into the vector knowledge base so it can be semantically retrieved in the future.".to_string()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        let schema = schema_for!(RagInsertArgs);
+        let mut val = serde_json::to_value(&schema).unwrap();
+        val.as_object_mut().unwrap().remove("$schema");
+        val.as_object_mut().unwrap().remove("title");
+        val
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let parsed_args: RagInsertArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        self.store.insert_chunk(parsed_args.content, parsed_args.source)
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            
+        Ok("Knowledge successfully embedded and saved into long-term vector memory.".to_string())
     }
 }
