@@ -2,23 +2,34 @@ use crate::context::{AgentContext, FunctionResponse, Message, Part};
 use crate::llm_client::{GeminiClient, StreamEvent};
 use crate::tools::Tool;
 use std::sync::Arc;
+use async_trait::async_trait;
+
+#[async_trait]
+pub trait AgentOutput: Send + Sync {
+    async fn on_text(&self, text: &str);
+    async fn on_tool_start(&self, name: &str, args: &str);
+    async fn on_tool_end(&self, result: &str);
+    async fn on_error(&self, error: &str);
+}
 
 pub struct AgentLoop {
     llm: Arc<GeminiClient>,
     tools: Vec<Arc<dyn Tool>>,
     context: AgentContext,
+    output: Arc<dyn AgentOutput>,
 }
 
 impl AgentLoop {
-    pub fn new(llm: Arc<GeminiClient>, tools: Vec<Arc<dyn Tool>>, context: AgentContext) -> Self {
+    pub fn new(llm: Arc<GeminiClient>, tools: Vec<Arc<dyn Tool>>, context: AgentContext, output: Arc<dyn AgentOutput>) -> Self {
         Self {
             llm,
             tools,
             context,
+            output,
         }
     }
 
-    pub async fn step(&mut self, user_input: String) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn step(&mut self, user_input: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.context.start_turn(user_input);
 
         loop {
@@ -32,28 +43,30 @@ impl AgentLoop {
             let mut full_text = String::new();
             let mut tool_calls = Vec::new();
 
-            print!("Rusty-Claw: ");
-            use std::io::Write;
-            std::io::stdout().flush()?;
+            // print!("Rusty-Claw: ");
+            // use std::io::Write;
+            // std::io::stdout().flush()?;
 
             while let Some(event) = rx.recv().await {
                 match event {
                     StreamEvent::Text(text) => {
-                        print!("{}", text);
-                        std::io::stdout().flush()?;
+                        self.output.on_text(&text).await;
+                        // print!("{}", text);
+                        // std::io::stdout().flush()?;
                         full_text.push_str(&text);
                     }
                     StreamEvent::ToolCall(call) => {
                         tool_calls.push(call);
                     }
                     StreamEvent::Error(e) => {
-                        println!("\n[LLM Error]: {}", e);
+                        self.output.on_error(&format!("\n[LLM Error]: {}", e)).await;
+                        // println!("\n[LLM Error]: {}", e);
                         return Err(e.into());
                     }
                     StreamEvent::Done => break,
                 }
             }
-            println!();
+            // println!();
 
             // Record assistant message
             let mut parts = Vec::new();
@@ -89,7 +102,8 @@ impl AgentLoop {
                 let tool_name = call.name.clone();
                 let tool_args = call.args.clone();
 
-                println!("\n> [Tool Call]: {} (args: {})", tool_name, tool_args);
+                self.output.on_tool_start(&tool_name, &tool_args.to_string()).await;
+                // println!("\n> [Tool Call]: {} (args: {})", tool_name, tool_args);
 
                 let result_str =
                     if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
@@ -101,7 +115,8 @@ impl AgentLoop {
                         format!("Error: Tool '{}' not found", tool_name)
                     };
 
-                println!("> [Tool Result]: {}", result_str);
+                self.output.on_tool_end(&result_str).await;
+                // println!("> [Tool Result]: {}", result_str);
 
                 response_parts.push(Part {
                     text: None,
