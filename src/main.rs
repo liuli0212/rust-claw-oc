@@ -61,7 +61,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let current_dir_str = current_dir.to_str().unwrap_or(".");
     let workspace = Arc::new(WorkspaceMemory::new(current_dir_str));
 
-    let rag_store = match VectorStore::new() {
+    // Define persistent RAG path
+    let rag_path = current_dir.join(".rusty-claw").join("knowledge_base.json");
+    let rag_path_str = rag_path.to_str().unwrap_or(".rusty-claw/knowledge_base.json");
+
+    let rag_store = match VectorStore::new(rag_path_str) {
         Ok(store) => Some(Arc::new(store)),
         Err(e) => {
             println!("WARNING: Failed to initialize VectorStore: {}", e);
@@ -74,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
 
-    if let Some(store) = rag_store {
+    if let Some(store) = &rag_store {
         tools.push(Arc::new(RagSearchTool::new(store.clone())));
         tools.push(Arc::new(RagInsertTool::new(store.clone())));
     }
@@ -86,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tools.push(Arc::new(skill));
     }
 
-    let session_manager = Arc::new(SessionManager::new(llm.clone(), tools.clone()));
+    let session_manager = Arc::new(SessionManager::new(llm.clone(), tools.clone(), rag_store.clone()));
 
     // Start Telegram Bot
     if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
