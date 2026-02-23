@@ -2,11 +2,15 @@ use async_trait::async_trait;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::process::Stdio;
+
 use std::time::Duration;
 use thiserror::Error;
-use tokio::process::Command;
+
 use tokio::time::timeout;
+use portable_pty::{CommandBuilder, native_pty_system, PtySize};
+use regex::Regex;
+use std::io::Read;
+
 
 #[derive(Error, Debug)]
 pub enum ToolError {
@@ -80,48 +84,79 @@ impl Tool for BashTool {
         let timeout_secs = parsed_args.timeout.unwrap_or(30);
         let cmd_str = parsed_args.command;
 
-        println!(">> [Executing bash]: {}", cmd_str);
+        println!(">> [Executing bash via PTY]: {}", cmd_str);
 
-        let child = Command::new("bash")
-            .arg("-c")
-            .arg(&cmd_str)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
-            Ok(Ok(output)) => {
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("-c");
+        cmd.arg(&cmd_str);
+
+        let child = pair.slave.spawn_command(cmd).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        drop(pair.slave); // Crucial: close slave so master gets EOF
+
+        let mut reader = pair.master.try_clone_reader().map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 { break; }
+                if tx.send(buf[..n].to_vec()).is_err() { break; }
+            }
+        });
+
+        let child_clone = child.clone();
+        let read_future = async move {
+            let mut raw_output = String::new();
+            while let Some(chunk) = rx.recv().await {
+                raw_output.push_str(&String::from_utf8_lossy(&chunk));
+            }
+
+            let exit_status = tokio::task::spawn_blocking(move || {
+                let mut c = child_clone.lock().unwrap();
+                c.wait()
+            }).await.map_err(|e| e.to_string());
+
+            (raw_output, exit_status)
+        };
+
+        match timeout(Duration::from_secs(timeout_secs), read_future).await {
+            Ok((raw_output, exit_status_res)) => {
+                let status_res = exit_status_res.map_err(|e| ToolError::ExecutionFailed(e.to_string()))?
+                    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+                
+                // Strip ANSI escape codes
+                let re = Regex::new(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])").unwrap();
+                let clean_output = re.replace_all(&raw_output, "").into_owned();
+                let clean_output = clean_output.replace("\r\n", "\n");
+
                 let mut res = String::new();
-                let stdout_str = String::from_utf8_lossy(&output.stdout);
-                let stderr_str = String::from_utf8_lossy(&output.stderr);
-
-                if !stdout_str.is_empty() {
-                    res.push_str("STDOUT:\n");
-                    res.push_str(&truncate_log(&stdout_str));
-                }
-                if !stderr_str.is_empty() {
-                    if !res.is_empty() {
-                        res.push_str("\n");
-                    }
-                    res.push_str("STDERR:\n");
-                    res.push_str(&truncate_log(&stderr_str));
+                if !clean_output.trim().is_empty() {
+                    res.push_str("OUTPUT:\n");
+                    res.push_str(&truncate_log(clean_output.trim()));
                 }
 
-                if !output.status.success() {
-                    res.push_str(&format!(
-                        "\nExit code: {}",
-                        output.status.code().unwrap_or(-1)
-                    ));
+                if !status_res.success() {
+                    res.push_str(&format!("\nExit code: {}", status_res.exit_code()));
                 } else if res.is_empty() {
                     res.push_str("Command executed successfully with no output.");
                 }
 
                 Ok(res)
             }
-            Ok(Err(e)) => Err(ToolError::ExecutionFailed(e.to_string())),
-            Err(_) => Err(ToolError::Timeout),
+            Err(_) => {
+                let mut c = child.lock().unwrap();
+                let _ = c.kill();
+                Err(ToolError::Timeout)
+            }
         }
     }
 }
