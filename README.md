@@ -1,53 +1,56 @@
 # Rusty-Claw
 
-A Rust-based implementation of OpenClaw, following the provided design document.
+An industrial-grade, highly autonomous CLI AI Agent built entirely in Rust. Designed to be lightweight, secure, and easily distributable as a single compiled binary without requiring a heavy runtime environment.
 
-## Architecture
+This project is a Rust-native implementation of an AI agent, closely following the "Zero-Trust & Sandbox" architecture design. It uses the latest LLM models (via Gemini API) to understand natural language instructions, plan tasks, and execute them safely on your local machine using its suite of tools.
 
-This project implements the core components specified in the `rusty-claw-design.md`:
+## Key Features
 
-1.  **`core` (AgentLoop & ContextManager)**:
-    *   State machine orchestrating the Think -> Act -> Observe loop.
-    *   Context management with structured messages.
-2.  **`llm_client` (Gemini API adapter)**:
-    *   Uses `reqwest` for HTTP requests.
-    *   Implements Server-Sent Events (SSE) parsing via `tokio::sync::mpsc::channel` for streaming the LLM response asynchronously.
-    *   Supports structured Tool Call extraction directly from the stream.
-3.  **`tools` (Tools Sandbox)**:
-    *   Uniform `Tool` trait defining `name`, `description`, `schema` and `execute`.
-    *   `BashTool`: Executes commands using `tokio::process::Command` with intelligent log truncation (top 500 lines, bottom 500 lines) and strict timeout control.
-    *   `schemars` is used to automatically generate JSON Schema from Rust structs.
-4.  **`memory` (File-based Storage)**:
-    *   `WorkspaceMemory`: Read/Write abstraction for `MEMORY.md`.
-    *   Registered as `read_workspace_memory` and `write_workspace_memory` tools for the LLM.
-5.  **`gateway/cli`**:
-    *   Interactive REPL built with `rustyline`.
+- 🧠 **Native Function Calling:** Uses robust JSON-Schema generation (`schemars`) and Gemini's native structured Tool Calling for zero-hallucination tool execution. 
+- 🔒 **Secure Bash Sandbox:** Employs a true pseudo-terminal (`portable-pty`) wrapper for executing bash commands. It handles interactive TTY commands flawlessly, strips ANSI color codes for clean context, and enforces strict timeouts (`SIGKILL`) to prevent zombie processes.
+- 💾 **RAG Memory (Semantic Knowledge Base):** Integrated with pure-Rust `fastembed` for local, offline, high-dimensional vector embeddings (no heavy C++ or Python dependencies). The agent can `memorize_knowledge` and `search_knowledge_base` to retain project rules or code snippets indefinitely.
+- 📊 **Context Budgeting:** Integrated with `tiktoken-rs`. It automatically calculates token consumption and uses a sliding-window truncation algorithm to ensure the context never exceeds the LLM's budget (e.g., 32k tokens), preventing crashes during long-running sessions.
+- 🧩 **Dynamic Markdown Skills:** You can teach the agent new tools without writing Rust code. Drop a Markdown file with a YAML frontmatter into the `skills/` directory, and it will be dynamically parsed and loaded as a fully functional LLM Tool.
 
 ## Prerequisites
 
-*   Rust toolchain (cargo, rustc)
-*   A valid Gemini API key.
+- Rust Toolchain (`cargo`, `rustc`)
+- A valid **Gemini API Key** (or another compatible LLM provider if adapted).
 
 ## Setup & Run
 
-1.  Create a `.env` file in the root directory and add your API key:
-    ```
-    GEMINI_API_KEY=your_api_key_here
-    ```
-2.  Build and run the agent:
-    ```bash
-    cargo run
-    ```
-3.  You will be dropped into an interactive REPL `>> `. Start chatting!
+1. Clone the repository and navigate into it:
+   ```bash
+   git clone https://github.com/liuli0212/rust-claw-oc.git
+   cd rust-claw-oc
+   ```
 
-## Design Decisions vs Spec
+2. Configure your API key. Create a `.env` file in the root of the project:
+   ```env
+   GEMINI_API_KEY=your_actual_api_key_here
+   ```
 
-*   **PTY**: For the MVP, `std::process::Command` (via `tokio::process::Command`) is used instead of `portable-pty` for the `BashTool`. It still handles timeouts and stdout/stderr correctly.
-*   **Vector Store**: The `MEMORY.md` workspace memory is implemented. The `lancedb` RAG implementation is a placeholder for future iterations due to the complexity of embedding generation inside a single MVP.
-*   **Native Function Calling**: Instead of the proposed fallback "JSON Extractor", this implementation correctly utilizes Gemini's native structured `functionCall` SSE response format for high reliability.
+3. Build and launch the agent (Release mode recommended for maximum speed):
+   ```bash
+   cargo run --release
+   ```
 
-## Code Quality Verification
+4. You will be greeted with the interactive REPL:
+   ```
+   Welcome to Rusty-Claw! (type 'exit' to quit)
+   Loaded 1 dynamic skills from 'skills/' directory.
+   >> 
+   ```
+   Try typing: *"Please list the files in the current directory"* or *"Memorize this rule: Always format code with rustfmt."*
 
-*   All networking is fully async using `tokio` and `reqwest`.
-*   Data structures are strictly typed using `serde`.
-*   Error handling is implemented using `thiserror`.
+## Architecture
+
+*   **`src/core.rs`**: The main `AgentLoop`. Implements the Think -> Act -> Observe state machine.
+*   **`src/llm_client.rs`**: Handles HTTP SSE Streaming and asynchronous chunk parsing.
+*   **`src/tools.rs`**: The sandbox executor. Defines the `Tool` trait and implements the powerful `BashTool` (PTY) and Memory interfaces.
+*   **`src/rag.rs`**: The pure-Rust semantic vector store using `fastembed`.
+*   **`src/context.rs`**: Context management and `tiktoken-rs` driven token budgeting.
+*   **`src/skills.rs`**: The dynamic Markdown-to-Tool parsing engine.
+
+## License
+MIT
