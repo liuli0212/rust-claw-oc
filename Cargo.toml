@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
+teloxide = { version = "0.13", features = ["macros"] }
+serenity = "0.12"
 tokio-util = "0.7.12"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }

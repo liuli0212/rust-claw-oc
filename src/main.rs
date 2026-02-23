@@ -5,18 +5,46 @@ mod memory;
 mod tools;
 mod skills;
 pub mod rag;
+mod session_manager;
+mod telegram;
+mod discord;
 
-use crate::context::AgentContext;
-use crate::core::AgentLoop;
+
+use crate::core::AgentOutput;
 use crate::llm_client::GeminiClient;
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::skills::load_skills;
 use crate::tools::{BashTool, ReadMemoryTool, WriteMemoryTool, RagSearchTool, RagInsertTool};
+use crate::session_manager::SessionManager;
 use dotenvy::dotenv;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::sync::Arc;
+use async_trait::async_trait;
+
+struct CliOutput;
+
+#[async_trait]
+impl AgentOutput for CliOutput {
+    async fn on_text(&self, text: &str) {
+        print!("{}", text);
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    async fn on_tool_start(&self, name: &str, args: &str) {
+        println!("\n> [Tool Call]: {} (args: {})", name, args);
+    }
+
+    async fn on_tool_end(&self, result: &str) {
+        println!("> [Tool Result]: {}", result);
+    }
+
+    async fn on_error(&self, error: &str) {
+        println!("{}", error);
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,7 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let llm = Arc::new(GeminiClient::new(api_key));
 
-    let workspace = Arc::new(WorkspaceMemory::new("."));
+    let current_dir = std::env::current_dir()?;
+    let current_dir_str = current_dir.to_str().unwrap_or(".");
+    let workspace = Arc::new(WorkspaceMemory::new(current_dir_str));
 
     let rag_store = match VectorStore::new() {
         Ok(store) => Some(Arc::new(store)),
@@ -56,8 +86,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tools.push(Arc::new(skill));
     }
 
-    let context = AgentContext::new();
-    let mut agent = AgentLoop::new(llm, tools, context);
+    let session_manager = Arc::new(SessionManager::new(llm.clone(), tools.clone()));
+
+    // Start Telegram Bot
+    if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+        let sm = session_manager.clone();
+        tokio::spawn(async move {
+            telegram::run_telegram_bot(token, sm).await;
+        });
+    }
+
+    // Start Discord Bot
+    if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN") {
+        let sm = session_manager.clone();
+        tokio::spawn(async move {
+            discord::run_discord_bot(token, sm).await;
+        });
+    }
+
+    let output = Arc::new(CliOutput);
+    // let mut agent = AgentLoop::new(llm, tools, context, output);
 
     let mut rl = DefaultEditor::new()?;
     println!("Welcome to Rusty-Claw! (type 'exit' to quit)");
@@ -78,7 +126,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let _ = rl.add_history_entry(line);
 
-                if let Err(e) = agent.step(line.to_string()).await {
+                let agent = session_manager.get_or_create_session("cli", output.clone()).await;
+                let mut agent_guard = agent.lock().await;
+
+                if let Err(e) = agent_guard.step(line.to_string()).await {
                     eprintln!("Agent error: {}", e);
                 }
             }

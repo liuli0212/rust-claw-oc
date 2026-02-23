@@ -11,6 +11,7 @@ This project is a Rust-native implementation of an AI agent, closely following t
 - 💾 **RAG Memory (Semantic Knowledge Base):** Integrated with pure-Rust `fastembed` for local, offline, high-dimensional vector embeddings (no heavy C++ or Python dependencies). The agent can `memorize_knowledge` and `search_knowledge_base` to retain project rules or code snippets indefinitely.
 - 📊 **Context Budgeting:** Integrated with `tiktoken-rs`. It automatically calculates token consumption and uses a sliding-window truncation algorithm to ensure the context never exceeds the LLM's budget (e.g., 32k tokens), preventing crashes during long-running sessions.
 - 🧩 **Dynamic Markdown Skills:** You can teach the agent new tools without writing Rust code. Drop a Markdown file with a YAML frontmatter into the `skills/` directory, and it will be dynamically parsed and loaded as a fully functional LLM Tool.
+- 💬 **Multi-Platform Support:** Supports Telegram and Discord integrations concurrently with the CLI interface. Each platform maintains its own session context.
 
 ## Prerequisites
 
@@ -28,6 +29,8 @@ This project is a Rust-native implementation of an AI agent, closely following t
 2. Configure your API key. Create a `.env` file in the root of the project:
    ```env
    GEMINI_API_KEY=your_actual_api_key_here
+   TELEGRAM_BOT_TOKEN=your_telegram_bot_token (optional)
+   DISCORD_BOT_TOKEN=your_discord_bot_token (optional)
    ```
 
 3. Build and launch the agent (Release mode recommended for maximum speed):
