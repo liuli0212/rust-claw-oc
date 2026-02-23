@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tiktoken_rs::CoreBPE;
 
@@ -46,10 +47,12 @@ pub struct AgentContext {
     pub dialogue_history: Vec<Turn>,
     pub current_turn: Option<Turn>,
     pub max_history_tokens: usize,
+    pub memory_file_path: PathBuf,
+    pub auto_rag_results: Option<String>,
 }
 
 impl AgentContext {
-    pub fn new() -> Self {
+    pub fn new(memory_file_path: PathBuf) -> Self {
         Self {
             system_prompts: vec![
                 "You are Rusty-Claw, an industrial-grade autonomous agent running locally on the user's machine.".to_string(),
@@ -62,6 +65,8 @@ impl AgentContext {
             dialogue_history: Vec::new(),
             current_turn: None,
             max_history_tokens: 32000,
+            memory_file_path,
+            auto_rag_results: None,
         }
     }
 
@@ -77,7 +82,9 @@ impl AgentContext {
             }
             if let Some(fr) = &part.function_response {
                 count += bpe.encode_with_special_tokens(&fr.name).len();
-                count += bpe.encode_with_special_tokens(&fr.response.to_string()).len();
+                count += bpe
+                    .encode_with_special_tokens(&fr.response.to_string())
+                    .len();
             }
         }
         count
@@ -119,6 +126,18 @@ impl AgentContext {
             sys_text.push_str("\n\n");
         }
 
+        if let Ok(memory) = std::fs::read_to_string(&self.memory_file_path) {
+            sys_text.push_str("### LONG-TERM MEMORY (MEMORY.md)\n");
+            sys_text.push_str(&memory);
+            sys_text.push_str("\n\n");
+        }
+
+        if let Some(rag) = &self.auto_rag_results {
+            sys_text.push_str("### RELEVANT KNOWLEDGE (Auto-RAG)\n");
+            sys_text.push_str(rag);
+            sys_text.push_str("\n\n");
+        }
+
         let system_msg = Message {
             role: "system".to_string(),
             parts: vec![Part {
@@ -131,15 +150,22 @@ impl AgentContext {
         let bpe = tiktoken_rs::cl100k_base().unwrap();
         let mut history_messages = Vec::new();
         let mut current_tokens = 0;
-        
+
         for turn in self.dialogue_history.iter().rev() {
-            let turn_tokens: usize = turn.messages.iter().map(|m| Self::estimate_tokens(&bpe, m)).sum();
+            let turn_tokens: usize = turn
+                .messages
+                .iter()
+                .map(|m| Self::estimate_tokens(&bpe, m))
+                .sum();
             if current_tokens + turn_tokens > self.max_history_tokens {
-                println!("\n>> [Memory]: Working memory truncated due to token budget ({} / {})", current_tokens, self.max_history_tokens);
+                println!(
+                    "\n>> [Memory]: Working memory truncated due to token budget ({} / {})",
+                    current_tokens, self.max_history_tokens
+                );
                 break;
             }
             current_tokens += turn_tokens;
-            
+
             let mut turn_block = Vec::new();
             for msg in &turn.messages {
                 turn_block.push(msg.clone());
@@ -147,7 +173,9 @@ impl AgentContext {
             history_messages.push(turn_block);
         }
         history_messages.reverse();
-        for block in history_messages { messages.extend(block); }
+        for block in history_messages {
+            messages.extend(block);
+        }
 
         if let Some(turn) = &self.current_turn {
             for msg in &turn.messages {
@@ -165,40 +193,63 @@ mod tests {
 
     #[test]
     fn test_context_turn_management() {
-        let mut ctx = AgentContext::new();
+        let mut ctx = AgentContext::new(PathBuf::from("MEMORY.md"));
         ctx.start_turn("Hello".to_string());
         assert!(ctx.current_turn.is_some());
         assert_eq!(ctx.current_turn.as_ref().unwrap().user_message, "Hello");
-        
+
         ctx.add_message_to_current_turn(Message {
             role: "model".to_string(),
-            parts: vec![Part { text: Some("Hi there".to_string()), function_call: None, function_response: None }]
+            parts: vec![Part {
+                text: Some("Hi there".to_string()),
+                function_call: None,
+                function_response: None,
+            }],
         });
-        
+
         ctx.end_turn();
         assert!(ctx.current_turn.is_none());
         assert_eq!(ctx.dialogue_history.len(), 1);
         assert_eq!(ctx.dialogue_history[0].messages.len(), 2);
     }
-    
+
     #[test]
     fn test_token_budget_truncation() {
-        let mut ctx = AgentContext::new();
+        let mut ctx = AgentContext::new(PathBuf::from("MEMORY.md"));
         ctx.max_history_tokens = 10; // Extremely small budget to guarantee cutoff
-        
+
         // Turn 1 (Oldest)
         ctx.start_turn("This is a very long string that should be truncated eventually. It has many many words and will exceed fifty tokens quickly.".to_string());
         ctx.end_turn();
-        
+
         // Turn 2 (Newest)
         ctx.start_turn("Short message".to_string());
         ctx.end_turn();
-        
+
         let (payload, _) = ctx.build_llm_payload();
-        
+
         // Output should have 1 item from Turn 2. The Turn 1 should be dropped.
         // Actually wait, build_llm_payload also returns the CURRENT turn which is empty if we called end_turn, but let's check length
-        assert!(payload.len() == 1, "Payload length was {}, expected 1", payload.len());
-        assert_eq!(payload.last().unwrap().parts[0].text.as_ref().unwrap(), "Short message");
+        assert!(
+            payload.len() == 1,
+            "Payload length was {}, expected 1",
+            payload.len()
+        );
+        assert_eq!(
+            payload.last().unwrap().parts[0].text.as_ref().unwrap(),
+            "Short message"
+        );
+    }
+
+    #[test]
+    fn test_auto_rag_injection() {
+        let mut ctx = AgentContext::new(PathBuf::from("MEMORY.md"));
+        ctx.auto_rag_results = Some("This is a relevant fact.".to_string());
+        
+        let (_, system_msg) = ctx.build_llm_payload();
+        let sys_text = system_msg.unwrap().parts[0].text.as_ref().unwrap().clone();
+        
+        assert!(sys_text.contains("### RELEVANT KNOWLEDGE (Auto-RAG)"));
+        assert!(sys_text.contains("This is a relevant fact."));
     }
 }

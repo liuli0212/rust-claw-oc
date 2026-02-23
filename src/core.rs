@@ -1,6 +1,7 @@
 use crate::context::{AgentContext, FunctionResponse, Message, Part};
 use crate::llm_client::{GeminiClient, StreamEvent};
 use crate::tools::Tool;
+use crate::rag::VectorStore;
 use std::sync::Arc;
 use async_trait::async_trait;
 
@@ -17,19 +18,43 @@ pub struct AgentLoop {
     tools: Vec<Arc<dyn Tool>>,
     context: AgentContext,
     output: Arc<dyn AgentOutput>,
+    rag_store: Option<Arc<VectorStore>>,
 }
 
 impl AgentLoop {
-    pub fn new(llm: Arc<GeminiClient>, tools: Vec<Arc<dyn Tool>>, context: AgentContext, output: Arc<dyn AgentOutput>) -> Self {
+    pub fn new(
+        llm: Arc<GeminiClient>,
+        tools: Vec<Arc<dyn Tool>>,
+        context: AgentContext,
+        output: Arc<dyn AgentOutput>,
+        rag_store: Option<Arc<VectorStore>>,
+    ) -> Self {
         Self {
             llm,
             tools,
             context,
             output,
+            rag_store,
         }
     }
 
     pub async fn step(&mut self, user_input: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Auto-RAG Pipeline
+        if let Some(store) = &self.rag_store {
+            if let Ok(results) = store.search(&user_input, 3) {
+                let relevant: Vec<String> = results.into_iter()
+                    .filter(|(_, _, score)| *score > 0.6)
+                    .map(|(content, source, _)| format!("[Source: {}]\n{}", source, content))
+                    .collect();
+                
+                if !relevant.is_empty() {
+                    self.context.auto_rag_results = Some(relevant.join("\n---\n"));
+                } else {
+                    self.context.auto_rag_results = None;
+                }
+            }
+        }
+
         self.context.start_turn(user_input);
 
         loop {
@@ -109,10 +134,28 @@ impl AgentLoop {
                     if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
                         match tool.execute(tool_args.clone()).await {
                             Ok(res) => res,
-                            Err(e) => format!("Error: {}", e),
+                            Err(e) => {
+                                let error_msg = e.to_string();
+                                let hint = if error_msg.contains("No such file") || error_msg.contains("not found") {
+                                    "Check if the file or directory exists. Use 'ls -R' to find files or 'pwd' to check your location."
+                                } else if error_msg.contains("Permission denied") {
+                                    "You might not have permission to access this resource."
+                                } else if error_msg.contains("Timeout") {
+                                    "The command took too long. Try a simpler command or increase the timeout."
+                                } else {
+                                    "Review your command syntax and arguments."
+                                };
+                                serde_json::json!({
+                                    "error": error_msg,
+                                    "hint": hint
+                                }).to_string()
+                            }
                         }
                     } else {
-                        format!("Error: Tool '{}' not found", tool_name)
+                        serde_json::json!({
+                            "error": format!("Tool '{}' not found", tool_name),
+                            "hint": "Check the available tools list and spelling."
+                        }).to_string()
                     };
 
                 self.output.on_tool_end(&result_str).await;
