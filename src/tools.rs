@@ -33,7 +33,9 @@ pub trait Tool: Send + Sync {
 }
 
 // Bash Tool
-pub struct BashTool;
+pub struct BashTool {
+    work_dir: String,
+}
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ExecuteCmdArgs {
@@ -45,7 +47,11 @@ pub struct ExecuteCmdArgs {
 
 impl BashTool {
     pub fn new() -> Self {
-        Self
+        let work_dir = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .to_string_lossy()
+            .to_string();
+        Self { work_dir }
     }
 }
 
@@ -95,6 +101,7 @@ impl Tool for BashTool {
         }).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         let mut cmd = CommandBuilder::new("bash");
+        cmd.cwd(self.work_dir.clone());
         cmd.arg("-c");
         cmd.arg(&cmd_str);
 
