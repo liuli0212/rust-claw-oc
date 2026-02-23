@@ -62,7 +62,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> String {
-        "Executes a bash command. Returns stdout and stderr. Use carefully.".to_string()
+        "Executes a bash command. Returns stdout and stderr. Best Practice: Always use 'ls -R' to verify file locations before operations. Use 'pwd' to check current directory.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -261,7 +261,7 @@ impl Tool for WriteMemoryTool {
     }
 
     fn description(&self) -> String {
-        "Overwrites the entire workspace long-term memory (MEMORY.md) with new content.".to_string()
+        "Overwrites the entire workspace long-term memory (MEMORY.md). Best Practice: Always read the existing memory first, merge new information, and then write back to avoid data loss.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
