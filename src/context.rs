@@ -384,6 +384,10 @@ impl AgentContext {
         self.retrieved_memory_sources = sources;
     }
 
+    pub fn retrieved_memory(&self) -> Option<&String> {
+        self.retrieved_memory.as_ref()
+    }
+
     pub fn start_turn(&mut self, text: String) {
         self.current_turn = Some(Turn {
             turn_id: uuid::Uuid::new_v4().to_string(),
