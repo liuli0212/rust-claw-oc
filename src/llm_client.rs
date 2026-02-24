@@ -8,6 +8,60 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+fn normalize_schema_for_gemini(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("definitions");
+            map.remove("$defs");
+            map.remove("title");
+
+            if let Some(type_val) = map.get_mut("type") {
+                if let Value::Array(type_arr) = type_val {
+                    let chosen = type_arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .find(|t| *t != "null")
+                        .unwrap_or("string")
+                        .to_string();
+                    *type_val = Value::String(chosen);
+                }
+            }
+
+            // Gemini schema parser is strict; simplify composition constructs.
+            for combiner in ["anyOf", "oneOf", "allOf"] {
+                if let Some(Value::Array(options)) = map.remove(combiner) {
+                    let mut replacement = options
+                        .into_iter()
+                        .find(|candidate| !candidate.get("$ref").is_some())
+                        .unwrap_or(Value::Null);
+                    normalize_schema_for_gemini(&mut replacement);
+                    if let Value::Object(repl_map) = replacement {
+                        for (k, v) in repl_map {
+                            map.insert(k, v);
+                        }
+                    }
+                }
+            }
+
+            if map.remove("$ref").is_some() {
+                map.clear();
+                map.insert("type".to_string(), Value::String("string".to_string()));
+            }
+
+            for nested in map.values_mut() {
+                normalize_schema_for_gemini(nested);
+            }
+        }
+        Value::Array(arr) => {
+            for nested in arr {
+                normalize_schema_for_gemini(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum LlmError {
     #[error("Network error: {0}")]
@@ -56,6 +110,27 @@ pub enum StreamEvent {
     Done,
 }
 
+fn parse_function_call(part: &Value) -> Option<FunctionCall> {
+    let func_call = part.get("functionCall")?;
+    let name = func_call
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let args = func_call.get("args").cloned().unwrap_or(Value::Null);
+    let thought_signature = func_call
+        .get("thought_signature")
+        .or_else(|| func_call.get("thoughtSignature"))
+        .and_then(|ts| ts.as_str())
+        .map(|s| s.to_string());
+
+    Some(FunctionCall {
+        name,
+        args,
+        thought_signature,
+    })
+}
+
 impl GeminiClient {
     pub fn new(api_key: String) -> Self {
         Self {
@@ -68,7 +143,6 @@ impl GeminiClient {
     pub fn _set_model(&mut self, model: String) {
         self.model_name = model;
     }
-
 
     pub async fn generate_text(
         &self,
@@ -104,7 +178,7 @@ impl GeminiClient {
         }
 
         let resp_json: Value = response.json().await?;
-        
+
         let text = resp_json
             .get("candidates")
             .and_then(|c| c.as_array())
@@ -129,10 +203,12 @@ impl GeminiClient {
     ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
         let mut function_declarations = Vec::new();
         for tool in tools {
+            let mut parameters = tool.parameters_schema();
+            normalize_schema_for_gemini(&mut parameters);
             function_declarations.push(FunctionDeclaration {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
-                parameters: tool.parameters_schema(),
+                parameters,
             });
         }
 
@@ -153,9 +229,12 @@ impl GeminiClient {
             "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
             self.model_name, self.api_key
         );
-        
+
         if std::env::var("RUST_LOG").unwrap_or_default() == "debug" {
-            println!("Request body: {}", serde_json::to_string_pretty(&req_body).unwrap());
+            println!(
+                "Request body: {}",
+                serde_json::to_string_pretty(&req_body).unwrap()
+            );
         }
 
         let response = self
@@ -191,9 +270,15 @@ impl GeminiClient {
                         }
 
                         // Parse SSE lines
-                        while let Some(idx) = buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n")) {
+                        while let Some(idx) =
+                            buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n"))
+                        {
                             let _is_crlf = buffer[..idx].ends_with('\r');
-                            let sep_len = if buffer.get(idx..idx+4) == Some("\r\n\r\n") { 4 } else { 2 };
+                            let sep_len = if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
+                                4
+                            } else {
+                                2
+                            };
 
                             let line = buffer[..idx].to_string();
                             buffer = buffer[idx + sep_len..].to_string();
@@ -231,26 +316,9 @@ impl GeminiClient {
                                                         .send(StreamEvent::Text(text.to_string()))
                                                         .await;
                                                 }
-                                                if let Some(func_call) = part.get("functionCall") {
-                                                    let name = func_call
-                                                        .get("name")
-                                                        .and_then(|n| n.as_str())
-                                                        .unwrap_or("")
-                                                        .to_string();
-                                                    let args = func_call
-                                                        .get("args")
-                                                        .cloned()
-                                                        .unwrap_or(Value::Null);
-                                                    let thought_signature = func_call
-                                                        .get("thought_signature")
-                                                        .and_then(|ts| ts.as_str())
-                                                        .map(|s| s.to_string());
-                                                        
+                                                if let Some(call) = parse_function_call(part) {
                                                     let _ =
-                                                        tx.send(StreamEvent::ToolCall(
-                                                            FunctionCall { name, args, thought_signature },
-                                                        ))
-                                                        .await;
+                                                        tx.send(StreamEvent::ToolCall(call)).await;
                                                 }
                                             }
                                         }
@@ -269,5 +337,126 @@ impl GeminiClient {
         });
 
         Ok(rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_schema_for_gemini_strips_unsupported_fields() {
+        let mut value = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "definitions": {
+                "Thing": {
+                    "type": "object"
+                }
+            },
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "$schema": "https://example.com/schema",
+                    "type": ["string", "null"]
+                },
+                "refy": {
+                    "$ref": "#/definitions/Thing"
+                },
+                "union": {
+                    "anyOf": [
+                        { "$ref": "#/definitions/Thing" },
+                        { "type": "integer" }
+                    ]
+                }
+            },
+            "items": [
+                {
+                    "$schema": "https://example.com/schema2",
+                    "type": "number"
+                }
+            ]
+        });
+
+        normalize_schema_for_gemini(&mut value);
+
+        assert!(value.get("$schema").is_none());
+        assert!(value.get("definitions").is_none());
+        assert!(value["properties"]["nested"].get("$schema").is_none());
+        assert_eq!(
+            value["properties"]["nested"].get("type").and_then(|v| v.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            value["properties"]["refy"].get("type").and_then(|v| v.as_str()),
+            Some("string")
+        );
+        assert_eq!(
+            value["properties"]["union"].get("type").and_then(|v| v.as_str()),
+            Some("integer")
+        );
+        assert!(value["items"][0].get("$schema").is_none());
+    }
+
+    #[test]
+    fn parse_function_call_reads_snake_case_signature() {
+        let part = serde_json::json!({
+            "functionCall": {
+                "name": "execute_bash",
+                "args": { "command": "pwd" },
+                "thought_signature": "sig_snake"
+            }
+        });
+
+        let parsed = parse_function_call(&part).unwrap();
+        assert_eq!(parsed.name, "execute_bash");
+        assert_eq!(parsed.thought_signature.as_deref(), Some("sig_snake"));
+    }
+
+    #[test]
+    fn parse_function_call_reads_camel_case_signature() {
+        let part = serde_json::json!({
+            "functionCall": {
+                "name": "execute_bash",
+                "args": { "command": "pwd" },
+                "thoughtSignature": "sig_camel"
+            }
+        });
+
+        let parsed = parse_function_call(&part).unwrap();
+        assert_eq!(parsed.name, "execute_bash");
+        assert_eq!(parsed.thought_signature.as_deref(), Some("sig_camel"));
+    }
+
+    #[test]
+    fn test_regression_function_call_signature_compat() {
+        let snake = serde_json::json!({
+            "functionCall": {
+                "name": "execute_bash",
+                "args": { "command": "pwd" },
+                "thought_signature": "sig_snake"
+            }
+        });
+        let camel = serde_json::json!({
+            "functionCall": {
+                "name": "execute_bash",
+                "args": { "command": "pwd" },
+                "thoughtSignature": "sig_camel"
+            }
+        });
+
+        assert_eq!(
+            parse_function_call(&snake)
+                .unwrap()
+                .thought_signature
+                .as_deref(),
+            Some("sig_snake")
+        );
+        assert_eq!(
+            parse_function_call(&camel)
+                .unwrap()
+                .thought_signature
+                .as_deref(),
+            Some("sig_camel")
+        );
     }
 }

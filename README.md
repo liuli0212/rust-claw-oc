@@ -55,5 +55,19 @@ This project is a Rust-native implementation of an AI agent, closely following t
 *   **`src/context.rs`**: Context management and `tiktoken-rs` driven token budgeting.
 *   **`src/skills.rs`**: The dynamic Markdown-to-Tool parsing engine.
 
+## Recent Enhancements
+
+- **Task-Loop execution**: The agent now runs multi-step task iterations and does not stop after a single failed step.
+- **Structured tool outputs**: Core tools now return a normalized JSON envelope (`ok`, `output`, `exit_code`, `duration_ms`, `truncated`) for better reasoning and recovery.
+- **Auto-recovery rules**: Bash failures can trigger rule-based remediation (for missing commands, missing paths, and missing `Cargo.toml`).
+- **Session persistence**: Transcript history is persisted per session and restored automatically.
+- **Prompt diagnostics**: Optional prompt reports can show token usage, memory retrieval, and compaction behavior.
+
+### Runtime toggles
+
+- `CLAW_PROMPT_REPORT=1` enables prompt/recovery diagnostics in output.
+- `CLAW_RECOVERY_RULES=all` enables all recovery rules (default). You can also pass a comma-separated subset, for example:
+  - `CLAW_RECOVERY_RULES=missing_command,missing_path`
+
 ## License
 MIT
