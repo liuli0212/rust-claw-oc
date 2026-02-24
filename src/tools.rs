@@ -669,6 +669,36 @@ mod tests {
         assert!(!env.ok);
         assert!(env.output.contains("TAVILY_API_KEY"));
     }
+
+    #[test]
+    fn test_web_fetch_extract_text_from_html() {
+        let html = r#"
+            <html>
+              <head><title>X</title><style>body{display:none;}</style></head>
+              <body>
+                <h1>Hello &amp; Welcome</h1>
+                <p>Rusty&nbsp;Claw</p>
+                <script>console.log("hidden")</script>
+              </body>
+            </html>
+        "#;
+        let text = extract_text_from_html(html);
+        assert!(text.contains("Hello & Welcome"));
+        assert!(text.contains("Rusty Claw"));
+        assert!(!text.contains("hidden"));
+    }
+
+    #[tokio::test]
+    async fn test_web_fetch_rejects_non_http_url() {
+        let tool = WebFetchTool::new();
+        let err = tool
+            .execute(serde_json::json!({
+                "url": "ftp://example.com"
+            }))
+            .await
+            .unwrap_err();
+        assert!(format!("{}", err).contains("http:// or https://"));
+    }
 }
 
 // RAG Store Insert Tool
@@ -814,6 +844,164 @@ impl Tool for ReadFileTool {
                 false,
             ),
         }
+    }
+}
+
+// --- Generic Web Fetch Tool ---
+pub struct WebFetchTool {
+    client: Client,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct WebFetchArgs {
+    /// URL to fetch. Must start with http:// or https://
+    pub url: String,
+    /// Maximum characters to return (default: 12000, clamped to 500..50000).
+    pub max_chars: Option<usize>,
+    /// Return raw HTML when true. When false, HTML pages are converted to readable text.
+    pub include_html: Option<bool>,
+}
+
+impl WebFetchTool {
+    pub fn new() -> Self {
+        Self {
+            client: Client::new(),
+        }
+    }
+}
+
+fn decode_common_html_entities(input: &str) -> String {
+    input
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+}
+
+fn extract_text_from_html(html: &str) -> String {
+    let script_re = Regex::new(r"(?is)<script\b[^>]*>.*?</script>").unwrap();
+    let style_re = Regex::new(r"(?is)<style\b[^>]*>.*?</style>").unwrap();
+    let tag_re = Regex::new(r"(?is)<[^>]+>").unwrap();
+    let ws_re = Regex::new(r"[ \t\r\f\v]+").unwrap();
+    let nl_re = Regex::new(r"\n{3,}").unwrap();
+
+    let without_script = script_re.replace_all(html, " ");
+    let without_style = style_re.replace_all(&without_script, " ");
+    let with_line_breaks = without_style
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</p>", "\n")
+        .replace("</div>", "\n")
+        .replace("</li>", "\n")
+        .replace("</h1>", "\n")
+        .replace("</h2>", "\n")
+        .replace("</h3>", "\n")
+        .replace("</h4>", "\n")
+        .replace("</h5>", "\n")
+        .replace("</h6>", "\n");
+    let without_tags = tag_re.replace_all(&with_line_breaks, " ");
+    let decoded = decode_common_html_entities(&without_tags);
+    let normalized_ws = ws_re.replace_all(&decoded, " ");
+    let normalized_newlines = normalized_ws.replace(" \n", "\n");
+    let squashed_newlines = nl_re.replace_all(&normalized_newlines, "\n\n");
+    squashed_newlines.trim().to_string()
+}
+
+#[async_trait]
+impl Tool for WebFetchTool {
+    fn name(&self) -> String {
+        "web_fetch".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Fetches a webpage by URL and returns readable content. Useful for reading specific pages directly."
+            .to_string()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(WebFetchArgs)).unwrap())
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let start = Instant::now();
+        let parsed: WebFetchArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        let url = parsed.url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(ToolError::InvalidArguments(
+                "url must start with http:// or https://".to_string(),
+            ));
+        }
+
+        let max_chars = parsed.max_chars.unwrap_or(12_000).clamp(500, 50_000);
+        let include_html = parsed.include_html.unwrap_or(false);
+
+        let response = self
+            .client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, "rusty-claw/0.1")
+            .send()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        let status = response.status();
+        let final_url = response.url().to_string();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let raw_body = response
+            .text()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        if !status.is_success() {
+            return serialize_tool_envelope(
+                "web_fetch",
+                false,
+                format!(
+                    "Failed to fetch URL. HTTP: {} | URL: {} | Body: {}",
+                    status,
+                    final_url,
+                    truncate_log(&raw_body)
+                ),
+                Some(1),
+                Some(start.elapsed().as_millis()),
+                raw_body.len() > 15_000,
+            );
+        }
+
+        let rendered = if include_html || !content_type.contains("text/html") {
+            raw_body
+        } else {
+            extract_text_from_html(&raw_body)
+        };
+
+        let (content, truncated) = if rendered.chars().count() > max_chars {
+            (rendered.chars().take(max_chars).collect::<String>(), true)
+        } else {
+            (rendered, false)
+        };
+
+        let output = format!(
+            "URL: {}\nFinal URL: {}\nContent-Type: {}\n\n{}",
+            url, final_url, content_type, content
+        );
+
+        serialize_tool_envelope(
+            "web_fetch",
+            true,
+            output,
+            Some(0),
+            Some(start.elapsed().as_millis()),
+            truncated,
+        )
     }
 }
 

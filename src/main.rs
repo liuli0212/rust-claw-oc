@@ -17,7 +17,7 @@ use crate::session_manager::SessionManager;
 use crate::skills::load_skills;
 use crate::tools::{
     BashTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool, TaskPlanTool,
-    TavilySearchTool, WriteFileTool, WriteMemoryTool,
+    TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool,
 };
 use async_trait::async_trait;
 use dotenvy::dotenv;
@@ -75,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.push(Arc::new(BashTool::new()));
     tools.push(Arc::new(WriteFileTool));
     tools.push(Arc::new(ReadFileTool));
+    tools.push(Arc::new(WebFetchTool::new()));
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(TaskPlanTool::new(
