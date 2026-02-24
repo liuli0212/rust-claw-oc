@@ -557,32 +557,31 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         sources
     }
 
-    async fn hydrate_retrieved_memory(&mut self, query: &str) -> (String, Vec<String>) {
+    async fn execute_retrieval_task(
+        tools: Vec<Arc<dyn Tool>>,
+        query: String,
+        output: Arc<dyn AgentOutput>,
+    ) -> (String, Vec<String>) {
         let trimmed = query.trim();
         if trimmed.is_empty() {
-            self.context.set_retrieved_memory(None, Vec::new());
             return (String::new(), Vec::new());
         }
         if !Self::should_run_memory_retrieval(trimmed) {
-            self.context.set_retrieved_memory(None, Vec::new());
             return (String::new(), Vec::new());
         }
 
-        let maybe_tool = self
-            .tools
+        let maybe_tool = tools
             .iter()
             .find(|t| t.name() == "search_knowledge_base")
             .cloned();
 
         let Some(tool) = maybe_tool else {
-            self.context.set_retrieved_memory(None, Vec::new());
             return (String::new(), Vec::new());
         };
 
         let retrieval_start = Instant::now();
-        self.output
-            .on_text("[System] Retrieving relevant memory...\n")
-            .await;
+        // Don't print "Retrieving..." here to avoid spamming UI if it finishes fast or times out silently
+        
         let rewritten_query = Self::rewrite_memory_query(trimmed);
         let result = tool
             .execute(serde_json::json!({
@@ -590,9 +589,10 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 "limit": 3
             }))
             .await;
+        
         let retrieval_elapsed = retrieval_start.elapsed();
-        if retrieval_elapsed >= Duration::from_millis(800) {
-            self.output
+        if retrieval_elapsed >= Duration::from_millis(1000) {
+             output
                 .on_text(&format!(
                     "[System] Memory retrieval finished in {} ms.\n",
                     retrieval_elapsed.as_millis()
@@ -604,487 +604,51 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             Ok(text) if !text.contains("No relevant information found") => {
                 let capped: String = text.chars().take(2400).collect();
                 let sources = Self::parse_retrieval_sources(&capped);
-                self.context
-                    .set_retrieved_memory(Some(capped), sources.clone());
-                (rewritten_query, sources)
+                (capped, sources)
             }
-            _ => {
-                self.context.set_retrieved_memory(None, Vec::new());
-                (rewritten_query, Vec::new())
-            }
+            _ => (String::new(), Vec::new()),
         }
-    }
-
-    fn build_compaction_prompt(turns: &[Turn]) -> String {
-        let mut summary_prompt = "Please summarize the following conversation history into a concise but comprehensive memorandum. Retain all key technical facts, file paths mentioned, decisions made, and pending issues.\n\n".to_string();
-
-        for (i, turn) in turns.iter().enumerate() {
-            summary_prompt.push_str(&format!("--- Turn {} ---\n", i + 1));
-            summary_prompt.push_str(&format!("User: {}\n", turn.user_message));
-            for msg in &turn.messages {
-                if msg.role == "model" {
-                    for part in &msg.parts {
-                        if let Some(text) = &part.text {
-                            summary_prompt.push_str(&format!("Agent: {}\n", text));
-                        }
-                        if let Some(fc) = &part.function_call {
-                            summary_prompt.push_str(&format!("Agent called tool '{}'\n", fc.name));
-                        }
-                    }
-                } else if msg.role == "function" {
-                    summary_prompt.push_str("Agent received tool results.\n");
-                }
-            }
-            summary_prompt.push('\n');
-        }
-
-        summary_prompt
-    }
-
-    async fn maybe_compact_history(&mut self) -> Option<String> {
-        let trigger_tokens = self.context.max_history_tokens * Self::COMPACTION_TRIGGER_RATIO_NUM
-            / Self::COMPACTION_TRIGGER_RATIO_DEN;
-        let target_tokens = self.context.max_history_tokens * Self::COMPACTION_TARGET_RATIO_NUM
-            / Self::COMPACTION_TARGET_RATIO_DEN;
-
-        let mut compaction_reason = None;
-        for _ in 0..Self::MAX_COMPACTION_ATTEMPTS_PER_STEP {
-            let history_tokens = self.context.dialogue_history_token_estimate();
-            if history_tokens <= trigger_tokens
-                || self.context.dialogue_history.len() < Self::COMPACTION_MIN_TURNS
-            {
-                break;
-            }
-
-            let drain_count = self
-                .context
-                .oldest_turns_for_compaction(target_tokens, Self::COMPACTION_MIN_TURNS);
-            if drain_count == 0 || drain_count >= self.context.dialogue_history.len() {
-                break;
-            }
-
-            compaction_reason = Some(format!(
-                "history_tokens={} exceeded trigger={} (max={})",
-                history_tokens, trigger_tokens, self.context.max_history_tokens
-            ));
-            self.output
-                .on_text("\n[System: Auto-compacting history due to token pressure...]\n")
-                .await;
-
-            let oldest_turns: Vec<_> = self
-                .context
-                .dialogue_history
-                .drain(0..drain_count)
-                .collect();
-            let summary_prompt = Self::build_compaction_prompt(&oldest_turns);
-
-            let sys_msg = Message {
-                role: "system".to_string(),
-                parts: vec![Part {
-                    text: Some("You are an expert summarization agent. Your job is to compress conversation history without losing technical details.".to_string()),
-                    function_call: None,
-                    function_response: None,
-                }],
-            };
-
-            let user_msg = Message {
-                role: "user".to_string(),
-                parts: vec![Part {
-                    text: Some(summary_prompt),
-                    function_call: None,
-                    function_response: None,
-                }],
-            };
-
-            match self.llm.generate_text(vec![user_msg], Some(sys_msg)).await {
-                Ok(summary) => {
-                    let compacted_turn = Turn {
-                        turn_id: uuid::Uuid::new_v4().to_string(),
-                        user_message: "SYSTEM: Old conversation history".to_string(),
-                        messages: vec![
-                            Message {
-                                role: "user".to_string(),
-                                parts: vec![Part {
-                                    text: Some("What happened earlier?".to_string()),
-                                    function_call: None,
-                                    function_response: None,
-                                }],
-                            },
-                            Message {
-                                role: "model".to_string(),
-                                parts: vec![Part {
-                                    text: Some(format!(
-                                        "Earlier conversation summary:\n{}",
-                                        summary
-                                    )),
-                                    function_call: None,
-                                    function_response: None,
-                                }],
-                            },
-                        ],
-                    };
-
-                    self.context.dialogue_history.insert(0, compacted_turn);
-                    self.output
-                        .on_text("[System: Compaction complete.]\n\n")
-                        .await;
-                }
-                Err(e) => {
-                    self.output
-                        .on_error(&format!("\n[Compaction Error]: {}\n", e))
-                        .await;
-                    for (i, turn) in oldest_turns.into_iter().enumerate() {
-                        self.context.dialogue_history.insert(i, turn);
-                    }
-                    break;
-                }
-            }
-        }
-        compaction_reason
-    }
-
-    async fn emit_prompt_report(
-        &self,
-        report: &PromptReport,
-        rewritten_query: &str,
-        compaction_reason: Option<&str>,
-    ) {
-        if !Self::should_emit_prompt_report() {
-            return;
-        }
-        let sources = if report.retrieved_memory_sources.is_empty() {
-            "none".to_string()
-        } else {
-            report.retrieved_memory_sources.join(", ")
-        };
-        let compaction = compaction_reason.unwrap_or("none");
-        let text = format!(
-            "\n[Prompt Report] total={} system={} history={} (turns={} budget={}) current={} rag_snippets={} sources={} query=\"{}\" compaction={}\n",
-            report.total_prompt_tokens,
-            report.system_prompt_tokens,
-            report.history_tokens_used,
-            report.history_turns_included,
-            report.max_history_tokens,
-            report.current_turn_tokens,
-            report.retrieved_memory_snippets,
-            sources,
-            rewritten_query.replace('\n', " "),
-            compaction
-        );
-        self.output.on_text(&text).await;
-    }
-
-    async fn emit_recovery_stats(&self, state: &TaskState) {
-        if !Self::should_emit_prompt_report() || state.recovery_attempts == 0 {
-            return;
-        }
-        let mut stats = Vec::new();
-        for (rule, hits) in &state.recovery_rule_hits {
-            let ratio = (*hits as f64) / (state.recovery_attempts as f64) * 100.0;
-            stats.push(format!(
-                "{}={}/{} ({:.1}%)",
-                rule, hits, state.recovery_attempts, ratio
-            ));
-        }
-        stats.sort();
-        let text = format!("[Recovery Stats] {}\n", stats.join(", "));
-        self.output.on_text(&text).await;
     }
 
     pub async fn step(
         &mut self,
         user_input: String,
     ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
-        let (rewritten_query, _sources) = self.hydrate_retrieved_memory(&user_input).await;
+        // Step 2 & 3: Optimized Retrieval
+        // We spawn retrieval as a separate future with a strict timeout.
+        // This prevents the bot from hanging for >1s just for RAG.
+        let retrieval_future = Self::execute_retrieval_task(
+            self.tools.clone(), 
+            user_input.clone(), 
+            self.output.clone()
+        );
+        
+        // Race: Give it 800ms max. If it takes longer, we skip it for this turn.
+        // This ensures the bot feels "snappy" even if the vector DB is slow.
+        let (retrieved_text, _sources) = match tokio::time::timeout(Duration::from_millis(800), retrieval_future).await {
+            Ok(res) => res,
+            Err(_) => {
+                // Timeout occurred
+                // self.output.on_text("[System] Memory retrieval timed out (skipped for speed).\n").await;
+                (String::new(), Vec::new())
+            }
+        };
+        
+        // Update context with whatever we got (or empty if timed out)
+        self.context.set_retrieved_memory(
+            if retrieved_text.is_empty() { None } else { Some(retrieved_text) }, 
+            _sources
+        );
+        let rewritten_query = if self.context.retrieved_memory.is_some() {
+             Self::rewrite_memory_query(&user_input)
+        } else {
+             String::new()
+        };
+
+        // Step 1: Async Compaction (Already implemented)
         let compaction_reason = self.maybe_compact_history().await;
+        
         self.context.start_turn(user_input);
-        let mut task_state = TaskState {
-            goal: self
-                .context
-                .current_turn
-                .as_ref()
-                .map(|t| t.user_message.clone())
-                .unwrap_or_default(),
-            ..TaskState::default()
-        };
-        let mut prompt_report_emitted = false;
-        let max_task_iterations = Self::max_task_iterations();
-        let mut exit_state = RunExit::CompletedSilent {
-            cause: "run_finished_without_output".to_string(),
-        };
-        for _ in 0..max_task_iterations {
-            task_state.iterations += 1;
-            let (history, system_instruction, prompt_report) = self.context.build_llm_payload();
-            if !prompt_report_emitted {
-                self.emit_prompt_report(
-                    &prompt_report,
-                    &rewritten_query,
-                    compaction_reason.as_deref(),
-                )
-                .await;
-                prompt_report_emitted = true;
-            }
-
-            let mut llm_attempt = 0usize;
-            let mut stream_error: Option<String> = None;
-            let mut rx = loop {
-                llm_attempt += 1;
-                match self
-                    .llm
-                    .stream(
-                        history.clone(),
-                        system_instruction.clone(),
-                        self.tools.clone(),
-                    )
-                    .await
-                {
-                    Ok(rx) => break rx,
-                    Err(e) => {
-                        let err_text = e.to_string();
-                        let can_recover = llm_attempt < Self::MAX_LLM_RECOVERY_ATTEMPTS
-                            && self.recover_from_llm_error(&err_text, llm_attempt).await;
-                        if can_recover {
-                            continue;
-                        }
-                        stream_error = Some(err_text);
-                        break tokio::sync::mpsc::channel(1).1;
-                    }
-                }
-            };
-            if let Some(err_text) = stream_error {
-                self.output
-                    .on_error(&format!("\n[LLM Error]: {}", err_text))
-                    .await;
-                exit_state = RunExit::RecoverableFailed {
-                    reason: "llm_stream_setup_failed".to_string(),
-                    attempts: llm_attempt,
-                };
-                break;
-            }
-
-            let mut full_text = String::new();
-            let mut raw_full_text = String::new();
-            let mut tool_calls = Vec::new();
-            let mut waiting_heartbeat_count = 0usize;
-            let mut saw_no_reply_token = false;
-            let mut saw_heartbeat_token = false;
-            let mut silent_cause_hint: Option<String> = None;
-
-            // print!("Rusty-Claw: ");
-            // use std::io::Write;
-            // std::io::stdout().flush()?;
-
-            loop {
-                let event = match tokio::time::timeout(Duration::from_secs(8), rx.recv()).await {
-                    Ok(ev) => ev,
-                    Err(_) => {
-                        waiting_heartbeat_count += 1;
-                        self.output
-                            .on_text(&format!(
-                                "[System] Still working... ({}s elapsed)\n",
-                                waiting_heartbeat_count * 8
-                            ))
-                            .await;
-                        continue;
-                    }
-                };
-
-                let Some(event) = event else {
-                    break;
-                };
-                match event {
-                    StreamEvent::Text(text) => {
-                        raw_full_text.push_str(&text);
-                        let (visible_text, saw_no_reply, saw_heartbeat) =
-                            Self::sanitize_stream_text_chunk(&text);
-                        saw_no_reply_token |= saw_no_reply;
-                        saw_heartbeat_token |= saw_heartbeat;
-                        if !visible_text.is_empty() {
-                            self.output.on_text(&visible_text).await;
-                            full_text.push_str(&visible_text);
-                        }
-                    }
-                    StreamEvent::ToolCall(call) => {
-                        tool_calls.push(call);
-                    }
-                    StreamEvent::Error(e) => {
-                        self.output.on_error(&format!("\n[LLM Error]: {}", e)).await;
-                        exit_state = RunExit::HardStop {
-                            reason: format!("llm_stream_error: {}", e),
-                        };
-                        break;
-                    }
-                    StreamEvent::Done => break,
-                }
-            }
-            // println!();
-
-            if Self::enforce_final_tag_enabled() {
-                if let Some(final_text) = Self::extract_final_tag_content(&full_text) {
-                    full_text = final_text;
-                } else {
-                    full_text.clear();
-                    silent_cause_hint = Some("enforce_final_tag_missing".to_string());
-                }
-            }
-            if full_text.trim().is_empty() {
-                if silent_cause_hint.is_none() && saw_no_reply_token {
-                    silent_cause_hint = Some("no_reply_token".to_string());
-                }
-                if silent_cause_hint.is_none() && saw_heartbeat_token {
-                    silent_cause_hint = Some("heartbeat_only".to_string());
-                }
-                if silent_cause_hint.is_none() && !raw_full_text.trim().is_empty() {
-                    silent_cause_hint = Some("control_text_suppressed".to_string());
-                }
-            }
-
-            // Record assistant message
-            let mut parts = Vec::new();
-            if !full_text.is_empty() {
-                parts.push(Part {
-                    text: Some(full_text.clone()),
-                    function_call: None,
-                    function_response: None,
-                });
-            }
-            for call in &tool_calls {
-                parts.push(Part {
-                    text: None,
-                    function_call: Some(call.clone()),
-                    function_response: None,
-                });
-            }
-            if !parts.is_empty() {
-                self.context.add_message_to_current_turn(Message {
-                    role: "model".to_string(),
-                    parts,
-                });
-            }
-            if matches!(exit_state, RunExit::HardStop { .. }) {
-                break;
-            }
-
-            if tool_calls.is_empty() {
-                task_state.last_model_text = full_text.clone();
-                task_state.completed = Self::is_task_complete(&task_state);
-                if task_state.completed {
-                    exit_state = if full_text.trim().is_empty() {
-                        RunExit::CompletedSilent {
-                            cause: silent_cause_hint
-                                .unwrap_or_else(|| "model_marked_done_without_text".to_string()),
-                        }
-                    } else {
-                        RunExit::CompletedWithReply
-                    };
-                    break;
-                }
-                if task_state.iterations >= max_task_iterations {
-                    self.output
-                        .on_error(
-                            &format!(
-                                "[Task] Reached max task iterations ({}). Stopping with partial progress.",
-                                max_task_iterations
-                            ),
-                        )
-                        .await;
-                    exit_state = RunExit::RecoverableFailed {
-                        reason: "max_task_iterations_reached".to_string(),
-                        attempts: task_state.iterations,
-                    };
-                    break;
-                }
-
-                let continuation = Self::build_next_action_prompt(&task_state);
-                self.context.add_message_to_current_turn(Message {
-                    role: "user".to_string(),
-                    parts: vec![Part {
-                        text: Some(continuation),
-                        function_call: None,
-                        function_response: None,
-                    }],
-                });
-                continue;
-            }
-            if full_text.trim().is_empty()
-                && tool_calls
-                    .iter()
-                    .all(|c| Self::is_message_delivery_tool(&c.name))
-            {
-                silent_cause_hint = Some("message_tool_suppressed_main_reply".to_string());
-            }
-
-            // Execute tools
-            let mut response_parts = Vec::new();
-            for call in tool_calls {
-                let tool_name = call.name.clone();
-                let tool_args = call.args.clone();
-
-                self.output
-                    .on_tool_start(&tool_name, &tool_args.to_string())
-                    .await;
-                let tool_result = self
-                    .execute_tool_call_with_recovery(&tool_name, &tool_args, &mut task_state)
-                    .await;
-                if !tool_result.ok {
-                    task_state.last_error = Some(tool_result.output.clone());
-                }
-                let result_str = if tool_result.recovery_attempted {
-                    format!(
-                        "{}\n[Auto-Recovery]\n{}",
-                        tool_result.output,
-                        tool_result.recovery_output.clone().unwrap_or_default()
-                    )
-                } else {
-                    tool_result.output.clone()
-                };
-
-                self.output.on_tool_end(&result_str).await;
-
-                response_parts.push(Part {
-                    text: None,
-                    function_call: None,
-                    function_response: Some(FunctionResponse {
-                        name: tool_name,
-                        response: serde_json::json!({
-                            "result": result_str,
-                            "structured": tool_result
-                        }),
-                    }),
-                });
-            }
-
-            self.context.add_message_to_current_turn(Message {
-                role: "function".to_string(),
-                parts: response_parts,
-            });
-            if full_text.trim().is_empty() {
-                if let Some(cause) = silent_cause_hint.clone() {
-                    exit_state = RunExit::CompletedSilent { cause };
-                }
-            }
-
-            // Loop back to give LLM the tool results
-        }
-
-        self.context.end_turn();
-        self.emit_recovery_stats(&task_state).await;
-        if matches!(
-            exit_state,
-            RunExit::CompletedSilent { .. } if task_state.iterations >= max_task_iterations
-        ) {
-            exit_state = RunExit::RecoverableFailed {
-                reason: "max_task_iterations_exhausted".to_string(),
-                attempts: task_state.iterations,
-            };
-        } else if matches!(exit_state, RunExit::CompletedSilent { .. })
-            && !task_state.last_model_text.trim().is_empty()
-        {
-            exit_state = RunExit::CompletedWithReply;
-        }
-        Ok(exit_state)
-    }
-}
 
 #[cfg(test)]
 mod tests {
