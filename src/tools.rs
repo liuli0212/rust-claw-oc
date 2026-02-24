@@ -171,18 +171,26 @@ impl Tool for BashTool {
 // Log truncation logic
 fn truncate_log(log: &str) -> String {
     let lines: Vec<&str> = log.lines().collect();
-    if lines.len() <= 1000 {
-        return log.to_string();
-    }
+    let max_lines = 200;
+    
+    // First pass: line-based truncation
+    let truncated_str = if lines.len() <= max_lines {
+        log.to_string()
+    } else {
+        let head = lines[0..100].join("\n");
+        let tail = lines[lines.len() - 100..].join("\n");
+        format!("{}\n\n[... Truncated {} lines ...]\n\n{}", head, lines.len() - max_lines, tail)
+    };
 
-    let top = lines[0..500].join("\n");
-    let bottom = lines[lines.len() - 500..].join("\n");
-    format!(
-        "{}\n\n[... Truncated {} lines ...]\n\n{}",
-        top,
-        lines.len() - 1000,
-        bottom
-    )
+    // Second pass: character-based truncation (e.g., max 15000 chars)
+    let max_chars = 15000;
+    if truncated_str.len() <= max_chars {
+        truncated_str
+    } else {
+        let head: String = truncated_str.chars().take(max_chars / 2).collect();
+        let tail: String = truncated_str.chars().skip(truncated_str.len() - (max_chars / 2)).collect();
+        format!("{}\n\n[... Truncated {} characters ...]\n\n{}", head, truncated_str.len() - max_chars, tail)
+    }
 }
 
 // Read Memory Tool
@@ -379,9 +387,9 @@ mod tests {
         }
         let truncated = truncate_log(&log);
         assert!(truncated.contains("line 1"));
-        assert!(truncated.contains("line 500"));
-        assert!(truncated.contains("[... Truncated 200 lines ...]"));
-        assert!(truncated.contains("line 701"));
+        assert!(truncated.contains("line 100"));
+        assert!(truncated.contains("[... Truncated 1000 lines ...]"));
+        assert!(truncated.contains("line 1101"));
         assert!(truncated.contains("line 1200"));
         assert!(!truncated.contains("line 600"));
     }

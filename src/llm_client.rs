@@ -31,6 +31,8 @@ pub struct GeminiRequest {
     pub system_instruction: Option<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDeclarationWrapper>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
+    pub tool_config: Option<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -92,6 +94,7 @@ impl GeminiClient {
                     function_declarations,
                 }])
             },
+            tool_config: None,
         };
 
         let url = format!(
@@ -186,9 +189,14 @@ impl GeminiClient {
                                                         .get("args")
                                                         .cloned()
                                                         .unwrap_or(Value::Null);
+                                                    let thought_signature = func_call
+                                                        .get("thought_signature")
+                                                        .and_then(|ts| ts.as_str())
+                                                        .map(|s| s.to_string());
+                                                        
                                                     let _ =
                                                         tx.send(StreamEvent::ToolCall(
-                                                            FunctionCall { name, args },
+                                                            FunctionCall { name, args, thought_signature },
                                                         ))
                                                         .await;
                                                 }
