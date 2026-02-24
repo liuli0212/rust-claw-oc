@@ -296,6 +296,55 @@ impl AgentLoop {
         trimmed.chars().count() >= 120
     }
 
+    fn is_complex_task(query: &str) -> bool {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let lower = trimmed.to_lowercase();
+        let markers = [
+            "implement",
+            "fix",
+            "debug",
+            "refactor",
+            "write",
+            "code",
+            "build",
+            "test",
+            "run",
+            "cargo",
+            "git",
+            "file",
+            "function",
+            "module",
+            "tool",
+            "schema",
+            "优化",
+            "实现",
+            "修复",
+            "调试",
+            "重构",
+            "编译",
+            "测试",
+            "运行",
+            "文件",
+            "函数",
+            "模块",
+            "工具",
+        ];
+        markers.iter().any(|m| lower.contains(m))
+            || lower.contains("src/")
+            || lower.contains(".rs")
+            || trimmed.chars().count() >= 80
+    }
+
+    fn max_attempts_for_input(query: &str) -> usize {
+        if !Self::is_complex_task(query) {
+            return 1;
+        }
+        Self::max_task_iterations()
+    }
+
     async fn emit_timing_report(
         &self,
         total_ms: u128,
@@ -848,6 +897,8 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         &mut self,
         user_input: String,
     ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
+        let is_complex_task = Self::is_complex_task(&user_input);
+        let max_attempts = Self::max_attempts_for_input(&user_input);
         let step_started = Instant::now();
         let retrieval_started = Instant::now();
         let retrieval_future = Self::execute_retrieval_task(
@@ -893,7 +944,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             ..TaskState::default()
         };
         let mut prompt_report_emitted = false;
-        let max_task_iterations = Self::max_task_iterations();
+        let max_task_iterations = max_attempts;
         let mut exit_state = RunExit::CompletedSilent {
             cause: "run_finished_without_output".to_string(),
         };
@@ -903,6 +954,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         let mut tool_exec_ms_acc: u128 = 0;
         let mut llm_attempts_total: usize = 0;
         let mut first_event_ms_first_iter: Option<u128> = None;
+        let mut consecutive_no_tool_iters: usize = 0;
         for _ in 0..max_task_iterations {
             task_state.iterations += 1;
             let prompt_build_started = Instant::now();
@@ -1067,6 +1119,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             }
 
             if tool_calls.is_empty() {
+                consecutive_no_tool_iters += 1;
                 task_state.last_model_text = full_text.clone();
                 task_state.completed = Self::is_task_complete(&task_state);
                 if task_state.completed {
@@ -1096,6 +1149,27 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                     break;
                 }
 
+                // Reason-driven continuation:
+                // - Simple prompts: single-attempt by default.
+                // - Complex prompts: allow one no-tool thinking turn, then stop unless tools run.
+                if !is_complex_task {
+                    if !full_text.trim().is_empty() {
+                        exit_state = RunExit::CompletedWithReply;
+                    }
+                    break;
+                }
+                if consecutive_no_tool_iters >= 2 {
+                    if !full_text.trim().is_empty() {
+                        exit_state = RunExit::CompletedWithReply;
+                    } else {
+                        exit_state = RunExit::RecoverableFailed {
+                            reason: "no_progress_without_tool_calls".to_string(),
+                            attempts: task_state.iterations,
+                        };
+                    }
+                    break;
+                }
+
                 let continuation = Self::build_next_action_prompt(&task_state);
                 self.context.add_message_to_current_turn(Message {
                     role: "user".to_string(),
@@ -1107,6 +1181,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 });
                 continue;
             }
+            consecutive_no_tool_iters = 0;
             if full_text.trim().is_empty()
                 && tool_calls
                     .iter()
@@ -1219,5 +1294,17 @@ mod tests {
         let text = "prefix <final>ship it</final> suffix";
         let extracted = AgentLoop::extract_final_tag_content(text).unwrap();
         assert_eq!(extracted, "ship it");
+    }
+
+    #[test]
+    fn simple_prompt_uses_single_attempt_budget() {
+        assert_eq!(AgentLoop::max_attempts_for_input("你叫什么名字？"), 1);
+    }
+
+    #[test]
+    fn complex_prompt_uses_multi_attempt_budget() {
+        assert!(
+            AgentLoop::max_attempts_for_input("请修复 src/core.rs 的 bug 并运行 cargo test") > 1
+        );
     }
 }
