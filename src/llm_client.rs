@@ -4,7 +4,8 @@ use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -76,6 +77,13 @@ pub struct GeminiClient {
     api_key: String,
     client: Client,
     model_name: String,
+    function_declarations_cache: Mutex<Option<CachedFunctionDeclarations>>,
+}
+
+#[derive(Clone)]
+struct CachedFunctionDeclarations {
+    signature: String,
+    declarations: Vec<FunctionDeclaration>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -137,6 +145,7 @@ impl GeminiClient {
             api_key,
             client: Client::new(),
             model_name: "gemini-3.1-pro-preview".to_string(), // Or gemini-2.0-flash
+            function_declarations_cache: Mutex::new(None),
         }
     }
 
@@ -158,6 +167,56 @@ impl GeminiClient {
             }
         }
         models
+    }
+
+    fn tool_signature(tools: &[Arc<dyn crate::tools::Tool>]) -> String {
+        let mut sig = String::new();
+        for tool in tools {
+            sig.push_str(&tool.name());
+            sig.push('|');
+            sig.push_str(&tool.description());
+            sig.push(';');
+        }
+        sig
+    }
+
+    fn get_function_declarations(
+        &self,
+        tools: &[Arc<dyn crate::tools::Tool>],
+    ) -> (Vec<FunctionDeclaration>, bool, u128) {
+        let started = Instant::now();
+        if tools.is_empty() {
+            return (Vec::new(), true, 0);
+        }
+
+        let signature = Self::tool_signature(tools);
+        if let Ok(cache_guard) = self.function_declarations_cache.lock() {
+            if let Some(cached) = cache_guard.as_ref() {
+                if cached.signature == signature {
+                    return (cached.declarations.clone(), true, started.elapsed().as_millis());
+                }
+            }
+        }
+
+        let mut declarations = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let mut parameters = tool.parameters_schema();
+            normalize_schema_for_gemini(&mut parameters);
+            declarations.push(FunctionDeclaration {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters,
+            });
+        }
+
+        if let Ok(mut cache_guard) = self.function_declarations_cache.lock() {
+            *cache_guard = Some(CachedFunctionDeclarations {
+                signature,
+                declarations: declarations.clone(),
+            });
+        }
+
+        (declarations, false, started.elapsed().as_millis())
     }
 
     pub async fn generate_text(
@@ -217,16 +276,14 @@ impl GeminiClient {
         system_instruction: Option<Message>,
         tools: Vec<Arc<dyn crate::tools::Tool>>,
     ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
-        let mut function_declarations = Vec::new();
-        for tool in tools {
-            let mut parameters = tool.parameters_schema();
-            normalize_schema_for_gemini(&mut parameters);
-            function_declarations.push(FunctionDeclaration {
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                parameters,
-            });
-        }
+        let (function_declarations, declarations_cache_hit, declarations_prepare_ms) =
+            self.get_function_declarations(&tools);
+        tracing::debug!(
+            declarations_prepare_ms = declarations_prepare_ms,
+            declarations_cache_hit = declarations_cache_hit,
+            tool_count = function_declarations.len(),
+            "prepared_function_declarations"
+        );
 
         let mut last_error: Option<String> = None;
         let response = {
@@ -251,12 +308,13 @@ impl GeminiClient {
                 );
 
                 if std::env::var("RUST_LOG").unwrap_or_default() == "debug" {
-                    println!(
+                    tracing::debug!(
                         "Request body: {}",
-                        serde_json::to_string_pretty(&req_body).unwrap()
+                        serde_json::to_string_pretty(&req_body).unwrap_or_default()
                     );
                 }
 
+                let send_started = Instant::now();
                 match self
                     .client
                     .post(&url)
@@ -266,18 +324,35 @@ impl GeminiClient {
                     .await
                 {
                     Ok(resp) if resp.status().is_success() => {
+                        tracing::debug!(
+                            model = %model_name,
+                            http_send_wait_ms = send_started.elapsed().as_millis(),
+                            "llm_stream_request_ok"
+                        );
                         selected_response = Some(resp);
                         break;
                     }
                     Ok(resp) => {
                         let status = resp.status();
                         let body = resp.text().await.unwrap_or_default();
+                        tracing::warn!(
+                            model = %model_name,
+                            status = %status,
+                            http_send_wait_ms = send_started.elapsed().as_millis(),
+                            "llm_stream_request_failed_status"
+                        );
                         last_error = Some(format!(
                             "model={} status={} body={}",
                             model_name, status, body
                         ));
                     }
                     Err(e) => {
+                        tracing::warn!(
+                            model = %model_name,
+                            http_send_wait_ms = send_started.elapsed().as_millis(),
+                            error = %e,
+                            "llm_stream_request_transport_error"
+                        );
                         last_error = Some(format!("model={} transport={}", model_name, e));
                     }
                 }
@@ -333,7 +408,7 @@ impl GeminiClient {
                                 return;
                             }
                             if std::env::var("RUST_LOG").unwrap_or_default() == "debug" {
-                                println!("Raw SSE chunk: {}", data_str);
+                                tracing::debug!("Raw SSE chunk: {}", data_str);
                             }
 
                             if let Ok(json) = serde_json::from_str::<Value>(data_str) {

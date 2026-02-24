@@ -41,7 +41,7 @@ impl Tool for SkillTool {
             }
         }
 
-        println!(">> [Executing Skill: {}]", self.name);
+        tracing::info!("Executing skill: {}", self.name);
 
         let output = Command::new("bash")
             .arg("-c")

@@ -63,12 +63,37 @@ CLAW_RECOVERY_RULES=all
 
 # Enforce strict <final> tag parsing for cleaner output (Default: 0)
 CLAW_ENFORCE_FINAL_TAG=1
+
+# Logging level (fallback when RUST_LOG is not set, Default: info)
+CLAW_LOG_LEVEL=info
+
+# Enable file logging (1/0, Default: 1)
+CLAW_FILE_LOG=1
+
+# Log directory and file name (Default: logs/rusty-claw.log with daily rotation)
+CLAW_LOG_DIR=logs
+CLAW_LOG_FILE=rusty-claw.log
 ```
 
 ### 3. Build & Run
 Run in release mode for maximum performance (especially for vector search):
 ```bash
 cargo run --release
+```
+
+Common runtime flags (override env vars):
+```bash
+# Debug logs + file logs in custom location
+cargo run --release -- \
+  --log-level debug \
+  --log-dir logs \
+  --log-file rusty-claw.log
+
+# Disable file log, keep stdout logs only
+cargo run --release -- --no-file-log
+
+# Force perf/prompt reports without editing .env
+cargo run --release -- --timing-report --prompt-report
 ```
 
 ## 🏗️ Architecture Overview
