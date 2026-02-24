@@ -78,7 +78,7 @@ pub struct GeminiClient {
     model_name: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct GeminiRequest {
     pub contents: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "systemInstruction")]
@@ -89,13 +89,13 @@ pub struct GeminiRequest {
     pub tool_config: Option<serde_json::Value>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ToolDeclarationWrapper {
     #[serde(rename = "functionDeclarations")]
     pub function_declarations: Vec<FunctionDeclaration>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct FunctionDeclaration {
     pub name: String,
     pub description: String,
@@ -142,6 +142,22 @@ impl GeminiClient {
 
     pub fn _set_model(&mut self, model: String) {
         self.model_name = model;
+    }
+
+    fn configured_models(&self) -> Vec<String> {
+        let mut models = vec![self.model_name.clone()];
+        if let Ok(fallbacks) = std::env::var("CLAW_FALLBACK_MODELS") {
+            for model in fallbacks
+                .split(',')
+                .map(|m| m.trim())
+                .filter(|m| !m.is_empty())
+            {
+                if !models.iter().any(|existing| existing == model) {
+                    models.push(model.to_string());
+                }
+            }
+        }
+        models
     }
 
     pub async fn generate_text(
@@ -212,46 +228,68 @@ impl GeminiClient {
             });
         }
 
-        let req_body = GeminiRequest {
-            contents: messages,
-            system_instruction,
-            tools: if function_declarations.is_empty() {
-                None
-            } else {
-                Some(vec![ToolDeclarationWrapper {
-                    function_declarations,
-                }])
-            },
-            tool_config: None,
+        let mut last_error: Option<String> = None;
+        let response = {
+            let mut selected_response = None;
+            for model_name in self.configured_models() {
+                let req_body = GeminiRequest {
+                    contents: messages.clone(),
+                    system_instruction: system_instruction.clone(),
+                    tools: if function_declarations.is_empty() {
+                        None
+                    } else {
+                        Some(vec![ToolDeclarationWrapper {
+                            function_declarations: function_declarations.clone(),
+                        }])
+                    },
+                    tool_config: None,
+                };
+
+                let url = format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+                    model_name, self.api_key
+                );
+
+                if std::env::var("RUST_LOG").unwrap_or_default() == "debug" {
+                    println!(
+                        "Request body: {}",
+                        serde_json::to_string_pretty(&req_body).unwrap()
+                    );
+                }
+
+                match self
+                    .client
+                    .post(&url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&req_body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        selected_response = Some(resp);
+                        break;
+                    }
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        last_error = Some(format!(
+                            "model={} status={} body={}",
+                            model_name, status, body
+                        ));
+                    }
+                    Err(e) => {
+                        last_error = Some(format!("model={} transport={}", model_name, e));
+                    }
+                }
+            }
+
+            selected_response.ok_or_else(|| {
+                LlmError::ApiError(format!(
+                    "All configured models failed. Last error: {}",
+                    last_error.unwrap_or_else(|| "unknown".to_string())
+                ))
+            })?
         };
-
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-            self.model_name, self.api_key
-        );
-
-        if std::env::var("RUST_LOG").unwrap_or_default() == "debug" {
-            println!(
-                "Request body: {}",
-                serde_json::to_string_pretty(&req_body).unwrap()
-            );
-        }
-
-        let response = self
-            .client
-            .post(&url)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&req_body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let err_text = response.text().await.unwrap_or_default();
-            return Err(LlmError::ApiError(format!(
-                "Status: {}, Body: {}",
-                err_text, err_text
-            ))); // Fixed formatting
-        }
 
         let (tx, rx) = mpsc::channel(100);
 
@@ -383,15 +421,21 @@ mod tests {
         assert!(value.get("definitions").is_none());
         assert!(value["properties"]["nested"].get("$schema").is_none());
         assert_eq!(
-            value["properties"]["nested"].get("type").and_then(|v| v.as_str()),
+            value["properties"]["nested"]
+                .get("type")
+                .and_then(|v| v.as_str()),
             Some("string")
         );
         assert_eq!(
-            value["properties"]["refy"].get("type").and_then(|v| v.as_str()),
+            value["properties"]["refy"]
+                .get("type")
+                .and_then(|v| v.as_str()),
             Some("string")
         );
         assert_eq!(
-            value["properties"]["union"].get("type").and_then(|v| v.as_str()),
+            value["properties"]["union"]
+                .get("type")
+                .and_then(|v| v.as_str()),
             Some("integer")
         );
         assert!(value["items"][0].get("$schema").is_none());

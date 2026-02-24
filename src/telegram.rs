@@ -57,8 +57,17 @@ pub async fn run_telegram_bot(token: String, session_manager: Arc<SessionManager
                     .await;
 
                 let mut agent_guard = agent.lock().await;
-                if let Err(e) = agent_guard.step(text.to_string()).await {
-                    let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
+                match agent_guard.step(text.to_string()).await {
+                    Ok(exit) => {
+                        if matches!(exit, crate::core::RunExit::RecoverableFailed { .. }) {
+                            let _ = bot
+                                .send_message(chat_id, format!("Run stopped: {}", exit.label()))
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
+                    }
                 }
             }
             Ok(())
