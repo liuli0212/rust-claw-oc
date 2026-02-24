@@ -69,6 +69,58 @@ impl GeminiClient {
         self.model_name = model;
     }
 
+
+    pub async fn generate_text(
+        &self,
+        messages: Vec<Message>,
+        system_instruction: Option<Message>,
+    ) -> Result<String, LlmError> {
+        let req_body = GeminiRequest {
+            contents: messages,
+            system_instruction,
+            tools: None,
+            tool_config: None,
+        };
+
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            self.model_name, self.api_key
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&req_body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(LlmError::ApiError(format!(
+                "API error: {}\nBody: {}",
+                error_text, error_text
+            )));
+        }
+
+        let resp_json: Value = response.json().await?;
+        
+        let text = resp_json
+            .get("candidates")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+            .and_then(|p| p.first())
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        Ok(text)
+    }
+
     pub async fn stream(
         &self,
         messages: Vec<Message>,
