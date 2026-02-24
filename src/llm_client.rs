@@ -140,11 +140,11 @@ fn parse_function_call(part: &Value) -> Option<FunctionCall> {
 }
 
 impl GeminiClient {
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, model_name: Option<String>) -> Self {
         Self {
             api_key,
             client: Client::new(),
-            model_name: "gemini-3.1-pro-preview".to_string(), // Or gemini-2.0-flash
+            model_name: model_name.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
             function_declarations_cache: Mutex::new(None),
         }
     }

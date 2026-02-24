@@ -31,6 +31,9 @@ use std::sync::Arc;
 #[derive(Debug, Parser)]
 #[command(name = "rusty-claw", about = "Rusty-Claw CLI agent")]
 struct CliArgs {
+    /// Primary Gemini model name (e.g. gemini-2.0-flash)
+    #[arg(long)]
+    model: Option<String>,
     /// Log level (e.g. trace, debug, info, warn, error)
     #[arg(long)]
     log_level: Option<String>,
@@ -113,7 +116,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("GEMINI_API_KEY not set. LLM calls will fail.");
     }
 
-    let llm = Arc::new(GeminiClient::new(api_key));
+    let llm = Arc::new(GeminiClient::new(api_key, args.model.clone()));
+    if let Some(model) = &args.model {
+        tracing::info!("Using CLI-selected model: {}", model);
+    }
 
     let current_dir = std::env::current_dir()?;
     let current_dir_str = current_dir.to_str().unwrap_or(".");

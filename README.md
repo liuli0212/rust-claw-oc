@@ -83,6 +83,9 @@ cargo run --release
 
 Common runtime flags (override env vars):
 ```bash
+# Choose model from CLI
+cargo run --release -- --model gemini-2.0-flash
+
 # Debug logs + file logs in custom location
 cargo run --release -- \
   --log-level debug \
