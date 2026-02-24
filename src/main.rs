@@ -15,7 +15,7 @@ use crate::llm_client::GeminiClient;
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::skills::load_skills;
-use crate::tools::{BashTool, ReadMemoryTool, WriteMemoryTool, RagSearchTool, RagInsertTool};
+use crate::tools::{BashTool, ReadMemoryTool, WriteMemoryTool, RagSearchTool, RagInsertTool, WriteFileTool, ReadFileTool};
 use crate::session_manager::SessionManager;
 use dotenvy::dotenv;
 use rustyline::error::ReadlineError;
@@ -71,6 +71,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tools: Vec<Arc<dyn tools::Tool>> = Vec::new();
     tools.push(Arc::new(BashTool::new()));
+    tools.push(Arc::new(WriteFileTool));
+    tools.push(Arc::new(ReadFileTool));
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
 

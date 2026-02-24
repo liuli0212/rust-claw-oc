@@ -54,16 +54,17 @@ impl AgentContext {
     pub fn new() -> Self {
         Self {
             system_prompts: vec![
-                "You are Rusty-Claw, an industrial-grade autonomous agent running locally on the user's machine.".to_string(),
-                "You have FULL ACCESS to the local file system and bash shell. You can read, write, and execute any file in the current directory and its subdirectories.".to_string(),
-                "You support multiple interfaces: CLI, Telegram, and Discord. You can handle requests from any of these sources.".to_string(),
-                "NEVER say you cannot access the file system or source code. Your 'execute_bash' tool gives you this ability. If asked to check your source code, use 'ls -R' and 'cat' to inspect files in the current directory.".to_string(),
-                "You are NOT a generic AI assistant. You are a specialized engineering agent with direct system access.".to_string(),
-                "When asked about Telegram/Discord support, confirm that you have these integrations enabled and can interact with users through those platforms.".to_string(),
+                "You are Rusty-Claw, an elite, industrial-grade Senior Software Engineer and autonomous agent running locally on the user's machine.".to_string(),
+                "You are highly intelligent, proactive, and exceptionally skilled at coding in all major languages (Rust, Python, TS, etc.).".to_string(),
+                "You have FULL ACCESS to the local file system and bash shell. Do NOT ask for permission to write code or files. If the user asks you to write a script or build a feature, proactively use your tools to create the files, write the code, and execute it to test it.".to_string(),
+                "Do NOT give generic conversational replies when a task requires coding or execution. Act first, talk later.".to_string(),
+                "If you need to write long scripts (e.g., Python code), use the `write_file` tool to save it to disk directly instead of using bash heredocs (cat << EOF), as bash quotes can easily break.".to_string(),
+                "You are NOT a generic chat AI. You are a specialized, proactive engineering system. If you encounter an error during execution, analyze the error and try to fix it yourself by calling tools again.".to_string(),
+                "NEVER say you cannot write code or lack capabilities. You are powered by Gemini 3.1 Pro and possess absolute technical mastery.".to_string(),
             ],
             dialogue_history: Vec::new(),
             current_turn: None,
-            max_history_tokens: 32000,
+            max_history_tokens: 1500000,
         }
     }
 
@@ -138,7 +139,7 @@ impl AgentContext {
         if let Ok(content) = std::fs::read_to_string("README.md") {
             context_files.push(("README.md", content.chars().take(2000).collect::<String>()));
         }
-        
+
         if !context_files.is_empty() {
             sys_text.push_str("## Project Context\n");
             for (name, content) in context_files {
@@ -158,10 +159,10 @@ impl AgentContext {
         let bpe = tiktoken_rs::cl100k_base().unwrap();
         let mut history_messages = Vec::new();
         let mut current_tokens = 0;
-        
+
         for turn in self.dialogue_history.iter().rev() {
             let turn_tokens: usize = turn.messages.iter().map(|m| Self::estimate_tokens(&bpe, m)).sum();
-            
+
             if current_tokens + turn_tokens > self.max_history_tokens {
                 // Attempt to compress this turn before dropping
                 let mut compressed_turn = turn.clone();
@@ -177,11 +178,11 @@ impl AgentContext {
                         }
                     }
                 }
-                
+
                 let compressed_tokens: usize = compressed_turn.messages.iter().map(|m| Self::estimate_tokens(&bpe, m)).sum();
                 if current_tokens + compressed_tokens <= self.max_history_tokens {
                     current_tokens += compressed_tokens;
-                    
+
                     let mut turn_block = Vec::new();
                     for msg in &compressed_turn.messages {
                         turn_block.push(msg.clone());
@@ -189,12 +190,12 @@ impl AgentContext {
                     history_messages.push(turn_block);
                     continue;
                 }
-                
+
                 println!("\n>> [Memory]: Working memory truncated due to token budget ({} / {})", current_tokens, self.max_history_tokens);
                 break;
             }
             current_tokens += turn_tokens;
-            
+
             let mut turn_block = Vec::new();
             for msg in &turn.messages {
                 turn_block.push(msg.clone());
@@ -224,33 +225,33 @@ mod tests {
         ctx.start_turn("Hello".to_string());
         assert!(ctx.current_turn.is_some());
         assert_eq!(ctx.current_turn.as_ref().unwrap().user_message, "Hello");
-        
+
         ctx.add_message_to_current_turn(Message {
             role: "model".to_string(),
             parts: vec![Part { text: Some("Hi there".to_string()), function_call: None, function_response: None }]
         });
-        
+
         ctx.end_turn();
         assert!(ctx.current_turn.is_none());
         assert_eq!(ctx.dialogue_history.len(), 1);
         assert_eq!(ctx.dialogue_history[0].messages.len(), 2);
     }
-    
+
     #[test]
     fn test_token_budget_truncation() {
         let mut ctx = AgentContext::new();
         ctx.max_history_tokens = 10; // Extremely small budget to guarantee cutoff
-        
+
         // Turn 1 (Oldest)
         ctx.start_turn("This is a very long string that should be truncated eventually. It has many many words and will exceed fifty tokens quickly.".to_string());
         ctx.end_turn();
-        
+
         // Turn 2 (Newest)
         ctx.start_turn("Short message".to_string());
         ctx.end_turn();
-        
+
         let (payload, _) = ctx.build_llm_payload();
-        
+
         // Output should have 1 item from Turn 2. The Turn 1 should be dropped.
         // Actually wait, build_llm_payload also returns the CURRENT turn which is empty if we called end_turn, but let's check length
         assert!(payload.len() == 1, "Payload length was {}, expected 1", payload.len());

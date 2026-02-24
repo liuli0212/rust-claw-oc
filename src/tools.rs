@@ -455,3 +455,58 @@ impl Tool for RagInsertTool {
         Ok("Knowledge successfully embedded and saved into long-term vector memory.".to_string())
     }
 }
+
+
+// --- File Write Tool ---
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct WriteFileArgs {
+    /// Absolute or relative path to the file to write
+    pub path: String,
+    /// The complete content to write into the file
+    pub content: String,
+}
+
+pub struct WriteFileTool;
+#[async_trait]
+impl Tool for WriteFileTool {
+    fn name(&self) -> String { "write_file".to_string() }
+    fn description(&self) -> String { "Writes complete content to a specified file. Overwrites if exists. Very reliable for writing code.".to_string() }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(WriteFileArgs)).unwrap()
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: WriteFileArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        if let Some(parent) = std::path::Path::new(&parsed.path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&parsed.path, &parsed.content)
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        Ok(format!("Successfully wrote {} bytes to {}", parsed.content.len(), parsed.path))
+    }
+}
+
+// --- File Read Tool ---
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ReadFileArgs {
+    /// Path to the file to read
+    pub path: String,
+}
+
+pub struct ReadFileTool;
+#[async_trait]
+impl Tool for ReadFileTool {
+    fn name(&self) -> String { "read_file".to_string() }
+    fn description(&self) -> String { "Reads the exact contents of a file from disk.".to_string() }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(ReadFileArgs)).unwrap()
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: ReadFileArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        match std::fs::read_to_string(&parsed.path) {
+            Ok(content) => Ok(content),
+            Err(e) => Err(ToolError::ExecutionFailed(format!("Failed to read {}: {}", parsed.path, e))),
+        }
+    }
+}
