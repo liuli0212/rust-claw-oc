@@ -109,6 +109,12 @@ impl AgentLoop {
         std::env::var("CLAW_PROMPT_REPORT").unwrap_or_default() == "1"
     }
 
+    fn should_emit_timing_report() -> bool {
+        std::env::var("CLAW_TIMING_REPORT")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    }
+
     fn max_task_iterations() -> usize {
         std::env::var("CLAW_MAX_TASK_ITERATIONS")
             .ok()
@@ -264,17 +270,69 @@ impl AgentLoop {
             return false;
         }
 
-        // Run retrieval only for task-like prompts or long requests.
+        if trimmed.chars().count() < 20 {
+            return false;
+        }
+
+        let memory_intent_markers = [
+            "remember", "recall", "previous", "earlier", "history", "memory", "之前", "上次",
+            "历史", "记住", "回忆",
+        ];
+        if memory_intent_markers.iter().any(|m| lower.contains(m)) {
+            return true;
+        }
+
+        // Run retrieval only for strongly task-like prompts.
         let task_markers = [
             "bug", "error", "fix", "build", "test", "cargo", "compile", "stack", "trace",
             "function", "file", "path", "schema", "tool", "代码", "修复", "实现", "分析", "报错",
             "测试", "编译", "文件", "路径", "工具", "问题",
         ];
-        if task_markers.iter().any(|m| lower.contains(m)) {
+        if task_markers.iter().any(|m| lower.contains(m)) && trimmed.chars().count() >= 24 {
             return true;
         }
 
-        trimmed.chars().count() >= 40
+        // Fallback for unusually long, detail-heavy requests.
+        trimmed.chars().count() >= 120
+    }
+
+    async fn emit_timing_report(
+        &self,
+        total_ms: u128,
+        retrieval_ms: u128,
+        retrieval_timed_out: bool,
+        compaction_ms: u128,
+        prompt_build_ms: u128,
+        llm_setup_ms: u128,
+        llm_stream_wait_ms: u128,
+        tool_exec_ms: u128,
+        iterations: usize,
+        llm_attempts: usize,
+        first_event_ms: Option<u128>,
+    ) {
+        if !Self::should_emit_timing_report() {
+            return;
+        }
+        let first = first_event_ms
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        let retrieval_note = if retrieval_timed_out { "timeout" } else { "ok" };
+        self.output
+            .on_text(&format!(
+                "[Perf] total={}ms iter={} llm_attempts={} retrieval={}ms({}) compaction={}ms prompt={}ms llm_setup={}ms llm_stream={}ms tool_exec={}ms first_event={}ms\n",
+                total_ms,
+                iterations,
+                llm_attempts,
+                retrieval_ms,
+                retrieval_note,
+                compaction_ms,
+                prompt_build_ms,
+                llm_setup_ms,
+                llm_stream_wait_ms,
+                tool_exec_ms,
+                first
+            ))
+            .await;
     }
 
     fn enabled_recovery_rules() -> HashSet<String> {
@@ -790,6 +848,8 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         &mut self,
         user_input: String,
     ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
+        let step_started = Instant::now();
+        let retrieval_started = Instant::now();
         let retrieval_future = Self::execute_retrieval_task(
             self.tools.clone(),
             user_input.clone(),
@@ -797,11 +857,12 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         );
 
         // Race: Give it 800ms max.
-        let (retrieved_text, _sources) =
+        let (retrieved_text, _sources, retrieval_timed_out) =
             match tokio::time::timeout(Duration::from_millis(800), retrieval_future).await {
-                Ok(res) => res,
-                Err(_) => (String::new(), Vec::new()),
+                Ok(res) => (res.0, res.1, false),
+                Err(_) => (String::new(), Vec::new(), true),
             };
+        let retrieval_ms = retrieval_started.elapsed().as_millis();
 
         self.context.set_retrieved_memory(
             if retrieved_text.is_empty() {
@@ -817,8 +878,9 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             String::new()
         };
 
-        // Step 1: Async Compaction (Already implemented)
+        let compaction_started = Instant::now();
         let compaction_reason = self.maybe_compact_history().await;
+        let compaction_ms = compaction_started.elapsed().as_millis();
 
         self.context.start_turn(user_input);
         let mut task_state = TaskState {
@@ -835,9 +897,17 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         let mut exit_state = RunExit::CompletedSilent {
             cause: "run_finished_without_output".to_string(),
         };
+        let mut prompt_build_ms_acc: u128 = 0;
+        let mut llm_setup_ms_acc: u128 = 0;
+        let mut llm_stream_wait_ms_acc: u128 = 0;
+        let mut tool_exec_ms_acc: u128 = 0;
+        let mut llm_attempts_total: usize = 0;
+        let mut first_event_ms_first_iter: Option<u128> = None;
         for _ in 0..max_task_iterations {
             task_state.iterations += 1;
+            let prompt_build_started = Instant::now();
             let (history, system_instruction, prompt_report) = self.context.build_llm_payload();
+            prompt_build_ms_acc += prompt_build_started.elapsed().as_millis();
             if !prompt_report_emitted {
                 self.emit_prompt_report(
                     &prompt_report,
@@ -850,6 +920,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
 
             let mut llm_attempt = 0usize;
             let mut stream_error: Option<String> = None;
+            let llm_setup_started = Instant::now();
             let mut rx = loop {
                 llm_attempt += 1;
                 match self
@@ -874,6 +945,8 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                     }
                 }
             };
+            llm_attempts_total += llm_attempt;
+            llm_setup_ms_acc += llm_setup_started.elapsed().as_millis();
             if let Some(err_text) = stream_error {
                 self.output
                     .on_error(&format!("\n[LLM Error]: {}", err_text))
@@ -892,6 +965,8 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             let mut saw_no_reply_token = false;
             let mut saw_heartbeat_token = false;
             let mut silent_cause_hint: Option<String> = None;
+            let llm_stream_started = Instant::now();
+            let mut first_event_recorded = false;
 
             loop {
                 let event = match tokio::time::timeout(Duration::from_secs(8), rx.recv()).await {
@@ -911,6 +986,13 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 let Some(event) = event else {
                     break;
                 };
+                if !first_event_recorded {
+                    let t = llm_stream_started.elapsed().as_millis();
+                    if first_event_ms_first_iter.is_none() {
+                        first_event_ms_first_iter = Some(t);
+                    }
+                    first_event_recorded = true;
+                }
                 match event {
                     StreamEvent::Text(text) => {
                         raw_full_text.push_str(&text);
@@ -936,6 +1018,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                     StreamEvent::Done => break,
                 }
             }
+            llm_stream_wait_ms_acc += llm_stream_started.elapsed().as_millis();
 
             if Self::enforce_final_tag_enabled() {
                 if let Some(final_text) = Self::extract_final_tag_content(&full_text) {
@@ -1041,9 +1124,11 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 self.output
                     .on_tool_start(&tool_name, &tool_args.to_string())
                     .await;
+                let tool_exec_started = Instant::now();
                 let tool_result = self
                     .execute_tool_call_with_recovery(&tool_name, &tool_args, &mut task_state)
                     .await;
+                tool_exec_ms_acc += tool_exec_started.elapsed().as_millis();
                 if !tool_result.ok {
                     task_state.last_error = Some(tool_result.output.clone());
                 }
@@ -1085,6 +1170,20 @@ Use tools proactively and perform one concrete next action. If complete, clearly
 
         self.context.end_turn();
         self.emit_recovery_stats(&task_state).await;
+        self.emit_timing_report(
+            step_started.elapsed().as_millis(),
+            retrieval_ms,
+            retrieval_timed_out,
+            compaction_ms,
+            prompt_build_ms_acc,
+            llm_setup_ms_acc,
+            llm_stream_wait_ms_acc,
+            tool_exec_ms_acc,
+            task_state.iterations,
+            llm_attempts_total,
+            first_event_ms_first_iter,
+        )
+        .await;
         if matches!(
             exit_state,
             RunExit::CompletedSilent { .. } if task_state.iterations >= max_task_iterations
