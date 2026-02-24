@@ -22,7 +22,7 @@ impl Tool for SkillTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        self.schema.clone()
+        crate::tools::clean_schema(self.schema.clone())
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
