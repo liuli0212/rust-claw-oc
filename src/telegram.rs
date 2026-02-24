@@ -1,8 +1,8 @@
-use teloxide::prelude::*;
-use std::sync::Arc;
-use crate::session_manager::SessionManager;
 use crate::core::AgentOutput;
+use crate::session_manager::SessionManager;
 use async_trait::async_trait;
+use std::sync::Arc;
+use teloxide::prelude::*;
 
 struct TelegramOutput {
     bot: Bot,
@@ -12,7 +12,6 @@ struct TelegramOutput {
 #[async_trait]
 impl AgentOutput for TelegramOutput {
     async fn on_text(&self, text: &str) {
-
         let _ = self.bot.send_message(self.chat_id, text).await;
     }
 
@@ -22,7 +21,6 @@ impl AgentOutput for TelegramOutput {
     }
 
     async fn on_tool_end(&self, result: &str) {
-
         let display_result = if result.len() > 3000 {
             format!("{}... (truncated)", &result[..3000])
         } else {
@@ -48,18 +46,19 @@ pub async fn run_telegram_bot(token: String, session_manager: Arc<SessionManager
             if let Some(text) = msg.text() {
                 let chat_id = msg.chat.id;
                 let session_id = format!("telegram:{}", chat_id);
-                
+
                 let output = Arc::new(TelegramOutput {
                     bot: bot.clone(),
                     chat_id,
                 });
-                
-                let agent = session_manager.get_or_create_session(&session_id, output).await;
-                
+
+                let agent = session_manager
+                    .get_or_create_session(&session_id, output)
+                    .await;
 
                 let mut agent_guard = agent.lock().await;
                 if let Err(e) = agent_guard.step(text.to_string()).await {
-                     let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
+                    let _ = bot.send_message(chat_id, format!("Error: {}", e)).await;
                 }
             }
             Ok(())

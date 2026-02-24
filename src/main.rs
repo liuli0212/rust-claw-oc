@@ -1,27 +1,29 @@
 mod context;
 mod core;
+mod discord;
 mod llm_client;
 mod memory;
-mod tools;
-mod skills;
 pub mod rag;
 mod session_manager;
+mod skills;
 mod telegram;
-mod discord;
-
+mod tools;
 
 use crate::core::AgentOutput;
 use crate::llm_client::GeminiClient;
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
-use crate::skills::load_skills;
-use crate::tools::{BashTool, ReadMemoryTool, WriteMemoryTool, RagSearchTool, RagInsertTool, WriteFileTool, ReadFileTool};
 use crate::session_manager::SessionManager;
+use crate::skills::load_skills;
+use crate::tools::{
+    BashTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool, TaskPlanTool,
+    TavilySearchTool, WriteFileTool, WriteMemoryTool,
+};
+use async_trait::async_trait;
 use dotenvy::dotenv;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::sync::Arc;
-use async_trait::async_trait;
 
 struct CliOutput;
 
@@ -75,6 +77,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.push(Arc::new(ReadFileTool));
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
+    tools.push(Arc::new(TaskPlanTool::new(
+        current_dir.join(".rusty_claw_task_plan.json"),
+    )));
+
+    if let Ok(tavily_api_key) = std::env::var("TAVILY_API_KEY") {
+        if !tavily_api_key.trim().is_empty() {
+            tools.push(Arc::new(TavilySearchTool::new(tavily_api_key)));
+        }
+    }
 
     if let Some(store) = rag_store {
         tools.push(Arc::new(RagSearchTool::new(store.clone())));
@@ -112,7 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rl = DefaultEditor::new()?;
     println!("Welcome to Rusty-Claw! (type 'exit' to quit)");
     if loaded_count > 0 {
-        println!("Loaded {} dynamic skills from 'skills/' directory.", loaded_count);
+        println!(
+            "Loaded {} dynamic skills from 'skills/' directory.",
+            loaded_count
+        );
     }
 
     loop {
@@ -128,7 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let _ = rl.add_history_entry(line);
 
-                let agent = session_manager.get_or_create_session("cli", output.clone()).await;
+                let agent = session_manager
+                    .get_or_create_session("cli", output.clone())
+                    .await;
                 let mut agent_guard = agent.lock().await;
 
                 if let Err(e) = agent_guard.step(line.to_string()).await {
