@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[async_trait]
 pub trait AgentOutput: Send + Sync {
@@ -86,6 +87,35 @@ impl AgentLoop {
 
     fn should_emit_prompt_report() -> bool {
         std::env::var("CLAW_PROMPT_REPORT").unwrap_or_default() == "1"
+    }
+
+    fn should_run_memory_retrieval(query: &str) -> bool {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        // Skip obvious chit-chat/ack turns to reduce latency.
+        let lower = trimmed.to_lowercase();
+        let small_talk = [
+            "ok", "okay", "thanks", "thank you", "great", "nice", "cool", "yes", "no", "好的",
+            "谢谢", "明白", "很好", "收到",
+        ];
+        if small_talk.iter().any(|w| lower == *w) {
+            return false;
+        }
+
+        // Run retrieval only for task-like prompts or long requests.
+        let task_markers = [
+            "bug", "error", "fix", "build", "test", "cargo", "compile", "stack", "trace",
+            "function", "file", "path", "schema", "tool", "代码", "修复", "实现", "分析", "报错",
+            "测试", "编译", "文件", "路径", "工具", "问题",
+        ];
+        if task_markers.iter().any(|m| lower.contains(m)) {
+            return true;
+        }
+
+        trimmed.chars().count() >= 40
     }
 
     fn enabled_recovery_rules() -> HashSet<String> {
@@ -374,6 +404,10 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             self.context.set_retrieved_memory(None, Vec::new());
             return (String::new(), Vec::new());
         }
+        if !Self::should_run_memory_retrieval(trimmed) {
+            self.context.set_retrieved_memory(None, Vec::new());
+            return (String::new(), Vec::new());
+        }
 
         let maybe_tool = self
             .tools
@@ -386,6 +420,10 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             return (String::new(), Vec::new());
         };
 
+        let retrieval_start = Instant::now();
+        self.output
+            .on_text("[System] Retrieving relevant memory...\n")
+            .await;
         let rewritten_query = Self::rewrite_memory_query(trimmed);
         let result = tool
             .execute(serde_json::json!({
@@ -393,6 +431,15 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 "limit": 3
             }))
             .await;
+        let retrieval_elapsed = retrieval_start.elapsed();
+        if retrieval_elapsed >= Duration::from_millis(800) {
+            self.output
+                .on_text(&format!(
+                    "[System] Memory retrieval finished in {} ms.\n",
+                    retrieval_elapsed.as_millis()
+                ))
+                .await;
+        }
 
         match result {
             Ok(text) if !text.contains("No relevant information found") => {
@@ -602,6 +649,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             ..TaskState::default()
         };
         let mut prompt_report_emitted = false;
+        let mut had_tool_activity = false;
         for _ in 0..Self::MAX_TASK_ITERATIONS {
             task_state.iterations += 1;
             let (history, system_instruction, prompt_report) = self.context.build_llm_payload();
@@ -622,12 +670,30 @@ Use tools proactively and perform one concrete next action. If complete, clearly
 
             let mut full_text = String::new();
             let mut tool_calls = Vec::new();
+            let mut waiting_heartbeat_count = 0usize;
 
             // print!("Rusty-Claw: ");
             // use std::io::Write;
             // std::io::stdout().flush()?;
 
-            while let Some(event) = rx.recv().await {
+            loop {
+                let event = match tokio::time::timeout(Duration::from_secs(8), rx.recv()).await {
+                    Ok(ev) => ev,
+                    Err(_) => {
+                        waiting_heartbeat_count += 1;
+                        self.output
+                            .on_text(&format!(
+                                "[System] Still working... ({}s elapsed)\n",
+                                waiting_heartbeat_count * 8
+                            ))
+                            .await;
+                        continue;
+                    }
+                };
+
+                let Some(event) = event else {
+                    break;
+                };
                 match event {
                     StreamEvent::Text(text) => {
                         self.output.on_text(&text).await;
@@ -674,6 +740,10 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             if tool_calls.is_empty() {
                 task_state.last_model_text = full_text.clone();
                 task_state.completed = Self::is_task_complete(&task_state);
+                // Keep chatty turns snappy: if no tool was used in this turn, stop immediately.
+                if !had_tool_activity {
+                    break;
+                }
                 if task_state.completed {
                     break;
                 }
@@ -701,6 +771,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             // Execute tools
             let mut response_parts = Vec::new();
             for call in tool_calls {
+                had_tool_activity = true;
                 let tool_name = call.name.clone();
                 let tool_args = call.args.clone();
 
