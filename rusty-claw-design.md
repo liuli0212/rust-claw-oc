@@ -232,3 +232,66 @@ LLM 返回的不仅是给用户的闲聊（Text），还可能夹杂着工具调
     2.  LLM 的 HTTP 请求被立刻掐断，停止计费。
     3.  正在执行的 Bash 进程收到 `SIGTERM` 强制终止（防止后台留有僵尸进程，如死循环的 `while true`）。
     4.  当前状态回滚，并向模型追加一条 `"Action cancelled by user."` 的系统提示，等待下一次指令。
+
+---
+
+## 9. 当前实现状态（2026-02 更新）
+
+以下能力已从“设计”进入“已落地实现”，并且与当前源码保持一致：
+
+### A. 任务闭环执行（Task Loop）
+
+* 位置：`src/core.rs`
+* 已实现：
+  * `TaskState` 管理目标、迭代次数、恢复次数、最近错误。
+  * 多轮任务迭代（`MAX_TASK_ITERATIONS`）而非“一轮失败就停”。
+  * 无工具调用且未完成时，自动生成下一步执行提示继续推进。
+
+### B. 结构化工具输出（统一 Envelope）
+
+* 位置：`src/tools.rs`, `src/core.rs`
+* 已实现：
+  * 核心工具统一返回结构化 JSON Envelope：`ok/tool_name/output/exit_code/duration_ms/truncated`。
+  * 已覆盖：`execute_bash`, `read_file`, `write_file`, `read_workspace_memory`, `write_workspace_memory`。
+  * `core` 统一解析结构化输出，失败场景可做规则化恢复判断。
+
+### C. 规则表驱动自动恢复（Recovery Rules）
+
+* 位置：`src/core.rs`
+* 已实现：
+  * Bash 失败恢复从硬编码改为“规则表”。
+  * 内置规则：`missing_command`, `missing_path`, `missing_cargo_toml`。
+  * 支持规则开关：`CLAW_RECOVERY_RULES=all` 或逗号子集（如 `missing_command,missing_path`）。
+  * 记录规则命中统计，并在诊断开启时输出命中率。
+
+### D. Gemini Tool Schema 兼容层
+
+* 位置：`src/llm_client.rs`
+* 已实现：
+  * 请求发送前执行 `normalize_schema_for_gemini`，清理/简化 Gemini 不兼容字段。
+  * 处理：`$schema`, `definitions`, `$defs`, `$ref`, `anyOf/oneOf/allOf`, `type: [..]`。
+  * 解决了 function declarations 参数因 JSON Schema 方言差异导致的 400 错误。
+
+### E. 会话持久化与历史恢复
+
+* 位置：`src/context.rs`, `src/session_manager.rs`
+* 已实现：
+  * Transcript 持久化：`.rusty_claw/sessions/<session>.jsonl`
+  * Session 注册表：`.rusty_claw/sessions.json`
+  * 会话重建时自动恢复历史 turn，支持多端会话连续性。
+
+### F. Prompt 可观测性（诊断开关）
+
+* 位置：`src/context.rs`, `src/core.rs`
+* 已实现：
+  * Prompt 组装统计：system/history/current token、history turns、retrieved memory sources。
+  * 诊断开关：`CLAW_PROMPT_REPORT=1` 时输出 prompt 与恢复统计报告。
+
+### G. 与本地助手目标的关系
+
+当前系统已经具备“分析 -> 调用工具 -> 出错自恢复 -> 持续推进 -> 结果回写”的核心循环能力，正在从“会聊天的 Agent”过渡到“可持续完成任务的本地工程助手”。
+
+后续建议的下一阶段重点：
+1. 完成判定升级为“验证驱动”（测试/编译通过再判定 DONE）。
+2. 恢复规则扩展为可插拔注册，并引入优先级与冷却机制。
+3. 将运行轨迹落盘为任务审计日志（便于离线评估与回归基准）。
