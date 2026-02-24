@@ -581,7 +581,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
 
         let retrieval_start = Instant::now();
         // Don't print "Retrieving..." here to avoid spamming UI if it finishes fast or times out silently
-        
+
         let rewritten_query = Self::rewrite_memory_query(trimmed);
         let result = tool
             .execute(serde_json::json!({
@@ -589,10 +589,10 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 "limit": 3
             }))
             .await;
-        
+
         let retrieval_elapsed = retrieval_start.elapsed();
         if retrieval_elapsed >= Duration::from_millis(1000) {
-             output
+            output
                 .on_text(&format!(
                     "[System] Memory retrieval finished in {} ms.\n",
                     retrieval_elapsed.as_millis()
@@ -641,64 +641,43 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             / Self::COMPACTION_TRIGGER_RATIO_DEN;
         let target_tokens = self.context.max_history_tokens * Self::COMPACTION_TARGET_RATIO_NUM
             / Self::COMPACTION_TARGET_RATIO_DEN;
+        let mut compaction_reason = None;
 
-        // Fast check without locking or heavy logic
-        let history_tokens = self.context.dialogue_history_token_estimate();
-        if history_tokens <= trigger_tokens
-            || self.context.dialogue_history.len() < Self::COMPACTION_MIN_TURNS
-        {
-            return None;
-        }
+        for _ in 0..Self::MAX_COMPACTION_ATTEMPTS_PER_STEP {
+            let history_tokens = self.context.dialogue_history_token_estimate();
+            if history_tokens <= trigger_tokens
+                || self.context.dialogue_history.len() < Self::COMPACTION_MIN_TURNS
+            {
+                break;
+            }
 
-        let drain_count = self
-            .context
-            .oldest_turns_for_compaction(target_tokens, Self::COMPACTION_MIN_TURNS);
-        if drain_count == 0 || drain_count >= self.context.dialogue_history.len() {
-            return None;
-        }
+            let drain_count = self
+                .context
+                .oldest_turns_for_compaction(target_tokens, Self::COMPACTION_MIN_TURNS);
+            if drain_count == 0 || drain_count >= self.context.dialogue_history.len() {
+                break;
+            }
 
-        let compaction_reason = format!(
-            "history_tokens={} exceeded trigger={} (max={})",
-            history_tokens, trigger_tokens, self.context.max_history_tokens
-        );
+            compaction_reason = Some(format!(
+                "history_tokens={} exceeded trigger={} (max={})",
+                history_tokens, trigger_tokens, self.context.max_history_tokens
+            ));
 
-        self.output
-            .on_text("\n[System: Triggering background history compaction...]\n")
-            .await;
+            self.output
+                .on_text("\n[System: Auto-compacting history due to token pressure...]\n")
+                .await;
 
-        let oldest_turns: Vec<_> = self
-            .context
-            .dialogue_history
-            .drain(0..drain_count)
-            .collect();
-        
-        // Insert a placeholder so we don't lose the "slot" in history
-        let placeholder_id = uuid::Uuid::new_v4().to_string();
-        let placeholder_turn = Turn {
-            turn_id: placeholder_id.clone(),
-            user_message: "SYSTEM: Old conversation history (Compacting...)".to_string(),
-            messages: vec![
-                Message {
-                    role: "model".to_string(),
-                    parts: vec![Part {
-                        text: Some("[System] Summarizing old conversation history in background...".to_string()),
-                        function_call: None,
-                        function_response: None,
-                    }],
-                },
-            ],
-        };
-        self.context.dialogue_history.insert(0, placeholder_turn);
+            let oldest_turns: Vec<_> = self
+                .context
+                .dialogue_history
+                .drain(0..drain_count)
+                .collect();
+            let summary_prompt = Self::build_compaction_prompt(&oldest_turns);
 
-        // Spawn background task
-        let llm = self.llm.clone();
-        let summary_prompt = Self::build_compaction_prompt(&oldest_turns);
-        
-        tokio::spawn(async move {
-             let sys_msg = Message {
+            let sys_msg = Message {
                 role: "system".to_string(),
                 parts: vec![Part {
-                    text: Some("You are an expert summarization agent.".to_string()),
+                    text: Some("You are an expert summarization agent. Your job is to compress conversation history without losing technical details.".to_string()),
                     function_call: None,
                     function_response: None,
                 }],
@@ -711,11 +690,52 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                     function_response: None,
                 }],
             };
-            // meaningful work but result is discarded for now to unblock main thread
-            let _ = llm.generate_text(vec![user_msg], Some(sys_msg)).await;
-        });
 
-        Some(compaction_reason)
+            match self.llm.generate_text(vec![user_msg], Some(sys_msg)).await {
+                Ok(summary) => {
+                    let compacted_turn = Turn {
+                        turn_id: uuid::Uuid::new_v4().to_string(),
+                        user_message: "SYSTEM: Old conversation history".to_string(),
+                        messages: vec![
+                            Message {
+                                role: "user".to_string(),
+                                parts: vec![Part {
+                                    text: Some("What happened earlier?".to_string()),
+                                    function_call: None,
+                                    function_response: None,
+                                }],
+                            },
+                            Message {
+                                role: "model".to_string(),
+                                parts: vec![Part {
+                                    text: Some(format!(
+                                        "Earlier conversation summary:\n{}",
+                                        summary
+                                    )),
+                                    function_call: None,
+                                    function_response: None,
+                                }],
+                            },
+                        ],
+                    };
+                    self.context.dialogue_history.insert(0, compacted_turn);
+                    self.output
+                        .on_text("[System: Compaction complete.]\n\n")
+                        .await;
+                }
+                Err(e) => {
+                    self.output
+                        .on_error(&format!("\n[Compaction Error]: {}\n", e))
+                        .await;
+                    for (i, turn) in oldest_turns.into_iter().enumerate() {
+                        self.context.dialogue_history.insert(i, turn);
+                    }
+                    break;
+                }
+            }
+        }
+
+        compaction_reason
     }
 
     async fn emit_prompt_report(
@@ -771,32 +791,35 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         user_input: String,
     ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
         let retrieval_future = Self::execute_retrieval_task(
-            self.tools.clone(), 
-            user_input.clone(), 
-            self.output.clone()
+            self.tools.clone(),
+            user_input.clone(),
+            self.output.clone(),
         );
-        
+
         // Race: Give it 800ms max.
-        let (retrieved_text, _sources) = match tokio::time::timeout(Duration::from_millis(800), retrieval_future).await {
-            Ok(res) => res,
-            Err(_) => {
-                (String::new(), Vec::new())
-            }
-        };
-        
+        let (retrieved_text, _sources) =
+            match tokio::time::timeout(Duration::from_millis(800), retrieval_future).await {
+                Ok(res) => res,
+                Err(_) => (String::new(), Vec::new()),
+            };
+
         self.context.set_retrieved_memory(
-            if retrieved_text.is_empty() { None } else { Some(retrieved_text) }, 
-            _sources
+            if retrieved_text.is_empty() {
+                None
+            } else {
+                Some(retrieved_text)
+            },
+            _sources,
         );
         let rewritten_query = if self.context.retrieved_memory().is_some() {
-             Self::rewrite_memory_query(&user_input)
+            Self::rewrite_memory_query(&user_input)
         } else {
-             String::new()
+            String::new()
         };
 
         // Step 1: Async Compaction (Already implemented)
         let compaction_reason = self.maybe_compact_history().await;
-        
+
         self.context.start_turn(user_input);
         let mut task_state = TaskState {
             goal: self

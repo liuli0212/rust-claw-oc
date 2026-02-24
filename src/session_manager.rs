@@ -36,7 +36,7 @@ impl SessionManager {
     pub fn new(llm: Arc<GeminiClient>, tools: Vec<Arc<dyn Tool>>) -> Self {
         let transcript_dir = PathBuf::from(".rusty_claw").join("sessions");
         let registry_path = PathBuf::from(".rusty_claw").join("sessions.json");
-        
+
         // Initial load of registry
         let registry = if registry_path.exists() {
             match fs::read_to_string(&registry_path) {
@@ -68,13 +68,14 @@ impl SessionManager {
         if let Some(agent) = sessions.get(session_id) {
             // Update timestamp in memory only (fast)
             self.update_registry_entry(session_id, None, None);
+            self.persist_registry_async();
             return agent.clone();
         }
 
         let transcript_path = transcript_path_for_session(&self.transcript_dir, session_id);
         let mut context = AgentContext::new().with_transcript_path(transcript_path.clone());
         let loaded_turns = context.load_transcript().unwrap_or(0);
-        
+
         // Update registry in memory + trigger async persist
         self.update_registry_entry(session_id, Some(transcript_path), Some(loaded_turns));
         self.persist_registry_async();

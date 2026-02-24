@@ -1,7 +1,7 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -89,7 +89,7 @@ impl VectorStore {
         for chunk in rows {
             loaded_chunks.push(chunk?);
         }
-        
+
         // Drop the statement to release the borrow on conn
         drop(stmt);
 
@@ -112,7 +112,7 @@ impl VectorStore {
         source: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let documents = vec![content.clone()];
-        
+
         // Generate embedding
         let embedding = {
             let mut model = self.model.lock().unwrap();
@@ -147,8 +147,8 @@ impl VectorStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(String, String, f32)>, Box<dyn std::error::Error>> {
-        let start = Instant::now();
-        
+        let _start = Instant::now();
+
         // 1. Generate query embedding
         let query_embedding = {
             let mut model = self.model.lock().unwrap();
@@ -156,7 +156,35 @@ impl VectorStore {
             embeddings[0].clone()
         };
 
-        // 2. Vector Search (In-Memory Scan)
+        // 2. Keyword Search (FTS5)
+        // Lock ordering rule: always conn -> chunks to avoid deadlocks with insert_chunk.
+        let fts_scores: std::collections::HashMap<i64, f64> = {
+            let conn = self.conn.lock().unwrap();
+            // Naive query sanitization
+            let safe_query = query.replace("\"", "").replace("'", "");
+            let fts_query = format!("\"{}\"", safe_query);
+            let mut scores = std::collections::HashMap::new();
+            let mut stmt = conn.prepare(
+                "SELECT content_rowid, bm25(chunks_fts) FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT 50"
+            )?;
+            let fts_iter = stmt.query_map(params![fts_query], |row| {
+                let id: i64 = row.get(0)?;
+                let score: f64 = row.get(1)?;
+                Ok((id, score))
+            });
+
+            if let Ok(iter) = fts_iter {
+                for item in iter {
+                    if let Ok((id, score)) = item {
+                        // SQLite BM25 is negative (more negative = better). We invert it.
+                        scores.insert(id, score.abs());
+                    }
+                }
+            }
+            scores
+        };
+
+        // 3. Vector Search (In-Memory Scan)
         // Since we likely have < 50k chunks, a brute-force cosine similarity scan is very fast.
         let chunks = self.chunks.read().unwrap();
         let mut scored_chunks: Vec<(usize, f32)> = chunks
@@ -170,67 +198,29 @@ impl VectorStore {
 
         // Sort by vector score descending (preliminary top K for vector)
         scored_chunks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        
-        // 3. Keyword Search (FTS5)
-        // We only boost scores, we don't filter out things that don't match keywords 
-        // (because semantic match might be what we want).
-        let conn = self.conn.lock().unwrap();
-        // Naive query sanitization
-        let safe_query = query.replace("\"", "").replace("'", "");
-        let fts_query = format!("\"{}\"", safe_query); // exact phrase boost or adjust logic
-
-        let mut fts_scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
-        // Get BM25 scores for matches
-        let mut stmt = conn.prepare(
-            "SELECT content_rowid, bm25(chunks_fts) FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT 50"
-        )?;
-        
-        let fts_iter = stmt.query_map(params![fts_query], |row| {
-            let id: i64 = row.get(0)?;
-            let score: f64 = row.get(1)?;
-            Ok((id, score))
-        });
-
-        // FTS matches might be empty if no keyword match
-        if let Ok(iter) = fts_iter {
-            for item in iter {
-                if let Ok((id, score)) = item {
-                    // SQLite BM25 is negative (more negative = better). We invert it.
-                    // Typical range is like -1.0 to -20.0.
-                    // Let's normalize it roughly to 0.0-1.0 range? Hard without corpus stats.
-                    // Simple inversion: positive_score = abs(score).
-                    fts_scores.insert(id, score.abs());
-                }
-            }
-        }
 
         // 4. Hybrid Scoring & Re-ranking
         let mut results = Vec::new();
         let vector_weight = 0.7;
         let keyword_weight = 0.3;
-        
+
         // Find max scores for normalization
         let max_vector_score = scored_chunks.first().map(|s| s.1).unwrap_or(1.0).max(0.001);
-        let max_keyword_score = fts_scores.values().fold(0.0f64, |a, &b| a.max(b)).max(0.001);
+        let max_keyword_score = fts_scores
+            .values()
+            .fold(0.0f64, |a, &b| a.max(b))
+            .max(0.001);
 
         // Consider candidates: Top 50 from vector + Top 50 from keywords (union)
         // Optimization: Just re-rank the top 100 vector results + any FTS hits
-        let top_vector_indices: Vec<usize> = scored_chunks.iter().take(100).map(|x| x.0).collect();
-        
-        // We iterate through all chunks that are either in top vector or have an FTS score
-        // For efficiency, just iterating top vector is usually enough unless we want PURE keyword hits to surface.
-        // Let's iterate top 100 vector hits.
-        for &idx in &top_vector_indices {
+        for (idx, v_score) in scored_chunks.iter().take(100).copied() {
             let chunk = &chunks[idx];
-            let v_score = scored_chunks.iter().find(|x| x.0 == idx).unwrap().1; // O(N) inside loop? No, use the vec.
-            
             let normalized_v = v_score.max(0.0) / max_vector_score;
-            
             let k_score = fts_scores.get(&chunk.id).copied().unwrap_or(0.0);
             let normalized_k = k_score / max_keyword_score;
-            
-            let final_score = (normalized_v * vector_weight) + (normalized_k as f32 * keyword_weight);
-            
+
+            let final_score =
+                (normalized_v * vector_weight) + (normalized_k as f32 * keyword_weight);
             results.push((chunk.content.clone(), chunk.source.clone(), final_score));
         }
 
@@ -274,9 +264,15 @@ mod tests {
         let _ = std::fs::remove_file(".rusty_claw_memory.db");
         let store = VectorStore::new().expect("Failed to init");
 
-        store.insert_chunk("Rust is fast.".to_string(), "doc1".to_string()).unwrap();
-        store.insert_chunk("Python is easy.".to_string(), "doc2".to_string()).unwrap();
-        store.insert_chunk("The rusty claw grabs.".to_string(), "doc3".to_string()).unwrap();
+        store
+            .insert_chunk("Rust is fast.".to_string(), "doc1".to_string())
+            .unwrap();
+        store
+            .insert_chunk("Python is easy.".to_string(), "doc2".to_string())
+            .unwrap();
+        store
+            .insert_chunk("The rusty claw grabs.".to_string(), "doc3".to_string())
+            .unwrap();
 
         // 1. Vector match (semantic)
         let res = store.search("speed performance", 1).unwrap();
