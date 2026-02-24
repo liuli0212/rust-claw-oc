@@ -4,70 +4,91 @@ An industrial-grade, highly autonomous CLI AI Agent built entirely in Rust. Desi
 
 This project is a Rust-native implementation of an AI agent, closely following the "Zero-Trust & Sandbox" architecture design. It uses the latest LLM models (via Gemini API) to understand natural language instructions, plan tasks, and execute them safely on your local machine using its suite of tools.
 
-## Key Features
+## 🚀 Key Features
 
-- 🧠 **Native Function Calling:** Uses robust JSON-Schema generation (`schemars`) and Gemini's native structured Tool Calling for zero-hallucination tool execution. 
-- 🔒 **Secure Bash Sandbox:** Employs a true pseudo-terminal (`portable-pty`) wrapper for executing bash commands. It handles interactive TTY commands flawlessly, strips ANSI color codes for clean context, and enforces strict timeouts (`SIGKILL`) to prevent zombie processes.
-- 💾 **RAG Memory (Semantic Knowledge Base):** Integrated with pure-Rust `fastembed` for local, offline, high-dimensional vector embeddings (no heavy C++ or Python dependencies). The agent can `memorize_knowledge` and `search_knowledge_base` to retain project rules or code snippets indefinitely.
-- 📊 **Context Budgeting:** Integrated with `tiktoken-rs`. It automatically calculates token consumption and uses a sliding-window truncation algorithm to ensure the context never exceeds the LLM's budget (e.g., 32k tokens), preventing crashes during long-running sessions.
-- 🧩 **Dynamic Markdown Skills:** You can teach the agent new tools without writing Rust code. Drop a Markdown file with a YAML frontmatter into the `skills/` directory, and it will be dynamically parsed and loaded as a fully functional LLM Tool.
-- 💬 **Multi-Platform Support:** Supports Telegram and Discord integrations concurrently with the CLI interface. Each platform maintains its own session context.
+- **⚡ High-Performance Core:** Built on Rust's Tokio runtime. The main event loop is non-blocking, ensuring the agent remains responsive even during heavy I/O operations.
+- **🧠 Hybrid RAG Memory:**
+  - **In-Memory Vector Cache:** Startup loads all embeddings into RAM for sub-millisecond similarity search.
+  - **SQLite + FTS5:** Integrated full-text search for precise keyword matching (BM25).
+  - **Auto-Persistence:** All memory chunks are ACID-persisted to a local SQLite database (`.rusty_claw_memory.db`).
+- **🛡️ Secure Bash Sandbox:** Employs a true pseudo-terminal (`portable-pty`) wrapper for executing bash commands. It handles interactive TTY commands, strips ANSI codes, and enforces timeouts.
+- **🔄 Resilient Context Management:**
+  - **Async Compaction:** History summarization runs in the background, never blocking the user's next turn.
+  - **Soft Limits:** Allows temporary context overflow to maintain conversation flow while cleanup happens asynchronously.
+- **🔌 Multi-Platform:** Supports CLI, Telegram, and Discord concurrently.
 
-## Prerequisites
+## 🛠️ Setup & Configuration
 
+### Prerequisites
 - Rust Toolchain (`cargo`, `rustc`)
-- A valid **Gemini API Key** (or another compatible LLM provider if adapted).
+- A valid **Gemini API Key** (Google AI Studio).
 
-## Setup & Run
+### 1. Installation
+Clone the repository:
+```bash
+git clone https://github.com/liuli0212/rust-claw-oc.git
+cd rust-claw-oc
+```
 
-1. Clone the repository and navigate into it:
-   ```bash
-   git clone https://github.com/liuli0212/rust-claw-oc.git
-   cd rust-claw-oc
-   ```
+### 2. Environment Variables (.env)
+Create a `.env` file in the root directory.
 
-2. Configure your API key. Create a `.env` file in the root of the project:
-   ```env
-   GEMINI_API_KEY=your_actual_api_key_here
-   TELEGRAM_BOT_TOKEN=your_telegram_bot_token (optional)
-   DISCORD_BOT_TOKEN=your_discord_bot_token (optional)
-   ```
+**Required:**
+```env
+# Google Gemini API Key (Required for LLM and Embeddings)
+GEMINI_API_KEY=your_actual_api_key_here
+```
 
-3. Build and launch the agent (Release mode recommended for maximum speed):
-   ```bash
-   cargo run --release
-   ```
+**Optional Integrations:**
+```env
+# Web Search via Tavily (Recommended for real-time data)
+TAVILY_API_KEY=tvly-xxxxxxxx
 
-4. You will be greeted with the interactive REPL:
-   ```
-   Welcome to Rusty-Claw! (type 'exit' to quit)
-   Loaded 1 dynamic skills from 'skills/' directory.
-   >> 
-   ```
-   Try typing: *"Please list the files in the current directory"* or *"Memorize this rule: Always format code with rustfmt."*
+# Chat Platform Bots
+TELEGRAM_BOT_TOKEN=12345:abcdef...
+DISCORD_BOT_TOKEN=MTAw...
+```
 
-## Architecture
+**Runtime Tuning (Advanced):**
+```env
+# Enable verbose prompt usage reports in logs (Default: 0)
+CLAW_PROMPT_REPORT=1
 
-*   **`src/core.rs`**: The main `AgentLoop`. Implements the Think -> Act -> Observe state machine.
-*   **`src/llm_client.rs`**: Handles HTTP SSE Streaming and asynchronous chunk parsing.
-*   **`src/tools.rs`**: The sandbox executor. Defines the `Tool` trait and implements the powerful `BashTool` (PTY) and Memory interfaces.
-*   **`src/rag.rs`**: The pure-Rust semantic vector store using `fastembed`.
-*   **`src/context.rs`**: Context management and `tiktoken-rs` driven token budgeting.
-*   **`src/skills.rs`**: The dynamic Markdown-to-Tool parsing engine.
+# Max autonomous steps per user request (Default: 12)
+CLAW_MAX_TASK_ITERATIONS=20
 
-## Recent Enhancements
+# Enable/Disable auto-recovery rules (Default: all)
+# Values: "all" or comma-separated list like "missing_command,missing_path"
+CLAW_RECOVERY_RULES=all
 
-- **Task-Loop execution**: The agent now runs multi-step task iterations and does not stop after a single failed step.
-- **Structured tool outputs**: Core tools now return a normalized JSON envelope (`ok`, `output`, `exit_code`, `duration_ms`, `truncated`) for better reasoning and recovery.
-- **Auto-recovery rules**: Bash failures can trigger rule-based remediation (for missing commands, missing paths, and missing `Cargo.toml`).
-- **Session persistence**: Transcript history is persisted per session and restored automatically.
-- **Prompt diagnostics**: Optional prompt reports can show token usage, memory retrieval, and compaction behavior.
+# Enforce strict <final> tag parsing for cleaner output (Default: 0)
+CLAW_ENFORCE_FINAL_TAG=1
+```
 
-### Runtime toggles
+### 3. Build & Run
+Run in release mode for maximum performance (especially for vector search):
+```bash
+cargo run --release
+```
 
-- `CLAW_PROMPT_REPORT=1` enables prompt/recovery diagnostics in output.
-- `CLAW_RECOVERY_RULES=all` enables all recovery rules (default). You can also pass a comma-separated subset, for example:
-  - `CLAW_RECOVERY_RULES=missing_command,missing_path`
+## 🏗️ Architecture Overview
+
+The system follows a non-blocking Actor-like model:
+
+*   **`src/core.rs`**: The `AgentLoop` state machine. It spawns background tasks for RAG (`execute_retrieval_task`) and compaction (`maybe_compact_history`) to keep the critical path clear.
+*   **`src/rag.rs`**: The Memory Subsystem.
+    *   Uses `fastembed-rs` for local embedding generation (runs on CPU/Metal).
+    *   Uses `rusqlite` for persistent storage.
+    *   Implements a hybrid scoring algorithm: `Score = 0.7 * Cosine(Vector) + 0.3 * BM25(Keyword)`.
+*   **`src/session_manager.rs`**: Manages session state with an in-memory Write-Through cache, flushing to disk asynchronously to avoid I/O blocking.
+*   **`src/tools.rs`**: Standard library of tools (Bash, File I/O, Web Fetch).
+
+## 🧩 Dynamic Skills
+You can teach the agent new tools without recompiling.
+1.  Create a `.md` file in `skills/`.
+2.  Add YAML frontmatter describing the tool.
+3.  Write the prompt/logic in Markdown.
+The agent loads these at startup.
 
 ## License
 MIT
