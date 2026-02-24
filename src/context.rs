@@ -17,6 +17,8 @@ pub struct Part {
 pub struct FunctionCall {
     pub name: String,
     pub args: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thought_signature")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +121,31 @@ impl AgentContext {
             sys_text.push_str("\n\n");
         }
 
+        // Dynamic Prompt Assembly: Inject Runtime Environment
+        sys_text.push_str("## Runtime Environment\n");
+        sys_text.push_str(&format!("OS: {}\n", std::env::consts::OS));
+        sys_text.push_str(&format!("Architecture: {}\n", std::env::consts::ARCH));
+        if let Ok(dir) = std::env::current_dir() {
+            sys_text.push_str(&format!("Current Directory: {}\n", dir.display()));
+        }
+        sys_text.push_str("\n");
+
+        // Dynamic Prompt Assembly: Inject Workspace Context Files
+        let mut context_files = Vec::new();
+        if let Ok(content) = std::fs::read_to_string("AGENTS.md") {
+            context_files.push(("AGENTS.md", content.chars().take(2000).collect::<String>()));
+        }
+        if let Ok(content) = std::fs::read_to_string("README.md") {
+            context_files.push(("README.md", content.chars().take(2000).collect::<String>()));
+        }
+        
+        if !context_files.is_empty() {
+            sys_text.push_str("## Project Context\n");
+            for (name, content) in context_files {
+                sys_text.push_str(&format!("### {}\n{}\n\n", name, content));
+            }
+        }
+
         let system_msg = Message {
             role: "system".to_string(),
             parts: vec![Part {
@@ -134,7 +161,35 @@ impl AgentContext {
         
         for turn in self.dialogue_history.iter().rev() {
             let turn_tokens: usize = turn.messages.iter().map(|m| Self::estimate_tokens(&bpe, m)).sum();
+            
             if current_tokens + turn_tokens > self.max_history_tokens {
+                // Attempt to compress this turn before dropping
+                let mut compressed_turn = turn.clone();
+                for msg in &mut compressed_turn.messages {
+                    for part in &mut msg.parts {
+                        if let Some(fr) = &mut part.function_response {
+                            let response_str = fr.response.to_string();
+                            if response_str.len() > 1000 {
+                                fr.response = serde_json::json!({
+                                    "result": "[... Truncated old tool result to save tokens ...]"
+                                });
+                            }
+                        }
+                    }
+                }
+                
+                let compressed_tokens: usize = compressed_turn.messages.iter().map(|m| Self::estimate_tokens(&bpe, m)).sum();
+                if current_tokens + compressed_tokens <= self.max_history_tokens {
+                    current_tokens += compressed_tokens;
+                    
+                    let mut turn_block = Vec::new();
+                    for msg in &compressed_turn.messages {
+                        turn_block.push(msg.clone());
+                    }
+                    history_messages.push(turn_block);
+                    continue;
+                }
+                
                 println!("\n>> [Memory]: Working memory truncated due to token budget ({} / {})", current_tokens, self.max_history_tokens);
                 break;
             }
