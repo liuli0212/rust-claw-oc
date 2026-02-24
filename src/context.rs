@@ -405,6 +405,39 @@ impl AgentContext {
         }
     }
 
+    pub fn truncate_current_turn_tool_results(&mut self, max_chars: usize) -> usize {
+        let mut truncated_parts = 0usize;
+        let Some(turn) = &mut self.current_turn else {
+            return 0;
+        };
+
+        for msg in &mut turn.messages {
+            if msg.role != "function" {
+                continue;
+            }
+            for part in &mut msg.parts {
+                let Some(fr) = &mut part.function_response else {
+                    continue;
+                };
+                let response_str = fr.response.to_string();
+                if response_str.chars().count() <= max_chars {
+                    continue;
+                }
+                let clipped: String = response_str.chars().take(max_chars).collect();
+                fr.response = serde_json::json!({
+                    "result": format!(
+                        "{}\n[... Truncated by context recovery ...]",
+                        clipped
+                    ),
+                    "original_chars": response_str.chars().count()
+                });
+                truncated_parts += 1;
+            }
+        }
+
+        truncated_parts
+    }
+
     pub fn end_turn(&mut self) {
         if let Some(turn) = self.current_turn.take() {
             if let Err(e) = self.append_turn_to_transcript(&turn) {
@@ -595,5 +628,35 @@ mod tests {
                 .any(|p| p.text.as_deref() == Some("next question"))),
             "current turn user input should be included in payload"
         );
+    }
+
+    #[test]
+    fn test_truncate_current_turn_tool_results() {
+        let mut ctx = AgentContext::new();
+        ctx.start_turn("do work".to_string());
+        ctx.add_message_to_current_turn(Message {
+            role: "function".to_string(),
+            parts: vec![Part {
+                text: None,
+                function_call: None,
+                function_response: Some(FunctionResponse {
+                    name: "execute_bash".to_string(),
+                    response: serde_json::json!({
+                        "result": "x".repeat(5000)
+                    }),
+                }),
+            }],
+        });
+
+        let truncated = ctx.truncate_current_turn_tool_results(400);
+        assert_eq!(truncated, 1);
+        let payload = ctx.current_turn.as_ref().unwrap();
+        let fr = payload.messages[1].parts[0]
+            .function_response
+            .as_ref()
+            .unwrap();
+        let serialized = fr.response.to_string();
+        assert!(serialized.contains("Truncated by context recovery"));
+        assert!(serialized.contains("original_chars"));
     }
 }

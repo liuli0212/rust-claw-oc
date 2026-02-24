@@ -9,7 +9,7 @@ mod skills;
 mod telegram;
 mod tools;
 
-use crate::core::AgentOutput;
+use crate::core::{AgentOutput, RunExit};
 use crate::llm_client::GeminiClient;
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
@@ -148,8 +148,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await;
                 let mut agent_guard = agent.lock().await;
 
-                if let Err(e) = agent_guard.step(line.to_string()).await {
-                    eprintln!("Agent error: {}", e);
+                match agent_guard.step(line.to_string()).await {
+                    Ok(exit) => match exit {
+                        RunExit::CompletedWithReply => {}
+                        RunExit::CompletedSilent { cause } => {
+                            println!("\n[Run Exit] completed_silent ({})", cause);
+                        }
+                        RunExit::RecoverableFailed { reason, attempts } => {
+                            println!(
+                                "\n[Run Exit] recoverable_failed (reason={}, attempts={})",
+                                reason, attempts
+                            );
+                        }
+                        RunExit::HardStop { reason } => {
+                            println!("\n[Run Exit] hard_stop ({})", reason);
+                        }
+                    },
+                    Err(e) => eprintln!("Agent error: {}", e),
                 }
             }
             Err(ReadlineError::Interrupted) => {

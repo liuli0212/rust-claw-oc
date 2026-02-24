@@ -24,6 +24,25 @@ pub struct AgentLoop {
     output: Arc<dyn AgentOutput>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RunExit {
+    CompletedWithReply,
+    CompletedSilent { cause: String },
+    RecoverableFailed { reason: String, attempts: usize },
+    HardStop { reason: String },
+}
+
+impl RunExit {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunExit::CompletedWithReply => "completed_with_reply",
+            RunExit::CompletedSilent { .. } => "completed_silent",
+            RunExit::RecoverableFailed { .. } => "recoverable_failed",
+            RunExit::HardStop { .. } => "hard_stop",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct TaskState {
     goal: String,
@@ -68,8 +87,9 @@ impl AgentLoop {
     const COMPACTION_TARGET_RATIO_DEN: usize = 100;
     const COMPACTION_MIN_TURNS: usize = 3;
     const MAX_COMPACTION_ATTEMPTS_PER_STEP: usize = 2;
-    const MAX_TASK_ITERATIONS: usize = 6;
+    const DEFAULT_MAX_TASK_ITERATIONS: usize = 12;
     const MAX_AUTO_RECOVERY_ATTEMPTS: usize = 2;
+    const MAX_LLM_RECOVERY_ATTEMPTS: usize = 3;
 
     pub fn new(
         llm: Arc<GeminiClient>,
@@ -89,6 +109,133 @@ impl AgentLoop {
         std::env::var("CLAW_PROMPT_REPORT").unwrap_or_default() == "1"
     }
 
+    fn max_task_iterations() -> usize {
+        std::env::var("CLAW_MAX_TASK_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, 50))
+            .unwrap_or(Self::DEFAULT_MAX_TASK_ITERATIONS)
+    }
+
+    fn is_context_overflow_error(err: &str) -> bool {
+        let lower = err.to_lowercase();
+        let markers = [
+            "context",
+            "token",
+            "too large",
+            "exceeds",
+            "maximum",
+            "request payload size",
+            "prompt is too long",
+            "input too long",
+        ];
+        (lower.contains("400") || lower.contains("invalid argument"))
+            && markers.iter().any(|m| lower.contains(m))
+    }
+
+    fn is_transient_llm_error(err: &str) -> bool {
+        let lower = err.to_lowercase();
+        let markers = [
+            "429",
+            "rate limit",
+            "resource exhausted",
+            "unavailable",
+            "deadline",
+            "timeout",
+            "connection reset",
+            "temporarily",
+            "503",
+            "502",
+            "504",
+        ];
+        markers.iter().any(|m| lower.contains(m))
+    }
+
+    fn enforce_final_tag_enabled() -> bool {
+        std::env::var("CLAW_ENFORCE_FINAL_TAG").unwrap_or_default() == "1"
+    }
+
+    fn sanitize_stream_text_chunk(chunk: &str) -> (String, bool, bool) {
+        let no_reply_markers = ["NO_REPLY", "<NO_REPLY/>", "<NO_REPLY>"];
+        let heartbeat_markers = ["[HEARTBEAT_OK]", "<HEARTBEAT_OK/>", "HEARTBEAT_OK"];
+
+        let mut sanitized = chunk.to_string();
+        let mut saw_no_reply = false;
+        let mut saw_heartbeat = false;
+
+        for marker in no_reply_markers {
+            if sanitized.contains(marker) {
+                saw_no_reply = true;
+                sanitized = sanitized.replace(marker, "");
+            }
+        }
+        for marker in heartbeat_markers {
+            if sanitized.contains(marker) {
+                saw_heartbeat = true;
+                sanitized = sanitized.replace(marker, "");
+            }
+        }
+
+        (sanitized, saw_no_reply, saw_heartbeat)
+    }
+
+    fn extract_final_tag_content(text: &str) -> Option<String> {
+        let lower = text.to_lowercase();
+        let start_marker = "<final>";
+        let end_marker = "</final>";
+        let start = lower.find(start_marker)?;
+        let end = lower[start + start_marker.len()..].find(end_marker)?;
+        let content_start = start + start_marker.len();
+        let content_end = content_start + end;
+        Some(text[content_start..content_end].trim().to_string())
+    }
+
+    fn is_message_delivery_tool(name: &str) -> bool {
+        let lower = name.to_lowercase();
+        lower.contains("send_message")
+            || lower.contains("message")
+            || lower.contains("reply")
+            || lower.contains("notify")
+    }
+
+    async fn recover_from_llm_error(&mut self, err: &str, attempt: usize) -> bool {
+        if Self::is_context_overflow_error(err) {
+            self.output
+                .on_text(
+                    "[System] LLM context overflow detected. Running compaction and truncating large tool outputs...\n",
+                )
+                .await;
+
+            let _ = self.maybe_compact_history().await;
+            let truncated = self.context.truncate_current_turn_tool_results(2_000);
+            if truncated > 0 {
+                self.output
+                    .on_text(&format!(
+                        "[System] Truncated {} oversized tool result(s) in current turn.\n",
+                        truncated
+                    ))
+                    .await;
+            }
+            // If no truncation happened, dropping retrieved snippets can still reduce prompt size.
+            self.context.set_retrieved_memory(None, Vec::new());
+            return true;
+        }
+
+        if Self::is_transient_llm_error(err) && attempt < Self::MAX_LLM_RECOVERY_ATTEMPTS {
+            let backoff_ms = (attempt as u64).saturating_mul(800);
+            self.output
+                .on_text(&format!(
+                    "[System] Transient LLM error. Retrying in {} ms...\n",
+                    backoff_ms
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            return true;
+        }
+
+        false
+    }
+
     fn should_run_memory_retrieval(query: &str) -> bool {
         let trimmed = query.trim();
         if trimmed.is_empty() {
@@ -98,8 +245,20 @@ impl AgentLoop {
         // Skip obvious chit-chat/ack turns to reduce latency.
         let lower = trimmed.to_lowercase();
         let small_talk = [
-            "ok", "okay", "thanks", "thank you", "great", "nice", "cool", "yes", "no", "好的",
-            "谢谢", "明白", "很好", "收到",
+            "ok",
+            "okay",
+            "thanks",
+            "thank you",
+            "great",
+            "nice",
+            "cool",
+            "yes",
+            "no",
+            "好的",
+            "谢谢",
+            "明白",
+            "很好",
+            "收到",
         ];
         if small_talk.iter().any(|w| lower == *w) {
             return false;
@@ -635,7 +794,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
     pub async fn step(
         &mut self,
         user_input: String,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
         let (rewritten_query, _sources) = self.hydrate_retrieved_memory(&user_input).await;
         let compaction_reason = self.maybe_compact_history().await;
         self.context.start_turn(user_input);
@@ -649,8 +808,11 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             ..TaskState::default()
         };
         let mut prompt_report_emitted = false;
-        let mut had_tool_activity = false;
-        for _ in 0..Self::MAX_TASK_ITERATIONS {
+        let max_task_iterations = Self::max_task_iterations();
+        let mut exit_state = RunExit::CompletedSilent {
+            cause: "run_finished_without_output".to_string(),
+        };
+        for _ in 0..max_task_iterations {
             task_state.iterations += 1;
             let (history, system_instruction, prompt_report) = self.context.build_llm_payload();
             if !prompt_report_emitted {
@@ -663,14 +825,50 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 prompt_report_emitted = true;
             }
 
-            let mut rx = self
-                .llm
-                .stream(history.clone(), system_instruction, self.tools.clone())
-                .await?;
+            let mut llm_attempt = 0usize;
+            let mut stream_error: Option<String> = None;
+            let mut rx = loop {
+                llm_attempt += 1;
+                match self
+                    .llm
+                    .stream(
+                        history.clone(),
+                        system_instruction.clone(),
+                        self.tools.clone(),
+                    )
+                    .await
+                {
+                    Ok(rx) => break rx,
+                    Err(e) => {
+                        let err_text = e.to_string();
+                        let can_recover = llm_attempt < Self::MAX_LLM_RECOVERY_ATTEMPTS
+                            && self.recover_from_llm_error(&err_text, llm_attempt).await;
+                        if can_recover {
+                            continue;
+                        }
+                        stream_error = Some(err_text);
+                        break tokio::sync::mpsc::channel(1).1;
+                    }
+                }
+            };
+            if let Some(err_text) = stream_error {
+                self.output
+                    .on_error(&format!("\n[LLM Error]: {}", err_text))
+                    .await;
+                exit_state = RunExit::RecoverableFailed {
+                    reason: "llm_stream_setup_failed".to_string(),
+                    attempts: llm_attempt,
+                };
+                break;
+            }
 
             let mut full_text = String::new();
+            let mut raw_full_text = String::new();
             let mut tool_calls = Vec::new();
             let mut waiting_heartbeat_count = 0usize;
+            let mut saw_no_reply_token = false;
+            let mut saw_heartbeat_token = false;
+            let mut silent_cause_hint: Option<String> = None;
 
             // print!("Rusty-Claw: ");
             // use std::io::Write;
@@ -696,23 +894,50 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 };
                 match event {
                     StreamEvent::Text(text) => {
-                        self.output.on_text(&text).await;
-                        // print!("{}", text);
-                        // std::io::stdout().flush()?;
-                        full_text.push_str(&text);
+                        raw_full_text.push_str(&text);
+                        let (visible_text, saw_no_reply, saw_heartbeat) =
+                            Self::sanitize_stream_text_chunk(&text);
+                        saw_no_reply_token |= saw_no_reply;
+                        saw_heartbeat_token |= saw_heartbeat;
+                        if !visible_text.is_empty() {
+                            self.output.on_text(&visible_text).await;
+                            full_text.push_str(&visible_text);
+                        }
                     }
                     StreamEvent::ToolCall(call) => {
                         tool_calls.push(call);
                     }
                     StreamEvent::Error(e) => {
                         self.output.on_error(&format!("\n[LLM Error]: {}", e)).await;
-                        // println!("\n[LLM Error]: {}", e);
-                        return Err(e.into());
+                        exit_state = RunExit::HardStop {
+                            reason: format!("llm_stream_error: {}", e),
+                        };
+                        break;
                     }
                     StreamEvent::Done => break,
                 }
             }
             // println!();
+
+            if Self::enforce_final_tag_enabled() {
+                if let Some(final_text) = Self::extract_final_tag_content(&full_text) {
+                    full_text = final_text;
+                } else {
+                    full_text.clear();
+                    silent_cause_hint = Some("enforce_final_tag_missing".to_string());
+                }
+            }
+            if full_text.trim().is_empty() {
+                if silent_cause_hint.is_none() && saw_no_reply_token {
+                    silent_cause_hint = Some("no_reply_token".to_string());
+                }
+                if silent_cause_hint.is_none() && saw_heartbeat_token {
+                    silent_cause_hint = Some("heartbeat_only".to_string());
+                }
+                if silent_cause_hint.is_none() && !raw_full_text.trim().is_empty() {
+                    silent_cause_hint = Some("control_text_suppressed".to_string());
+                }
+            }
 
             // Record assistant message
             let mut parts = Vec::new();
@@ -736,23 +961,37 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                     parts,
                 });
             }
+            if matches!(exit_state, RunExit::HardStop { .. }) {
+                break;
+            }
 
             if tool_calls.is_empty() {
                 task_state.last_model_text = full_text.clone();
                 task_state.completed = Self::is_task_complete(&task_state);
-                // Keep chatty turns snappy: if no tool was used in this turn, stop immediately.
-                if !had_tool_activity {
-                    break;
-                }
                 if task_state.completed {
+                    exit_state = if full_text.trim().is_empty() {
+                        RunExit::CompletedSilent {
+                            cause: silent_cause_hint
+                                .unwrap_or_else(|| "model_marked_done_without_text".to_string()),
+                        }
+                    } else {
+                        RunExit::CompletedWithReply
+                    };
                     break;
                 }
-                if task_state.iterations >= Self::MAX_TASK_ITERATIONS {
+                if task_state.iterations >= max_task_iterations {
                     self.output
                         .on_error(
-                            "[Task] Reached max task iterations. Stopping with partial progress.",
+                            &format!(
+                                "[Task] Reached max task iterations ({}). Stopping with partial progress.",
+                                max_task_iterations
+                            ),
                         )
                         .await;
+                    exit_state = RunExit::RecoverableFailed {
+                        reason: "max_task_iterations_reached".to_string(),
+                        attempts: task_state.iterations,
+                    };
                     break;
                 }
 
@@ -767,11 +1006,17 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 });
                 continue;
             }
+            if full_text.trim().is_empty()
+                && tool_calls
+                    .iter()
+                    .all(|c| Self::is_message_delivery_tool(&c.name))
+            {
+                silent_cause_hint = Some("message_tool_suppressed_main_reply".to_string());
+            }
 
             // Execute tools
             let mut response_parts = Vec::new();
             for call in tool_calls {
-                had_tool_activity = true;
                 let tool_name = call.name.clone();
                 let tool_args = call.args.clone();
 
@@ -813,12 +1058,51 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 role: "function".to_string(),
                 parts: response_parts,
             });
+            if full_text.trim().is_empty() {
+                if let Some(cause) = silent_cause_hint.clone() {
+                    exit_state = RunExit::CompletedSilent { cause };
+                }
+            }
 
             // Loop back to give LLM the tool results
         }
 
         self.context.end_turn();
         self.emit_recovery_stats(&task_state).await;
-        Ok(())
+        if matches!(
+            exit_state,
+            RunExit::CompletedSilent { .. } if task_state.iterations >= max_task_iterations
+        ) {
+            exit_state = RunExit::RecoverableFailed {
+                reason: "max_task_iterations_exhausted".to_string(),
+                attempts: task_state.iterations,
+            };
+        } else if matches!(exit_state, RunExit::CompletedSilent { .. })
+            && !task_state.last_model_text.trim().is_empty()
+        {
+            exit_state = RunExit::CompletedWithReply;
+        }
+        Ok(exit_state)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AgentLoop;
+
+    #[test]
+    fn sanitize_stream_text_chunk_strips_control_tokens() {
+        let (text, no_reply, heartbeat) =
+            AgentLoop::sanitize_stream_text_chunk("NO_REPLY [HEARTBEAT_OK] visible");
+        assert_eq!(text.trim(), "visible");
+        assert!(no_reply);
+        assert!(heartbeat);
+    }
+
+    #[test]
+    fn extract_final_tag_content_reads_block() {
+        let text = "prefix <final>ship it</final> suffix";
+        let extracted = AgentLoop::extract_final_tag_content(text).unwrap();
+        assert_eq!(extracted, "ship it");
     }
 }

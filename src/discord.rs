@@ -60,8 +60,18 @@ impl EventHandler for Handler {
             .get_or_create_session(&session_id, output)
             .await;
         let mut agent = agent.lock().await;
-        if let Err(e) = agent.step(msg.content).await {
-            let _ = msg.channel_id.say(&ctx.http, format!("Error: {}", e)).await;
+        match agent.step(msg.content).await {
+            Ok(exit) => {
+                if matches!(exit, crate::core::RunExit::RecoverableFailed { .. }) {
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx.http, format!("Run stopped: {}", exit.label()))
+                        .await;
+                }
+            }
+            Err(e) => {
+                let _ = msg.channel_id.say(&ctx.http, format!("Error: {}", e)).await;
+            }
         }
     }
 
