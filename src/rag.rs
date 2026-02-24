@@ -1,22 +1,32 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RagChunk {
+    pub id: i64,
     pub content: String,
     pub source: String,
     pub embedding: Vec<f32>,
 }
 
 pub struct VectorStore {
+    // We use a Mutex for the embedding model because it's not thread-safe or we want to serialize calls
     model: Mutex<TextEmbedding>,
+    // SQLite connection for persistence and FTS5 search
     conn: Mutex<Connection>,
+    // In-memory cache of all chunks for fast vector scanning
+    // RwLock allows multiple readers (searches) at once
+    chunks: RwLock<Vec<RagChunk>>,
 }
 
 impl VectorStore {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let start = Instant::now();
+        println!("[RAG] Initializing VectorStore...");
+
         let mut opts = InitOptions::new(EmbeddingModel::AllMiniLML6V2);
         opts.show_download_progress = true;
         let model = TextEmbedding::try_new(opts)?;
@@ -24,19 +34,72 @@ impl VectorStore {
         // Open a SQLite connection for hybrid search
         let conn = Connection::open(".rusty_claw_memory.db")?;
 
-        // Initialize the FTS5 virtual table
+        // Initialize the tables
+        // 1. chunks: The source of truth
         conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                content,
-                source UNINDEXED,
-                embedding UNINDEXED
+            "CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL,
+                embedding_json TEXT NOT NULL
             )",
             [],
         )?;
 
+        // 2. chunks_fts: The keyword search index (external content table)
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                content,
+                content_rowid UNINDEXED
+            )",
+            [],
+        )?;
+
+        // 3. Triggers to keep FTS in sync
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
+              INSERT INTO chunks_fts(content, content_rowid) VALUES (new.content, new.id);
+            END;",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
+              DELETE FROM chunks_fts WHERE content_rowid = old.id;
+            END;",
+            [],
+        )?;
+
+        // Load all chunks into memory
+        let mut loaded_chunks = Vec::new();
+        let mut stmt = conn.prepare("SELECT id, content, source, embedding_json FROM chunks")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let content: String = row.get(1)?;
+            let source: String = row.get(2)?;
+            let embedding_json: String = row.get(3)?;
+            let embedding: Vec<f32> = serde_json::from_str(&embedding_json).unwrap_or_default();
+            Ok(RagChunk {
+                id,
+                content,
+                source,
+                embedding,
+            })
+        })?;
+
+        for chunk in rows {
+            loaded_chunks.push(chunk?);
+        }
+
+        println!(
+            "[RAG] Loaded {} chunks into memory in {}ms",
+            loaded_chunks.len(),
+            start.elapsed().as_millis()
+        );
+
         Ok(Self {
             model: Mutex::new(model),
             conn: Mutex::new(conn),
+            chunks: RwLock::new(loaded_chunks),
         })
     }
 
@@ -46,18 +109,32 @@ impl VectorStore {
         source: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let documents = vec![content.clone()];
-        let mut model = self.model.lock().unwrap();
-        let embeddings = model.embed(documents, None)?;
-        let embedding = embeddings[0].clone();
+        
+        // Generate embedding
+        let embedding = {
+            let mut model = self.model.lock().unwrap();
+            let embeddings = model.embed(documents, None)?;
+            embeddings[0].clone()
+        };
 
-        // Serialize the embedding vector into JSON so we can store it in the UNINDEXED column
         let embedding_json = serde_json::to_string(&embedding)?;
 
+        // Write to DB
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO chunks_fts (content, source, embedding) VALUES (?1, ?2, ?3)",
+            "INSERT INTO chunks (content, source, embedding_json) VALUES (?1, ?2, ?3)",
             params![content, source, embedding_json],
         )?;
+        let id = conn.last_insert_rowid();
+
+        // Update in-memory cache
+        let mut chunks = self.chunks.write().unwrap();
+        chunks.push(RagChunk {
+            id,
+            content,
+            source,
+            embedding,
+        });
 
         Ok(())
     }
@@ -67,110 +144,100 @@ impl VectorStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(String, String, f32)>, Box<dyn std::error::Error>> {
+        let start = Instant::now();
+        
+        // 1. Generate query embedding
         let query_embedding = {
             let mut model = self.model.lock().unwrap();
             let embeddings = model.embed(vec![query.to_string()], None)?;
             embeddings[0].clone()
         };
 
+        // 2. Vector Search (In-Memory Scan)
+        // Since we likely have < 50k chunks, a brute-force cosine similarity scan is very fast.
+        let chunks = self.chunks.read().unwrap();
+        let mut scored_chunks: Vec<(usize, f32)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(idx, chunk)| {
+                let score = cosine_similarity(&chunk.embedding, &query_embedding);
+                (idx, score)
+            })
+            .collect();
+
+        // Sort by vector score descending (preliminary top K for vector)
+        scored_chunks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // 3. Keyword Search (FTS5)
+        // We only boost scores, we don't filter out things that don't match keywords 
+        // (because semantic match might be what we want).
         let conn = self.conn.lock().unwrap();
+        // Naive query sanitization
+        let safe_query = query.replace("\"", "").replace("'", "");
+        let fts_query = format!("\"{}\"", safe_query); // exact phrase boost or adjust logic
 
-        // Let's retrieve all chunks and perform hybrid scoring.
-        // In a real production system, we'd use SQLite vec extensions or only fetch top K from FTS,
-        // but for now, we combine an FTS5 full-text score with vector cosine similarity.
-
-        // First, let's get BM25 scores for matching chunks, and get all other chunks to calculate vector similarity.
+        let mut fts_scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+        // Get BM25 scores for matches
         let mut stmt = conn.prepare(
-            "SELECT content, source, embedding, bm25(chunks_fts) as bm25_score FROM chunks_fts",
+            "SELECT content_rowid, bm25(chunks_fts) FROM chunks_fts WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT 50"
         )?;
+        
+        let fts_iter = stmt.query_map(params![fts_query], |row| {
+            let id: i64 = row.get(0)?;
+            let score: f64 = row.get(1)?;
+            Ok((id, score))
+        });
 
-        let mut rows = stmt.query([])?;
-        let mut results = Vec::new();
-
-        let mut max_bm25 = 0.0_f64;
-        let mut max_vector = 0.0_f32;
-
-        struct ScoredChunk {
-            content: String,
-            source: String,
-            bm25_score: f64,
-            vector_score: f32,
-        }
-
-        let mut scored_chunks = Vec::new();
-
-        while let Some(row) = rows.next()? {
-            let content: String = row.get(0)?;
-            let source: String = row.get(1)?;
-            let embedding_json: String = row.get(2)?;
-            // Since we queried without MATCH, bm25_score might just be 0, wait, `bm25` requires a MATCH clause.
-            // Oh, we can't use bm25() without MATCH.
-
-            // So we need TWO passes or just use Rust for everything.
-            // Let's do two passes to get hybrid scores.
-            let chunk_embedding: Vec<f32> = serde_json::from_str(&embedding_json)?;
-            let vector_score = cosine_similarity(&chunk_embedding, &query_embedding);
-
-            scored_chunks.push(ScoredChunk {
-                content,
-                source,
-                bm25_score: 0.0, // Default to 0
-                vector_score,
-            });
-        }
-
-        // Pass 2: get BM25 scores
-        // We will tokenize the query manually and use MATCH.
-        let fts_query = query.replace("'", "''"); // escape quotes
-        let match_query = format!("'{}'", fts_query); // naive match query
-
-        let mut fts_stmt = conn.prepare(&format!(
-            "SELECT content, bm25(chunks_fts) FROM chunks_fts WHERE chunks_fts MATCH ?1"
-        ))?;
-        // Ignore error if match syntax is invalid (e.g. empty query)
-        if let Ok(mut fts_rows) = fts_stmt.query([match_query]) {
-            while let Ok(Some(row)) = fts_rows.next() {
-                let content: String = row.get(0)?;
-                let bm25_score: f64 = row.get(1)?;
-                // the bm25() function returns a *negative* value where more negative means better match in SQLite
-                // So we negate it to make it positive.
-                let positive_bm25 = -bm25_score;
-
-                if let Some(chunk) = scored_chunks.iter_mut().find(|c| c.content == content) {
-                    chunk.bm25_score = positive_bm25;
+        // FTS matches might be empty if no keyword match
+        if let Ok(iter) = fts_iter {
+            for item in iter {
+                if let Ok((id, score)) = item {
+                    // SQLite BM25 is negative (more negative = better). We invert it.
+                    // Typical range is like -1.0 to -20.0.
+                    // Let's normalize it roughly to 0.0-1.0 range? Hard without corpus stats.
+                    // Simple inversion: positive_score = abs(score).
+                    fts_scores.insert(id, score.abs());
                 }
             }
         }
 
-        // Normalize scores
-        for chunk in &scored_chunks {
-            if chunk.bm25_score > max_bm25 {
-                max_bm25 = chunk.bm25_score;
-            }
-            if chunk.vector_score > max_vector {
-                max_vector = chunk.vector_score;
-            }
+        // 4. Hybrid Scoring & Re-ranking
+        let mut results = Vec::new();
+        let vector_weight = 0.7;
+        let keyword_weight = 0.3;
+        
+        // Find max scores for normalization
+        let max_vector_score = scored_chunks.first().map(|s| s.1).unwrap_or(1.0).max(0.001);
+        let max_keyword_score = fts_scores.values().fold(0.0f64, |a, &b| a.max(b)).max(0.001);
+
+        // Consider candidates: Top 50 from vector + Top 50 from keywords (union)
+        // Optimization: Just re-rank the top 100 vector results + any FTS hits
+        let top_vector_indices: Vec<usize> = scored_chunks.iter().take(100).map(|x| x.0).collect();
+        
+        // We iterate through all chunks that are either in top vector or have an FTS score
+        // For efficiency, just iterating top vector is usually enough unless we want PURE keyword hits to surface.
+        // Let's iterate top 100 vector hits.
+        for &idx in &top_vector_indices {
+            let chunk = &chunks[idx];
+            let v_score = scored_chunks.iter().find(|x| x.0 == idx).unwrap().1; // O(N) inside loop? No, use the vec.
+            
+            let normalized_v = v_score.max(0.0) / max_vector_score;
+            
+            let k_score = fts_scores.get(&chunk.id).copied().unwrap_or(0.0);
+            let normalized_k = k_score / max_keyword_score;
+            
+            let final_score = (normalized_v * vector_weight) + (normalized_k as f32 * keyword_weight);
+            
+            results.push((chunk.content.clone(), chunk.source.clone(), final_score));
         }
 
-        for chunk in scored_chunks {
-            let mut normalized_bm25 = 0.0;
-            if max_bm25 > 0.0 {
-                normalized_bm25 = (chunk.bm25_score / max_bm25) as f32;
-            }
-
-            let mut normalized_vector = 0.0;
-            if max_vector > 0.0 {
-                // Vector scores are between -1 and 1
-                normalized_vector = chunk.vector_score.max(0.0) / max_vector.max(0.0001);
-            }
-
-            // Alpha weights: 0.3 for full text, 0.7 for semantic vector
-            let combined_score = (0.3 * normalized_bm25) + (0.7 * normalized_vector);
-            results.push((chunk.content, chunk.source, combined_score));
-        }
-
+        // Sort by final score
         results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
+
+        // if results.len() > 0 {
+        //     println!("[RAG] Search finished in {}ms. Top score: {}", start.elapsed().as_millis(), results[0].2);
+        // }
 
         Ok(results)
     }
@@ -200,29 +267,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_rag_insert_and_search() {
-        // Clean up previous db
+    fn test_rag_hybrid_search() {
         let _ = std::fs::remove_file(".rusty_claw_memory.db");
+        let store = VectorStore::new().expect("Failed to init");
 
-        let store = VectorStore::new().expect("Failed to init fastembed");
+        store.insert_chunk("Rust is fast.".to_string(), "doc1".to_string()).unwrap();
+        store.insert_chunk("Python is easy.".to_string(), "doc2".to_string()).unwrap();
+        store.insert_chunk("The rusty claw grabs.".to_string(), "doc3".to_string()).unwrap();
 
-        store
-            .insert_chunk(
-                "Rust is a blazing fast systems programming language.".to_string(),
-                "doc1.md".to_string(),
-            )
-            .unwrap();
+        // 1. Vector match (semantic)
+        let res = store.search("speed performance", 1).unwrap();
+        assert_eq!(res[0].1, "doc1");
 
-        store
-            .insert_chunk(
-                "Python is a great language for data science and AI.".to_string(),
-                "doc2.md".to_string(),
-            )
-            .unwrap();
-
-        let results = store.search("Which language is fast?", 1).unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1, "doc1.md");
+        // 2. Keyword match (exact)
+        let res2 = store.search("rusty claw", 1).unwrap();
+        assert_eq!(res2[0].1, "doc3");
     }
 }
