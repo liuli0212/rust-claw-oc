@@ -89,6 +89,9 @@ impl VectorStore {
         for chunk in rows {
             loaded_chunks.push(chunk?);
         }
+        
+        // Drop the statement to release the borrow on conn
+        drop(stmt);
 
         println!(
             "[RAG] Loaded {} chunks into memory in {}ms",
