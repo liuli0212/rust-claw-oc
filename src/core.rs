@@ -29,10 +29,99 @@ impl AgentLoop {
         }
     }
 
+
     pub async fn step(&mut self, user_input: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.context.start_turn(user_input);
 
+        // --- AUTO-COMPACTION LOGIC ---
+        // If history has more than 10 turns, we compact the oldest 5 into a single summary
+        if self.context.dialogue_history.len() > 10 {
+            self.output.on_text("\n[System: Auto-compacting long conversation history to preserve context window...]\n").await;
+            
+            let oldest_turns: Vec<_> = self.context.dialogue_history.drain(0..5).collect();
+            
+            // Build a prompt for the LLM to summarize
+            let mut summary_prompt = "Please summarize the following conversation history into a concise but comprehensive memorandum. Retain all key technical facts, file paths mentioned, decisions made, and pending issues.\n\n".to_string();
+            
+            for (i, turn) in oldest_turns.iter().enumerate() {
+                summary_prompt.push_str(&format!("--- Turn {} ---\n", i + 1));
+                summary_prompt.push_str(&format!("User: {}\n", turn.user_message));
+                for msg in &turn.messages {
+                    if msg.role == "model" {
+                        for part in &msg.parts {
+                            if let Some(text) = &part.text {
+                                summary_prompt.push_str(&format!("Agent: {}\n", text));
+                            }
+                            if let Some(fc) = &part.function_call {
+                                summary_prompt.push_str(&format!("Agent called tool '{}'\n", fc.name));
+                            }
+                        }
+                    } else if msg.role == "function" {
+                         summary_prompt.push_str("Agent received tool results.\n");
+                    }
+                }
+                summary_prompt.push_str("\n");
+            }
+
+            let sys_msg = Message {
+                role: "system".to_string(),
+                parts: vec![Part {
+                    text: Some("You are an expert summarization agent. Your job is to compress conversation history without losing technical details.".to_string()),
+                    function_call: None,
+                    function_response: None,
+                }],
+            };
+
+            let user_msg = Message {
+                role: "user".to_string(),
+                parts: vec![Part {
+                    text: Some(summary_prompt),
+                    function_call: None,
+                    function_response: None,
+                }],
+            };
+
+            match self.llm.generate_text(vec![user_msg], Some(sys_msg)).await {
+                Ok(summary) => {
+                    // Create a synthetic turn representing the compacted history
+                    let compacted_turn = crate::context::Turn {
+                        turn_id: uuid::Uuid::new_v4().to_string(),
+                        user_message: "SYSTEM: Old conversation history".to_string(),
+                        messages: vec![
+                            Message {
+                                role: "user".to_string(),
+                                parts: vec![Part {
+                                    text: Some("What happened earlier?".to_string()),
+                                    function_call: None,
+                                    function_response: None,
+                                }],
+                            },
+                            Message {
+                                role: "model".to_string(),
+                                parts: vec![Part {
+                                    text: Some(format!("Earlier conversation summary:\n{}", summary)),
+                                    function_call: None,
+                                    function_response: None,
+                                }],
+                            }
+                        ]
+                    };
+                    self.context.dialogue_history.insert(0, compacted_turn);
+                    self.output.on_text("[System: Compaction complete.]\n\n").await;
+                }
+                Err(e) => {
+                    self.output.on_error(&format!("\n[Compaction Error]: {}\n", e)).await;
+                    // Put them back if failed
+                    for (i, turn) in oldest_turns.into_iter().enumerate() {
+                        self.context.dialogue_history.insert(i, turn);
+                    }
+                }
+            }
+        }
+        // --- END AUTO-COMPACTION ---
+
         loop {
+
             let (history, system_instruction) = self.context.build_llm_payload();
 
             let mut rx = self
