@@ -445,7 +445,7 @@ impl AgentContext {
     pub fn end_turn(&mut self) {
         if let Some(turn) = self.current_turn.take() {
             if let Err(e) = self.append_turn_to_transcript(&turn) {
-                eprintln!("Failed to append turn to transcript: {}", e);
+                tracing::warn!("Failed to append turn to transcript: {}", e);
             }
             self.dialogue_history.push(turn);
         }

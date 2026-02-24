@@ -76,12 +76,12 @@ impl EventHandler for Handler {
     }
 
     async fn ready(&self, _: Context, ready: Ready) {
-        println!("Discord Bot {} is connected!", ready.user.name);
+        tracing::info!("Discord Bot {} is connected", ready.user.name);
     }
 }
 
 pub async fn run_discord_bot(token: String, session_manager: Arc<SessionManager>) {
-    println!("Starting Discord bot...");
+    tracing::info!("Starting Discord bot");
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
@@ -91,6 +91,6 @@ pub async fn run_discord_bot(token: String, session_manager: Arc<SessionManager>
         .expect("Err creating Discord client");
 
     if let Err(why) = client.start().await {
-        println!("Discord Client error: {:?}", why);
+        tracing::error!("Discord client error: {:?}", why);
     }
 }

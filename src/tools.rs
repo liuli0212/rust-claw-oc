@@ -155,7 +155,7 @@ impl Tool for BashTool {
         let cmd_str = parsed_args.command;
         let start = Instant::now();
 
-        println!(">> [Executing bash via PTY]: {}", cmd_str);
+        tracing::info!("Executing bash via PTY: {}", cmd_str);
 
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -255,6 +255,11 @@ impl Tool for BashTool {
             Err(_) => {
                 let mut c = child.lock().unwrap();
                 let _ = c.kill();
+                tracing::warn!(
+                    "Bash command timed out after {}s: {}",
+                    timeout_secs,
+                    cmd_str
+                );
                 Err(ToolError::Timeout)
             }
         }

@@ -37,7 +37,7 @@ impl AgentOutput for TelegramOutput {
 }
 
 pub async fn run_telegram_bot(token: String, session_manager: Arc<SessionManager>) {
-    println!("Starting Telegram bot...");
+    tracing::info!("Starting Telegram bot");
     let bot = Bot::new(token);
 
     teloxide::repl(bot, move |bot: Bot, msg: Message| {

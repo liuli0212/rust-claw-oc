@@ -25,7 +25,7 @@ pub struct VectorStore {
 impl VectorStore {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let start = Instant::now();
-        println!("[RAG] Initializing VectorStore...");
+        tracing::info!("[RAG] Initializing VectorStore...");
 
         let mut opts = InitOptions::new(EmbeddingModel::AllMiniLML6V2);
         opts.show_download_progress = true;
@@ -93,7 +93,7 @@ impl VectorStore {
         // Drop the statement to release the borrow on conn
         drop(stmt);
 
-        println!(
+        tracing::info!(
             "[RAG] Loaded {} chunks into memory in {}ms",
             loaded_chunks.len(),
             start.elapsed().as_millis()
