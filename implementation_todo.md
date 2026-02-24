@@ -6,35 +6,32 @@
 - [x] **Step 2: Parallelize RAG Retrieval (`hydrate_retrieved_memory`)**
 - [x] **Step 3: Optimize `should_run_memory_retrieval` Heuristics**
 
-## Phase 2: RAG Subsystem Upgrade (Focus: Intelligence & Caching)
+## Phase 2: RAG Subsystem Upgrade (Completed)
 
-The goal is to make retrieval faster and smarter by caching results and combining keyword search.
+- [x] **Step 1: Implement `EmbeddingCache` Struct (In-Memory + SQLite)**
+- [x] **Step 2: Add Keyword Search Layer (FTS5)**
+- [x] **Step 3: Implement Hybrid Scoring**
+
+## Phase 3: Infrastructure & Cleanup (Focus: Stability & Polish)
+
+The goal is to fix lingering inefficiencies and ensure the new subsystems are robust.
 
 ### Todo List
 
-- [x] **Step 1: Implement `EmbeddingCache` Struct**
-    - [x] **Analysis:** `rag.rs` currently lacks any form of query caching.
-    - [x] **Action:** I have rewritten `src/rag.rs` to implement an **In-Memory + SQLite Hybrid Store**.
-        -   **Startup:** Loads all chunks (text + vector) into RAM (`Vec<RagChunk>`).
-        -   **Insert:** Updates both RAM and SQLite (write-through).
-        -   **Search:**
-            -   **Vector Search:** Performs cosine similarity scan in-memory (blazing fast for <10k chunks).
-            -   **Keyword Search:** Uses SQLite FTS5 index for BM25 ranking.
-            -   **Hybrid Scoring:** Combines vector + keyword scores.
-    - [x] **Verification:** Verified logic by static analysis.
+- [ ] **Step 1: Optimize Session Registry I/O**
+    - [ ] **Analysis:** `SessionManager` rewrites the entire JSON registry on every interaction.
+    - [ ] **Action:** Make `upsert_registry` async/debounced or just keep in memory and write on exit/periodic intervals.
+    - [ ] **Verification:** Verify `sessions.json` is not being hammered.
 
-- [ ] **Step 2: Add Keyword Search Layer (BM25 / Simple)**
-    - [ ] **Analysis:** The FTS5 implementation in `rag.rs` was buggy/incomplete.
-    - [ ] **Action:** I am fixing the SQL queries to properly use `MATCH` and extract `bm25()` scores.
-    - [ ] **Action:** Ensuring special characters in queries are escaped to prevent SQL errors.
+- [ ] **Step 2: Final Code Review & Cleanup**
+    - [ ] **Action:** Run `cargo fmt` and `cargo clippy`.
+    - [ ] **Action:** Remove any temporary debugging print statements.
+    - [ ] **Action:** Ensure error handling is graceful (no panics in background tasks).
 
-- [ ] **Step 3: Implement Hybrid Scoring**
-    - [ ] **Action:** Combine Vector Score (0.7) + Keyword Score (0.3).
-    - [ ] **Action:** Re-rank results based on this combined score.
-
-- [ ] **Step 4: Cleanup & Commit**
-    - [ ] **Action:** Review code, run tests, commit changes.
+- [ ] **Step 3: Update Documentation**
+    - [ ] **Action:** Update `README.md` to reflect the new Architecture (Hybrid RAG, Local Embeddings).
 
 ---
 
-I have completed the core `EmbeddingCache` logic in `src/rag.rs`. I am now refining the FTS5 integration and hybrid scoring.
+I will start with **Step 1: Optimize Session Registry I/O**.
+I'll modify `src/session_manager.rs` to only write to disk periodically or on significant state changes, rather than every read.
