@@ -49,13 +49,25 @@ mod tests {
     async fn test_workspace_memory() {
         let dir = tempdir().unwrap();
         let mem = WorkspaceMemory::new(dir.path().to_str().unwrap());
-        
+
         let empty = mem.read_memory().await.unwrap();
         assert_eq!(empty, "");
-        
+
         mem.write_memory("Hello World").await.unwrap();
-        
+
         let read_back = mem.read_memory().await.unwrap();
         assert_eq!(read_back, "Hello World");
+    }
+
+    #[tokio::test]
+    async fn test_regression_workspace_memory_overwrite() {
+        let dir = tempdir().unwrap();
+        let mem = WorkspaceMemory::new(dir.path().to_str().unwrap());
+
+        mem.write_memory("v1").await.unwrap();
+        mem.write_memory("v2").await.unwrap();
+
+        let read_back = mem.read_memory().await.unwrap();
+        assert_eq!(read_back, "v2");
     }
 }

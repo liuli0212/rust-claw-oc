@@ -27,7 +27,7 @@ impl Tool for SkillTool {
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let mut script = self.script_template.clone();
-        
+
         // Very basic template replacement for string arguments
         if let Some(obj) = args.as_object() {
             for (k, v) in obj {
@@ -69,7 +69,10 @@ impl Tool for SkillTool {
         }
 
         if !output.status.success() {
-            res.push_str(&format!("\nExit code: {}", output.status.code().unwrap_or(-1)));
+            res.push_str(&format!(
+                "\nExit code: {}",
+                output.status.code().unwrap_or(-1)
+            ));
         } else if res.is_empty() {
             res.push_str("Skill executed successfully with no output.");
         }
@@ -108,10 +111,10 @@ fn parse_skill_markdown(content: &str) -> Option<SkillTool> {
     let script_template = parts[2].trim().to_string();
 
     let yaml_val: serde_yaml::Value = serde_yaml::from_str(yaml_str).ok()?;
-    
+
     let name = yaml_val.get("name")?.as_str()?.to_string();
     let description = yaml_val.get("description")?.as_str()?.to_string();
-    
+
     // Construct schema
     let mut schema = serde_json::json!({
         "type": "object",
@@ -125,22 +128,38 @@ fn parse_skill_markdown(content: &str) -> Option<SkillTool> {
 
         for (k, v) in params {
             let k_str = k.as_str()?.to_string();
-            let desc = v.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
-            let ptype = v.get("type").and_then(|d| d.as_str()).unwrap_or("string").to_string();
-            
+            let desc = v
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ptype = v
+                .get("type")
+                .and_then(|d| d.as_str())
+                .unwrap_or("string")
+                .to_string();
+
             let req = v.get("required").and_then(|r| r.as_bool()).unwrap_or(false);
             if req {
                 required.push(k_str.clone());
             }
 
-            properties.insert(k_str, serde_json::json!({
-                "type": ptype,
-                "description": desc
-            }));
+            properties.insert(
+                k_str,
+                serde_json::json!({
+                    "type": ptype,
+                    "description": desc
+                }),
+            );
         }
 
         schema["properties"] = serde_json::Value::Object(properties);
-        schema["required"] = serde_json::Value::Array(required.into_iter().map(serde_json::Value::String).collect());
+        schema["required"] = serde_json::Value::Array(
+            required
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        );
     }
 
     Some(SkillTool {
@@ -171,9 +190,32 @@ echo "Hello {{person_name}}"
         let skill = parse_skill_markdown(md).unwrap();
         assert_eq!(skill.name, "say_hello");
         assert_eq!(skill.description, "Says hello to a person");
-        assert!(skill.script_template.contains("echo \"Hello {{person_name}}\""));
-        
+        assert!(skill
+            .script_template
+            .contains("echo \"Hello {{person_name}}\""));
+
         let schema_props = skill.schema.get("properties").unwrap();
         assert!(schema_props.get("person_name").is_some());
+    }
+
+    #[test]
+    fn test_regression_parse_skill_markdown() {
+        let md = r#"---
+name: echo_number
+description: Echoes a number
+parameters:
+  n:
+    type: integer
+    description: Number to print
+    required: true
+---
+echo "{{n}}"
+"#;
+
+        let skill = parse_skill_markdown(md).unwrap();
+        assert_eq!(skill.name, "echo_number");
+        assert_eq!(skill.description, "Echoes a number");
+        assert!(skill.script_template.contains("{{n}}"));
+        assert_eq!(skill.schema["required"], serde_json::json!(["n"]));
     }
 }
