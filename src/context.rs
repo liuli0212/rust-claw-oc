@@ -20,7 +20,7 @@ pub struct Part {
 pub struct FunctionCall {
     pub name: String,
     pub args: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "thought_signature")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
     pub thought_signature: Option<String>,
 }
 
