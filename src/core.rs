@@ -1180,6 +1180,9 @@ impl AgentLoop {
                 });
             }
             for call in &tool_calls {
+                if call.name.trim().is_empty() {
+                    continue; // Skip hallucinated empty tool calls
+                }
                 parts.push(Part {
                     text: None,
                     function_call: Some(call.clone()),
@@ -1252,10 +1255,22 @@ impl AgentLoop {
                 let tool_name = call.name.clone();
                 let tool_args = call.args.clone();
 
+                // Aliyun/OpenAI compat can sometimes hallucinate empty tool names when it glitches. 
+                // We MUST skip these to prevent corrupting the dialogue history which will crash Gemini later.
+                if tool_name.trim().is_empty() {
+                    continue;
+                }
+
                 if tool_name == "finish_task" {
                     requested_finish = true;
-                    self.output.on_tool_start(&tool_name, &tool_args.to_string()).await;
-                    self.output.on_tool_end("Task marked as finished.").await;
+                    // Provide explicit summary extraction so the user sees the final answer.
+                    let mut display_summary = tool_args.to_string();
+                    if let Some(obj) = tool_args.as_object() {
+                        if let Some(summary) = obj.get("summary").and_then(|v| v.as_str()) {
+                            display_summary = summary.to_string();
+                        }
+                    }
+                    self.output.on_text(&format!("\n\x1b[35m[Agent]: {}\x1b[0m\n", display_summary)).await;
                     break;
                 }
 
