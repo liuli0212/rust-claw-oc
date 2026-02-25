@@ -328,6 +328,11 @@ impl AgentLoop {
             "module",
             "tool",
             "schema",
+            "explore",
+            "search",
+            "grep",
+            "find",
+            "analyze",
             "优化",
             "实现",
             "修复",
@@ -340,6 +345,13 @@ impl AgentLoop {
             "函数",
             "模块",
             "工具",
+            "更新",
+            "设计",
+            "文档",
+            "阅读",
+            "搜索",
+            "查找",
+            "分析",
         ];
         markers.iter().any(|m| lower.contains(m))
             || lower.contains("src/")
@@ -1361,7 +1373,8 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                     break;
                 }
                 // For simple prompts, a direct model reply is enough. Exit before task-iteration checks.
-                if !is_complex_task {
+                // However, if we just executed a tool (has_tool_observation), the model MUST output text before we can consider it done.
+                if !is_complex_task && (!has_tool_observation || !full_text.trim().is_empty()) {
                     if !full_text.trim().is_empty() {
                         exit_state = RunExit::CompletedWithReply;
                     }
