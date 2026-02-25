@@ -1214,7 +1214,7 @@ impl AgentLoop {
                     parts,
                 });
             }
-            if matches!(exit_state, RunExit::HardStop { .. }) {
+            if matches!(exit_state, RunExit::HardStop { .. } | RunExit::YieldedToUser) {
                 break;
             }
 
