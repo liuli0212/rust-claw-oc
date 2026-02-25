@@ -267,6 +267,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let sm_clone = session_manager.clone();
+    tokio::spawn(async move {
+        if let Ok(_) = tokio::signal::ctrl_c().await {
+            // First Ctrl+C: Cancel the current agent.
+            sm_clone.cancel_session("cli").await;
+            
+            // If they press it again, exit?
+            // Actually, tokio::signal::ctrl_c() is a one-shot or stream.
+            // Let's loop it:
+            let mut sigs = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+            while let Some(_) = sigs.recv().await {
+                sm_clone.cancel_session("cli").await;
+            }
+        }
+    });
+
     loop {
         let readline = rl.readline(">> ");
         match readline {
@@ -304,6 +320,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         RunExit::HardStop { reason } => {
                             println!("\n[Run Exit] hard_stop ({})", reason);
+                        }
+                        RunExit::YieldedToUser => {
+                            // Message is already printed by core.rs
                         }
                     },
                     Err(e) => eprintln!("Agent error: {}", e),
