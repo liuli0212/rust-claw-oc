@@ -606,6 +606,9 @@ impl AgentLoop {
             return true;
         }
         let text = state.last_model_text.to_lowercase();
+        if text.trim().is_empty() {
+            return false; // Cannot be complete without saying something
+        }
         let done_markers = ["done", "completed", "fixed", "resolved", "successfully"];
         done_markers.iter().any(|m| text.contains(m)) && !text.contains("need to")
     }
@@ -1374,10 +1377,9 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 }
                 // For simple prompts, a direct model reply is enough. Exit before task-iteration checks.
                 // However, if we just executed a tool (has_tool_observation), the model MUST output text before we can consider it done.
-                if !is_complex_task && (!has_tool_observation || !full_text.trim().is_empty()) {
-                    if !full_text.trim().is_empty() {
-                        exit_state = RunExit::CompletedWithReply;
-                    }
+                // It also must not just say a single word, it should be a real explanation if there was a tool output.
+                if !is_complex_task && !full_text.trim().is_empty() && (!has_tool_observation || full_text.trim().len() > 10) {
+                    exit_state = RunExit::CompletedWithReply;
                     if Self::should_emit_verbose_progress() {
                         self.output
                             .on_text("[Progress] 快速问答已完成，本轮不再继续扩展执行。\n")
@@ -1385,6 +1387,25 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                     }
                     break;
                 }
+                
+                // --- SILENT EXIT PREVENTION ---
+                if full_text.trim().is_empty() && has_tool_observation && consecutive_no_tool_iters < 2 {
+                    if Self::should_emit_verbose_progress() {
+                        self.output
+                            .on_text("[Progress] 模型阅读了工具输出但未给出解释，强制要求其给出结论...\n")
+                            .await;
+                    }
+                    self.context.add_message_to_current_turn(Message {
+                        role: "user".to_string(),
+                        parts: vec![Part {
+                            text: Some("Please explain the tool results to me and tell me what we should do next or if the task is complete.".to_string()),
+                            function_call: None,
+                            function_response: None,
+                        }],
+                    });
+                    continue;
+                }
+                // ------------------------------
                 if task_state.iterations >= iteration_limit {
                     if !full_text.trim().is_empty() {
                         exit_state = RunExit::CompletedWithReply;
