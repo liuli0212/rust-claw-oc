@@ -19,7 +19,9 @@ This project is a Rust-native implementation of an AI agent, closely following t
 - **🎯 Precision Patch Engine:**
   - **Atomic Edits:** Uses a structured patching mechanism (SEARCH/REPLACE with context) to ensure safe, localized code modifications.
   - **Verification:** Automatically validates context before applying changes, preventing accidental corruption of source files.
-- **🔌 Multi-Platform:** Supports CLI, Telegram, and Discord concurrently.
+- **🔌 Multi-Platform & Multi-Provider:**
+  - **Providers:** Supports Google Gemini, Aliyun Qwen, and any OpenAI-compatible API (DeepSeek, LocalAI, vLLM).
+  - **Platforms:** Supports CLI, Telegram, and Discord concurrently.
 
 ## 🛠️ Setup & Configuration
 
@@ -52,6 +54,31 @@ TAVILY_API_KEY=tvly-xxxxxxxx
 TELEGRAM_BOT_TOKEN=12345:abcdef...
 DISCORD_BOT_TOKEN=MTAw...
 ```
+### 3. Configuration (Optional)
+You can configure providers using a `config.toml` file in the current directory or `~/.config/rusty-claw/config.toml`.
+
+**Example `config.toml`:**
+```toml
+default_provider = "deepseek"
+
+[providers.deepseek]
+type = "openai_compat"
+api_key_env = "DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com/v1/chat/completions"
+model = "deepseek-chat"
+
+[providers.aliyun]
+type = "openai_compat"
+api_key_env = "DASHSCOPE_API_KEY"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+model = "qwen-plus"
+```
+
+### 4. CLI Commands
+- `/status`: Show current provider, model, context usage stats, and token count.
+- `/new`: Clear current session context and start fresh.
+- `exit`: Quit the application.
+
 
 **Runtime Tuning (Advanced):**
 ```env

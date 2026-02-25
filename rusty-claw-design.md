@@ -48,3 +48,11 @@ To reduce latency and API costs:
 ## 5. Tooling & Sandbox
 -   **Sandboxed Execution:** Use Docker or lightweight virtualization (Wasm/Firecracker) for executing untrusted code tools.
 -   **Standard Lib:** Provide a robust standard library of tools (File I/O, Web Search, Bash) that are highly optimized and safe.
+## 6. Configuration & Extensibility
+- **Config Loader:** `src/config.rs` handles TOML parsing and provider resolution. It supports cascading overrides (CLI > Config > Defaults).
+- **Dynamic Providers:** The system abstracts LLM interaction via the `LlmClient` trait, allowing seamless switching between Gemini, Aliyun, and OpenAI-compatible endpoints at runtime.
+
+## 7. Operational Safety
+- **Strict Plan Enforcement:** The `TaskPlanTool` is integrated into the system prompt. If a plan exists (`.rusty_claw_task_plan.json`), it is injected into the context, and the model is explicitly instructed to follow it.
+- **State Persistence:** Plan state is persisted to disk JSON, ensuring recovery after restart.
+
