@@ -11,6 +11,20 @@ struct DiscordOutput {
     channel_id: serenity::model::id::ChannelId,
 }
 
+impl DiscordOutput {
+    fn truncate_to_three_lines(input: &str) -> String {
+        let lines: Vec<&str> = input.lines().collect();
+        if lines.len() <= 3 {
+            return input.to_string();
+        }
+        format!(
+            "{}\n... ({} more lines)",
+            lines[..3].join("\n"),
+            lines.len() - 3
+        )
+    }
+}
+
 #[async_trait]
 impl AgentOutput for DiscordOutput {
     async fn on_text(&self, text: &str) {
@@ -18,7 +32,11 @@ impl AgentOutput for DiscordOutput {
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
-        let msg = format!("🛠️ **Tool Call**: `{}`\nArgs: `{}`", name, args);
+        let msg = format!(
+            "🛠️ **Tool Call**: `{}`\nArgs:\n```{}\n```",
+            name,
+            Self::truncate_to_three_lines(args)
+        );
         let _ = self.channel_id.say(&self.ctx.http, msg).await;
     }
 

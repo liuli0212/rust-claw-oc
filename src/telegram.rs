@@ -9,6 +9,20 @@ struct TelegramOutput {
     chat_id: ChatId,
 }
 
+impl TelegramOutput {
+    fn truncate_to_three_lines(input: &str) -> String {
+        let lines: Vec<&str> = input.lines().collect();
+        if lines.len() <= 3 {
+            return input.to_string();
+        }
+        format!(
+            "{}\n... ({} more lines)",
+            lines[..3].join("\n"),
+            lines.len() - 3
+        )
+    }
+}
+
 #[async_trait]
 impl AgentOutput for TelegramOutput {
     async fn on_text(&self, text: &str) {
@@ -16,7 +30,11 @@ impl AgentOutput for TelegramOutput {
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
-        let msg = format!("🛠️ Tool Call: {}\nArgs: {}", name, args);
+        let msg = format!(
+            "🛠️ Tool Call: {}\nArgs: {}",
+            name,
+            Self::truncate_to_three_lines(args)
+        );
         let _ = self.bot.send_message(self.chat_id, msg).await;
     }
 
