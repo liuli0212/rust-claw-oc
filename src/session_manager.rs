@@ -24,8 +24,8 @@ struct SessionEntry {
 pub struct SessionManager {
     llm: Arc<dyn LlmClient>,
     tools: Vec<Arc<dyn Tool>>,
-    // Active agent sessions (In-Memory)
-    sessions: AsyncMutex<HashMap<String, Arc<AsyncMutex<AgentLoop>>>>,
+    // Active agent sessions (In-Memory) + their cancel tokens
+    sessions: AsyncMutex<HashMap<String, (Arc<AsyncMutex<AgentLoop>>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>,
     transcript_dir: PathBuf,
     registry_path: PathBuf,
     // In-Memory Registry Cache (Fast Read/Write)
@@ -80,9 +80,8 @@ impl SessionManager {
 
     pub async fn cancel_session(&self, session_id: &str) {
         let sessions = self.sessions.lock().await;
-        if let Some(agent) = sessions.get(session_id) {
-            let agent_guard = agent.lock().await;
-            agent_guard.cancel_token.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some((_, token)) = sessions.get(session_id) {
+            token.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -92,7 +91,7 @@ impl SessionManager {
         output: Arc<dyn AgentOutput>,
     ) -> Arc<AsyncMutex<AgentLoop>> {
         let mut sessions = self.sessions.lock().await;
-        if let Some(agent) = sessions.get(session_id) {
+        if let Some((agent, _)) = sessions.get(session_id) {
             // Update timestamp in memory only (fast)
             self.update_registry_entry(session_id, None, None);
             self.persist_registry_async();
@@ -107,9 +106,10 @@ impl SessionManager {
         self.update_registry_entry(session_id, Some(transcript_path), Some(loaded_turns));
         self.persist_registry_async();
 
-        let agent = AgentLoop::new(self.llm.clone(), self.tools.clone(), context, output);
-        let agent = Arc::new(AsyncMutex::new(agent));
-        sessions.insert(session_id.to_string(), agent.clone());
+        let agent_loop = AgentLoop::new(self.llm.clone(), self.tools.clone(), context, output);
+        let token = agent_loop.cancel_token.clone();
+        let agent = Arc::new(AsyncMutex::new(agent_loop));
+        sessions.insert(session_id.to_string(), (agent.clone(), token));
         agent
     }
 
