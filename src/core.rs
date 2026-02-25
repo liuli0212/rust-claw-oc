@@ -1116,7 +1116,12 @@ impl AgentLoop {
 
             tracing::debug!("Raw LLM Output (full_text):\n{}", raw_full_text);
             for (i, call) in tool_calls.iter().enumerate() {
-                tracing::debug!("Parsed ToolCall [{}]: name={}, args={}", i, call.name, call.args);
+                tracing::debug!("Parsed ToolCall [{}]: name={}, args={}, thought={:?}", i, call.name, call.args, call.thought_signature);
+                if let Some(thought) = &call.thought_signature {
+                    let thought_msg = format!("<think>\n{}\n</think>\n", thought);
+                    full_text.insert_str(0, &thought_msg);
+                    self.output.on_text(&thought_msg).await;
+                }
             }
 
             if Self::enforce_final_tag_enabled() {
