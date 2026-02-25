@@ -17,19 +17,27 @@ pub fn init_logging(
 ) -> Result<Option<WorkerGuard>, Box<dyn std::error::Error>> {
     let file_filter = EnvFilter::try_from_default_env()
         .or_else(|_| {
-            let level = config
+            let mut level = config
                 .log_level
                 .clone()
                 .or_else(|| std::env::var("CLAW_LOG_LEVEL").ok())
                 .unwrap_or_else(|| "info".to_string());
+            if !level.contains("rustyline=") {
+                level.push_str(",rustyline=warn");
+            }
             EnvFilter::try_new(level)
         })
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+        .unwrap_or_else(|_| EnvFilter::new("info,rustyline=warn"));
 
     let console_filter = std::env::var("CLAW_CONSOLE_LOG_LEVEL")
         .ok()
-        .and_then(|v| EnvFilter::try_new(v).ok())
-        .unwrap_or_else(|| EnvFilter::new("warn"));
+        .and_then(|mut v| {
+            if !v.contains("rustyline=") {
+                v.push_str(",rustyline=warn");
+            }
+            EnvFilter::try_new(v).ok()
+        })
+        .unwrap_or_else(|| EnvFilter::new("warn,rustyline=warn"));
 
     let enable_file = config.file_log.unwrap_or_else(|| {
         std::env::var("CLAW_FILE_LOG")
