@@ -54,6 +54,10 @@ struct TaskState {
     last_error: Option<String>,
     recovery_attempts: usize,
     recovery_rule_hits: HashMap<String, usize>,
+    
+    // Deadlock detection & Dynamic Budget
+    energy_points: usize,
+    recent_tool_signatures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,7 +94,6 @@ impl AgentLoop {
     const COMPACTION_MIN_TURNS: usize = 3;
     const MAX_COMPACTION_ATTEMPTS_PER_STEP: usize = 2;
     const DEFAULT_MAX_TASK_ITERATIONS: usize = 12;
-    const SIMPLE_TASK_MAX_ITERATIONS: usize = 2;
     const MAX_AUTO_RECOVERY_ATTEMPTS: usize = 2;
     const MAX_LLM_RECOVERY_ATTEMPTS: usize = 3;
 
@@ -542,13 +545,6 @@ impl AgentLoop {
         parsed
     }
 
-    fn build_next_action_prompt(state: &TaskState) -> String {
-        format!(
-            "Continue solving the same task. Goal: {}. This is iteration {}. Use tools proactively. If complete, you MUST call the `finish_task` tool.",
-            state.goal, state.iterations
-        )
-    }
-
     fn summarize_model_intent(text: &str) -> Option<String> {
         let cleaned = text.replace('\n', " ");
         let trimmed = cleaned.trim();
@@ -608,41 +604,6 @@ impl AgentLoop {
             format!("{}；依据：{}", base, intent)
         } else {
             base
-        }
-    }
-
-    fn summarize_tool_output(text: &str) -> String {
-        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-        let clipped: String = first.chars().take(120).collect();
-        if clipped.is_empty() {
-            "无可展示输出".to_string()
-        } else {
-            clipped
-        }
-    }
-
-    fn summarize_args(args: &Value, max_chars: usize) -> String {
-        let s = args.to_string();
-        let clipped: String = s.chars().take(max_chars).collect();
-        if clipped.is_empty() {
-            "{}".to_string()
-        } else {
-            clipped
-        }
-    }
-
-    fn iteration_objective(goal: &str, has_tool_observation: bool) -> String {
-        let goal_snippet: String = goal.trim().chars().take(48).collect();
-        if has_tool_observation {
-            format!(
-                "基于上一轮工具结果收敛结论并给出可执行答复（任务：{}）",
-                goal_snippet
-            )
-        } else {
-            format!(
-                "识别任务关键点并决定是直接回答还是调用工具（任务：{}）",
-                goal_snippet
-            )
         }
     }
 
@@ -962,13 +923,13 @@ impl AgentLoop {
         &mut self,
         user_input: String,
     ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
-        let mut iteration_limit = Self::max_task_iterations();
+        let _initial_limit = Self::max_task_iterations();
         self.output
             .on_text(&format!(
                 "[Progress] 接收任务：{}。最大允许 {} 轮。
 ",
                 user_input.trim(),
-                iteration_limit
+                15 // Starting energy
             ))
             .await;
         if Self::should_emit_verbose_progress() {
@@ -1035,10 +996,17 @@ impl AgentLoop {
                 .as_ref()
                 .map(|t| t.user_message.clone())
                 .unwrap_or_default(),
-            ..TaskState::default()
+            iterations: 0,
+            completed: false,
+            last_model_text: String::new(),
+            last_error: None,
+            recovery_attempts: 0,
+            recovery_rule_hits: HashMap::new(),
+            energy_points: 15, // Starting energy
+            recent_tool_signatures: Vec::new(),
         };
         let mut prompt_report_emitted = false;
-        let mut iter_max = iteration_limit;
+        
         let mut exit_state = RunExit::CompletedSilent {
             cause: "run_finished_without_output".to_string(),
         };
@@ -1048,16 +1016,17 @@ impl AgentLoop {
         let mut tool_exec_ms_acc: u128 = 0;
         let mut llm_attempts_total: usize = 0;
         let mut first_event_ms_first_iter: Option<u128> = None;
-        let mut consecutive_no_tool_iters: usize = 0;
-        let mut has_tool_observation = false;
-        while task_state.iterations < iteration_limit {
+        
+        
+        while task_state.energy_points > 0 {
             task_state.iterations += 1;
+            task_state.energy_points = task_state.energy_points.saturating_sub(1);
             if Self::should_emit_verbose_progress() {
                 let objective = "寻找解决方案并执行，或调用 finish_task 结束";
                 self.output
                     .on_text(&format!(
-                        "[Progress] 当前阶段：执行第 {}/{} 轮，目标：{}。\n",
-                        task_state.iterations, iteration_limit, objective
+                        "[Progress] 当前阶段：第 {} 轮 (剩余精力: {})，目标：{}。\n",
+                        task_state.iterations, task_state.energy_points, objective
                     ))
                     .await;
             }
@@ -1233,20 +1202,17 @@ impl AgentLoop {
 
 
             if tool_calls.is_empty() {
-                consecutive_no_tool_iters += 1;
+                
                 task_state.last_model_text = full_text.clone();
                 
-                if task_state.iterations >= iteration_limit {
+                task_state.energy_points = task_state.energy_points.saturating_sub(1);
+                
+                if task_state.energy_points == 0 {
                     self.output
-                        .on_error(
-                            &format!(
-                                "[Task] Reached max task iterations ({}). Stopping with partial progress.",
-                                iteration_limit
-                            ),
-                        )
+                        .on_error("[Task] Energy depleted (potential infinite loop). Stopping with partial progress.")
                         .await;
                     exit_state = RunExit::RecoverableFailed {
-                        reason: "max_task_iterations_reached".to_string(),
+                        reason: "energy_depleted".to_string(),
                         attempts: task_state.iterations,
                     };
                     break;
@@ -1270,7 +1236,7 @@ impl AgentLoop {
                 continue;
             }
 
-            consecutive_no_tool_iters = 0;
+            
 
             if full_text.trim().is_empty()
                 && tool_calls
@@ -1329,6 +1295,52 @@ impl AgentLoop {
                     tool_result.output.clone()
                 };
 
+                // Dynamic Energy System: Restore energy on successful or meaningful tool usage
+                // Cost: 1 energy point per iteration.
+                // Reward: +1 for successful commands, +2 for successful file edits/reads. Max cap: 20.
+                if tool_result.ok {
+                    let reward = if tool_name == "read_file" || tool_name == "write_file" { 2 } else { 1 };
+                    task_state.energy_points = (task_state.energy_points + reward).min(20);
+                } else {
+                    // Penalty: Failed commands don't restore energy, draining the budget faster.
+                    task_state.energy_points = task_state.energy_points.saturating_sub(1);
+                }
+
+                // Deadlock Detection: Has it called the exact same tool with the exact same args multiple times?
+                let call_signature = format!("{}:{}", tool_name, tool_args.to_string());
+                task_state.recent_tool_signatures.push(call_signature.clone());
+                if task_state.recent_tool_signatures.len() > 6 {
+                    task_state.recent_tool_signatures.remove(0);
+                }
+
+                let mut same_call_count = 0;
+                for sig in &task_state.recent_tool_signatures {
+                    if sig == &call_signature {
+                        same_call_count += 1;
+                    }
+                }
+
+                if same_call_count >= 3 && !tool_result.ok {
+                    self.output.on_error(&format!("\n[Deadlock Detected] Agent has failed with the exact same tool call {} times in a row.\n", same_call_count)).await;
+                    
+                    // Inject a stern warning into the context
+                    let warning_msg = Message {
+                        role: "user".to_string(),
+                        parts: vec![Part {
+                            text: Some(format!(
+                                "SYSTEM WARNING: You have executed the exact same failing tool call (`{}`) {} times in a row. You are stuck in a loop. STOP trying this approach immediately. Use `read_file` to review your code, or try a completely different strategy. If you cannot fix it, use `finish_task` to ask the user for help.",
+                                tool_name, same_call_count
+                            )),
+                            function_call: None,
+                            function_response: None,
+                        }]
+                    };
+                    self.context.add_message_to_current_turn(warning_msg);
+                    
+                    // Heavily penalize energy to force exit if it keeps doing it
+                    task_state.energy_points = task_state.energy_points.saturating_sub(5);
+                }
+
                 self.output.on_tool_end(&result_str).await;
 
                 response_parts.push(Part {
@@ -1350,7 +1362,7 @@ impl AgentLoop {
                 role: "function".to_string(),
                 parts: response_parts,
             });
-            has_tool_observation = true;
+            
             if full_text.trim().is_empty() {
                 if let Some(cause) = silent_cause_hint.clone() {
                     exit_state = RunExit::CompletedSilent { cause };
@@ -1377,10 +1389,10 @@ impl AgentLoop {
         if matches!(
             exit_state,
             RunExit::CompletedSilent { .. }
-                if task_state.iterations >= iteration_limit
+                if task_state.energy_points == 0
         ) {
             exit_state = RunExit::RecoverableFailed {
-                reason: "max_task_iterations_exhausted".to_string(),
+                reason: "energy_depleted".to_string(),
                 attempts: task_state.iterations,
             };
         } else if matches!(exit_state, RunExit::CompletedSilent { .. })
