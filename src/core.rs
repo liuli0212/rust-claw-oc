@@ -59,7 +59,7 @@ struct TaskState {
     last_error: Option<String>,
     recovery_attempts: usize,
     recovery_rule_hits: HashMap<String, usize>,
-    
+
     // Deadlock detection & Dynamic Budget
     energy_points: usize,
     recent_tool_signatures: Vec<String>,
@@ -767,6 +767,7 @@ impl AgentLoop {
                     text: Some("You are an expert summarization agent. Your job is to compress conversation history without losing technical details.".to_string()),
                     function_call: None,
                     function_response: None,
+                    thought_signature: None,
                 }],
             };
             let user_msg = Message {
@@ -775,6 +776,7 @@ impl AgentLoop {
                     text: Some(summary_prompt),
                     function_call: None,
                     function_response: None,
+                    thought_signature: None,
                 }],
             };
 
@@ -790,6 +792,7 @@ impl AgentLoop {
                                     text: Some("What happened earlier?".to_string()),
                                     function_call: None,
                                     function_response: None,
+                                    thought_signature: None,
                                 }],
                             },
                             Message {
@@ -801,6 +804,7 @@ impl AgentLoop {
                                     )),
                                     function_call: None,
                                     function_response: None,
+                                    thought_signature: None,
                                 }],
                             },
                         ],
@@ -960,7 +964,7 @@ impl AgentLoop {
             recent_tool_signatures: Vec::new(),
         };
         let mut prompt_report_emitted = false;
-        
+
         let mut exit_state = RunExit::CompletedSilent {
             cause: "run_finished_without_output".to_string(),
         };
@@ -970,8 +974,8 @@ impl AgentLoop {
         let mut tool_exec_ms_acc: u128 = 0;
         let mut llm_attempts_total: usize = 0;
         let mut first_event_ms_first_iter: Option<u128> = None;
-        
-        
+
+
         self.cancel_token.store(false, Ordering::SeqCst);
 
         while task_state.energy_points > 0 {
@@ -980,7 +984,7 @@ impl AgentLoop {
                 exit_state = RunExit::YieldedToUser;
                 break;
             }
-            
+
             task_state.iterations += 1;
             task_state.energy_points = task_state.energy_points.saturating_sub(1);
             if Self::should_emit_verbose_progress() {
@@ -995,7 +999,7 @@ impl AgentLoop {
             let prompt_build_started = Instant::now();
             let (history, system_instruction, prompt_report) = self.context.build_llm_payload();
             prompt_build_ms_acc += prompt_build_started.elapsed().as_millis();
-            tracing::trace!("LLM Payload Context - System Instruction: {:?} | History length: {} messages", system_instruction, history.len());
+            tracing::trace!("LLM Payload Context -  History length: {} messages", history.len());
             if !prompt_report_emitted {
                 self.emit_prompt_report(
                     &prompt_report,
@@ -1091,6 +1095,7 @@ impl AgentLoop {
                         raw_full_text.push_str(&text);
                         let (visible_text, saw_no_reply, saw_heartbeat) =
                             Self::sanitize_stream_text_chunk(&text);
+                        tracing::debug!("[Stream] Received Text chunk: len={}, content={:?}", text.len(), text);
                         saw_no_reply_token |= saw_no_reply;
                         saw_heartbeat_token |= saw_heartbeat;
                         if !visible_text.is_empty() {
@@ -1098,8 +1103,9 @@ impl AgentLoop {
                             full_text.push_str(&visible_text);
                         }
                     }
-                    StreamEvent::ToolCall(call) => {
+                    StreamEvent::ToolCall(call, _signature) => {
                         tool_calls.push(call);
+                        // If signature is needed we would use it here, but we are skipping it for now to fix the payload error.
                     }
                     StreamEvent::Error(e) => {
                         tracing::error!("LLM Stream Error: {}", e);
@@ -1116,15 +1122,7 @@ impl AgentLoop {
 
             tracing::debug!("Raw LLM Output (full_text):\n{}", raw_full_text);
             for (i, call) in tool_calls.iter().enumerate() {
-                tracing::debug!("Parsed ToolCall [{}]: name={}, args={}, thought={:?}", i, call.name, call.args, call.thought_signature);
-                if let Some(thought) = &call.thought_signature {
-                    // Only prepend thought if the raw_full_text didn't already have it
-                    if raw_full_text.trim().is_empty() {
-                        let thought_msg = format!("<think>\n{}\n</think>\n", thought);
-                        full_text.insert_str(0, &thought_msg);
-                        self.output.on_text(&thought_msg).await;
-                    }
-                }
+                tracing::debug!("Parsed ToolCall [{}]: name={}, args={}", i, call.name, call.args);
             }
 
             if Self::enforce_final_tag_enabled() {
@@ -1157,6 +1155,7 @@ impl AgentLoop {
             if !full_text.is_empty() {
                 parts.push(Part {
                     text: Some(full_text.clone()),
+                    thought_signature: None,
                     function_call: None,
                     function_response: None,
                 });
@@ -1170,6 +1169,7 @@ impl AgentLoop {
                         self.context.add_message_to_current_turn(Message {
                             role: "model".to_string(),
                             parts: vec![t.clone()],
+                            // No, `t` is a Part, so it should be fine if Part is updated, but wait. `t.clone()` is a Part.
                         });
                     }
                 }
@@ -1184,6 +1184,7 @@ impl AgentLoop {
                     text: None,
                     function_call: Some(call.clone()),
                     function_response: None,
+                    thought_signature: None,
                 });
             }
             if !parts.is_empty() {
@@ -1199,9 +1200,9 @@ impl AgentLoop {
 
 
             if tool_calls.is_empty() {
-                
+
                 task_state.last_model_text = full_text.clone();
-                
+
                 if task_state.energy_points == 0 {
                     self.output
                         .on_error("[Task] Energy depleted (potential infinite loop). Stopping with partial progress.")
@@ -1219,19 +1220,20 @@ impl AgentLoop {
 ")
                         .await;
                 }
-                
+
                 self.context.add_message_to_current_turn(Message {
                     role: "user".to_string(),
                     parts: vec![Part {
                         text: Some("You did not call any tools. If the task is incomplete, please proceed with your next tool call. If the task is fully completed, you MUST call the `finish_task` tool to exit the loop.".to_string()),
                         function_call: None,
                         function_response: None,
+                        thought_signature: None,
                     }],
                 });
                 continue;
             }
 
-            
+
 
             if full_text.trim().is_empty()
                 && tool_calls
@@ -1255,7 +1257,7 @@ impl AgentLoop {
                 let tool_name = call.name.clone();
                 let tool_args = call.args.clone();
 
-                // Aliyun/OpenAI compat can sometimes hallucinate empty tool names when it glitches. 
+                // Aliyun/OpenAI compat can sometimes hallucinate empty tool names when it glitches.
                 // We MUST skip these to prevent corrupting the dialogue history which will crash Gemini later.
                 if tool_name.trim().is_empty() {
                     continue;
@@ -1281,7 +1283,7 @@ impl AgentLoop {
                         extracted_thought = Some(t.to_string());
                     }
                 }
-                
+
                 if let Some(thought) = extracted_thought {
                     self.output.on_text(&format!("
 [90m[Thinking]: {}[0m
@@ -1352,11 +1354,12 @@ impl AgentLoop {
 
                 if same_call_count >= 3 && !tool_result.ok {
                     self.output.on_error(&format!("\n[Deadlock Detected] Agent has failed with the exact same tool call {} times in a row.\n", same_call_count)).await;
-                    
+
                     // Inject a stern warning into the context
                     let warning_msg = Message {
                         role: "user".to_string(),
                         parts: vec![Part {
+                            thought_signature: None,
                             text: Some(format!(
                                 "SYSTEM WARNING: You have executed the exact same failing tool call (`{}`) {} times in a row. You are stuck in a loop. STOP trying this approach immediately. Use `read_file` to review your code, or try a completely different strategy. If you cannot fix it, use `finish_task` to ask the user for help.",
                                 tool_name, same_call_count
@@ -1366,7 +1369,7 @@ impl AgentLoop {
                         }]
                     };
                     self.context.add_message_to_current_turn(warning_msg);
-                    
+
                     // Heavily penalize energy to force exit if it keeps doing it
                     task_state.energy_points = task_state.energy_points.saturating_sub(5);
                 }
@@ -1380,6 +1383,7 @@ impl AgentLoop {
                         name: tool_name,
                         response: serde_json::json!({ "result": result_str }),
                     }),
+                    thought_signature: None,
                 });
             }
 
@@ -1392,7 +1396,7 @@ impl AgentLoop {
                 role: "function".to_string(),
                 parts: response_parts,
             });
-            
+
             if full_text.trim().is_empty() {
                 if let Some(cause) = silent_cause_hint.clone() {
                     exit_state = RunExit::CompletedSilent { cause };
