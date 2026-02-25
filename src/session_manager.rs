@@ -59,6 +59,25 @@ impl SessionManager {
         }
     }
 
+    pub async fn reset_session(&self, session_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        
+        // Remove from memory
+        sessions.remove(session_id);
+        
+        // Delete transcript file if it exists
+        let transcript_path = transcript_path_for_session(&self.transcript_dir, session_id);
+        if transcript_path.exists() {
+            let _ = std::fs::remove_file(&transcript_path);
+        }
+        
+        // Remove from registry
+        if let Ok(mut registry) = self.registry_cache.write() {
+            registry.sessions.remove(session_id);
+        }
+        self.persist_registry_async();
+    }
+
     pub async fn get_or_create_session(
         &self,
         session_id: &str,

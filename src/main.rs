@@ -275,6 +275,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line == "exit" {
                     break;
                 }
+                if line == "/new" {
+                    session_manager.reset_session("cli").await;
+                    println!("\x1b[32m[System] Session cleared. Starting fresh.\x1b[0m");
+                    continue;
+                }
                 if line.is_empty() {
                     continue;
                 }
