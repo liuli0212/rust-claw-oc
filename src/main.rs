@@ -11,15 +11,15 @@ mod telegram;
 mod tools;
 
 use crate::core::{AgentOutput, RunExit};
-use crate::llm_client::GeminiClient;
+use crate::llm_client::{GeminiClient, LlmClient, OpenAiCompatClient};
 use crate::logging::LoggingConfig;
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::session_manager::SessionManager;
 use crate::skills::load_skills;
 use crate::tools::{
-    BashTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool, TaskPlanTool,
-    TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool,
+    BashTool, EditFileTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool,
+    TaskPlanTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool,
 };
 use async_trait::async_trait;
 use clap::Parser;
@@ -31,7 +31,10 @@ use std::sync::Arc;
 #[derive(Debug, Parser)]
 #[command(name = "rusty-claw", about = "Rusty-Claw CLI agent")]
 struct CliArgs {
-    /// Primary Gemini model name (e.g. gemini-2.0-flash)
+    /// LLM Provider (gemini, aliyun)
+    #[arg(long, default_value = "gemini")]
+    provider: String,
+    /// Model name (e.g. gemini-2.0-flash, qwen-max)
     #[arg(long)]
     model: Option<String>,
     /// Log level (e.g. trace, debug, info, warn, error)
@@ -59,24 +62,79 @@ struct CliArgs {
 
 struct CliOutput;
 
+impl CliOutput {
+    fn truncate_to_three_lines(input: &str) -> String {
+        let lines: Vec<&str> = input.lines().collect();
+        if lines.len() <= 3 {
+            return input.to_string();
+        }
+        format!(
+            "{}\n... ({} more lines)",
+            lines[..3].join("\n"),
+            lines.len() - 3
+        )
+    }
+
+    fn is_prefixed_status(text: &str) -> bool {
+        let t = text.trim_start();
+        t.starts_with("[Progress]")
+            || t.starts_with("[System]")
+            || t.starts_with("[Perf]")
+            || t.starts_with("[Prompt Report]")
+            || t.starts_with("[Recovery Stats]")
+    }
+
+    fn style_status(text: &str) -> String {
+        let t = text.trim_start();
+        if t.starts_with("[Progress]") {
+            format!("\x1b[38;5;245m{}\x1b[0m", text)
+        } else if t.starts_with("[System]") {
+            format!("\x1b[36m{}\x1b[0m", text)
+        } else if t.starts_with("[Perf]") || t.starts_with("[Prompt Report]") {
+            format!("\x1b[35m{}\x1b[0m", text)
+        } else {
+            format!("\x1b[38;5;244m{}\x1b[0m", text)
+        }
+    }
+}
+
 #[async_trait]
 impl AgentOutput for CliOutput {
     async fn on_text(&self, text: &str) {
-        print!("{}", text);
+        if Self::is_prefixed_status(text) {
+            print!("{}", Self::style_status(text));
+        } else {
+            // Highlight model-visible reply content so it stands out from progress logs.
+            print!("\x1b[1;97m{}\x1b[0m", text);
+        }
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
-        println!("\n> [Tool Call]: {} (args: {})", name, args);
+        let display_args = Self::truncate_to_three_lines(args);
+        // Suppress noisy output for basic file operations
+        if name == "read_file" || name == "write_file" {
+            println!(
+                "\n\x1b[33m> [Tool Call]: {} ...\x1b[0m",
+                name
+            );
+        } else {
+            println!(
+                "\n\x1b[33m> [Tool Call]: {} (args: {})\x1b[0m",
+                name, display_args
+            );
+        }
     }
 
     async fn on_tool_end(&self, result: &str) {
-        println!("> [Tool Result]: {}", result);
+        // Truncate the result to max 3 lines to avoid screen spam
+        let display_result = Self::truncate_to_three_lines(result);
+        println!("\x1b[32m> [Tool Result]: {}\x1b[0m", display_result);
     }
 
     async fn on_error(&self, error: &str) {
-        println!("{}", error);
+        println!("\x1b[31m{}\x1b[0m", error);
     }
 }
 
@@ -111,15 +169,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let api_key = std::env::var("GEMINI_API_KEY").unwrap_or_else(|_| "DUMMY_KEY".to_string());
-    if api_key == "DUMMY_KEY" {
-        tracing::warn!("GEMINI_API_KEY not set. LLM calls will fail.");
-    }
-
-    let llm = Arc::new(GeminiClient::new(api_key, args.model.clone()));
-    if let Some(model) = &args.model {
-        tracing::info!("Using CLI-selected model: {}", model);
-    }
+    let llm: Arc<dyn LlmClient> = match args.provider.as_str() {
+        "aliyun" => {
+            let api_key = std::env::var("DASHSCOPE_API_KEY")
+                .expect("DASHSCOPE_API_KEY must be set for aliyun provider");
+            let model = args.model.unwrap_or_else(|| "qwen-max".to_string());
+            tracing::info!("Using Aliyun provider with model: {}", model);
+            Arc::new(OpenAiCompatClient::new(
+                api_key,
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string(),
+                model,
+            ))
+        }
+        "gemini" | _ => {
+            let api_key = std::env::var("GEMINI_API_KEY")
+                .expect("GEMINI_API_KEY must be set for gemini provider");
+            let model = args.model.clone();
+            tracing::info!(
+                "Using Gemini provider with model: {:?}",
+                model.as_deref().unwrap_or("default")
+            );
+            Arc::new(GeminiClient::new(api_key, model))
+        }
+    };
 
     let current_dir = std::env::current_dir()?;
     let current_dir_str = current_dir.to_str().unwrap_or(".");
@@ -137,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.push(Arc::new(BashTool::new()));
     tools.push(Arc::new(WriteFileTool));
     tools.push(Arc::new(ReadFileTool));
+    tools.push(Arc::new(EditFileTool::new()));
     tools.push(Arc::new(WebFetchTool::new()));
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
@@ -183,7 +256,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let output = Arc::new(CliOutput);
-    // let mut agent = AgentLoop::new(llm, tools, context, output);
 
     let mut rl = DefaultEditor::new()?;
     println!("Welcome to Rusty-Claw! (type 'exit' to quit)");
