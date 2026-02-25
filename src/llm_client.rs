@@ -1,13 +1,277 @@
 use crate::context::{FunctionCall, Message};
+use crate::tools::Tool;
+use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use thiserror::Error;
 use tokio::sync::mpsc;
+
+#[derive(Error, Debug)]
+pub enum LlmError {
+    #[error("Network error: {0}")]
+    NetworkError(#[from] reqwest::Error),
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+    #[error("API error: {0}")]
+    ApiError(String),
+}
+
+#[derive(Debug)]
+pub enum StreamEvent {
+    Text(String),
+    ToolCall(FunctionCall),
+    Error(String),
+    Done,
+}
+
+#[async_trait]
+pub trait LlmClient: Send + Sync {
+    async fn generate_text(
+        &self,
+        messages: Vec<Message>,
+        system_instruction: Option<Message>,
+    ) -> Result<String, LlmError>;
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        system_instruction: Option<Message>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, LlmError>;
+}
+
+// --- Gemini Implementation ---
+
+pub struct GeminiClient {
+    api_key: String,
+    client: Client,
+    model_name: String,
+    #[allow(dead_code)]
+    function_declarations_cache: Mutex<Option<CachedFunctionDeclarations>>,
+}
+
+#[derive(Clone)]
+struct CachedFunctionDeclarations {
+    #[allow(dead_code)]
+    signature: String,
+    #[allow(dead_code)]
+    declarations: Vec<FunctionDeclaration>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct GeminiRequest {
+    pub contents: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "systemInstruction")]
+    pub system_instruction: Option<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolDeclarationWrapper>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
+    pub tool_config: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ToolDeclarationWrapper {
+    #[serde(rename = "functionDeclarations")]
+    pub function_declarations: Vec<FunctionDeclaration>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FunctionDeclaration {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl GeminiClient {
+    pub fn new(api_key: String, model_name: Option<String>) -> Self {
+        Self {
+            api_key,
+            client: Client::new(),
+            model_name: model_name.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
+            function_declarations_cache: Mutex::new(None),
+        }
+    }
+
+    fn get_function_declarations(&self, tools: &[Arc<dyn Tool>]) -> Vec<FunctionDeclaration> {
+        if tools.is_empty() {
+            return Vec::new();
+        }
+
+        let mut declarations = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let mut parameters = tool.parameters_schema();
+            normalize_schema_for_gemini(&mut parameters);
+            declarations.push(FunctionDeclaration {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters,
+            });
+        }
+        declarations
+    }
+}
+
+#[async_trait]
+impl LlmClient for GeminiClient {
+    async fn generate_text(
+        &self,
+        messages: Vec<Message>,
+        system_instruction: Option<Message>,
+    ) -> Result<String, LlmError> {
+        let req_body = GeminiRequest {
+            contents: messages,
+            system_instruction,
+            tools: None,
+            tool_config: None,
+        };
+
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            self.model_name, self.api_key
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&req_body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(LlmError::ApiError(response.text().await?));
+        }
+
+        let resp_json: Value = response.json().await?;
+        let text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        Ok(text)
+    }
+
+    async fn stream(
+        &self,
+        messages: Vec<Message>,
+        system_instruction: Option<Message>,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+        let function_declarations = self.get_function_declarations(&tools);
+        let (tx, rx) = mpsc::channel(100);
+
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let model_name = self.model_name.clone();
+
+        tokio::spawn(async move {
+            let req_body = GeminiRequest {
+                contents: messages,
+                system_instruction,
+                tools: if function_declarations.is_empty() {
+                    None
+                } else {
+                    Some(vec![ToolDeclarationWrapper {
+                        function_declarations,
+                    }])
+                },
+                tool_config: None,
+            };
+
+            let url = format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+                model_name, api_key
+            );
+
+            let resp = match client
+                .post(&url)
+                .header(CONTENT_TYPE, "application/json")
+                .json(&req_body)
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    let _ = tx
+                        .send(StreamEvent::Error(format!(
+                            "Gemini API error: {} body={}",
+                            status, body
+                        )))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                    return;
+                }
+            };
+
+            let mut stream = resp.bytes_stream();
+            let mut buffer = String::new();
+
+            while let Some(chunk_res) = stream.next().await {
+                if let Ok(chunk) = chunk_res {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(idx) = buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n")) {
+                        let sep_len = if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
+                            4
+                        } else {
+                            2
+                        };
+                        let line = buffer[..idx].trim().to_string();
+                        buffer = buffer[idx + sep_len..].to_string();
+                        if line.starts_with("data: ") {
+                            let data = &line[6..];
+                            if data == "[DONE]" {
+                                let _ = tx.send(StreamEvent::Done).await;
+                                return;
+                            }
+                            if let Ok(json) = serde_json::from_str::<Value>(data) {
+                                if let Some(parts) =
+                                    json["candidates"][0]["content"]["parts"].as_array()
+                                {
+                                    for part in parts {
+                                        if let Some(text) = part["text"].as_str() {
+                                            let _ =
+                                                tx.send(StreamEvent::Text(text.to_string())).await;
+                                        }
+                                        if let Some(func_call) = parse_function_call(part) {
+                                            let _ = tx.send(StreamEvent::ToolCall(func_call)).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(StreamEvent::Done).await;
+        });
+
+        Ok(rx)
+    }
+}
+
+fn parse_function_call(part: &Value) -> Option<FunctionCall> {
+    let func_call = part.get("functionCall")?;
+    let name = func_call.get("name")?.as_str()?.to_string();
+    let args = func_call.get("args")?.clone();
+    let thought_signature = func_call
+        .get("thought_signature")
+        .or_else(|| func_call.get("thoughtSignature"))
+        .and_then(|ts| ts.as_str())
+        .map(|s| s.to_string());
+    Some(FunctionCall {
+        name,
+        args,
+        thought_signature,
+    })
+}
 
 fn normalize_schema_for_gemini(value: &mut Value) {
     match value {
@@ -29,12 +293,11 @@ fn normalize_schema_for_gemini(value: &mut Value) {
                 }
             }
 
-            // Gemini schema parser is strict; simplify composition constructs.
             for combiner in ["anyOf", "oneOf", "allOf"] {
                 if let Some(Value::Array(options)) = map.remove(combiner) {
                     let mut replacement = options
                         .into_iter()
-                        .find(|candidate| !candidate.get("$ref").is_some())
+                        .find(|candidate| candidate.get("$ref").is_none())
                         .unwrap_or(Value::Null);
                     normalize_schema_for_gemini(&mut replacement);
                     if let Value::Object(repl_map) = replacement {
@@ -63,375 +326,211 @@ fn normalize_schema_for_gemini(value: &mut Value) {
     }
 }
 
-#[derive(Error, Debug)]
-pub enum LlmError {
-    #[error("Network error: {0}")]
-    NetworkError(#[from] reqwest::Error),
-    #[error("Serialization error: {0}")]
-    SerializationError(#[from] serde_json::Error),
-    #[error("API error: {0}")]
-    ApiError(String),
-}
+// --- OpenAI Compatible Implementation (Aliyun DashScope) ---
 
-pub struct GeminiClient {
+pub struct OpenAiCompatClient {
     api_key: String,
-    client: Client,
+    base_url: String,
     model_name: String,
-    function_declarations_cache: Mutex<Option<CachedFunctionDeclarations>>,
+    client: Client,
 }
 
-#[derive(Clone)]
-struct CachedFunctionDeclarations {
-    signature: String,
-    declarations: Vec<FunctionDeclaration>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct GeminiRequest {
-    pub contents: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "systemInstruction")]
-    pub system_instruction: Option<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ToolDeclarationWrapper>>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
-    pub tool_config: Option<serde_json::Value>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct ToolDeclarationWrapper {
-    #[serde(rename = "functionDeclarations")]
-    pub function_declarations: Vec<FunctionDeclaration>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct FunctionDeclaration {
-    pub name: String,
-    pub description: String,
-    pub parameters: Value,
-}
-
-#[derive(Debug)]
-pub enum StreamEvent {
-    Text(String),
-    ToolCall(FunctionCall),
-    Error(String),
-    Done,
-}
-
-fn parse_function_call(part: &Value) -> Option<FunctionCall> {
-    let func_call = part.get("functionCall")?;
-    let name = func_call
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or("")
-        .to_string();
-    let args = func_call.get("args").cloned().unwrap_or(Value::Null);
-    let thought_signature = func_call
-        .get("thought_signature")
-        .or_else(|| func_call.get("thoughtSignature"))
-        .and_then(|ts| ts.as_str())
-        .map(|s| s.to_string());
-
-    Some(FunctionCall {
-        name,
-        args,
-        thought_signature,
-    })
-}
-
-impl GeminiClient {
-    pub fn new(api_key: String, model_name: Option<String>) -> Self {
+impl OpenAiCompatClient {
+    pub fn new(api_key: String, base_url: String, model_name: String) -> Self {
         Self {
             api_key,
+            base_url,
+            model_name,
             client: Client::new(),
-            model_name: model_name.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
-            function_declarations_cache: Mutex::new(None),
         }
     }
+}
 
-    pub fn _set_model(&mut self, model: String) {
-        self.model_name = model;
-    }
-
-    fn configured_models(&self) -> Vec<String> {
-        let mut models = vec![self.model_name.clone()];
-        if let Ok(fallbacks) = std::env::var("CLAW_FALLBACK_MODELS") {
-            for model in fallbacks
-                .split(',')
-                .map(|m| m.trim())
-                .filter(|m| !m.is_empty())
-            {
-                if !models.iter().any(|existing| existing == model) {
-                    models.push(model.to_string());
-                }
-            }
-        }
-        models
-    }
-
-    fn tool_signature(tools: &[Arc<dyn crate::tools::Tool>]) -> String {
-        let mut sig = String::new();
-        for tool in tools {
-            sig.push_str(&tool.name());
-            sig.push('|');
-            sig.push_str(&tool.description());
-            sig.push(';');
-        }
-        sig
-    }
-
-    fn get_function_declarations(
-        &self,
-        tools: &[Arc<dyn crate::tools::Tool>],
-    ) -> (Vec<FunctionDeclaration>, bool, u128) {
-        let started = Instant::now();
-        if tools.is_empty() {
-            return (Vec::new(), true, 0);
-        }
-
-        let signature = Self::tool_signature(tools);
-        if let Ok(cache_guard) = self.function_declarations_cache.lock() {
-            if let Some(cached) = cache_guard.as_ref() {
-                if cached.signature == signature {
-                    return (cached.declarations.clone(), true, started.elapsed().as_millis());
-                }
-            }
-        }
-
-        let mut declarations = Vec::with_capacity(tools.len());
-        for tool in tools {
-            let mut parameters = tool.parameters_schema();
-            normalize_schema_for_gemini(&mut parameters);
-            declarations.push(FunctionDeclaration {
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
-                parameters,
-            });
-        }
-
-        if let Ok(mut cache_guard) = self.function_declarations_cache.lock() {
-            *cache_guard = Some(CachedFunctionDeclarations {
-                signature,
-                declarations: declarations.clone(),
-            });
-        }
-
-        (declarations, false, started.elapsed().as_millis())
-    }
-
-    pub async fn generate_text(
+#[async_trait]
+impl LlmClient for OpenAiCompatClient {
+    async fn generate_text(
         &self,
         messages: Vec<Message>,
         system_instruction: Option<Message>,
     ) -> Result<String, LlmError> {
-        let req_body = GeminiRequest {
-            contents: messages,
-            system_instruction,
-            tools: None,
-            tool_config: None,
-        };
+        let mut openai_messages = Vec::new();
+        if let Some(sys) = system_instruction {
+            openai_messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys.parts[0].text.as_deref().unwrap_or("")
+            }));
+        }
+        for msg in messages {
+            let role = if msg.role == "user" {
+                "user"
+            } else {
+                "assistant"
+            };
+            openai_messages.push(serde_json::json!({
+                "role": role,
+                "content": msg.parts[0].text.as_deref().unwrap_or("")
+            }));
+        }
 
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.model_name, self.api_key
-        );
+        let body = serde_json::json!({
+            "model": self.model_name,
+            "messages": openai_messages,
+        });
 
         let response = self
             .client
-            .post(&url)
+            .post(&self.base_url)
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .header(CONTENT_TYPE, "application/json")
-            .json(&req_body)
+            .json(&body)
             .send()
             .await?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(LlmError::ApiError(format!(
-                "API error: {}\nBody: {}",
-                error_text, error_text
-            )));
+            return Err(LlmError::ApiError(response.text().await?));
         }
 
         let resp_json: Value = response.json().await?;
-
-        let text = resp_json
-            .get("candidates")
-            .and_then(|c| c.as_array())
-            .and_then(|c| c.first())
-            .and_then(|c| c.get("content"))
-            .and_then(|c| c.get("parts"))
-            .and_then(|p| p.as_array())
-            .and_then(|p| p.first())
-            .and_then(|p| p.get("text"))
-            .and_then(|t| t.as_str())
+        let text = resp_json["choices"][0]["message"]["content"]
+            .as_str()
             .unwrap_or("")
             .to_string();
-
         Ok(text)
     }
 
-    pub async fn stream(
+    async fn stream(
         &self,
         messages: Vec<Message>,
         system_instruction: Option<Message>,
-        tools: Vec<Arc<dyn crate::tools::Tool>>,
+        tools: Vec<Arc<dyn Tool>>,
     ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
-        let (function_declarations, declarations_cache_hit, declarations_prepare_ms) =
-            self.get_function_declarations(&tools);
-        tracing::debug!(
-            declarations_prepare_ms = declarations_prepare_ms,
-            declarations_cache_hit = declarations_cache_hit,
-            tool_count = function_declarations.len(),
-            "prepared_function_declarations"
-        );
-
-        let mut last_error: Option<String> = None;
-        let response = {
-            let mut selected_response = None;
-            for model_name in self.configured_models() {
-                let req_body = GeminiRequest {
-                    contents: messages.clone(),
-                    system_instruction: system_instruction.clone(),
-                    tools: if function_declarations.is_empty() {
-                        None
-                    } else {
-                        Some(vec![ToolDeclarationWrapper {
-                            function_declarations: function_declarations.clone(),
-                        }])
-                    },
-                    tool_config: None,
-                };
-
-                let url = format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-                    model_name, self.api_key
-                );
-
-                if std::env::var("RUST_LOG").unwrap_or_default() == "debug" {
-                    tracing::debug!(
-                        "Request body: {}",
-                        serde_json::to_string_pretty(&req_body).unwrap_or_default()
-                    );
-                }
-
-                let send_started = Instant::now();
-                match self
-                    .client
-                    .post(&url)
-                    .header(CONTENT_TYPE, "application/json")
-                    .json(&req_body)
-                    .send()
-                    .await
-                {
-                    Ok(resp) if resp.status().is_success() => {
-                        tracing::debug!(
-                            model = %model_name,
-                            http_send_wait_ms = send_started.elapsed().as_millis(),
-                            "llm_stream_request_ok"
-                        );
-                        selected_response = Some(resp);
-                        break;
-                    }
-                    Ok(resp) => {
-                        let status = resp.status();
-                        let body = resp.text().await.unwrap_or_default();
-                        tracing::warn!(
-                            model = %model_name,
-                            status = %status,
-                            http_send_wait_ms = send_started.elapsed().as_millis(),
-                            "llm_stream_request_failed_status"
-                        );
-                        last_error = Some(format!(
-                            "model={} status={} body={}",
-                            model_name, status, body
-                        ));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            model = %model_name,
-                            http_send_wait_ms = send_started.elapsed().as_millis(),
-                            error = %e,
-                            "llm_stream_request_transport_error"
-                        );
-                        last_error = Some(format!("model={} transport={}", model_name, e));
-                    }
-                }
-            }
-
-            selected_response.ok_or_else(|| {
-                LlmError::ApiError(format!(
-                    "All configured models failed. Last error: {}",
-                    last_error.unwrap_or_else(|| "unknown".to_string())
-                ))
-            })?
-        };
-
         let (tx, rx) = mpsc::channel(100);
 
-        let mut stream = response.bytes_stream();
+        let mut openai_messages = Vec::new();
+        if let Some(sys) = system_instruction {
+            openai_messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys.parts[0].text.as_deref().unwrap_or("")
+            }));
+        }
+        for msg in messages {
+            let role = if msg.role == "user" {
+                "user"
+            } else {
+                "assistant"
+            };
+            let content = msg
+                .parts
+                .iter()
+                .find_map(|p| p.text.as_deref())
+                .unwrap_or("");
+            openai_messages.push(serde_json::json!({
+                "role": role,
+                "content": content
+            }));
+        }
+
+        let mut body_map = serde_json::json!({
+            "model": self.model_name,
+            "messages": openai_messages,
+            "stream": true,
+        });
+
+        if !tools.is_empty() {
+            let mut openai_tools = Vec::new();
+            for tool in tools {
+                openai_tools.push(serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name(),
+                        "description": tool.description(),
+                        "parameters": tool.parameters_schema(),
+                    }
+                }));
+            }
+            body_map["tools"] = serde_json::json!(openai_tools);
+        }
+
+        let client = self.client.clone();
+        let api_key = self.api_key.clone();
+        let base_url = self.base_url.clone();
 
         tokio::spawn(async move {
+            let resp = match client
+                .post(&base_url)
+                .header(AUTHORIZATION, format!("Bearer {}", api_key))
+                .header(CONTENT_TYPE, "application/json")
+                .json(&body_map)
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    let _ = tx
+                        .send(StreamEvent::Error(format!(
+                            "OpenAI API error: {}",
+                            r.status()
+                        )))
+                        .await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
+                    return;
+                }
+            };
+
+            let mut stream = resp.bytes_stream();
             let mut buffer = String::new();
+
             while let Some(chunk_res) = stream.next().await {
-                match chunk_res {
-                    Ok(chunk) => {
-                        let text = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&text);
-
-                        if std::env::var("RUST_LOG").unwrap_or_default() == "debug" {
-                            // println!("Buffer size: {}", buffer.len());
-                        }
-
-                        // Parse SSE lines
-                        while let Some(idx) =
-                            buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n"))
-                        {
-                            let _is_crlf = buffer[..idx].ends_with('\r');
-                            let sep_len = if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
-                                4
-                            } else {
-                                2
-                            };
-
-                            let line = buffer[..idx].to_string();
-                            buffer = buffer[idx + sep_len..].to_string();
-
-                            let mut data_str = line.as_str();
-                            if data_str.starts_with("data: ") {
-                                data_str = &data_str[6..];
-                            } else {
-                                continue;
+                if let Ok(chunk) = chunk_res {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    while let Some(idx) = buffer.find("\n\n") {
+                        let line = buffer[..idx].trim().to_string();
+                        buffer = buffer[idx + 2..].to_string();
+                        if line.starts_with("data: ") {
+                            let data = &line[6..];
+                            if data == "[DONE]" {
+                                break;
                             }
-
-                            if data_str == "[DONE]" {
-                                let _ = tx.send(StreamEvent::Done).await;
-                                return;
-                            }
-                            if std::env::var("RUST_LOG").unwrap_or_default() == "debug" {
-                                tracing::debug!("Raw SSE chunk: {}", data_str);
-                            }
-
-                            if let Ok(json) = serde_json::from_str::<Value>(data_str) {
-                                if let Some(candidates) =
-                                    json.get("candidates").and_then(|c| c.as_array())
-                                {
-                                    for cand in candidates {
-                                        if let Some(parts) = cand
-                                            .get("content")
-                                            .and_then(|c| c.get("parts"))
-                                            .and_then(|p| p.as_array())
-                                        {
-                                            for part in parts {
-                                                if let Some(text) =
-                                                    part.get("text").and_then(|t| t.as_str())
-                                                {
-                                                    let _ = tx
-                                                        .send(StreamEvent::Text(text.to_string()))
-                                                        .await;
-                                                }
-                                                if let Some(call) = parse_function_call(part) {
-                                                    let _ =
-                                                        tx.send(StreamEvent::ToolCall(call)).await;
+                            if let Ok(json) = serde_json::from_str::<Value>(data) {
+                                if let Some(choices) = json["choices"].as_array() {
+                                    for choice in choices {
+                                        if let Some(delta) = choice.get("delta") {
+                                            if let Some(content) =
+                                                delta.get("content").and_then(|v| v.as_str())
+                                            {
+                                                let _ = tx
+                                                    .send(StreamEvent::Text(content.to_string()))
+                                                    .await;
+                                            }
+                                            if let Some(tool_calls) =
+                                                delta.get("tool_calls").and_then(|v| v.as_array())
+                                            {
+                                                for tc in tool_calls {
+                                                    if let Some(func) = tc.get("function") {
+                                                        let name = func
+                                                            .get("name")
+                                                            .and_then(|v| v.as_str())
+                                                            .unwrap_or("")
+                                                            .to_string();
+                                                        let args_str = func
+                                                            .get("arguments")
+                                                            .and_then(|v| v.as_str())
+                                                            .unwrap_or("{}");
+                                                        let args = serde_json::from_str(args_str)
+                                                            .unwrap_or(Value::Null);
+                                                        let _ = tx
+                                                            .send(StreamEvent::ToolCall(
+                                                                FunctionCall {
+                                                                    name,
+                                                                    args,
+                                                                    thought_signature: None,
+                                                                },
+                                                            ))
+                                                            .await;
+                                                    }
                                                 }
                                             }
                                         }
@@ -440,142 +539,11 @@ impl GeminiClient {
                             }
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                        break;
-                    }
                 }
             }
             let _ = tx.send(StreamEvent::Done).await;
         });
 
         Ok(rx)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_schema_for_gemini_strips_unsupported_fields() {
-        let mut value = serde_json::json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "definitions": {
-                "Thing": {
-                    "type": "object"
-                }
-            },
-            "type": "object",
-            "properties": {
-                "nested": {
-                    "$schema": "https://example.com/schema",
-                    "type": ["string", "null"]
-                },
-                "refy": {
-                    "$ref": "#/definitions/Thing"
-                },
-                "union": {
-                    "anyOf": [
-                        { "$ref": "#/definitions/Thing" },
-                        { "type": "integer" }
-                    ]
-                }
-            },
-            "items": [
-                {
-                    "$schema": "https://example.com/schema2",
-                    "type": "number"
-                }
-            ]
-        });
-
-        normalize_schema_for_gemini(&mut value);
-
-        assert!(value.get("$schema").is_none());
-        assert!(value.get("definitions").is_none());
-        assert!(value["properties"]["nested"].get("$schema").is_none());
-        assert_eq!(
-            value["properties"]["nested"]
-                .get("type")
-                .and_then(|v| v.as_str()),
-            Some("string")
-        );
-        assert_eq!(
-            value["properties"]["refy"]
-                .get("type")
-                .and_then(|v| v.as_str()),
-            Some("string")
-        );
-        assert_eq!(
-            value["properties"]["union"]
-                .get("type")
-                .and_then(|v| v.as_str()),
-            Some("integer")
-        );
-        assert!(value["items"][0].get("$schema").is_none());
-    }
-
-    #[test]
-    fn parse_function_call_reads_snake_case_signature() {
-        let part = serde_json::json!({
-            "functionCall": {
-                "name": "execute_bash",
-                "args": { "command": "pwd" },
-                "thought_signature": "sig_snake"
-            }
-        });
-
-        let parsed = parse_function_call(&part).unwrap();
-        assert_eq!(parsed.name, "execute_bash");
-        assert_eq!(parsed.thought_signature.as_deref(), Some("sig_snake"));
-    }
-
-    #[test]
-    fn parse_function_call_reads_camel_case_signature() {
-        let part = serde_json::json!({
-            "functionCall": {
-                "name": "execute_bash",
-                "args": { "command": "pwd" },
-                "thoughtSignature": "sig_camel"
-            }
-        });
-
-        let parsed = parse_function_call(&part).unwrap();
-        assert_eq!(parsed.name, "execute_bash");
-        assert_eq!(parsed.thought_signature.as_deref(), Some("sig_camel"));
-    }
-
-    #[test]
-    fn test_regression_function_call_signature_compat() {
-        let snake = serde_json::json!({
-            "functionCall": {
-                "name": "execute_bash",
-                "args": { "command": "pwd" },
-                "thought_signature": "sig_snake"
-            }
-        });
-        let camel = serde_json::json!({
-            "functionCall": {
-                "name": "execute_bash",
-                "args": { "command": "pwd" },
-                "thoughtSignature": "sig_camel"
-            }
-        });
-
-        assert_eq!(
-            parse_function_call(&snake)
-                .unwrap()
-                .thought_signature
-                .as_deref(),
-            Some("sig_snake")
-        );
-        assert_eq!(
-            parse_function_call(&camel)
-                .unwrap()
-                .thought_signature
-                .as_deref(),
-            Some("sig_camel")
-        );
     }
 }

@@ -1,4 +1,5 @@
 # Rusty-Claw
+> **Powered by JaviRust (Elite AI Engineering Agent)**
 
 An industrial-grade, highly autonomous CLI AI Agent built entirely in Rust. Designed to be lightweight, secure, and easily distributable as a single compiled binary without requiring a heavy runtime environment.
 
@@ -15,6 +16,9 @@ This project is a Rust-native implementation of an AI agent, closely following t
 - **🔄 Resilient Context Management:**
   - **Async Compaction:** History summarization runs in the background, never blocking the user's next turn.
   - **Soft Limits:** Allows temporary context overflow to maintain conversation flow while cleanup happens asynchronously.
+- **🎯 Precision Patch Engine:**
+  - **Atomic Edits:** Uses a structured patching mechanism (SEARCH/REPLACE with context) to ensure safe, localized code modifications.
+  - **Verification:** Automatically validates context before applying changes, preventing accidental corruption of source files.
 - **🔌 Multi-Platform:** Supports CLI, Telegram, and Discord concurrently.
 
 ## 🛠️ Setup & Configuration
@@ -56,67 +60,4 @@ CLAW_PROMPT_REPORT=1
 
 # Max autonomous steps per user request (Default: 12)
 CLAW_MAX_TASK_ITERATIONS=20
-
-# Enable/Disable auto-recovery rules (Default: all)
-# Values: "all" or comma-separated list like "missing_command,missing_path"
-CLAW_RECOVERY_RULES=all
-
-# Enforce strict <final> tag parsing for cleaner output (Default: 0)
-CLAW_ENFORCE_FINAL_TAG=1
-
-# Logging level (fallback when RUST_LOG is not set, Default: info)
-CLAW_LOG_LEVEL=info
-
-# Enable file logging (1/0, Default: 1)
-CLAW_FILE_LOG=1
-
-# Log directory and file name (Default: logs/rusty-claw.log with daily rotation)
-CLAW_LOG_DIR=logs
-CLAW_LOG_FILE=rusty-claw.log
 ```
-
-### 3. Build & Run
-Run in release mode for maximum performance (especially for vector search):
-```bash
-cargo run --release
-```
-
-Common runtime flags (override env vars):
-```bash
-# Choose model from CLI
-cargo run --release -- --model gemini-2.0-flash
-
-# Debug logs + file logs in custom location
-cargo run --release -- \
-  --log-level debug \
-  --log-dir logs \
-  --log-file rusty-claw.log
-
-# Disable file log, keep stdout logs only
-cargo run --release -- --no-file-log
-
-# Force perf/prompt reports without editing .env
-cargo run --release -- --timing-report --prompt-report
-```
-
-## 🏗️ Architecture Overview
-
-The system follows a non-blocking Actor-like model:
-
-*   **`src/core.rs`**: The `AgentLoop` state machine. It spawns background tasks for RAG (`execute_retrieval_task`) and compaction (`maybe_compact_history`) to keep the critical path clear.
-*   **`src/rag.rs`**: The Memory Subsystem.
-    *   Uses `fastembed-rs` for local embedding generation (runs on CPU/Metal).
-    *   Uses `rusqlite` for persistent storage.
-    *   Implements a hybrid scoring algorithm: `Score = 0.7 * Cosine(Vector) + 0.3 * BM25(Keyword)`.
-*   **`src/session_manager.rs`**: Manages session state with an in-memory Write-Through cache, flushing to disk asynchronously to avoid I/O blocking.
-*   **`src/tools.rs`**: Standard library of tools (Bash, File I/O, Web Fetch).
-
-## 🧩 Dynamic Skills
-You can teach the agent new tools without recompiling.
-1.  Create a `.md` file in `skills/`.
-2.  Add YAML frontmatter describing the tool.
-3.  Write the prompt/logic in Markdown.
-The agent loads these at startup.
-
-## License
-MIT
