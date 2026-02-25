@@ -198,6 +198,27 @@ impl AgentContext {
                 sections.push(section);
             }
         }
+        if let Ok(plan_content) = fs::read_to_string(".rusty_claw_task_plan.json") {
+             if let Ok(plan) = serde_json::from_str::<crate::tools::TaskPlanState>(&plan_content) {
+                 let mut plan_str = String::new();
+                 plan_str.push_str("You MUST follow this plan strictly. Do not skip steps without approval.\n\n");
+                 for (i, item) in plan.items.iter().enumerate() {
+                     let status_icon = match item.status.as_str() {
+                         "completed" => "[x]",
+                         "in_progress" => "[IN PROGRESS]",
+                         _ => "[ ]",
+                     };
+                     plan_str.push_str(&format!("{} {}. {}\n", status_icon, i + 1, item.step));
+                     if let Some(note) = &item.note {
+                         plan_str.push_str(&format!("   Note: {}\n", note));
+                     }
+                 }
+                 if let Some(section) = Self::build_prompt_section("Current Task Plan (STRICT)", plan_str, 4_000) {
+                     sections.push(section);
+                 }
+             }
+        }
+
 
         let mut project_context = String::new();
         if let Ok(content) = fs::read_to_string("AGENTS.md") {
@@ -528,6 +549,7 @@ mod tests {
                 text: Some("Hi there".to_string()),
                 function_call: None,
                 function_response: None,
+                thought_signature: None,
             }],
         });
 
@@ -586,10 +608,10 @@ mod tests {
                 text: Some("running tool".to_string()),
                 function_call: Some(FunctionCall {
                     name: "execute_bash".to_string(),
-                    thought_signature: None,
-                    thought_signature: None,
+                    args: serde_json::Value::Null,
                 }),
                 function_response: None,
+                thought_signature: None,
             }],
         });
         ctx.add_message_to_current_turn(Message {
@@ -601,6 +623,7 @@ mod tests {
                     name: "execute_bash".to_string(),
                     response: serde_json::json!({"result":"/tmp"}),
                 }),
+                thought_signature: None,
             }],
         });
         ctx.end_turn();
@@ -651,6 +674,7 @@ mod tests {
                         "result": "x".repeat(5000)
                     }),
                 }),
+                thought_signature: None,
             }],
         });
 

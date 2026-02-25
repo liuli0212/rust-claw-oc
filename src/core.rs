@@ -116,6 +116,17 @@ impl AgentLoop {
             cancel_token: Arc::new(AtomicBool::new(false)),
         }
     }
+    pub fn get_status(&self) -> (String, String, usize, usize) {
+        let history_tokens = self.context.dialogue_history_token_estimate();
+        let max_tokens = self.context.max_history_tokens;
+        (
+            self.llm.provider_name().to_string(),
+            self.llm.model_name().to_string(),
+            history_tokens,
+            max_tokens,
+        )
+    }
+
 
     fn should_emit_prompt_report() -> bool {
         std::env::var("CLAW_PROMPT_REPORT").unwrap_or_default() == "1"

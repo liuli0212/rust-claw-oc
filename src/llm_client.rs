@@ -31,6 +31,8 @@ pub enum StreamEvent {
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    fn model_name(&self) -> &str;
+    fn provider_name(&self) -> &str;
     async fn generate_text(
         &self,
         messages: Vec<Message>,
@@ -118,6 +120,12 @@ impl GeminiClient {
 
 #[async_trait]
 impl LlmClient for GeminiClient {
+    fn model_name(&self) -> &str {
+        &self.model_name
+    }
+    fn provider_name(&self) -> &str {
+        "gemini"
+    }
     async fn generate_text(
         &self,
         messages: Vec<Message>,
@@ -361,6 +369,12 @@ impl OpenAiCompatClient {
 
 #[async_trait]
 impl LlmClient for OpenAiCompatClient {
+    fn model_name(&self) -> &str {
+        &self.model_name
+    }
+    fn provider_name(&self) -> &str {
+        "aliyun"
+    }
     async fn generate_text(
         &self,
         messages: Vec<Message>,
@@ -614,3 +628,46 @@ impl LlmClient for OpenAiCompatClient {
         Ok(rx)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use crate::context::Part;
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_aliyun_qwen_generate() {
+        let _ = dotenvy::dotenv();
+        let api_key = env::var("DASHSCOPE_API_KEY");
+        let api_key = env::var("DASHSCOPE_API_KEY");
+        if api_key.is_err() {
+            println!("Skipping test: DASHSCOPE_API_KEY not set");
+            return;
+        }
+        let api_key = api_key.unwrap();
+        
+        let client = OpenAiCompatClient::new(
+            api_key,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string(),
+            "qwen-plus".to_string(),
+        );
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            parts: vec![Part {
+                text: Some("Hello".to_string()),
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+            }],
+        }];
+
+        let result = client.generate_text(messages, None).await;
+        match result {
+            Ok(text) => println!("Aliyun Success: {}", text),
+            Err(e) => panic!("Aliyun Failed: {}", e),
+        }
+    }
+}
+

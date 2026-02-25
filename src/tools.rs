@@ -945,11 +945,8 @@ pub struct TaskPlanTool {
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone)]
 pub struct TaskPlanItem {
-    /// A short plan step.
     pub step: String,
-    /// One of: pending, in_progress, completed.
-    pub status: String,
-    /// Optional note/details for this step.
+    pub status: String, // pending, in_progress, completed
     pub note: Option<String>,
 }
 
@@ -960,15 +957,15 @@ pub struct TaskPlanState {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct TaskPlanArgs {
-    /// Action: get, replace, add, update_status, remove, clear.
+    /// Action: get, add, update_status, update_text, remove, clear.
     pub action: String,
-    /// Used by replace.
-    pub items: Option<Vec<TaskPlanItem>>,
-    /// Used by add.
-    pub item: Option<TaskPlanItem>,
-    /// Used by update_status/remove.
+    /// For "add", "update_text": The step description.
+    pub step: Option<String>,
+    /// For "add", "update_status", "update_text": Optional note.
+    pub note: Option<String>,
+    /// For "update_status", "update_text", "remove": The 0-based index of the item.
     pub index: Option<usize>,
-    /// Used by update_status.
+    /// For "update_status": pending, in_progress, completed.
     pub status: Option<String>,
 }
 
@@ -1006,19 +1003,6 @@ impl TaskPlanTool {
             ))),
         }
     }
-
-    fn validate_single_in_progress(items: &[TaskPlanItem]) -> Result<(), ToolError> {
-        let count = items
-            .iter()
-            .filter(|i| i.status.as_str() == "in_progress")
-            .count();
-        if count > 1 {
-            return Err(ToolError::InvalidArguments(
-                "at most one plan item can be in_progress".to_string(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
@@ -1028,7 +1012,7 @@ impl Tool for TaskPlanTool {
     }
 
     fn description(&self) -> String {
-        "Manages a persistent local task plan. Supports actions: get, replace, add, update_status, remove, clear.".to_string()
+        "Manages the strict execution plan. You MUST update this plan as you progress. Actions: get, add, update_status (index, status), update_text (index, step), remove (index), clear.".to_string()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1049,24 +1033,16 @@ impl Tool for TaskPlanTool {
                 state.items.clear();
                 self.save_state(&state)?;
             }
-            "replace" => {
-                let mut items = parsed.items.ok_or_else(|| {
-                    ToolError::InvalidArguments("replace requires 'items'".to_string())
-                })?;
-                for item in &mut items {
-                    item.status = Self::normalize_status(&item.status)?;
-                }
-                Self::validate_single_in_progress(&items)?;
-                state.items = items;
-                self.save_state(&state)?;
-            }
             "add" => {
-                let mut item = parsed.item.ok_or_else(|| {
-                    ToolError::InvalidArguments("add requires 'item'".to_string())
+                let step = parsed.step.ok_or_else(|| {
+                    ToolError::InvalidArguments("add requires 'step'".to_string())
                 })?;
-                item.status = Self::normalize_status(&item.status)?;
+                let item = TaskPlanItem {
+                    step,
+                    status: "pending".to_string(),
+                    note: parsed.note,
+                };
                 state.items.push(item);
-                Self::validate_single_in_progress(&state.items)?;
                 self.save_state(&state)?;
             }
             "update_status" => {
@@ -1074,17 +1050,30 @@ impl Tool for TaskPlanTool {
                     ToolError::InvalidArguments("update_status requires 'index'".to_string())
                 })?;
                 if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!(
-                        "index {} out of bounds (len={})",
-                        index,
-                        state.items.len()
-                    )));
+                    return Err(ToolError::InvalidArguments(format!("index {} out of bounds", index)));
                 }
                 let status = parsed.status.ok_or_else(|| {
                     ToolError::InvalidArguments("update_status requires 'status'".to_string())
                 })?;
                 state.items[index].status = Self::normalize_status(&status)?;
-                Self::validate_single_in_progress(&state.items)?;
+                if let Some(note) = parsed.note {
+                    state.items[index].note = Some(note);
+                }
+                self.save_state(&state)?;
+            }
+            "update_text" => {
+                let index = parsed.index.ok_or_else(|| {
+                    ToolError::InvalidArguments("update_text requires 'index'".to_string())
+                })?;
+                if index >= state.items.len() {
+                    return Err(ToolError::InvalidArguments(format!("index {} out of bounds", index)));
+                }
+                if let Some(step) = parsed.step {
+                    state.items[index].step = step;
+                }
+                if let Some(note) = parsed.note {
+                    state.items[index].note = Some(note);
+                }
                 self.save_state(&state)?;
             }
             "remove" => {
@@ -1092,20 +1081,13 @@ impl Tool for TaskPlanTool {
                     ToolError::InvalidArguments("remove requires 'index'".to_string())
                 })?;
                 if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!(
-                        "index {} out of bounds (len={})",
-                        index,
-                        state.items.len()
-                    )));
+                    return Err(ToolError::InvalidArguments(format!("index {} out of bounds", index)));
                 }
                 state.items.remove(index);
                 self.save_state(&state)?;
             }
             _ => {
-                return Err(ToolError::InvalidArguments(format!(
-                    "unsupported action '{}'",
-                    parsed.action
-                )));
+                return Err(ToolError::InvalidArguments(format!("unsupported action '{}'", parsed.action)));
             }
         }
 
