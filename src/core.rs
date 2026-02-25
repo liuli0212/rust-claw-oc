@@ -19,11 +19,14 @@ pub trait AgentOutput: Send + Sync {
     async fn on_error(&self, error: &str);
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 pub struct AgentLoop {
     llm: Arc<dyn LlmClient>,
     tools: Vec<Arc<dyn Tool>>,
     context: AgentContext,
     output: Arc<dyn AgentOutput>,
+    pub cancel_token: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +35,7 @@ pub enum RunExit {
     CompletedSilent { cause: String },
     RecoverableFailed { reason: String, attempts: usize },
     HardStop { reason: String },
+    YieldedToUser,
 }
 
 impl RunExit {
@@ -41,6 +45,7 @@ impl RunExit {
             RunExit::CompletedSilent { .. } => "completed_silent",
             RunExit::RecoverableFailed { .. } => "recoverable_failed",
             RunExit::HardStop { .. } => "hard_stop",
+            RunExit::YieldedToUser => "yielded_to_user",
         }
     }
 }
@@ -108,6 +113,7 @@ impl AgentLoop {
             tools,
             context,
             output,
+            cancel_token: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1018,7 +1024,15 @@ impl AgentLoop {
         let mut first_event_ms_first_iter: Option<u128> = None;
         
         
+        self.cancel_token.store(false, Ordering::SeqCst);
+
         while task_state.energy_points > 0 {
+            if self.cancel_token.load(Ordering::SeqCst) {
+                self.output.on_text("\n\x1b[33m⚠️ [System] 任务已被用户强制挂起！您可以输入新的指示来继续。\x1b[0m\n").await;
+                exit_state = RunExit::YieldedToUser;
+                break;
+            }
+            
             task_state.iterations += 1;
             task_state.energy_points = task_state.energy_points.saturating_sub(1);
             if Self::should_emit_verbose_progress() {
@@ -1094,6 +1108,11 @@ impl AgentLoop {
             let mut first_event_recorded = false;
 
             loop {
+                if self.cancel_token.load(Ordering::SeqCst) {
+                    self.output.on_text("\n\x1b[33m⚠️ [System] 正在中断 LLM 请求...\x1b[0m\n").await;
+                    exit_state = RunExit::YieldedToUser;
+                    break;
+                }
                 let event = match tokio::time::timeout(Duration::from_secs(8), rx.recv()).await {
                     Ok(ev) => ev,
                     Err(_) => {

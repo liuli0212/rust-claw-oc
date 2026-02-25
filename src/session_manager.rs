@@ -78,6 +78,14 @@ impl SessionManager {
         self.persist_registry_async();
     }
 
+    pub async fn cancel_session(&self, session_id: &str) {
+        let sessions = self.sessions.lock().await;
+        if let Some(agent) = sessions.get(session_id) {
+            let agent_guard = agent.lock().await;
+            agent_guard.cancel_token.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     pub async fn get_or_create_session(
         &self,
         session_id: &str,
