@@ -1,5 +1,5 @@
 use crate::context::{
-    AgentContext, FunctionCall, FunctionResponse, Message, Part, PromptReport, Turn,
+    AgentContext, FunctionResponse, Message, Part, PromptReport, Turn,
 };
 use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;

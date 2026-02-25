@@ -1,4 +1,5 @@
 mod context;
+mod config;
 mod core;
 mod discord;
 mod llm_client;
@@ -169,27 +170,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let llm: Arc<dyn LlmClient> = match args.provider.as_str() {
-        "aliyun" => {
-            let api_key = std::env::var("DASHSCOPE_API_KEY")
-                .expect("DASHSCOPE_API_KEY must be set for aliyun provider");
-            let model = args.model.unwrap_or_else(|| "qwen-plus".to_string());
-            tracing::info!("Using Aliyun provider with model: {}", model);
-            Arc::new(OpenAiCompatClient::new(
-                api_key,
-                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string(),
-                model,
-            ))
+    let config = config::AppConfig::load();
+    let provider_name = if args.provider != "gemini" {
+        args.provider.clone()
+    } else {
+        config.default_provider.clone().unwrap_or(args.provider.clone())
+    };
+
+    let llm: Arc<dyn LlmClient> = if let Some(prov_config) = config.get_provider(&provider_name) {
+        tracing::info!("Initializing provider '{}' from config", provider_name);
+        match prov_config.type_name.as_str() {
+            "openai_compat" | "aliyun" => {
+                let api_key = if let Some(env_var) = &prov_config.api_key_env {
+                    std::env::var(env_var).unwrap_or_else(|_| {
+                        prov_config.api_key.clone().expect("API key not found in env or config")
+                    })
+                } else {
+                    prov_config.api_key.clone().expect("API key must be provided")
+                };
+                
+                let base_url = prov_config.base_url.clone()
+                    .expect("base_url required for openai_compat");
+                let model = prov_config.model.clone()
+                    .or(args.model.clone())
+                    .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+
+                Arc::new(OpenAiCompatClient::new(api_key, base_url, model))
+            }
+            "gemini" => {
+                let api_key = if let Some(env_var) = &prov_config.api_key_env {
+                    std::env::var(env_var).unwrap_or_else(|_| {
+                        prov_config.api_key.clone().expect("API key not found")
+                    })
+                } else {
+                    prov_config.api_key.clone().expect("API key must be provided")
+                };
+                let model = args.model.clone().or(prov_config.model.clone());
+                Arc::new(GeminiClient::new(api_key, model))
+            }
+            _ => panic!("Unknown provider type '{}'", prov_config.type_name),
         }
-        "gemini" | _ => {
-            let api_key = std::env::var("GEMINI_API_KEY")
-                .expect("GEMINI_API_KEY must be set for gemini provider");
-            let model = args.model.clone();
-            tracing::info!(
-                "Using Gemini provider with model: {:?}",
-                model.as_deref().unwrap_or("default")
-            );
-            Arc::new(GeminiClient::new(api_key, model))
+    } else {
+        match provider_name.as_str() {
+            "aliyun" => {
+                let api_key = std::env::var("DASHSCOPE_API_KEY")
+                    .expect("DASHSCOPE_API_KEY must be set for aliyun provider");
+                let model = args.model.unwrap_or_else(|| "qwen-plus".to_string());
+                tracing::info!("Using Aliyun provider with model: {}", model);
+                Arc::new(OpenAiCompatClient::new(
+                    api_key,
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string(),
+                    model,
+                ))
+            }
+            "gemini" | _ => {
+                let api_key = std::env::var("GEMINI_API_KEY")
+                    .expect("GEMINI_API_KEY must be set for gemini provider");
+                let model = args.model.clone();
+                tracing::info!(
+                    "Using Gemini provider with model: {:?}",
+                    model.as_deref().unwrap_or("default")
+                );
+                Arc::new(GeminiClient::new(api_key, model))
+            }
         }
     };
 
