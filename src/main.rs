@@ -173,11 +173,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "aliyun" => {
             let api_key = std::env::var("DASHSCOPE_API_KEY")
                 .expect("DASHSCOPE_API_KEY must be set for aliyun provider");
-            let model = args.model.unwrap_or_else(|| "qwen-max".to_string());
+            let model = args.model.unwrap_or_else(|| "qwen-plus".to_string());
             tracing::info!("Using Aliyun provider with model: {}", model);
             Arc::new(OpenAiCompatClient::new(
                 api_key,
-                "https://coding.dashscope.aliyuncs.com/v1/chat/completions".to_string(),
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string(),
                 model,
             ))
         }
@@ -293,6 +293,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line == "/new" {
                     session_manager.reset_session("cli").await;
                     println!("\x1b[32m[System] Session cleared. Starting fresh.\x1b[0m");
+                    continue;
+                }
+                if line == "/status" {
+                    let agent = session_manager
+                        .get_or_create_session("cli", output.clone())
+                        .await;
+                    let agent_guard = agent.lock().await;
+                    let (provider, model, tokens, max_tokens) = agent_guard.get_status();
+                    let percentage = (tokens as f64 / max_tokens as f64) * 100.0;
+                    println!("\x1b[36m[Status]\x1b[0m");
+                    println!("Provider: {}", provider);
+                    println!("Model:    {}", model);
+                    println!("Context:  {} / {} tokens ({:.1}%)", tokens, max_tokens, percentage);
                     continue;
                 }
                 if line.is_empty() {
