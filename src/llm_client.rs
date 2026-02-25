@@ -23,7 +23,7 @@ pub enum LlmError {
 #[derive(Debug)]
 pub enum StreamEvent {
     Text(String),
-    ToolCall(FunctionCall),
+    ToolCall(FunctionCall, Option<String>),
     Error(String),
     Done,
 }
@@ -218,7 +218,9 @@ impl LlmClient for GeminiClient {
 
             while let Some(chunk_res) = stream.next().await {
                 if let Ok(chunk) = chunk_res {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    let chunk_str = String::from_utf8_lossy(&chunk);
+                    tracing::trace!("Received streaming chunk: {}", chunk_str);
+                    buffer.push_str(&chunk_str);
                     while let Some(idx) = buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n")) {
                         let sep_len = if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
                             4
@@ -242,8 +244,8 @@ impl LlmClient for GeminiClient {
                                             let _ =
                                                 tx.send(StreamEvent::Text(text.to_string())).await;
                                         }
-                                        if let Some(func_call) = parse_function_call(part) {
-                                            let _ = tx.send(StreamEvent::ToolCall(func_call)).await;
+                                        if let Some((func_call, signature)) = parse_function_call(part) {
+                                            let _ = tx.send(StreamEvent::ToolCall(func_call, signature)).await;
                                         }
                                     }
                                 }
@@ -259,7 +261,7 @@ impl LlmClient for GeminiClient {
     }
 }
 
-fn parse_function_call(part: &Value) -> Option<FunctionCall> {
+fn parse_function_call(part: &Value) -> Option<(FunctionCall, Option<String>)> {
     let func_call = part.get("functionCall")?;
     let name = func_call.get("name")?.as_str()?.to_string();
     let args = func_call.get("args")?.clone();
@@ -268,11 +270,10 @@ fn parse_function_call(part: &Value) -> Option<FunctionCall> {
         .or_else(|| part.get("thought_signature"))
         .and_then(|ts| ts.as_str())
         .map(|s| s.to_string());
-    Some(FunctionCall {
+    Some((FunctionCall {
         name,
         args,
-        thought_signature,
-    })
+    }, thought_signature))
 }
 
 fn normalize_schema_for_gemini(value: &mut Value) {
@@ -487,14 +488,14 @@ impl LlmClient for OpenAiCompatClient {
 
             let mut stream = resp.bytes_stream();
             let mut buffer = String::new();
-            
+
             // To properly parse OpenAI chunked tool calls (they can come with `index`)
             let mut active_tools: std::collections::HashMap<usize, (String, String)> = std::collections::HashMap::new();
 
             while let Some(chunk_res) = stream.next().await {
                 if let Ok(chunk) = chunk_res {
                     buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    
+
                     // Process complete lines
                     let mut lines = Vec::new();
                     while let Some(idx) = buffer.find('\n') {
@@ -522,7 +523,7 @@ impl LlmClient for OpenAiCompatClient {
                                                 for tc in tool_calls {
                                                     let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                                                     let entry = active_tools.entry(idx).or_insert_with(|| (String::new(), String::new()));
-                                                    
+
                                                     if let Some(func) = tc.get("function") {
                                                         if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
                                                             entry.0.push_str(name);
@@ -560,7 +561,7 @@ impl LlmClient for OpenAiCompatClient {
                                                 for tc in tool_calls {
                                                     let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                                                     let entry = active_tools.entry(idx).or_insert_with(|| (String::new(), String::new()));
-                                                    
+
                                                     if let Some(func) = tc.get("function") {
                                                         if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
                                                             entry.0.push_str(name);
@@ -592,12 +593,11 @@ impl LlmClient for OpenAiCompatClient {
                         let _ = tx.send(StreamEvent::ToolCall(FunctionCall {
                             name,
                             args,
-                            thought_signature: None,
-                        })).await;
+                        }, None)).await;
                     }
                 }
             }
-            
+
             let _ = tx.send(StreamEvent::Done).await;
         });
 

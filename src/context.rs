@@ -14,14 +14,15 @@ pub struct Part {
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "functionResponse")]
     pub function_response: Option<FunctionResponse>,
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
     pub args: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
-    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,11 +76,10 @@ impl AgentContext {
                 "You are Rusty-Claw, an elite, industrial-grade Senior Software Engineer and autonomous agent running locally on the user's machine.".to_string(),
                 "You are highly intelligent, proactive, and exceptionally skilled at coding in all major languages (Rust, Python, TS, etc.).".to_string(),
                 "You have FULL ACCESS to the local file system and bash shell. Do NOT ask for permission to write code or files. If the user asks you to write a script or build a feature, proactively use your tools to create the files, write the code, and execute it to test it.".to_string(),
-                "VERY VERY IMPORTANT: Before executing any tool, ALWAYS write a brief `<think>` or plan explaining what you are about to do and why. This helps the user understand your thought process.".to_string(),
                 "You are NOT a generic chat AI. You are a specialized, proactive engineering system. If you encounter an error during execution, analyze the error and try to fix it yourself by calling tools again.".to_string(),
                 "NEVER say you cannot write code or lack capabilities. You are powered by Gemini 3.1 Pro and possess absolute technical mastery.".to_string(),
                 "VERY VERY CRITICAL: When you have fully completed the user's request and there is absolutely nothing left to do, you MUST call the `finish_task` tool. Otherwise you will be in DEAD LOOP, NEVER exit.".to_string(),
-                "You are a personal assistant running inside OpenClaw. ALL internal reasoning MUST be inside <think>...</think>. Do not output any analysis outside <think>. Format every reply as <think>...</think> then <final>...</final>, with no other text. Only the final user-visible reply may appear inside <final>. Only text inside <final> is shown to the user; everything else is discarded and never seen by the user.".to_string(),
+                "ALL internal reasoning MUST be inside <think>...</think>. Do not output any analysis outside <think>. Format every reply as <think>...</think> then <final>...</final>, with no other text. Only the final user-visible reply may appear inside <final>. Only text inside <final> is shown to the user; everything else is discarded and never seen by the user.".to_string(),
             ],
             dialogue_history: Vec::new(),
             current_turn: None,
@@ -243,7 +243,7 @@ impl AgentContext {
             if cleaned
                 .function_call
                 .as_ref()
-                .is_some_and(|fc| fc.thought_signature.is_none())
+                .is_some_and(|_fc| cleaned.thought_signature.is_none())
             {
                 cleaned.function_call = None;
             }
@@ -399,6 +399,7 @@ impl AgentContext {
                     text: Some(text),
                     function_call: None,
                     function_response: None,
+                    thought_signature: None,
                 }],
             }],
         });
@@ -471,6 +472,7 @@ impl AgentContext {
         let system_msg = Message {
             role: "system".to_string(),
             parts: vec![Part {
+                    thought_signature: None,
                 text: Some(self.build_system_prompt()),
                 function_call: None,
                 function_response: None,
@@ -584,7 +586,7 @@ mod tests {
                 text: Some("running tool".to_string()),
                 function_call: Some(FunctionCall {
                     name: "execute_bash".to_string(),
-                    args: serde_json::json!({"command":"pwd"}),
+                    thought_signature: None,
                     thought_signature: None,
                 }),
                 function_response: None,
@@ -622,10 +624,9 @@ mod tests {
             !payload.iter().any(|m| m.parts.iter().any(|p| p
                 .function_call
                 .as_ref()
-                .is_some_and(|fc| fc.thought_signature.is_none()))),
+                .is_some_and(|_fc| p.thought_signature.is_none()))),
             "payload must not contain functionCall parts without thought_signature"
         );
-
         assert!(
             payload.iter().filter(|m| m.role == "user").any(|m| m
                 .parts
