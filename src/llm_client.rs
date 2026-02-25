@@ -186,10 +186,12 @@ impl LlmClient for GeminiClient {
                 model_name, api_key
             );
 
+            let body_json_string = serde_json::to_string(&req_body).unwrap_or_default();
+            tracing::trace!("Sending request to Gemini API: url={}, payload_size={} bytes", url, body_json_string.len());
             let resp = match client
                 .post(&url)
                 .header(CONTENT_TYPE, "application/json")
-                .json(&req_body)
+                .body(body_json_string)
                 .send()
                 .await
             {
@@ -457,11 +459,13 @@ impl LlmClient for OpenAiCompatClient {
         let base_url = self.base_url.clone();
 
         tokio::spawn(async move {
+            let body_json_string = serde_json::to_string(&body_map).unwrap_or_default();
+            tracing::trace!("Sending request to OpenAI compat API: url={}, payload_size={} bytes", base_url, body_json_string.len());
             let resp = match client
                 .post(&base_url)
                 .header(AUTHORIZATION, format!("Bearer {}", api_key))
                 .header(CONTENT_TYPE, "application/json")
-                .json(&body_map)
+                .body(body_json_string)
                 .send()
                 .await
             {

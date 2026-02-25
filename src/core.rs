@@ -1153,6 +1153,7 @@ impl AgentLoop {
                         tool_calls.push(call);
                     }
                     StreamEvent::Error(e) => {
+                        tracing::error!("LLM Stream Error: {}", e);
                         self.output.on_error(&format!("\n[LLM Error]: {}", e)).await;
                         exit_state = RunExit::HardStop {
                             reason: format!("llm_stream_error: {}", e),
@@ -1163,6 +1164,11 @@ impl AgentLoop {
                 }
             }
             llm_stream_wait_ms_acc += llm_stream_started.elapsed().as_millis();
+
+            tracing::debug!("Raw LLM Output (full_text):\n{}", raw_full_text);
+            for (i, call) in tool_calls.iter().enumerate() {
+                tracing::debug!("Parsed ToolCall [{}]: name={}, args={}", i, call.name, call.args);
+            }
 
             if Self::enforce_final_tag_enabled() {
                 if let Some(final_text) = Self::extract_final_tag_content(&full_text) {
