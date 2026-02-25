@@ -19,7 +19,7 @@ use crate::session_manager::SessionManager;
 use crate::skills::load_skills;
 use crate::tools::{
     BashTool, EditFileTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool,
-    TaskPlanTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool,
+    TaskPlanTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool, FinishTaskTool,
 };
 use async_trait::async_trait;
 use clap::Parser;
@@ -209,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.push(Arc::new(BashTool::new()));
     tools.push(Arc::new(WriteFileTool));
     tools.push(Arc::new(ReadFileTool));
+    tools.push(Arc::new(FinishTaskTool));
     tools.push(Arc::new(EditFileTool::new()));
     tools.push(Arc::new(WebFetchTool::new()));
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
