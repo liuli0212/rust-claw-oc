@@ -263,9 +263,9 @@ fn parse_function_call(part: &Value) -> Option<FunctionCall> {
     let func_call = part.get("functionCall")?;
     let name = func_call.get("name")?.as_str()?.to_string();
     let args = func_call.get("args")?.clone();
-    let thought_signature = func_call
+    let thought_signature = part
         .get("thought_signature")
-        .or_else(|| func_call.get("thoughtSignature"))
+        .or_else(|| part.get("thoughtSignature"))
         .and_then(|ts| ts.as_str())
         .map(|s| s.to_string());
     Some(FunctionCall {
