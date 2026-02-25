@@ -482,6 +482,9 @@ impl LlmClient for OpenAiCompatClient {
 
             let mut stream = resp.bytes_stream();
             let mut buffer = String::new();
+            
+            let mut current_tool_name: Option<String> = None;
+            let mut current_tool_args = String::new();
 
             while let Some(chunk_res) = stream.next().await {
                 if let Ok(chunk) = chunk_res {
@@ -510,26 +513,22 @@ impl LlmClient for OpenAiCompatClient {
                                             {
                                                 for tc in tool_calls {
                                                     if let Some(func) = tc.get("function") {
-                                                        let name = func
-                                                            .get("name")
-                                                            .and_then(|v| v.as_str())
-                                                            .unwrap_or("")
-                                                            .to_string();
-                                                        let args_str = func
-                                                            .get("arguments")
-                                                            .and_then(|v| v.as_str())
-                                                            .unwrap_or("{}");
-                                                        let args = serde_json::from_str(args_str)
-                                                            .unwrap_or(Value::Null);
-                                                        let _ = tx
-                                                            .send(StreamEvent::ToolCall(
-                                                                FunctionCall {
+                                                        if let Some(n) = func.get("name").and_then(|v| v.as_str()) {
+                                                            if let Some(name) = current_tool_name.take() {
+                                                                let args = serde_json::from_str(&current_tool_args).unwrap_or(serde_json::Value::Null);
+                                                                let _ = tx.send(StreamEvent::ToolCall(FunctionCall {
                                                                     name,
                                                                     args,
                                                                     thought_signature: None,
-                                                                },
-                                                            ))
-                                                            .await;
+                                                                })).await;
+                                                            }
+                                                            current_tool_name = Some(n.to_string());
+                                                            current_tool_args.clear();
+                                                        }
+                                                        
+                                                        if let Some(arg_chunk) = func.get("arguments").and_then(|v| v.as_str()) {
+                                                            current_tool_args.push_str(arg_chunk);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -541,6 +540,15 @@ impl LlmClient for OpenAiCompatClient {
                     }
                 }
             }
+            if let Some(name) = current_tool_name {
+                let args = serde_json::from_str(&current_tool_args).unwrap_or(serde_json::Value::Null);
+                let _ = tx.send(StreamEvent::ToolCall(FunctionCall {
+                    name,
+                    args,
+                    thought_signature: None,
+                })).await;
+            }
+            
             let _ = tx.send(StreamEvent::Done).await;
         });
 
