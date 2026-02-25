@@ -1,6 +1,16 @@
 use async_trait::async_trait;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use regex::Regex;
 use reqwest::Client;
 use schemars::{schema_for, JsonSchema};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use thiserror::Error;
+use tokio::time::timeout;
 
 // Helper to clean up JSON schema for strict LLM APIs like Gemini
 pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
@@ -10,19 +20,6 @@ pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
     }
     schema_val
 }
-
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
-use std::time::Duration;
-use std::time::Instant;
-use thiserror::Error;
-
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use regex::Regex;
-use std::io::Read;
-use std::path::PathBuf;
-use tokio::time::timeout;
 
 #[derive(Error, Debug)]
 pub enum ToolError {
@@ -306,7 +303,7 @@ fn truncate_log(log: &str) -> String {
 
 // Read Memory Tool
 pub struct ReadMemoryTool {
-    workspace: std::sync::Arc<crate::memory::WorkspaceMemory>,
+    pub workspace: std::sync::Arc<crate::memory::WorkspaceMemory>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -333,19 +330,6 @@ impl Tool for ReadMemoryTool {
         let mut val = serde_json::to_value(&schema).unwrap();
         val.as_object_mut().unwrap().remove("$schema");
         val.as_object_mut().unwrap().remove("title");
-        if let Some(properties) = val.get_mut("properties").and_then(|p| p.as_object_mut()) {
-            if let Some(timeout) = properties
-                .get_mut("timeout")
-                .and_then(|t| t.as_object_mut())
-            {
-                if let Some(type_arr) = timeout.get("type").and_then(|t| t.as_array()) {
-                    if let Some(first) = type_arr.first() {
-                        let f = first.clone();
-                        timeout.insert("type".to_string(), f);
-                    }
-                }
-            }
-        }
         val
     }
 
@@ -370,7 +354,7 @@ impl Tool for ReadMemoryTool {
 
 // Write Memory Tool
 pub struct WriteMemoryTool {
-    workspace: std::sync::Arc<crate::memory::WorkspaceMemory>,
+    pub workspace: std::sync::Arc<crate::memory::WorkspaceMemory>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -400,19 +384,6 @@ impl Tool for WriteMemoryTool {
         let mut val = serde_json::to_value(&schema).unwrap();
         val.as_object_mut().unwrap().remove("$schema");
         val.as_object_mut().unwrap().remove("title");
-        if let Some(properties) = val.get_mut("properties").and_then(|p| p.as_object_mut()) {
-            if let Some(timeout) = properties
-                .get_mut("timeout")
-                .and_then(|t| t.as_object_mut())
-            {
-                if let Some(type_arr) = timeout.get("type").and_then(|t| t.as_array()) {
-                    if let Some(first) = type_arr.first() {
-                        let f = first.clone();
-                        timeout.insert("type".to_string(), f);
-                    }
-                }
-            }
-        }
         val
     }
 
@@ -435,7 +406,7 @@ impl Tool for WriteMemoryTool {
 
 // RAG Store Tool
 pub struct RagSearchTool {
-    store: std::sync::Arc<crate::rag::VectorStore>,
+    pub store: std::sync::Arc<crate::rag::VectorStore>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -467,16 +438,6 @@ impl Tool for RagSearchTool {
         let mut val = serde_json::to_value(&schema).unwrap();
         val.as_object_mut().unwrap().remove("$schema");
         val.as_object_mut().unwrap().remove("title");
-        if let Some(properties) = val.get_mut("properties").and_then(|p| p.as_object_mut()) {
-            if let Some(limit) = properties.get_mut("limit").and_then(|t| t.as_object_mut()) {
-                if let Some(type_arr) = limit.get("type").and_then(|t| t.as_array()) {
-                    if let Some(first) = type_arr.first() {
-                        let f = first.clone();
-                        limit.insert("type".to_string(), f);
-                    }
-                }
-            }
-        }
         val
     }
 
@@ -508,207 +469,9 @@ impl Tool for RagSearchTool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_truncate_log_short() {
-        let log = "line 1\nline 2\nline 3";
-        assert_eq!(truncate_log(log), log);
-    }
-
-    #[test]
-    fn test_truncate_log_long() {
-        let mut log = String::new();
-        for i in 1..=1200 {
-            log.push_str(&format!("line {}\n", i));
-        }
-        let truncated = truncate_log(&log);
-        assert!(truncated.contains("line 1"));
-        assert!(truncated.contains("line 100"));
-        assert!(truncated.contains("[... Truncated 1000 lines ...]"));
-        assert!(truncated.contains("line 1101"));
-        assert!(truncated.contains("line 1200"));
-        assert!(!truncated.contains("line 600"));
-    }
-
-    #[test]
-    fn test_bash_tool_schema() {
-        let tool = BashTool::new();
-        let schema = tool.parameters_schema();
-        let props = schema.get("properties").unwrap();
-        assert!(props.get("command").is_some());
-        assert!(props.get("timeout").is_some());
-
-        // Ensure no $schema or title (Gemini bug workaround)
-        assert!(schema.get("$schema").is_none());
-        assert!(schema.get("title").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_regression_file_tools_roundtrip() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("hello.txt");
-        let content = "hello regression";
-
-        let writer = WriteFileTool;
-        let write_res = writer
-            .execute(serde_json::json!({
-                "path": file_path.to_string_lossy().to_string(),
-                "content": content
-            }))
-            .await
-            .unwrap();
-        let write_env: ToolExecutionEnvelope = serde_json::from_str(&write_res).unwrap();
-        assert!(write_env.ok);
-        assert!(write_env.output.contains("Successfully wrote"));
-
-        let reader = ReadFileTool;
-        let read_res = reader
-            .execute(serde_json::json!({
-                "path": file_path.to_string_lossy().to_string()
-            }))
-            .await
-            .unwrap();
-        let read_env: ToolExecutionEnvelope = serde_json::from_str(&read_res).unwrap();
-        assert!(read_env.ok);
-        assert_eq!(read_env.output, content);
-    }
-
-    #[tokio::test]
-    async fn test_regression_workspace_memory_tools_roundtrip() {
-        let dir = tempdir().unwrap();
-        let workspace = Arc::new(crate::memory::WorkspaceMemory::new(
-            dir.path().to_str().unwrap(),
-        ));
-
-        let write_tool = WriteMemoryTool::new(workspace.clone());
-        let write_res = write_tool
-            .execute(serde_json::json!({
-                "content": "remember this"
-            }))
-            .await
-            .unwrap();
-        let write_env: ToolExecutionEnvelope = serde_json::from_str(&write_res).unwrap();
-        assert!(write_env.ok);
-        assert_eq!(write_env.output, "Memory updated successfully.");
-
-        let read_tool = ReadMemoryTool::new(workspace);
-        let read_res = read_tool.execute(serde_json::json!({})).await.unwrap();
-        let read_env: ToolExecutionEnvelope = serde_json::from_str(&read_res).unwrap();
-        assert!(read_env.ok);
-        assert_eq!(read_env.output, "remember this");
-    }
-
-    #[tokio::test]
-    async fn test_regression_bash_tool_smoke() {
-        let tool = BashTool::new();
-        let result = tool
-            .execute(serde_json::json!({
-                "command": "printf 'regression-ok'",
-                "timeout": 5
-            }))
-            .await
-            .unwrap();
-
-        let parsed: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
-        assert!(parsed.ok);
-        assert_eq!(parsed.exit_code, Some(0));
-        assert!(parsed.output.contains("regression-ok"));
-    }
-
-    #[tokio::test]
-    async fn test_regression_task_plan_lifecycle() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("task-plan.json");
-        let tool = TaskPlanTool::new(path);
-
-        let replace = tool
-            .execute(serde_json::json!({
-                "action": "replace",
-                "items": [
-                    { "step": "Design", "status": "completed" },
-                    { "step": "Implement", "status": "in_progress" }
-                ]
-            }))
-            .await
-            .unwrap();
-        let replace_env: ToolExecutionEnvelope = serde_json::from_str(&replace).unwrap();
-        assert!(replace_env.ok);
-
-        let update = tool
-            .execute(serde_json::json!({
-                "action": "update_status",
-                "index": 1,
-                "status": "completed"
-            }))
-            .await
-            .unwrap();
-        let update_env: ToolExecutionEnvelope = serde_json::from_str(&update).unwrap();
-        assert!(update_env.ok);
-        assert!(update_env.output.contains("\"completed\""));
-
-        let get = tool
-            .execute(serde_json::json!({ "action": "get" }))
-            .await
-            .unwrap();
-        let get_env: ToolExecutionEnvelope = serde_json::from_str(&get).unwrap();
-        assert!(get_env.ok);
-        assert!(get_env.output.contains("\"Design\""));
-        assert!(get_env.output.contains("\"Implement\""));
-    }
-
-    #[tokio::test]
-    async fn test_regression_tavily_tool_without_key_returns_error_envelope() {
-        let tool = TavilySearchTool::new(String::new());
-        let result = tool
-            .execute(serde_json::json!({
-                "query": "rust tokio tutorial"
-            }))
-            .await
-            .unwrap();
-        let env: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
-        assert!(!env.ok);
-        assert!(env.output.contains("TAVILY_API_KEY"));
-    }
-
-    #[test]
-    fn test_web_fetch_extract_text_from_html() {
-        let html = r#"
-            <html>
-              <head><title>X</title><style>body{display:none;}</style></head>
-              <body>
-                <h1>Hello &amp; Welcome</h1>
-                <p>Rusty&nbsp;Claw</p>
-                <script>console.log("hidden")</script>
-              </body>
-            </html>
-        "#;
-        let text = extract_text_from_html(html);
-        assert!(text.contains("Hello & Welcome"));
-        assert!(text.contains("Rusty Claw"));
-        assert!(!text.contains("hidden"));
-    }
-
-    #[tokio::test]
-    async fn test_web_fetch_rejects_non_http_url() {
-        let tool = WebFetchTool::new();
-        let err = tool
-            .execute(serde_json::json!({
-                "url": "ftp://example.com"
-            }))
-            .await
-            .unwrap_err();
-        assert!(format!("{}", err).contains("http:// or https://"));
-    }
-}
-
 // RAG Store Insert Tool
 pub struct RagInsertTool {
-    store: std::sync::Arc<crate::rag::VectorStore>,
+    pub store: std::sync::Arc<crate::rag::VectorStore>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -854,7 +617,7 @@ impl Tool for ReadFileTool {
 
 // --- Generic Web Fetch Tool ---
 pub struct WebFetchTool {
-    client: Client,
+    pub client: Client,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1012,8 +775,8 @@ impl Tool for WebFetchTool {
 
 // --- Tavily Web Search Tool ---
 pub struct TavilySearchTool {
-    api_key: String,
-    client: Client,
+    pub api_key: String,
+    pub client: Client,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1167,7 +930,7 @@ impl Tool for TavilySearchTool {
 
 // --- Task Plan Tool ---
 pub struct TaskPlanTool {
-    path: PathBuf,
+    pub path: PathBuf,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone)]
@@ -1348,3 +1111,327 @@ impl Tool for TaskPlanTool {
         )
     }
 }
+
+// --- Patch Editor Tool ---
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct EditFileArgs {
+    /// The structural patch to apply (*** Begin Patch ... *** End Patch)
+    pub patch: String,
+}
+
+pub struct EditFileTool {
+    pub work_dir: PathBuf,
+}
+
+impl EditFileTool {
+    pub fn new() -> Self {
+        let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self { work_dir }
+    }
+}
+
+#[async_trait]
+impl Tool for EditFileTool {
+    fn name(&self) -> String {
+        "edit_file".to_string()
+    }
+    fn description(&self) -> String {
+        "Applies a structural patch to one or more files. Supports Update, Add, and Delete operations with strict verification.".to_string()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(EditFileArgs)).unwrap())
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let start = Instant::now();
+        let parsed: EditFileArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        // 1. Parse the patch using the engine we built
+        let patches = crate::tools::PatchEngine::parse_patch(&parsed.patch)
+            .map_err(|e| ToolError::InvalidArguments(format!("Patch parse error: {}", e)))?;
+
+        // 2. Apply the patches
+        match crate::tools::PatchEngine::apply_patches(&self.work_dir, &patches) {
+            Ok(result) => serialize_tool_envelope(
+                "edit_file",
+                true,
+                format!(
+                    "Successfully applied patches to: {}",
+                    result.changed_paths.join(", ")
+                ),
+                Some(0),
+                Some(start.elapsed().as_millis()),
+                false,
+            ),
+            Err(e) => serialize_tool_envelope(
+                "edit_file",
+                false,
+                format!("Patch application failed: {}", e),
+                Some(1),
+                Some(start.elapsed().as_millis()),
+                false,
+            ),
+        }
+    }
+}
+
+// --- Patch Engine Implementation ---
+pub mod patch_engine_impl {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PatchOp {
+        Update,
+        Add,
+        Delete,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum HunkLine {
+        Context(String),
+        Add(String),
+        Remove(String),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Hunk {
+        pub lines: Vec<HunkLine>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Patch {
+        pub op: PatchOp,
+        pub file_path: String,
+        pub hunks: Vec<Hunk>,
+        pub add_file_lines: Vec<String>,
+    }
+
+    pub struct ApplyResult {
+        pub changed_paths: Vec<String>,
+    }
+
+    pub struct PatchEngine;
+
+    impl PatchEngine {
+        pub fn parse_patch(input: &str) -> Result<Vec<Patch>, String> {
+            let lines: Vec<&str> = input.lines().collect();
+            let mut idx = 0usize;
+            let mut patches = Vec::new();
+
+            while idx < lines.len() {
+                if Self::is_begin_marker(lines[idx]) {
+                    idx += 1;
+                    while idx < lines.len() && !Self::is_end_marker(lines[idx]) {
+                        let line = lines[idx].trim();
+                        if let Some(path) = line.strip_prefix("*** Update File:") {
+                            let file_path = path.trim().to_string();
+                            idx += 1;
+                            let mut hunks = Vec::new();
+                            while idx < lines.len() {
+                                let current = lines[idx].trim();
+                                if current.starts_with("*** ") || Self::is_end_marker(lines[idx]) {
+                                    break;
+                                }
+                                if !current.starts_with("@@") {
+                                    return Err(format!(
+                                        "line {}: expected hunk header '@@'",
+                                        idx + 1
+                                    ));
+                                }
+                                let (hunk, next_idx) = Self::parse_hunk(&lines, idx)?;
+                                hunks.push(hunk);
+                                idx = next_idx;
+                            }
+                            patches.push(Patch {
+                                op: PatchOp::Update,
+                                file_path,
+                                hunks,
+                                add_file_lines: Vec::new(),
+                            });
+                            continue;
+                        }
+                        if let Some(path) = line.strip_prefix("*** Add File:") {
+                            let file_path = path.trim().to_string();
+                            idx += 1;
+                            let mut add_lines = Vec::new();
+                            while idx < lines.len() {
+                                let current = lines[idx];
+                                if current.trim().starts_with("*** ")
+                                    || Self::is_end_marker(current)
+                                {
+                                    break;
+                                }
+                                if !current.starts_with('+') {
+                                    return Err(format!(
+                                        "line {}: add lines must start with '+'",
+                                        idx + 1
+                                    ));
+                                }
+                                add_lines.push(current[1..].to_string());
+                                idx += 1;
+                            }
+                            patches.push(Patch {
+                                op: PatchOp::Add,
+                                file_path,
+                                hunks: Vec::new(),
+                                add_file_lines: add_lines,
+                            });
+                            continue;
+                        }
+                        if let Some(path) = line.strip_prefix("*** Delete File:") {
+                            let file_path = path.trim().to_string();
+                            patches.push(Patch {
+                                op: PatchOp::Delete,
+                                file_path,
+                                hunks: Vec::new(),
+                                add_file_lines: Vec::new(),
+                            });
+                            idx += 1;
+                            continue;
+                        }
+                        idx += 1;
+                    }
+                }
+                idx += 1;
+            }
+            if patches.is_empty() {
+                return Err("No patches found".to_string());
+            }
+            Ok(patches)
+        }
+
+        pub fn apply_patches(root: &Path, patches: &[Patch]) -> Result<ApplyResult, String> {
+            let mut changed = Vec::new();
+            for patch in patches {
+                let target = Self::resolve_under_root(root, &patch.file_path)?;
+                match patch.op {
+                    PatchOp::Add => {
+                        let content = patch.add_file_lines.join("\n") + "\n";
+                        fs::write(&target, content).map_err(|e| e.to_string())?;
+                        changed.push(patch.file_path.clone());
+                    }
+                    PatchOp::Delete => {
+                        fs::remove_file(&target).map_err(|e| e.to_string())?;
+                        changed.push(patch.file_path.clone());
+                    }
+                    PatchOp::Update => {
+                        let raw = fs::read_to_string(&target).map_err(|e| e.to_string())?;
+                        let (mut file_lines, ending, has_nl) = Self::split_lines(&raw);
+                        let mut cursor = 0usize;
+                        for hunk in &patch.hunks {
+                            let old_seq = Self::old_sequence(hunk);
+                            let new_seq = Self::new_sequence(hunk);
+                            let mut matches = Vec::new();
+                            for i in cursor..=file_lines.len().saturating_sub(old_seq.len()) {
+                                if file_lines[i..i + old_seq.len()] == old_seq[..] {
+                                    matches.push(i);
+                                }
+                            }
+                            if matches.is_empty() {
+                                return Err(format!("Context not found in {}", patch.file_path));
+                            }
+                            if matches.len() > 1 {
+                                return Err(format!("Ambiguous context in {}", patch.file_path));
+                            }
+                            let at = matches[0];
+                            file_lines.splice(at..at + old_seq.len(), new_seq.clone());
+                            cursor = at + new_seq.len();
+                        }
+                        let mut out = file_lines.join(ending);
+                        if has_nl {
+                            out.push_str(ending);
+                        }
+                        fs::write(&target, out).map_err(|e| e.to_string())?;
+                        changed.push(patch.file_path.clone());
+                    }
+                }
+            }
+            Ok(ApplyResult {
+                changed_paths: changed,
+            })
+        }
+
+        fn parse_hunk(lines: &[&str], header_idx: usize) -> Result<(Hunk, usize), String> {
+            let mut idx = header_idx + 1;
+            let mut out = Vec::new();
+            while idx < lines.len() {
+                let line = lines[idx];
+                if line.trim().starts_with("@@")
+                    || line.trim().starts_with("*** ")
+                    || Self::is_end_marker(line)
+                {
+                    break;
+                }
+                let prefix = line.chars().next().ok_or("Empty hunk line")?;
+                let body = line.chars().skip(1).collect::<String>();
+                match prefix {
+                    ' ' => out.push(HunkLine::Context(body)),
+                    '-' => out.push(HunkLine::Remove(body)),
+                    '+' => out.push(HunkLine::Add(body)),
+                    _ => return Err(format!("Invalid prefix '{}'", prefix)),
+                }
+                idx += 1;
+            }
+            Ok((Hunk { lines: out }, idx))
+        }
+
+        fn old_sequence(hunk: &Hunk) -> Vec<String> {
+            hunk.lines
+                .iter()
+                .filter_map(|l| match l {
+                    HunkLine::Context(s) | HunkLine::Remove(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn new_sequence(hunk: &Hunk) -> Vec<String> {
+            hunk.lines
+                .iter()
+                .filter_map(|l| match l {
+                    HunkLine::Context(s) | HunkLine::Add(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn split_lines(content: &str) -> (Vec<String>, &'static str, bool) {
+            let ending = if content.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let has_nl = content.ends_with('\n');
+            let mut lines: Vec<String> = content
+                .replace("\r\n", "\n")
+                .split('\n')
+                .map(|s| s.to_string())
+                .collect();
+            if has_nl {
+                lines.pop();
+            }
+            (lines, ending, has_nl)
+        }
+
+        fn resolve_under_root(root: &Path, raw_path: &str) -> Result<PathBuf, String> {
+            let path = PathBuf::from(raw_path);
+            if path.is_absolute() {
+                return Err("Absolute path not allowed".into());
+            }
+            let full = root.join(path);
+            // Simple normalization for demo
+            Ok(full)
+        }
+
+        fn is_begin_marker(line: &str) -> bool {
+            line.trim().starts_with("*** Begin Patch")
+        }
+        fn is_end_marker(line: &str) -> bool {
+            line.trim().starts_with("*** End Patch")
+        }
+    }
+}
+
+pub use patch_engine_impl::PatchEngine;

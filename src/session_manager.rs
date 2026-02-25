@@ -1,20 +1,20 @@
 use crate::context::{transcript_path_for_session, AgentContext};
 use crate::core::{AgentLoop, AgentOutput};
-use crate::llm_client::GeminiClient;
+use crate::llm_client::LlmClient;
 use crate::tools::Tool;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock}; // Changed: Added RwLock
-use tokio::sync::Mutex as AsyncMutex; // Renamed to avoid confusion
+use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex as AsyncMutex;
 
-#[derive(Debug, Serialize, Deserialize, Default, Clone)] // Added Clone
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct SessionRegistry {
     sessions: HashMap<String, SessionEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)] // Added Clone
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct SessionEntry {
     transcript_path: String,
     updated_at_unix: u64,
@@ -22,7 +22,7 @@ struct SessionEntry {
 }
 
 pub struct SessionManager {
-    llm: Arc<GeminiClient>,
+    llm: Arc<dyn LlmClient>,
     tools: Vec<Arc<dyn Tool>>,
     // Active agent sessions (In-Memory)
     sessions: AsyncMutex<HashMap<String, Arc<AsyncMutex<AgentLoop>>>>,
@@ -33,9 +33,9 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub fn new(llm: Arc<GeminiClient>, tools: Vec<Arc<dyn Tool>>) -> Self {
-        let transcript_dir = PathBuf::from(".rusty_claw").join("sessions");
-        let registry_path = PathBuf::from(".rusty_claw").join("sessions.json");
+    pub fn new(llm: Arc<dyn LlmClient>, tools: Vec<Arc<dyn Tool>>) -> Self {
+        let transcript_dir = PathBuf::from("rusty_claw").join("sessions");
+        let registry_path = PathBuf::from("rusty_claw").join("sessions.json");
 
         // Initial load of registry
         let registry = if registry_path.exists() {

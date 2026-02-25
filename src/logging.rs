@@ -1,6 +1,7 @@
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Debug, Clone, Default)]
@@ -14,7 +15,7 @@ pub struct LoggingConfig {
 pub fn init_logging(
     config: LoggingConfig,
 ) -> Result<Option<WorkerGuard>, Box<dyn std::error::Error>> {
-    let filter = EnvFilter::try_from_default_env()
+    let file_filter = EnvFilter::try_from_default_env()
         .or_else(|_| {
             let level = config
                 .log_level
@@ -25,6 +26,11 @@ pub fn init_logging(
         })
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    let console_filter = std::env::var("CLAW_CONSOLE_LOG_LEVEL")
+        .ok()
+        .and_then(|v| EnvFilter::try_new(v).ok())
+        .unwrap_or_else(|| EnvFilter::new("warn"));
+
     let enable_file = config.file_log.unwrap_or_else(|| {
         std::env::var("CLAW_FILE_LOG")
             .map(|v| v != "0")
@@ -33,8 +39,8 @@ pub fn init_logging(
 
     if !enable_file {
         tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer())
+            .with(console_filter)
+            .with(fmt::layer().with_target(false))
             .try_init()?;
         return Ok(None);
     }
@@ -53,13 +59,14 @@ pub fn init_logging(
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer())
+        .with(console_filter)
+        .with(fmt::layer().with_target(false))
         .with(
             fmt::layer()
                 .with_ansi(false)
                 .with_writer(non_blocking)
-                .with_target(true),
+                .with_target(true)
+                .with_filter(file_filter),
         )
         .try_init()?;
 
