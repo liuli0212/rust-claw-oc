@@ -1118,9 +1118,12 @@ impl AgentLoop {
             for (i, call) in tool_calls.iter().enumerate() {
                 tracing::debug!("Parsed ToolCall [{}]: name={}, args={}, thought={:?}", i, call.name, call.args, call.thought_signature);
                 if let Some(thought) = &call.thought_signature {
-                    let thought_msg = format!("<think>\n{}\n</think>\n", thought);
-                    full_text.insert_str(0, &thought_msg);
-                    self.output.on_text(&thought_msg).await;
+                    // Only prepend thought if the raw_full_text didn't already have it
+                    if raw_full_text.trim().is_empty() {
+                        let thought_msg = format!("<think>\n{}\n</think>\n", thought);
+                        full_text.insert_str(0, &thought_msg);
+                        self.output.on_text(&thought_msg).await;
+                    }
                 }
             }
 
