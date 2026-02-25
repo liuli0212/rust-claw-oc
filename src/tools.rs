@@ -162,7 +162,10 @@ impl Tool for BashTool {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!("BashTool Error: Failed to open PTY - {}", e);
+                ToolError::ExecutionFailed(e.to_string())
+            })?;
 
         let mut cmd = CommandBuilder::new("bash");
         cmd.cwd(self.work_dir.clone());
@@ -172,7 +175,10 @@ impl Tool for BashTool {
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            .map_err(|e| {
+                tracing::error!("BashTool Error: Failed to spawn command '{}' - {}", cmd_str, e);
+                ToolError::ExecutionFailed(e.to_string())
+            })?;
         let child = std::sync::Arc::new(std::sync::Mutex::new(child));
         drop(pair.slave); // Crucial: close slave so master gets EOF
 
@@ -521,6 +527,8 @@ impl Tool for RagInsertTool {
 // --- File Write Tool ---
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct WriteFileArgs {
+    /// Explain what changes you are making and why
+    pub thought: String,
     /// Absolute or relative path to the file to write
     pub path: String,
     /// The complete content to write into the file
@@ -574,6 +582,8 @@ impl Tool for WriteFileTool {
 // --- File Read Tool ---
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ReadFileArgs {
+    /// Explain briefly why you need to read this file
+    pub thought: String,
     /// Path to the file to read
     pub path: String,
 }
