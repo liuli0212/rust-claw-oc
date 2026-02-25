@@ -305,70 +305,7 @@ impl AgentLoop {
         trimmed.chars().count() >= 120
     }
 
-    fn is_complex_task(query: &str) -> bool {
-        let trimmed = query.trim();
-        if trimmed.is_empty() {
-            return false;
-        }
-        let lower = trimmed.to_lowercase();
-        let markers = [
-            "implement",
-            "fix",
-            "debug",
-            "refactor",
-            "write",
-            "code",
-            "build",
-            "test",
-            "run",
-            "cargo",
-            "git",
-            "file",
-            "function",
-            "module",
-            "tool",
-            "schema",
-            "explore",
-            "search",
-            "grep",
-            "find",
-            "analyze",
-            "优化",
-            "实现",
-            "修复",
-            "调试",
-            "重构",
-            "编译",
-            "测试",
-            "运行",
-            "文件",
-            "函数",
-            "模块",
-            "工具",
-            "更新",
-            "设计",
-            "文档",
-            "阅读",
-            "搜索",
-            "查找",
-            "分析",
-            "继续",
-            "continue",
-            "next",
-            "下一步",
-        ];
-        markers.iter().any(|m| lower.contains(m))
-            || lower.contains("src/")
-            || lower.contains(".rs")
-            || trimmed.chars().count() >= 40
-    }
-
-    fn max_attempts_for_input(query: &str) -> usize {
-        if !Self::is_complex_task(query) {
-            // Simple prompts typically finish in one pass, but tool-using answers need
-            // a second pass so the model can synthesize final output from tool results.
-            return Self::SIMPLE_TASK_MAX_ITERATIONS;
-        }
+    fn max_attempts_for_input(_query: &str) -> usize {
         Self::max_task_iterations()
     }
 
@@ -605,22 +542,9 @@ impl AgentLoop {
         parsed
     }
 
-    fn is_task_complete(state: &TaskState) -> bool {
-        if state.completed {
-            return true;
-        }
-        let text = state.last_model_text.to_lowercase();
-        if text.trim().is_empty() {
-            return false; // Cannot be complete without saying something
-        }
-        let done_markers = ["done", "completed", "fixed", "resolved", "successfully"];
-        done_markers.iter().any(|m| text.contains(m)) && !text.contains("need to")
-    }
-
     fn build_next_action_prompt(state: &TaskState) -> String {
         format!(
-            "Continue solving the same task. Goal: {}. This is iteration {}. \
-Use tools proactively and perform one concrete next action. If complete, clearly say DONE and summarize verification.",
+            "Continue solving the same task. Goal: {}. This is iteration {}. Use tools proactively. If complete, you MUST call the `finish_task` tool.",
             state.goal, state.iterations
         )
     }
@@ -704,47 +628,6 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             "{}".to_string()
         } else {
             clipped
-        }
-    }
-
-    fn progress_decision_summary(
-        model_text: &str,
-        tool_calls: &[FunctionCall],
-        has_tool_observation: bool,
-    ) -> String {
-        let text_hint = Self::summarize_model_intent(model_text)
-            .unwrap_or_else(|| "无显式文本结论".to_string());
-        if tool_calls.is_empty() {
-            if has_tool_observation {
-                format!("已有工具证据，当前倾向直接给出结论；线索：{}", text_hint)
-            } else {
-                format!("先做快速判断是否需要外部证据；线索：{}", text_hint)
-            }
-        } else {
-            let names: Vec<String> = tool_calls.iter().map(|c| c.name.clone()).collect();
-            format!("需要补充可验证证据，计划调用工具：{}", names.join(", "))
-        }
-    }
-
-    fn progress_next_summary(
-        tool_calls: &[FunctionCall],
-        has_tool_observation: bool,
-        is_complex_task: bool,
-    ) -> String {
-        if let Some(first) = tool_calls.first() {
-            return format!(
-                "执行 {}，参数摘要：{}",
-                first.name,
-                Self::summarize_args(&first.args, 120)
-            );
-        }
-        if has_tool_observation {
-            return "基于当前证据生成最终答复并结束本轮任务".to_string();
-        }
-        if is_complex_task {
-            "继续下一轮并要求模型给出一个具体可执行动作".to_string()
-        } else {
-            "直接回复用户，不再扩展工具调用".to_string()
         }
     }
 
@@ -1079,24 +962,19 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         &mut self,
         user_input: String,
     ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
-        let is_complex_task = Self::is_complex_task(&user_input);
-        let initial_attempt_limit = Self::max_attempts_for_input(&user_input);
-        let global_max_task_iterations = Self::max_task_iterations();
+        let mut iteration_limit = Self::max_task_iterations();
         self.output
             .on_text(&format!(
-                "[Progress] 已接收任务：{}。模式：{}，最多尝试 {} 轮。\n",
+                "[Progress] 接收任务：{}。最大允许 {} 轮。
+",
                 user_input.trim(),
-                if is_complex_task {
-                    "复杂任务"
-                } else {
-                    "快速问答"
-                },
-                initial_attempt_limit
+                iteration_limit
             ))
             .await;
         if Self::should_emit_verbose_progress() {
             self.output
-                .on_text("[Progress] 当前阶段：分析问题并准备执行。\n")
+                .on_text("[Progress] 当前阶段：分析问题并准备执行。
+")
                 .await;
         }
         let step_started = Instant::now();
@@ -1160,7 +1038,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
             ..TaskState::default()
         };
         let mut prompt_report_emitted = false;
-        let mut iteration_limit = initial_attempt_limit;
+        let mut iter_max = iteration_limit;
         let mut exit_state = RunExit::CompletedSilent {
             cause: "run_finished_without_output".to_string(),
         };
@@ -1175,7 +1053,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         while task_state.iterations < iteration_limit {
             task_state.iterations += 1;
             if Self::should_emit_verbose_progress() {
-                let objective = Self::iteration_objective(&task_state.goal, has_tool_observation);
+                let objective = "寻找解决方案并执行，或调用 finish_task 结束";
                 self.output
                     .on_text(&format!(
                         "[Progress] 当前阶段：执行第 {}/{} 轮，目标：{}。\n",
@@ -1353,70 +1231,12 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 self.output.on_text("\n").await;
             }
 
-            let decision =
-                Self::progress_decision_summary(&full_text, &tool_calls, has_tool_observation);
-            let next =
-                Self::progress_next_summary(&tool_calls, has_tool_observation, is_complex_task);
-            self.output
-                .on_text(&format!("[Progress] Decision: {}。\n", decision))
-                .await;
-            self.output
-                .on_text(&format!("[Progress] Next: {}。\n", next))
-                .await;
 
             if tool_calls.is_empty() {
                 consecutive_no_tool_iters += 1;
                 task_state.last_model_text = full_text.clone();
-                task_state.completed = Self::is_task_complete(&task_state);
-                if task_state.completed {
-                    exit_state = if full_text.trim().is_empty() {
-                        RunExit::CompletedSilent {
-                            cause: silent_cause_hint
-                                .unwrap_or_else(|| "model_marked_done_without_text".to_string()),
-                        }
-                    } else {
-                        RunExit::CompletedWithReply
-                    };
-                    break;
-                }
-                // For simple prompts, a direct model reply is enough. Exit before task-iteration checks.
-                // However, if we just executed a tool (has_tool_observation), the model MUST output text before we can consider it done.
-                // It also must not just say a single word, it should be a real explanation if there was a tool output.
-                // AND if the text contains phrases implying it will do something NEXT (e.g. "正在注入", "接下来"), we should NOT exit.
-                let implies_continuation = full_text.contains("正在") || full_text.contains("接下来") || full_text.contains("will now") || full_text.contains("going to");
-                if !is_complex_task && !full_text.trim().is_empty() && (!has_tool_observation || full_text.trim().len() > 10) && !implies_continuation {
-                    exit_state = RunExit::CompletedWithReply;
-                    if Self::should_emit_verbose_progress() {
-                        self.output
-                            .on_text("[Progress] 快速问答已完成，本轮不再继续扩展执行。\n")
-                            .await;
-                    }
-                    break;
-                }
                 
-                // --- SILENT EXIT PREVENTION ---
-                if full_text.trim().is_empty() && has_tool_observation && consecutive_no_tool_iters < 2 {
-                    if Self::should_emit_verbose_progress() {
-                        self.output
-                            .on_text("[Progress] 模型阅读了工具输出但未给出解释，强制要求其给出结论...\n")
-                            .await;
-                    }
-                    self.context.add_message_to_current_turn(Message {
-                        role: "user".to_string(),
-                        parts: vec![Part {
-                            text: Some("Please explain the tool results to me and tell me what we should do next or if the task is complete.".to_string()),
-                            function_call: None,
-                            function_response: None,
-                        }],
-                    });
-                    continue;
-                }
-                // ------------------------------
                 if task_state.iterations >= iteration_limit {
-                    if !full_text.trim().is_empty() {
-                        exit_state = RunExit::CompletedWithReply;
-                        break;
-                    }
                     self.output
                         .on_error(
                             &format!(
@@ -1432,54 +1252,26 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                     break;
                 }
 
-                // Reason-driven continuation.
-                if consecutive_no_tool_iters >= 2 {
-                    if !full_text.trim().is_empty() {
-                        exit_state = RunExit::CompletedWithReply;
-                    } else {
-                        exit_state = RunExit::RecoverableFailed {
-                            reason: "no_progress_without_tool_calls".to_string(),
-                            attempts: task_state.iterations,
-                        };
-                    }
-                    if Self::should_emit_verbose_progress() {
-                        self.output
-                            .on_text("[Progress] 连续两轮未产生工具动作，判定无进一步执行增益，结束本次任务。\n")
-                            .await;
-                    }
-                    break;
-                }
-
                 if Self::should_emit_verbose_progress() {
                     self.output
-                        .on_text(
-                            "[Progress] 本轮未调用工具，下一轮将继续推进并尝试采取具体动作。\n",
-                        )
+                        .on_text("[Progress] 模型未调用任何工具 (包括 finish_task)。强制要求其继续执行或结案...
+")
                         .await;
                 }
-                let continuation = Self::build_next_action_prompt(&task_state);
+                
                 self.context.add_message_to_current_turn(Message {
                     role: "user".to_string(),
                     parts: vec![Part {
-                        text: Some(continuation),
+                        text: Some("You did not call any tools. If the task is incomplete, please proceed with your next tool call. If the task is fully completed, you MUST call the `finish_task` tool to exit the loop.".to_string()),
                         function_call: None,
                         function_response: None,
                     }],
                 });
                 continue;
             }
+
             consecutive_no_tool_iters = 0;
-            if iteration_limit < global_max_task_iterations {
-                iteration_limit = (iteration_limit + 1).min(global_max_task_iterations);
-                if Self::should_emit_verbose_progress() {
-                    self.output
-                        .on_text(&format!(
-                            "[Progress] 检测到工具调用，已将最大尝试轮数扩展至 {}（逐轮扩展）。\n",
-                            iteration_limit
-                        ))
-                        .await;
-                }
-            }
+
             if full_text.trim().is_empty()
                 && tool_calls
                     .iter()
@@ -1490,13 +1282,24 @@ Use tools proactively and perform one concrete next action. If complete, clearly
 
             // Execute tools
             let mut response_parts = Vec::new();
+            let mut requested_finish = false;
+
             for call in tool_calls {
                 let tool_name = call.name.clone();
                 let tool_args = call.args.clone();
+
+                if tool_name == "finish_task" {
+                    requested_finish = true;
+                    self.output.on_tool_start(&tool_name, &tool_args.to_string()).await;
+                    self.output.on_tool_end("Task marked as finished.").await;
+                    break;
+                }
+
                 if Self::should_emit_verbose_progress() {
                     self.output
                         .on_text(&format!(
-                            "[Progress] 准备执行：{}。目的：{}。\n",
+                            "[Progress] 准备执行：{}。目的：{}。
+",
                             tool_name,
                             Self::tool_purpose(&tool_name, &tool_args, &full_text)
                         ))
@@ -1516,7 +1319,9 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 }
                 let result_str = if tool_result.recovery_attempted {
                     format!(
-                        "{}\n[Auto-Recovery]\n{}",
+                        "{}
+[Auto-Recovery]
+{}",
                         tool_result.output,
                         tool_result.recovery_output.clone().unwrap_or_default()
                     )
@@ -1525,28 +1330,20 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 };
 
                 self.output.on_tool_end(&result_str).await;
-                if Self::should_emit_verbose_progress() {
-                    self.output
-                        .on_text(&format!(
-                            "[Progress] {} 已完成（{}）。结果摘要：{}。\n",
-                            tool_name,
-                            if tool_result.ok { "成功" } else { "失败" },
-                            Self::summarize_tool_output(&result_str)
-                        ))
-                        .await;
-                }
 
                 response_parts.push(Part {
                     text: None,
                     function_call: None,
                     function_response: Some(FunctionResponse {
                         name: tool_name,
-                        response: serde_json::json!({
-                            "result": result_str,
-                            "structured": tool_result
-                        }),
+                        response: serde_json::json!({ "result": result_str }),
                     }),
                 });
+            }
+
+            if requested_finish {
+                exit_state = RunExit::CompletedWithReply;
+                break;
             }
 
             self.context.add_message_to_current_turn(Message {
@@ -1580,7 +1377,7 @@ Use tools proactively and perform one concrete next action. If complete, clearly
         if matches!(
             exit_state,
             RunExit::CompletedSilent { .. }
-                if task_state.iterations >= global_max_task_iterations
+                if task_state.iterations >= iteration_limit
         ) {
             exit_state = RunExit::RecoverableFailed {
                 reason: "max_task_iterations_exhausted".to_string(),
@@ -1623,7 +1420,7 @@ mod tests {
 
     #[test]
     fn simple_prompt_uses_two_attempt_budget_for_tool_followup() {
-        assert_eq!(AgentLoop::max_attempts_for_input("你叫什么名字？"), 2);
+        assert_eq!(AgentLoop::max_attempts_for_input("你叫什么名字？"), AgentLoop::max_task_iterations());
     }
 
     #[test]

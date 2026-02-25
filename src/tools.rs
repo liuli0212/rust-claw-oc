@@ -1435,3 +1435,26 @@ pub mod patch_engine_impl {
 }
 
 pub use patch_engine_impl::PatchEngine;
+
+
+// --- Finish Task Tool ---
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct FinishTaskArgs {
+    /// A summary of what was accomplished and the final answer to the user
+    pub summary: String,
+}
+
+pub struct FinishTaskTool;
+#[async_trait]
+impl Tool for FinishTaskTool {
+    fn name(&self) -> String { "finish_task".to_string() }
+    fn description(&self) -> String { "Call this tool ONLY when you have fully completed the user's request and have nothing else to do. This will end your execution loop.".to_string() }
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(FinishTaskArgs)).unwrap())
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: FinishTaskArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        Ok(format!("Task marked as finished. Summary: {}", parsed.summary))
+    }
+}
