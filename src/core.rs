@@ -1002,7 +1002,7 @@ impl AgentLoop {
             last_error: None,
             recovery_attempts: 0,
             recovery_rule_hits: HashMap::new(),
-            energy_points: 15, // Starting energy
+            energy_points: 20, // Starting energy
             recent_tool_signatures: Vec::new(),
         };
         let mut prompt_report_emitted = false;
@@ -1205,8 +1205,6 @@ impl AgentLoop {
                 
                 task_state.last_model_text = full_text.clone();
                 
-                task_state.energy_points = task_state.energy_points.saturating_sub(1);
-                
                 if task_state.energy_points == 0 {
                     self.output
                         .on_error("[Task] Energy depleted (potential infinite loop). Stopping with partial progress.")
@@ -1300,10 +1298,11 @@ impl AgentLoop {
                 // Reward: +1 for successful commands, +2 for successful file edits/reads. Max cap: 20.
                 if tool_result.ok {
                     let reward = if tool_name == "read_file" || tool_name == "write_file" { 2 } else { 1 };
-                    task_state.energy_points = (task_state.energy_points + reward).min(20);
+                    task_state.energy_points = (task_state.energy_points + reward).min(25);
                 } else {
-                    // Penalty: Failed commands don't restore energy, draining the budget faster.
-                    task_state.energy_points = task_state.energy_points.saturating_sub(1);
+                    // Penalty: Failed commands don't restore energy. (Already drained 1 at the top of loop).
+                    // We can deduct 1 more if we want to punish failures quickly, but maybe that's too aggressive.
+                    // Let's keep it forgiving to allow debugging.
                 }
 
                 // Deadlock Detection: Has it called the exact same tool with the exact same args multiple times?
