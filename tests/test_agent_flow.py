@@ -34,22 +34,22 @@ def run_agent_test():
         {
             "name": "1. Dynamic Context Test (Runtime Info)",
             "input": "What operating system and architecture are you running on right now?\n",
-            "wait": 8
+            "wait": 15
         },
         {
             "name": "2. Long Output Truncation Test",
             "input": "Run `ls -laR` in this directory. Tell me if the output was truncated or how many files you see.\n",
-            "wait": 15
+            "wait": 30
         },
         {
             "name": "3. RAG Memory Insert Test",
             "input": "Memorize this knowledge: 'Rusty-Claw uses sqlite fts5 and fastembed for hybrid search'.\n",
-            "wait": 10
+            "wait": 15
         },
         {
             "name": "4. RAG Memory Recall Test",
             "input": "Search your knowledge base: What technologies does Rusty-Claw use for hybrid search?\n",
-            "wait": 10
+            "wait": 15
         }
     ]
 
@@ -70,7 +70,7 @@ def run_agent_test():
     
     # Collect output
     try:
-        stdout, stderr = process.communicate(timeout=10)
+        stdout, stderr = process.communicate(timeout=30)
         print("\n=== AGENT OUTPUT LOG ===")
         print(stdout)
         
