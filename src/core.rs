@@ -1198,6 +1198,21 @@ impl AgentLoop {
                     function_response: None,
                 });
             }
+            if matches!(exit_state, RunExit::HardStop { .. } | RunExit::YieldedToUser) {
+                // If we aborted, DO NOT push unexecuted tool calls into the history.
+                // It will violate the API protocol (expected function_response next).
+                // Just push the partial text if any.
+                if let Some(t) = parts.first_mut() {
+                    if t.text.is_some() {
+                        self.context.add_message_to_current_turn(Message {
+                            role: "model".to_string(),
+                            parts: vec![t.clone()],
+                        });
+                    }
+                }
+                break;
+            }
+
             for call in &tool_calls {
                 if call.name.trim().is_empty() {
                     continue; // Skip hallucinated empty tool calls
@@ -1213,9 +1228,6 @@ impl AgentLoop {
                     role: "model".to_string(),
                     parts,
                 });
-            }
-            if matches!(exit_state, RunExit::HardStop { .. } | RunExit::YieldedToUser) {
-                break;
             }
 
             if !full_text.is_empty() && !full_text.ends_with('\n') {
