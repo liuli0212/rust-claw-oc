@@ -352,11 +352,15 @@ impl AgentLoop {
             "搜索",
             "查找",
             "分析",
+            "继续",
+            "continue",
+            "next",
+            "下一步",
         ];
         markers.iter().any(|m| lower.contains(m))
             || lower.contains("src/")
             || lower.contains(".rs")
-            || trimmed.chars().count() >= 80
+            || trimmed.chars().count() >= 40
     }
 
     fn max_attempts_for_input(query: &str) -> usize {
@@ -1378,7 +1382,9 @@ Use tools proactively and perform one concrete next action. If complete, clearly
                 // For simple prompts, a direct model reply is enough. Exit before task-iteration checks.
                 // However, if we just executed a tool (has_tool_observation), the model MUST output text before we can consider it done.
                 // It also must not just say a single word, it should be a real explanation if there was a tool output.
-                if !is_complex_task && !full_text.trim().is_empty() && (!has_tool_observation || full_text.trim().len() > 10) {
+                // AND if the text contains phrases implying it will do something NEXT (e.g. "正在注入", "接下来"), we should NOT exit.
+                let implies_continuation = full_text.contains("正在") || full_text.contains("接下来") || full_text.contains("will now") || full_text.contains("going to");
+                if !is_complex_task && !full_text.trim().is_empty() && (!has_tool_observation || full_text.trim().len() > 10) && !implies_continuation {
                     exit_state = RunExit::CompletedWithReply;
                     if Self::should_emit_verbose_progress() {
                         self.output
