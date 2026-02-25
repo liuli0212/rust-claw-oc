@@ -1269,8 +1269,14 @@ impl AgentLoop {
             // Execute tools
             let mut response_parts = Vec::new();
             let mut requested_finish = false;
+            let mut executed_signatures = std::collections::HashSet::new();
 
             for call in tool_calls {
+                let sig = format!("{}:{}", call.name, call.args.to_string());
+                if !executed_signatures.insert(sig) {
+                    // Deduplicate identical parallel tool calls (common hallucination in Qwen/OpenAI compat)
+                    continue;
+                }
                 let tool_name = call.name.clone();
                 let tool_args = call.args.clone();
 

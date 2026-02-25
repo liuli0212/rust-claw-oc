@@ -434,6 +434,7 @@ impl LlmClient for OpenAiCompatClient {
             "model": self.model_name,
             "messages": openai_messages,
             "stream": true,
+            "parallel_tool_calls": false, // Prevent buggy multiple identical tool calls from Qwen/OpenAI
         });
 
         if !tools.is_empty() {
