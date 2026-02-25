@@ -561,58 +561,6 @@ impl AgentLoop {
         Some(summary)
     }
 
-    fn tool_purpose(tool_name: &str, tool_args: &Value, model_text: &str) -> String {
-        let base = match tool_name {
-            "execute_bash" => {
-                let cmd = tool_args
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<empty>");
-                format!("执行命令并验证结果：`{}`", cmd)
-            }
-            "read_file" => {
-                let path = tool_args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unknown>");
-                format!("读取文件以确认实现细节：`{}`", path)
-            }
-            "write_file" => {
-                let path = tool_args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unknown>");
-                format!("写入代码或配置变更：`{}`", path)
-            }
-            "web_fetch" => {
-                let url = tool_args
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unknown>");
-                format!("抓取网页原文用于回答：`{}`", url)
-            }
-            "web_search_tavily" => {
-                let query = tool_args
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("<unknown>");
-                format!("检索外部资料：`{}`", query)
-            }
-            "task_plan" => "更新任务计划状态并同步进展".to_string(),
-            "read_workspace_memory" => "读取工作区记忆以恢复上下文".to_string(),
-            "write_workspace_memory" => "记录关键信息到工作区记忆".to_string(),
-            "search_knowledge_base" => "检索知识库历史经验".to_string(),
-            "memorize_knowledge" => "沉淀新知识到知识库".to_string(),
-            _ => "执行下一步动作并收集可验证证据".to_string(),
-        };
-
-        if let Some(intent) = Self::summarize_model_intent(model_text) {
-            format!("{}；依据：{}", base, intent)
-        } else {
-            base
-        }
-    }
-
     fn rewrite_memory_query(query: &str) -> String {
         let trimmed = query.trim();
         if trimmed.is_empty() {
@@ -1047,6 +995,7 @@ impl AgentLoop {
             let prompt_build_started = Instant::now();
             let (history, system_instruction, prompt_report) = self.context.build_llm_payload();
             prompt_build_ms_acc += prompt_build_started.elapsed().as_millis();
+            tracing::trace!("LLM Payload Context - System Instruction: {:?} | History length: {} messages", system_instruction, history.len());
             if !prompt_report_emitted {
                 self.emit_prompt_report(
                     &prompt_report,
@@ -1317,13 +1266,26 @@ impl AgentLoop {
                     break;
                 }
 
+                // Extract the forced thought parameter if it exists
+                let mut extracted_thought = None;
+                if let Some(obj) = tool_args.as_object() {
+                    if let Some(t) = obj.get("thought").and_then(|v| v.as_str()) {
+                        extracted_thought = Some(t.to_string());
+                    }
+                }
+                
+                if let Some(thought) = extracted_thought {
+                    self.output.on_text(&format!("
+[90m[Thinking]: {}[0m
+", thought)).await;
+                }
+
                 if Self::should_emit_verbose_progress() {
                     self.output
                         .on_text(&format!(
-                            "[Progress] 准备执行：{}。目的：{}。
+                            "[Progress] 准备执行：{}
 ",
-                            tool_name,
-                            Self::tool_purpose(&tool_name, &tool_args, &full_text)
+                            tool_name
                         ))
                         .await;
                 }
@@ -1337,7 +1299,10 @@ impl AgentLoop {
                     .await;
                 tool_exec_ms_acc += tool_exec_started.elapsed().as_millis();
                 if !tool_result.ok {
+                    tracing::warn!("Tool execution failed: {} - {}", tool_name, tool_result.output);
                     task_state.last_error = Some(tool_result.output.clone());
+                } else {
+                    tracing::debug!("Tool execution succeeded: {}", tool_name);
                 }
                 let result_str = if tool_result.recovery_attempted {
                     format!(
