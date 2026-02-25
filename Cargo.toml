@@ -29,6 +29,8 @@ rusqlite = { version = "0.38.0", features = ["bundled"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+dirs = "5.0"
 
 [dev-dependencies]
 tempfile = "3.25.0"
