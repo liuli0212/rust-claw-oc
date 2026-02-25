@@ -23,6 +23,7 @@ pub enum LlmError {
 #[derive(Debug)]
 pub enum StreamEvent {
     Text(String),
+    Thought(String),
     ToolCall(FunctionCall, Option<String>),
     Error(String),
     Done,
@@ -134,6 +135,12 @@ impl LlmClient for GeminiClient {
             self.model_name, self.api_key
         );
 
+        tracing::debug!(
+            "Gemini generate_text request: url={}, body={}",
+            url,
+            serde_json::to_string(&req_body).unwrap_or_default()
+        );
+
         let response = self
             .client
             .post(&url)
@@ -187,7 +194,7 @@ impl LlmClient for GeminiClient {
             );
 
             let body_json_string = serde_json::to_string(&req_body).unwrap_or_default();
-            tracing::trace!("Sending request to Gemini API: url={}, payload_size={} bytes", url, body_json_string.len());
+            tracing::debug!("Gemini stream request: url={}, body={}", url, body_json_string);
             let resp = match client
                 .post(&url)
                 .header(CONTENT_TYPE, "application/json")
@@ -240,6 +247,9 @@ impl LlmClient for GeminiClient {
                                     json["candidates"][0]["content"]["parts"].as_array()
                                 {
                                     for part in parts {
+                                        if let Some(thought) = part["thought"].as_str() {
+                                            let _ = tx.send(StreamEvent::Thought(thought.to_string())).await;
+                                        }
                                         if let Some(text) = part["text"].as_str() {
                                             let _ =
                                                 tx.send(StreamEvent::Text(text.to_string())).await;

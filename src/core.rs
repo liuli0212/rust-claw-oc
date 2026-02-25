@@ -1091,6 +1091,9 @@ impl AgentLoop {
                     first_event_recorded = true;
                 }
                 match event {
+                    StreamEvent::Thought(thought) => {
+                        self.output.on_text(&format!("\n\x1b[90m[Thinking]: {} \x1b[0m\n", thought)).await;
+                    }
                     StreamEvent::Text(text) => {
                         raw_full_text.push_str(&text);
                         let (visible_text, saw_no_reply, saw_heartbeat) =
@@ -1286,7 +1289,7 @@ impl AgentLoop {
 
                 if let Some(thought) = extracted_thought {
                     self.output.on_text(&format!("
-[90m[Thinking]: {}[0m
+ \x1b[90m[Thinking]: {} \x1b[0m
 ", thought)).await;
                 }
 
