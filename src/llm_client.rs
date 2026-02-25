@@ -490,37 +490,41 @@ impl LlmClient for OpenAiCompatClient {
             while let Some(chunk_res) = stream.next().await {
                 if let Ok(chunk) = chunk_res {
                     buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(idx) = buffer.find("\n\n") {
-                        let line = buffer[..idx].trim().to_string();
-                        buffer = buffer[idx + 2..].to_string();
+                    
+                    // Process complete lines
+                    let mut lines = Vec::new();
+                    while let Some(idx) = buffer.find('\n') {
+                        lines.push(buffer[..idx].to_string());
+                        buffer = buffer[idx + 1..].to_string();
+                    }
+
+                    for line in lines {
+                        let line = line.trim();
                         if line.starts_with("data: ") {
                             let data = &line[6..];
                             if data == "[DONE]" {
-                                break;
+                                continue;
                             }
                             if let Ok(json) = serde_json::from_str::<Value>(data) {
-                                if let Some(choices) = json["choices"].as_array() {
+                                if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
                                     for choice in choices {
                                         if let Some(delta) = choice.get("delta") {
-                                            if let Some(content) =
-                                                delta.get("content").and_then(|v| v.as_str())
-                                            {
-                                                let _ = tx
-                                                    .send(StreamEvent::Text(content.to_string()))
-                                                    .await;
+                                            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                                                if !content.is_empty() {
+                                                    let _ = tx.send(StreamEvent::Text(content.to_string())).await;
+                                                }
                                             }
-                                            if let Some(tool_calls) =
-                                                delta.get("tool_calls").and_then(|v| v.as_array())
-                                            {
+                                            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                                                 for tc in tool_calls {
                                                     let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                    let entry = active_tools.entry(idx).or_insert_with(|| (String::new(), String::new()));
+                                                    
                                                     if let Some(func) = tc.get("function") {
-                                                        let entry = active_tools.entry(idx).or_insert_with(|| (String::new(), String::new()));
-                                                        if let Some(n) = func.get("name").and_then(|v| v.as_str()) {
-                                                            entry.0.push_str(n);
+                                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                                            entry.0.push_str(name);
                                                         }
-                                                        if let Some(arg_chunk) = func.get("arguments").and_then(|v| v.as_str()) {
-                                                            entry.1.push_str(arg_chunk);
+                                                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                                            entry.1.push_str(args);
                                                         }
                                                     }
                                                 }
@@ -533,13 +537,54 @@ impl LlmClient for OpenAiCompatClient {
                     }
                 }
             }
+
+            // Flush remaining buffer if it looks like a line
+            let final_line = buffer.trim();
+            if final_line.starts_with("data: ") {
+                let data = &final_line[6..];
+                if data != "[DONE]" {
+                    if let Ok(json) = serde_json::from_str::<Value>(data) {
+                         if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
+                                    for choice in choices {
+                                        if let Some(delta) = choice.get("delta") {
+                                            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                                                if !content.is_empty() {
+                                                    let _ = tx.send(StreamEvent::Text(content.to_string())).await;
+                                                }
+                                            }
+                                            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                                for tc in tool_calls {
+                                                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                                                    let entry = active_tools.entry(idx).or_insert_with(|| (String::new(), String::new()));
+                                                    
+                                                    if let Some(func) = tc.get("function") {
+                                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                                            entry.0.push_str(name);
+                                                        }
+                                                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                                            entry.1.push_str(args);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                    }
+                }
+            }
+
             // Send all accumulated tool calls, sorted by index to preserve order
             let mut tool_indices: Vec<usize> = active_tools.keys().cloned().collect();
             tool_indices.sort_unstable();
             for idx in tool_indices {
                 if let Some((name, args_str)) = active_tools.remove(&idx) {
                     if !name.trim().is_empty() {
-                        let args = serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null);
+                        let args = if args_str.trim().is_empty() {
+                            serde_json::Value::Object(serde_json::Map::new())
+                        } else {
+                            serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
+                        };
                         let _ = tx.send(StreamEvent::ToolCall(FunctionCall {
                             name,
                             args,
