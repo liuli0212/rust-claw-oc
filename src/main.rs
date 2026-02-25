@@ -177,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!("Using Aliyun provider with model: {}", model);
             Arc::new(OpenAiCompatClient::new(
                 api_key,
-                "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string(),
+                "https://coding.dashscope.aliyuncs.com/v1/chat/completions".to_string(),
                 model,
             ))
         }
@@ -272,7 +272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(_) = tokio::signal::ctrl_c().await {
             // First Ctrl+C: Cancel the current agent.
             sm_clone.cancel_session("cli").await;
-            
+
             // If they press it again, exit?
             // Actually, tokio::signal::ctrl_c() is a one-shot or stream.
             // Let's loop it:
