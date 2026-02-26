@@ -224,6 +224,11 @@ impl AgentContext {
         // Add Task Plan Instruction
         project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
         project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
+        project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n");
+        project_context.push_str("HOWEVER, if the user explicitly issues a new, unrelated command or asks to change direction, you should prioritize the user's new request over the existing plan (ask for confirmation if unsure).\n\n");
+        // Add Task Plan Instruction
+        project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
+        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
         project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n\n");
         if let Ok(content) = fs::read_to_string("AGENTS.md") {
             project_context.push_str("### AGENTS.md\n");
@@ -533,7 +538,18 @@ impl AgentContext {
             self.build_history_with_budget();
         let mut current_turn_tokens = 0;
         if let Some(turn) = &self.current_turn {
-            if let Some(sanitized_turn) = Self::sanitize_turn(turn) {
+            if let Some(mut sanitized_turn) = Self::sanitize_turn(turn) {
+                // FOCUS BOOSTER: If history is long, reinforce the new instruction.
+                if history_turns_included >= 2 {
+                    if let Some(user_msg) = sanitized_turn.messages.iter_mut().find(|m| m.role == "user") {
+                        if let Some(part) = user_msg.parts.first_mut() {
+                            if let Some(text) = &mut part.text {
+                                *text = format!("[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]\n\n{}", text);
+                            }
+                        }
+                    }
+                }
+
                 current_turn_tokens = sanitized_turn
                     .messages
                     .iter()
