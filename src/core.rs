@@ -59,10 +59,12 @@ struct TaskState {
     last_error: Option<String>,
     recovery_attempts: usize,
     recovery_rule_hits: HashMap<String, usize>,
-
+    consecutive_failures: usize,
+    frustration_level: usize,
     // Deadlock detection & Dynamic Budget
     energy_points: usize,
     recent_tool_signatures: Vec<String>,
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -986,6 +988,8 @@ impl AgentLoop {
             last_error: None,
             recovery_attempts: 0,
             recovery_rule_hits: HashMap::new(),
+            consecutive_failures: 0,
+            frustration_level: 0,
             energy_points: 20, // Starting energy
             recent_tool_signatures: Vec::new(),
         };
@@ -1020,6 +1024,32 @@ impl AgentLoop {
             );
             task_state.iterations += 1;
             task_state.energy_points = task_state.energy_points.saturating_sub(1);
+            
+            // Rethink Trigger: Low Energy
+            if task_state.energy_points == 5 {
+                 self.context.add_message_to_current_turn(Message {
+                        role: "user".to_string(),
+                        parts: vec![Part {
+                            thought_signature: None,
+                            text: Some("SYSTEM ALERT: Energy is low (5 points left). Please wrap up the current task or focus on the critical path. If you are stuck, use `finish_task` to report partial progress.".to_string()),
+                            function_call: None,
+                            function_response: None,
+                        }],
+                    });
+            }
+            
+            // Rethink Trigger: High Iteration Count
+            if task_state.iterations == 15 {
+                 self.context.add_message_to_current_turn(Message {
+                        role: "user".to_string(),
+                        parts: vec![Part {
+                            thought_signature: None,
+                            text: Some("SYSTEM ALERT: You have taken 15 steps. Please pause and Review your progress. Are you looping? If so, try a different strategy.".to_string()),
+                            function_call: None,
+                            function_response: None,
+                        }],
+                    });
+            }
             if Self::should_emit_verbose_progress() {
                 let objective = "寻找解决方案并执行，或调用 finish_task 结束";
                 self.output
@@ -1347,8 +1377,31 @@ impl AgentLoop {
                 if !tool_result.ok {
                     tracing::error!("Tool execution failed: {} - {}", tool_name, crate::utils::truncate_log(&tool_result.output));
                     task_state.last_error = Some(tool_result.output.clone());
+                    task_state.consecutive_failures += 1;
+                    
+                    if task_state.consecutive_failures >= 3 {
+                        task_state.frustration_level += 1;
+                        task_state.consecutive_failures = 0; 
+                        task_state.energy_points = task_state.energy_points.saturating_add(3).min(30);
+                        
+                        self.output.on_text(&format!(
+                            "\n\x1b[33m[System] Warning: {} consecutive failures. Boosting energy (+3) and pausing to reflect.\x1b[0m\n",
+                            3
+                        )).await;
+                        
+                        self.context.add_message_to_current_turn(Message {
+                            role: "user".to_string(),
+                            parts: vec![Part {
+                                text: Some("SYSTEM ALERT: You are failing repeatedly. STOP and THINK. Do not repeat the same command. Analyze the error message carefully. Try a different approach (e.g. read_file instead of grep, or ls -R).".to_string()),
+                                function_call: None,
+                                function_response: None,
+                                thought_signature: None,
+                            }],
+                        });
+                    }
                 } else {
                     tracing::info!("Tool execution succeeded: {}", tool_name);
+                    task_state.consecutive_failures = 0;
                 }
                 let result_str = if tool_result.recovery_attempted {
                     format!(
