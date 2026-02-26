@@ -336,6 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if line == "/new" {
                     session_manager.reset_session("cli").await;
+                    let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
                     println!("\x1b[32m[System] Session cleared. Starting fresh.\x1b[0m");
                     continue;
                 }
