@@ -63,16 +63,15 @@ struct TaskState {
     consecutive_no_tool_warnings: usize,
     frustration_level: usize,
     // Deadlock detection & Dynamic Budget
-    energy_points: usize,
     recent_tool_signatures: Vec<String>,
     // Alert flags
     low_energy_alert_sent: bool,
     high_turns_alert_sent: bool,
-
+    consecutive_empty_responses: usize,
+    energy_points: usize,
 
 }
 
-#[derive(Debug, PartialEq)]
 pub enum InterventionAction {
     None,
     Warn(String),
@@ -1090,10 +1089,12 @@ impl AgentLoop {
             consecutive_no_tool_warnings: 0,
             frustration_level: 0,
             energy_points: start_energy,
+            consecutive_empty_responses: 0,
             recent_tool_signatures: Vec::new(),
             low_energy_alert_sent: false,
             high_turns_alert_sent: false,
         };
+
 
         let mut prompt_report_emitted = false;
 
@@ -1388,10 +1389,34 @@ impl AgentLoop {
                 }
 
                 if Self::should_emit_verbose_progress() {
-                    self.output
-                        .on_text("[Progress] 模型未调用任何工具 (包括 finish_task)。强制要求其继续执行或结案...\n")
+self.output
+.on_text("[Progress] 模型未调用任何工具 (包括 finish_task)。强制要求其继续执行或结案...\n")
                         .await;
                 }
+
+                // Handle empty response (Model glitch/STOP with no content)
+                if full_text.trim().is_empty() {
+                     task_state.consecutive_empty_responses += 1;
+                     let attempts = task_state.consecutive_empty_responses;
+
+                     // Exponential Backoff: 1s, 2s, 4s, 8s, 16s, 30s...
+                     let backoff_ms = (2u64.pow((attempts as u32).min(6)) * 1000).min(30_000);
+
+                     self.output.on_text(&format!("\n[System] Model returned empty response (Attempt {}). Cooling down for {}s...\n", attempts, backoff_ms / 1000)).await;
+
+                     if attempts > 10 {
+                          self.output.on_error("[System] Persistent empty responses for >3 minutes. Yielding to user.").await;
+                          exit_state = RunExit::YieldedToUser;
+                          break;
+                     }
+
+                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                     // Do NOT inject warning message to keep context clean. Just retry.
+                     continue;
+                } else {
+                     task_state.consecutive_empty_responses = 0;
+                }
+
 
                 task_state.consecutive_no_tool_warnings += 1;
                 let warning_msg = if task_state.consecutive_no_tool_warnings == 1 {
