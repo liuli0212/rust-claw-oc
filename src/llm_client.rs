@@ -271,33 +271,73 @@ impl LlmClient for GeminiClient {
                 model_name, api_key
             );
 
-            let body_json_string = serde_json::to_string(&req_body).unwrap_or_default();
-            tracing::info!("Gemini stream request: url={}, body={}", url, truncate_log(&body_json_string));
-            let resp = match client
-                .post(&url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(body_json_string)
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => r,
-                Ok(r) => {
-                    let status = r.status();
-                    let body = r.text().await.unwrap_or_default();
-                    tracing::error!("Gemini Stream API Error: status={} body={}", status, truncate_log_error(&body));
-                    let _ = tx
-                        .send(StreamEvent::Error(format!(
-                            "Gemini API error: {} body={}",
-                            status, body
-                        ))).await;
-                    return;
+            let mut attempts = 0;
+            let max_attempts = 5;
+            let mut last_error = String::from("initialization");
+
+            let resp = loop {
+                attempts += 1;
+                let body_json_string = serde_json::to_string(&req_body).unwrap_or_default();
+                
+                tracing::info!(
+                    "Sending Gemini stream request (Attempt {}/{}): body={}",
+                    attempts,
+                    max_attempts,
+                    truncate_log(&body_json_string)
+                );
+
+                let req_result = client
+                    .post(&url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body_json_string)
+                    .send()
+                    .await;
+
+                match req_result {
+                    Ok(r) if r.status().is_success() => break r,
+                    Ok(r) => {
+                        let status = r.status();
+                        let is_transient = status.is_server_error() || status.as_u16() == 429;
+                        let body = r.text().await.unwrap_or_default();
+                        last_error = format!("status={} body={}", status, truncate_log_error(&body));
+                        
+                        tracing::warn!(
+                            "Gemini Stream API Error (Attempt {}/{}): {}",
+                            attempts,
+                            max_attempts,
+                            last_error
+                        );
+
+                        if !is_transient || attempts >= max_attempts {
+                            let _ = tx.send(StreamEvent::Error(format!(
+                                "Gemini API error after {} attempts: {}",
+                                attempts, last_error
+                            ))).await;
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        last_error = e.to_string();
+                        tracing::warn!(
+                            "Gemini Network Error (Attempt {}/{}): {}",
+                            attempts,
+                            max_attempts,
+                            last_error
+                        );
+
+                        if attempts >= max_attempts {
+                            let _ = tx.send(StreamEvent::Error(format!(
+                                "Gemini network error after {} attempts: {}",
+                                attempts, last_error
+                            ))).await;
+                            return;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("Gemini Network Error: {}", e);
-                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                    return;
-                }
+
+                let backoff = std::time::Duration::from_secs(1 << (attempts - 1));
+                tracing::info!("Transient error detected. Retrying in {:?}...", backoff);
+                tokio::time::sleep(backoff).await;
             };
 
             let mut stream = resp.bytes_stream();
@@ -494,9 +534,15 @@ impl LlmClient for OpenAiCompatClient {
             .await?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await?;
-            tracing::error!("OpenAI API Error: {}", truncate_log_error(&error_text));
-            return Err(LlmError::ApiError(error_text));
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_else(|_| "Could not read error body".to_string());
+            tracing::error!(
+                "OpenAI API Error: status={}, url={}, body={}",
+                status,
+                self.base_url,
+                truncate_log_error(&error_text)
+            );
+            return Err(LlmError::ApiError(format!("OpenAI API error: {} body={}", status, error_text)));
         }
 
         let resp_json: Value = response.json().await?;
@@ -567,34 +613,76 @@ impl LlmClient for OpenAiCompatClient {
         let base_url = self.base_url.clone();
 
         tokio::spawn(async move {
-            let body_json_string = serde_json::to_string(&body_map).unwrap_or_default();
-            tracing::info!("Sending request to OpenAI compat API: url={}, body={}", base_url, truncate_log(&body_json_string));
-            let resp = match client
-                .post(&base_url)
-                .header(AUTHORIZATION, format!("Bearer {}", api_key))
-                .header(CONTENT_TYPE, "application/json")
-                .body(body_json_string)
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => r,
-                Ok(r) => {
-                    let status = r.status();
-                    let body = r.text().await.unwrap_or_default();
-                    tracing::error!("OpenAI Stream API Error: status={} body={}", status, truncate_log_error(&body));
-                    let _ = tx
-                        .send(StreamEvent::Error(format!(
-                            "OpenAI API error: {} body={}",
-                            status, body
-                        ))).await;
-                    return;
+            let mut attempts = 0;
+            let max_attempts = 5;
+            let mut last_error = String::from("initialization");
+
+            let resp = loop {
+                attempts += 1;
+                let body_json_string = serde_json::to_string(&body_map).unwrap_or_default();
+                
+                tracing::info!(
+                    "Sending stream request to {} (Attempt {}/{}): body={}",
+                    base_url,
+                    attempts,
+                    max_attempts,
+                    truncate_log(&body_json_string)
+                );
+
+                let req_result = client
+                    .post(&base_url)
+                    .header(AUTHORIZATION, format!("Bearer {}", api_key))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body_json_string)
+                    .send()
+                    .await;
+
+                match req_result {
+                    Ok(r) if r.status().is_success() => break r,
+                    Ok(r) => {
+                        let status = r.status();
+                        let is_transient = status.is_server_error() || status.as_u16() == 429;
+                        let body = r.text().await.unwrap_or_default();
+                        last_error = format!("status={} body={}", status, truncate_log_error(&body));
+                        
+                        tracing::warn!(
+                            "OpenAI Stream API Error (Attempt {}/{}): {}",
+                            attempts,
+                            max_attempts,
+                            last_error
+                        );
+
+                        if !is_transient || attempts >= max_attempts {
+                            let _ = tx.send(StreamEvent::Error(format!(
+                                "OpenAI API error after {} attempts: {}",
+                                attempts, last_error
+                            ))).await;
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        last_error = e.to_string();
+                        tracing::warn!(
+                            "OpenAI Network Error (Attempt {}/{}): {}",
+                            attempts,
+                            max_attempts,
+                            last_error
+                        );
+
+                        if attempts >= max_attempts {
+                            let _ = tx.send(StreamEvent::Error(format!(
+                                "OpenAI network error after {} attempts: {}",
+                                attempts, last_error
+                            ))).await;
+                            return;
+                        }
+                    }
                 }
-                Err(e) => {
-                    tracing::error!("OpenAI Network Error: {}", e);
-                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
-                    return;
-                }
+
+                // Exponential backoff: 1s, 2s, 4s, 8s...
+                let backoff = std::time::Duration::from_secs(1 << (attempts - 1));
+                tracing::info!("Transient error detected. Retrying in {:?}...", backoff);
+                tokio::time::sleep(backoff).await;
             };
 
             let mut stream = resp.bytes_stream();
