@@ -16,9 +16,10 @@ This project is a Rust-native implementation of an AI agent, closely following t
 - **🔄 Resilient Context Management:**
   - **Async Compaction:** History summarization runs in the background, never blocking the user's next turn.
   - **Soft Limits:** Allows temporary context overflow to maintain conversation flow while cleanup happens asynchronously.
-- **🎯 Precision Patch Engine:**
-  - **Atomic Edits:** Uses a structured patching mechanism (SEARCH/REPLACE with context) to ensure safe, localized code modifications.
   - **Verification:** Automatically validates context before applying changes, preventing accidental corruption of source files.
+- **⚡ Dual-Phase Task Execution:**
+  - **Phase 1 (Lead Architect):** Analyzes request complexity and generates a multi-step execution plan using a lightweight, low-token prompt.
+  - **Phase 2 (Execution Engineer):** Executes the plan turn-by-turn with full project context (AGENTS.md, README, Environment) and autonomous tool usage.
 - **🔌 Multi-Platform & Multi-Provider:**
   - **Providers:** Supports Google Gemini, Aliyun Qwen, and any OpenAI-compatible API (DeepSeek, LocalAI, vLLM).
   - **Platforms:** Supports CLI, Telegram, and Discord concurrently.
@@ -70,8 +71,9 @@ model = "deepseek-chat"
 [providers.aliyun]
 type = "openai_compat"
 api_key_env = "DASHSCOPE_API_KEY"
-base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-model = "qwen-plus"
+# Note: For Aliyun Coding Plan, use the full endpoint path
+base_url = "https://coding.dashscope.aliyuncs.com/v1/chat/completions"
+model = "qwen3.5-plus"
 ```
 
 ### 4. CLI Commands

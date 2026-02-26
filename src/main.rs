@@ -339,11 +339,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() < 2 {
                         println!("\x1b[31mUsage: /model <provider> [model]\x1b[0m");
-                        println!("Current providers: gemini, aliyun, openai_compat");
+                        // Show available providers from config
+                        let config = crate::config::AppConfig::load();
+                        let providers: Vec<&String> = config.providers.keys().collect();
+                        println!("Available providers: {}", providers.join(", "));
                         continue;
                     }
                     let provider = parts[1];
                     let model = parts.get(2).map(|s| s.to_string());
+                    
+                    // Ensure session exists first
+                    let _agent = session_manager
+                        .get_or_create_session("cli", output.clone())
+                        .await;
                     
                     match session_manager.update_session_llm("cli", provider, model).await {
                         Ok(msg) => println!("\x1b[32m[System] {}\x1b[0m", msg),

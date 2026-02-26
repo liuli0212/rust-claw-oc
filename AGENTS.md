@@ -33,7 +33,7 @@ Welcome, Agent. You are operating within `rusty-claw-oc`, a high-performance, si
 ## 🏗️ Architecture Overview
 
 Rusty-Claw relies on a minimal-dependency, highly synchronous/asynchronous hybrid architecture:
-- **`src/core.rs`**: Contains `AgentLoop`, the core state machine that orchestrates API calls, context management, and tool execution. Includes Auto-Compaction for long context windows.
+- **`src/core.rs`**: Contains `AgentLoop`, the core state machine. It implements a **Dual-Phase Execution** strategy: `analyze_request` for initial planning (Lead Architect mode) and a main `step` loop for turn-by-turn execution (Engineer mode). Includes Auto-Compaction for long context windows.
 - **`src/context.rs`**: Manages the conversational turns, dynamic System Prompt assembly (injecting OS/Arch, WorkDir, and local MD files), and intelligent Token Budgeting (history squashing).
 - **`src/tools.rs`**: Contains the implementations of the Agent's capabilities (`BashTool`, `WriteFileTool`, `ReadFileTool`, etc.). Tools implement the async `Tool` trait.
 - **`src/llm_client.rs`**: Handles communication with the Gemini API (default: `gemini-3.1-pro-preview`). Supports both streaming and single-shot generation.
