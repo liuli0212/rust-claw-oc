@@ -976,21 +976,7 @@ impl AgentLoop {
 
         self.context.start_turn(user_input.clone());
         let plan_path = std::path::Path::new(".rusty_claw_task_plan.json");
-        if !plan_path.exists() {
-             let is_complex = user_input.len() > 100 || ["plan", "complex", "refactor", "feature", "implement", "architect"].iter().any(|k| user_input.to_lowercase().contains(k));
-             if is_complex {
-                 self.output.on_text("\n\x1b[36m[System] Detected complex task. Suggesting `task_plan` creation to the agent.\x1b[0m\n").await;
-                 self.context.add_message_to_current_turn(Message {
-                     role: "user".to_string(),
-                     parts: vec![Part {
-                         text: Some("SYSTEM SUGGESTION: This task seems complex. Consider using the `task_plan` tool to create a structured plan (use action='add' to start). This helps track progress and ensures nothing is missed.".to_string()),
-                         function_call: None,
-                         function_response: None,
-                         thought_signature: None,
-                     }],
-                 });
-             }
-        }
+        let start_energy = if plan_path.exists() { 50 } else { 30 };
         let mut task_state = TaskState {
             goal: self
                 .context
@@ -1006,7 +992,7 @@ impl AgentLoop {
             recovery_rule_hits: HashMap::new(),
             consecutive_failures: 0,
             frustration_level: 0,
-            energy_points: 20, // Starting energy
+            energy_points: start_energy,
             recent_tool_signatures: Vec::new(),
         };
         let mut prompt_report_emitted = false;
@@ -1450,13 +1436,25 @@ impl AgentLoop {
                 // Cost: 1 energy point per iteration.
                 // Reward: +1 for successful commands, +2 for successful file edits/reads. Max cap: 20.
                 if tool_result.ok {
+                    let mut reward = if tool_name == "read_file" || tool_name == "write_file" { 2 } else { 1 };
+                    
+                    if tool_name == "task_plan" {
+                        reward = 2; 
+                        if let Some(action) = tool_args.get("action").and_then(|v| v.as_str()) {
+                            if action == "update_status" {
+                                if let Some(status) = tool_args.get("status").and_then(|v| v.as_str()) {
+                                    if status == "completed" {
+                                        reward = 5; 
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    task_state.energy_points = (task_state.energy_points + reward).min(60);
+                }
                     let reward = if tool_name == "read_file" || tool_name == "write_file" { 2 } else { 1 };
                     task_state.energy_points = (task_state.energy_points + reward).min(25);
-                } else {
-                    // Penalty: Failed commands don't restore energy. (Already drained 1 at the top of loop).
-                    // We can deduct 1 more if we want to punish failures quickly, but maybe that's too aggressive.
-                    // Let's keep it forgiving to allow debugging.
-                }
 
                 // Deadlock Detection: Has it called the exact same tool with the exact same args multiple times?
                 let call_signature = format!("{}:{}", tool_name, tool_args.to_string());
