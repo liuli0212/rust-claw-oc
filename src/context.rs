@@ -539,8 +539,8 @@ impl AgentContext {
         let mut current_turn_tokens = 0;
         if let Some(turn) = &self.current_turn {
             if let Some(mut sanitized_turn) = Self::sanitize_turn(turn) {
-                // FOCUS BOOSTER: If history is long, reinforce the new instruction.
-                if history_turns_included >= 2 {
+                // FOCUS BOOSTER: Reinforce the new instruction. Too many history turns can make the model forget the new instruction.
+                if history_turns_included >= 1 {
                     if let Some(user_msg) = sanitized_turn.messages.iter_mut().find(|m| m.role == "user") {
                         if let Some(part) = user_msg.parts.first_mut() {
                             if let Some(text) = &mut part.text {
