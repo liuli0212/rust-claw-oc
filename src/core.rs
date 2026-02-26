@@ -1051,9 +1051,18 @@ impl AgentLoop {
              if let Some(plan) = self.analyze_request(&user_input).await {
                  if Self::should_emit_verbose_progress() {
                      self.output.on_text(&format!("[System] Complex task detected. Generated {}-step plan.\n", plan.plan.len())).await;
-
-                     self.output.on_text(&format!("[System] Reasoning: {}\n", plan.reasoning)).await;
                  }
+                 
+                 // ALWAYS print the reasoning and plan to the user, not just in verbose mode.
+                 // This is critical feedback for the user to understand what the agent is doing.
+                 self.output.on_text("\n\x1b[36m[System] Task Analysis & Plan:\x1b[0m\n").await;
+                 self.output.on_text(&format!("\x1b[90mReasoning: {}\x1b[0m\n", plan.reasoning)).await;
+                 self.output.on_text("Plan:\n").await;
+                 for (i, step) in plan.plan.iter().enumerate() {
+                     self.output.on_text(&format!("{}. {}\n", i + 1, step)).await;
+                 }
+                 self.output.on_text("\n").await;
+
                  // Write plan file
                  let state = crate::tools::TaskPlanState {
                      items: plan.plan.into_iter().map(|step| crate::tools::TaskPlanItem {
