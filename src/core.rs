@@ -60,11 +60,24 @@ struct TaskState {
     recovery_attempts: usize,
     recovery_rule_hits: HashMap<String, usize>,
     consecutive_failures: usize,
+    consecutive_no_tool_warnings: usize,
     frustration_level: usize,
     // Deadlock detection & Dynamic Budget
     energy_points: usize,
     recent_tool_signatures: Vec<String>,
+    // Alert flags
+    low_energy_alert_sent: bool,
+    high_turns_alert_sent: bool,
 
+
+}
+
+#[derive(Debug, PartialEq)]
+pub enum InterventionAction {
+    None,
+    Warn(String),
+    HardStop(String),
+    BoostEnergy { amount: usize, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +156,10 @@ impl AgentLoop {
     pub fn get_context_details(&self) -> String {
         self.context.get_context_details()
     }
+    pub fn update_llm(&mut self, new_llm: Arc<dyn LlmClient>) {
+        self.llm = new_llm;
+    }
+
 
     pub async fn force_compact(&mut self) -> Result<String, String> {
         match self.maybe_compact_history(true).await {
@@ -271,7 +288,7 @@ impl AgentLoop {
                 .await;
 
             let _ = self.maybe_compact_history(true).await;
-            let truncated = self.context.truncate_current_turn_tool_results(2_000);
+            let truncated = self.context.truncate_current_turn_tool_results(20_000);
             if truncated > 0 {
                 self.output
                     .on_text(&format!(
@@ -922,7 +939,8 @@ impl AgentLoop {
         let text = format!("[Recovery Stats] {}\n", stats.join(", "));
         self.output.on_text(&text).await;
     }
-    async fn analyze_request(&self, user_input: &str) -> Option<Vec<String>> {
+    async fn analyze_request(&self, user_input: &str) -> Option<AnalysisOutput> {
+
         let sys_msg = Message {
             role: "system".to_string(),
             parts: vec![Part {
@@ -947,7 +965,7 @@ impl AgentLoop {
                 let cleaned = text.trim().trim_start_matches("```json").trim_end_matches("```").trim();
                 if let Ok(parsed) = serde_json::from_str::<AnalysisOutput>(cleaned) {
                     if parsed.is_complex && !parsed.plan.is_empty() {
-                        return Some(parsed.plan);
+                        return Some(parsed);
                     }
                 }
                 None
@@ -955,6 +973,7 @@ impl AgentLoop {
             Err(_) => None,
         }
     }
+
 
 
     pub async fn step(
@@ -1032,11 +1051,13 @@ impl AgentLoop {
              }
              if let Some(plan) = self.analyze_request(&user_input).await {
                  if Self::should_emit_verbose_progress() {
-                     self.output.on_text(&format!("[System] Complex task detected. Generated {}-step plan.\n", plan.len())).await;
+                     self.output.on_text(&format!("[System] Complex task detected. Generated {}-step plan.\n", plan.plan.len())).await;
+
+                     self.output.on_text(&format!("[System] Reasoning: {}\n", plan.reasoning)).await;
                  }
                  // Write plan file
                  let state = crate::tools::TaskPlanState {
-                     items: plan.into_iter().map(|step| crate::tools::TaskPlanItem {
+                     items: plan.plan.into_iter().map(|step| crate::tools::TaskPlanItem {
                          step,
                          status: "pending".to_string(),
                          note: None
@@ -1046,7 +1067,7 @@ impl AgentLoop {
                      let _ = std::fs::write(".rusty_claw_task_plan.json", json);
                  }
              }
-        }
+         }
 
 
         self.context.start_turn(user_input.clone());
@@ -1066,10 +1087,14 @@ impl AgentLoop {
             recovery_attempts: 0,
             recovery_rule_hits: HashMap::new(),
             consecutive_failures: 0,
+            consecutive_no_tool_warnings: 0,
             frustration_level: 0,
             energy_points: start_energy,
             recent_tool_signatures: Vec::new(),
+            low_energy_alert_sent: false,
+            high_turns_alert_sent: false,
         };
+
         let mut prompt_report_emitted = false;
 
         let mut exit_state = RunExit::CompletedSilent {
@@ -1103,7 +1128,7 @@ impl AgentLoop {
             task_state.energy_points = task_state.energy_points.saturating_sub(1);
             
             // Rethink Trigger: Low Energy
-            if task_state.energy_points == 5 {
+            if task_state.energy_points <= 5 && !task_state.low_energy_alert_sent {
                  self.context.add_message_to_current_turn(Message {
                         role: "user".to_string(),
                         parts: vec![Part {
@@ -1113,10 +1138,11 @@ impl AgentLoop {
                             function_response: None,
                         }],
                     });
+                 task_state.low_energy_alert_sent = true;
             }
             
             // Rethink Trigger: High Iteration Count
-            if task_state.iterations == 15 {
+            if task_state.iterations == 15 && !task_state.high_turns_alert_sent {
                  self.context.add_message_to_current_turn(Message {
                         role: "user".to_string(),
                         parts: vec![Part {
@@ -1126,7 +1152,9 @@ impl AgentLoop {
                             function_response: None,
                         }],
                     });
+                 task_state.high_turns_alert_sent = true;
             }
+
             if Self::should_emit_verbose_progress() {
                 let objective = "寻找解决方案并执行，或调用 finish_task 结束";
                 self.output
@@ -1206,6 +1234,7 @@ impl AgentLoop {
                     exit_state = RunExit::YieldedToUser;
                     break;
                 }
+
                 let event = match tokio::time::timeout(Duration::from_secs(8), rx.recv()).await {
                     Ok(ev) => ev,
                     Err(_) => {
@@ -1217,6 +1246,7 @@ impl AgentLoop {
                             ))
                             .await;
                         continue;
+
                     }
                 };
 
@@ -1359,21 +1389,33 @@ impl AgentLoop {
 
                 if Self::should_emit_verbose_progress() {
                     self.output
-                        .on_text("[Progress] 模型未调用任何工具 (包括 finish_task)。强制要求其继续执行或结案...
-")
+                        .on_text("[Progress] 模型未调用任何工具 (包括 finish_task)。强制要求其继续执行或结案...\n")
                         .await;
                 }
+
+                task_state.consecutive_no_tool_warnings += 1;
+                let warning_msg = if task_state.consecutive_no_tool_warnings == 1 {
+                     "You did not call any tools. If the task is incomplete, please proceed with your next tool call. If the task is fully completed, you MUST call the `finish_task` tool to exit the loop.".to_string()
+                } else if task_state.consecutive_no_tool_warnings == 2 {
+                     "SYSTEM WARNING: You are violating the protocol. You have failed to call a tool for the second time in a row. You MUST call a tool (like `finish_task` or `execute_bash`) in your next turn, or the session will be terminated.".to_string()
+                } else {
+                     self.output.on_error("[System] Aborting due to repeated failure to call tools.").await;
+                     exit_state = RunExit::HardStop { reason: "repeated_no_tool_calls".to_string() };
+                     break;
+                };
 
                 self.context.add_message_to_current_turn(Message {
                     role: "user".to_string(),
                     parts: vec![Part {
-                        text: Some("You did not call any tools. If the task is incomplete, please proceed with your next tool call. If the task is fully completed, you MUST call the `finish_task` tool to exit the loop.".to_string()),
+                        text: Some(warning_msg),
                         function_call: None,
                         function_response: None,
                         thought_signature: None,
                     }],
                 });
                 continue;
+            } else {
+                task_state.consecutive_no_tool_warnings = 0;
             }
 
 
@@ -1466,34 +1508,39 @@ impl AgentLoop {
                     .execute_tool_call_with_recovery(&tool_name, &tool_args, &mut task_state)
                     .await;
                 tool_exec_ms_acc += tool_exec_started.elapsed().as_millis();
-                if !tool_result.ok {
-                    tracing::error!("Tool execution failed: {} - {}", tool_name, crate::utils::truncate_log(&tool_result.output));
-                    task_state.last_error = Some(tool_result.output.clone());
-                    task_state.consecutive_failures += 1;
-                    
-                    if task_state.consecutive_failures >= 3 {
-                        task_state.frustration_level += 1;
-                        task_state.consecutive_failures = 0; 
-                        task_state.energy_points = task_state.energy_points.saturating_add(3).min(30);
-                        
+                match Self::assess_consecutive_failures(&mut task_state, tool_result.ok) {
+                    InterventionAction::HardStop(reason) => {
+                         self.output.on_error("[System] Aborting due to persistent consecutive failures despite warnings.").await;
+                         exit_state = RunExit::HardStop { reason };
+                         break;
+                    }
+                    InterventionAction::BoostEnergy { amount, .. } => {
                         self.output.on_text(&format!(
-                            "\n\x1b[33m[System] Warning: {} consecutive failures. Boosting energy (+3) and pausing to reflect.\x1b[0m\n",
-                            3
+                            "\n\x1b[33m[System] Warning: 3 consecutive failures. Boosting energy (+{}) and pausing to reflect.\x1b[0m\n",
+                            amount
                         )).await;
                         
-                        self.context.add_message_to_current_turn(Message {
-                            role: "user".to_string(),
-                            parts: vec![Part {
-                                text: Some("SYSTEM ALERT: You are failing repeatedly. STOP and THINK. Do not repeat the same command. Analyze the error message carefully. Try a different approach (e.g. read_file instead of grep, or ls -R).".to_string()),
-                                function_call: None,
-                                function_response: None,
-                                thought_signature: None,
-                            }],
-                        });
+                        // Deduplicate warning if last message was already a warning
+                        let last_msg_is_warning = self.context.current_turn.as_ref()
+                            .and_then(|t| t.messages.last())
+                            .and_then(|m| m.parts.last())
+                            .and_then(|p| p.text.as_ref())
+                            .map(|t| t.starts_with("SYSTEM ALERT: You are failing repeatedly"))
+                            .unwrap_or(false);
+
+                        if !last_msg_is_warning {
+                            self.context.add_message_to_current_turn(Message {
+                                role: "user".to_string(),
+                                parts: vec![Part {
+                                    text: Some("SYSTEM ALERT: You are failing repeatedly. STOP and THINK. Do not repeat the same command. Analyze the error message carefully. Try a different approach (e.g. read_file instead of grep, or ls -R).".to_string()),
+                                    function_call: None,
+                                    function_response: None,
+                                    thought_signature: None,
+                                }],
+                            });
+                        }
                     }
-                } else {
-                    tracing::info!("Tool execution succeeded: {}", tool_name);
-                    task_state.consecutive_failures = 0;
+                    _ => {}
                 }
                 let result_str = if tool_result.recovery_attempted {
                     format!(
@@ -1538,34 +1585,38 @@ impl AgentLoop {
                     task_state.recent_tool_signatures.remove(0);
                 }
 
-                let mut same_call_count = 0;
-                for sig in &task_state.recent_tool_signatures {
-                    if sig == &call_signature {
-                        same_call_count += 1;
+                match Self::assess_deadlock(&mut task_state, &tool_name, &tool_args.to_string(), tool_result.ok) {
+                    InterventionAction::HardStop(reason) => {
+                         self.output.on_error("[Deadlock] Force stopping due to persistent deadlock.").await;
+                         exit_state = RunExit::HardStop { reason };
+                         break;
                     }
+                    InterventionAction::Warn(msg) => {
+                        self.output.on_error("\n[Deadlock Detected] Agent has failed with the exact same tool call multiple times in a row.\n").await;
+
+                        // Deduplicate warning
+                        let last_msg_is_warning = self.context.current_turn.as_ref()
+                            .and_then(|t| t.messages.last())
+                            .and_then(|m| m.parts.last())
+                            .and_then(|p| p.text.as_ref())
+                            .map(|t| t.starts_with("SYSTEM WARNING: You have executed the exact same failing tool call"))
+                            .unwrap_or(false);
+
+                        if !last_msg_is_warning {
+                            self.context.add_message_to_current_turn(Message {
+                                role: "user".to_string(),
+                                parts: vec![Part {
+                                    thought_signature: None,
+                                    text: Some(msg),
+                                    function_call: None,
+                                    function_response: None,
+                                }]
+                            });
+                        }
+                    }
+                    _ => {}
                 }
 
-                if same_call_count >= 3 && !tool_result.ok {
-                    self.output.on_error(&format!("\n[Deadlock Detected] Agent has failed with the exact same tool call {} times in a row.\n", same_call_count)).await;
-
-                    // Inject a stern warning into the context
-                    let warning_msg = Message {
-                        role: "user".to_string(),
-                        parts: vec![Part {
-                            thought_signature: None,
-                            text: Some(format!(
-                                "SYSTEM WARNING: You have executed the exact same failing tool call (`{}`) {} times in a row. You are stuck in a loop. STOP trying this approach immediately. Use `read_file` to review your code, or try a completely different strategy. If you cannot fix it, use `finish_task` to ask the user for help.",
-                                tool_name, same_call_count
-                            )),
-                            function_call: None,
-                            function_response: None,
-                        }]
-                    };
-                    self.context.add_message_to_current_turn(warning_msg);
-
-                    // Heavily penalize energy to force exit if it keeps doing it
-                    task_state.energy_points = task_state.energy_points.saturating_sub(5);
-                }
 
                 self.output.on_tool_end(&result_str).await;
 
@@ -1635,6 +1686,66 @@ impl AgentLoop {
             .await;
         Ok(exit_state)
     }
+    fn assess_no_tool_intervention(task_state: &mut TaskState) -> InterventionAction {
+        task_state.consecutive_no_tool_warnings += 1;
+        if task_state.consecutive_no_tool_warnings == 1 {
+            InterventionAction::Warn("You did not call any tools. If the task is incomplete, please proceed with your next tool call. If the task is fully completed, you MUST call the `finish_task` tool to exit the loop.".to_string())
+        } else if task_state.consecutive_no_tool_warnings == 2 {
+            InterventionAction::Warn("SYSTEM WARNING: You are violating the protocol. You have failed to call a tool for the second time in a row. You MUST call a tool (like `finish_task` or `execute_bash`) in your next turn, or the session will be terminated.".to_string())
+        } else if task_state.consecutive_no_tool_warnings >= 3 {
+            InterventionAction::HardStop("repeated_no_tool_calls".to_string())
+        } else {
+            InterventionAction::None
+        }
+    }
+
+    fn assess_consecutive_failures(task_state: &mut TaskState, tool_ok: bool) -> InterventionAction {
+        if tool_ok {
+            task_state.consecutive_failures = 0;
+            return InterventionAction::None;
+        }
+
+        task_state.consecutive_failures += 1;
+        if task_state.consecutive_failures >= 3 {
+            task_state.frustration_level += 1;
+            if task_state.frustration_level >= 3 {
+                return InterventionAction::HardStop("persistent_consecutive_failures".to_string());
+            }
+
+            task_state.consecutive_failures = 0;
+            task_state.energy_points = task_state.energy_points.saturating_add(3).min(30);
+            return InterventionAction::BoostEnergy {
+                amount: 3,
+                reason: "3 consecutive failures".to_string(),
+            };
+        }
+        InterventionAction::None
+    }
+
+    fn assess_deadlock(task_state: &mut TaskState, tool_name: &str, args: &str, tool_ok: bool) -> InterventionAction {
+        let call_signature = format!("{}:{}", tool_name, args);
+        task_state.recent_tool_signatures.push(call_signature.clone());
+        if task_state.recent_tool_signatures.len() > 6 {
+            task_state.recent_tool_signatures.remove(0);
+        }
+
+        let same_call_count = task_state.recent_tool_signatures.iter().filter(|s| *s == &call_signature).count();
+
+        if same_call_count >= 5 && !tool_ok {
+            return InterventionAction::HardStop("deadlock_loop".to_string());
+        }
+
+        if same_call_count >= 3 && !tool_ok {
+            task_state.energy_points = task_state.energy_points.saturating_sub(5);
+            return InterventionAction::Warn(format!(
+                "SYSTEM WARNING: You have executed the exact same failing tool call (`{}`) {} times in a row. You are stuck in a loop. STOP trying this approach immediately. Use `read_file` to review your code, or try a completely different strategy. If you cannot fix it, use `finish_task` to ask the user for help.",
+                tool_name, same_call_count
+            ));
+        }
+
+        InterventionAction::None
+    }
+
 }
 
 #[cfg(test)]
@@ -1668,4 +1779,97 @@ mod tests {
             AgentLoop::max_attempts_for_input("请修复 src/core.rs 的 bug 并运行 cargo test") > 1
         );
     }
+
+    #[test]
+    fn test_assess_no_tool_intervention() {
+        let mut state = super::TaskState::default();
+
+        // 1st time: Warn 1
+        let action = AgentLoop::assess_no_tool_intervention(&mut state);
+        assert!(matches!(action, super::InterventionAction::Warn(msg) if msg.contains("You did not call any tools")));
+        assert_eq!(state.consecutive_no_tool_warnings, 1);
+
+        // 2nd time: Warn 2
+        let action = AgentLoop::assess_no_tool_intervention(&mut state);
+        assert!(matches!(action, super::InterventionAction::Warn(msg) if msg.contains("violating the protocol")));
+        assert_eq!(state.consecutive_no_tool_warnings, 2);
+
+        // 3rd time: HardStop
+        let action = AgentLoop::assess_no_tool_intervention(&mut state);
+        assert!(matches!(action, super::InterventionAction::HardStop(reason) if reason == "repeated_no_tool_calls"));
+        assert_eq!(state.consecutive_no_tool_warnings, 3);
+    }
+
+    #[test]
+    fn test_assess_consecutive_failures() {
+        let mut state = super::TaskState::default();
+        state.energy_points = 10;
+
+        // 1. Success resets counter
+        state.consecutive_failures = 5;
+        let action = AgentLoop::assess_consecutive_failures(&mut state, true);
+        assert_eq!(action, super::InterventionAction::None);
+        assert_eq!(state.consecutive_failures, 0);
+
+        // 2. Failures increment counter
+        let action = AgentLoop::assess_consecutive_failures(&mut state, false);
+        assert_eq!(action, super::InterventionAction::None);
+        assert_eq!(state.consecutive_failures, 1);
+
+        let action = AgentLoop::assess_consecutive_failures(&mut state, false);
+        assert_eq!(action, super::InterventionAction::None);
+        assert_eq!(state.consecutive_failures, 2);
+
+        // 3. 3rd failure triggers BoostEnergy
+        let action = AgentLoop::assess_consecutive_failures(&mut state, false);
+        assert!(matches!(action, super::InterventionAction::BoostEnergy { amount: 3, .. }));
+        assert_eq!(state.consecutive_failures, 0); // Resets
+        assert_eq!(state.frustration_level, 1);
+        assert_eq!(state.energy_points, 13); // 10 + 3
+
+        // 4. Repeat until frustration limit
+        // Frustration 1 -> 2
+        state.consecutive_failures = 2;
+        let action = AgentLoop::assess_consecutive_failures(&mut state, false);
+        assert!(matches!(action, super::InterventionAction::BoostEnergy { .. }));
+        assert_eq!(state.frustration_level, 2);
+
+        // Frustration 2 -> 3 (HardStop)
+        state.consecutive_failures = 2;
+        let action = AgentLoop::assess_consecutive_failures(&mut state, false);
+        assert!(matches!(action, super::InterventionAction::HardStop(reason) if reason == "persistent_consecutive_failures"));
+        assert_eq!(state.frustration_level, 3);
+    }
+
+    #[test]
+    fn test_assess_deadlock() {
+        let mut state = super::TaskState::default();
+        state.energy_points = 20;
+
+        let tool_name = "grep";
+        let args = "pattern";
+
+        // 1. Call 1 (Fail)
+        let action = AgentLoop::assess_deadlock(&mut state, tool_name, args, false);
+        assert_eq!(action, super::InterventionAction::None);
+
+        // 2. Call 2 (Fail)
+        let action = AgentLoop::assess_deadlock(&mut state, tool_name, args, false);
+        assert_eq!(action, super::InterventionAction::None);
+
+        // 3. Call 3 (Fail) -> Warn + Penalty
+        let action = AgentLoop::assess_deadlock(&mut state, tool_name, args, false);
+        assert!(matches!(action, super::InterventionAction::Warn(msg) if msg.contains("exact same failing tool call")));
+        assert_eq!(state.energy_points, 15); // 20 - 5
+
+        // 4. Call 4 (Fail)
+        let action = AgentLoop::assess_deadlock(&mut state, tool_name, args, false);
+        assert!(matches!(action, super::InterventionAction::Warn(_))); // Warns again at 4
+        assert_eq!(state.energy_points, 10); // 15 - 5
+
+        // 5. Call 5 (Fail) -> HardStop
+        let action = AgentLoop::assess_deadlock(&mut state, tool_name, args, false);
+        assert!(matches!(action, super::InterventionAction::HardStop(reason) if reason == "deadlock_loop"));
+    }
+
 }

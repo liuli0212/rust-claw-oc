@@ -329,12 +329,60 @@ impl AgentContext {
         for msg in &mut cloned.messages {
             for part in &mut msg.parts {
                 if let Some(fr) = &mut part.function_response {
-                    let response_str = fr.response.to_string();
-                    if response_str.len() > 1_200 {
-                        fr.response = serde_json::json!({
-                            "result": "[... Truncated old tool result to save tokens ...]",
-                            "original_chars": response_str.len()
-                        });
+                    // Smart truncation: Try to truncate the "result" field inside the JSON first
+                    let mut truncated_in_place = false;
+                    
+                    // We need to work with the value as a mutable object if possible
+                    if let Some(obj) = fr.response.as_object_mut() {
+                        if let Some(val) = obj.get_mut("result") {
+                            // Case 1: result is a String (common for read_file, execute_bash)
+                            if let Some(s) = val.as_str() {
+                                // TIERED CONTEXT STRATEGY:
+                                // History items are compressed to 12,000 chars (Head 6k + Tail 6k).
+                                // This retains context & errors while saving tokens.
+                                if s.len() > 12_000 {
+                                    let char_count = s.chars().count();
+                                    if char_count > 12_000 {
+                                        let keep = 6_000;
+                                        let head: String = s.chars().take(keep).collect();
+                                        let tail: String = s.chars().skip(char_count - keep).collect();
+                                        
+                                        *val = serde_json::Value::String(format!(
+                                            "{}\n... [History Compressed: {} chars hidden] ...\n{}",
+                                            head,
+                                            char_count - 12_000,
+                                            tail
+                                        ));
+                                        truncated_in_place = true;
+                                    }
+                                }
+                            } 
+                            // Case 2: result is a large object
+                            else if val.to_string().len() > 12_000 {
+                                let s = val.to_string();
+                                let char_count = s.chars().count();
+                                if char_count > 12_000 {
+                                    let head: String = s.chars().take(4_000).collect();
+                                    *val = serde_json::Value::String(format!(
+                                        "{}\n... [History Object Compressed] ...",
+                                        head
+                                    ));
+                                    truncated_in_place = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback safety cap
+                    if !truncated_in_place {
+                        let response_str = fr.response.to_string();
+                        if response_str.len() > 20_000 {
+                             let head: String = response_str.chars().take(2_000).collect();
+                             fr.response = serde_json::json!({
+                                "result": format!("{}\n... [Truncated massive object] ...", head),
+                                "original_chars": response_str.len()
+                            });
+                        }
                     }
                 }
             }
@@ -505,16 +553,28 @@ impl AgentContext {
                     continue;
                 };
                 let response_str = fr.response.to_string();
-                if response_str.chars().count() <= max_chars {
+                let char_count = response_str.chars().count();
+                
+                if char_count <= max_chars {
                     continue;
                 }
-                let clipped: String = response_str.chars().take(max_chars).collect();
+                
+                // Smart Truncation for Current Turn Recovery:
+                // When recovering from context overflow, we still want to see the beginning and end 
+                // of the output to diagnose what happened (e.g. valid data vs error message).
+                // We keep 50% Head and 50% Tail of the allowed budget.
+                let keep_half = max_chars / 2;
+                let head: String = response_str.chars().take(keep_half).collect();
+                let tail: String = response_str.chars().skip(char_count - keep_half).collect();
+
                 fr.response = serde_json::json!({
                     "result": format!(
-                        "{}\n[... Truncated by context recovery ...]",
-                        clipped
+                        "{}\n... [Truncated by context recovery: {} chars hidden] ...\n{}",
+                        head,
+                        char_count - max_chars,
+                        tail
                     ),
-                    "original_chars": response_str.chars().count()
+                    "original_chars": char_count
                 });
                 truncated_parts += 1;
             }
@@ -723,7 +783,7 @@ mod tests {
             payload.iter().filter(|m| m.role == "user").any(|m| m
                 .parts
                 .iter()
-                .any(|p| p.text.as_deref() == Some("next question"))),
+                .any(|p| p.text.as_deref().unwrap_or_default().contains("next question"))),
             "current turn user input should be included in payload"
         );
     }
