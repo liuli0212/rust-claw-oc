@@ -156,7 +156,25 @@ impl SessionManager {
             let _ = fs::write(&registry_path, serialized);
         });
     }
+    pub async fn update_session_llm(&self, session_id: &str, provider: &str, model: Option<String>) -> Result<String, String> {
+        let config = crate::config::AppConfig::load();
+        // We use the factory function from llm_client
+        match crate::llm_client::create_llm_client(provider, model.clone(), &config) {
+            Ok(new_llm) => {
+                let sessions = self.sessions.lock().await;
+                if let Some((agent_mutex, _)) = sessions.get(session_id) {
+                    let mut agent = agent_mutex.lock().await;
+                    agent.update_llm(new_llm);
+                    Ok(format!("Updated session '{}' to provider '{}' model '{:?}'", session_id, provider, model))
+                } else {
+                    Err(format!("Session '{}' not found", session_id))
+                }
+            }
+            Err(e) => Err(e)
+        }
+    }
 }
+
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
