@@ -111,7 +111,7 @@ impl AgentLoop {
     const MAX_COMPACTION_ATTEMPTS_PER_STEP: usize = 2;
     const DEFAULT_MAX_TASK_ITERATIONS: usize = 12;
     const MAX_AUTO_RECOVERY_ATTEMPTS: usize = 2;
-    const MAX_LLM_RECOVERY_ATTEMPTS: usize = 3;
+    const MAX_LLM_RECOVERY_ATTEMPTS: usize = 25;
 
     pub fn new(
         llm: Arc<dyn LlmClient>,
@@ -260,6 +260,10 @@ impl AgentLoop {
 
     async fn recover_from_llm_error(&mut self, err: &str, attempt: usize) -> bool {
         if Self::is_context_overflow_error(err) {
+            // Limit context overflow fixes to 3 attempts to prevent infinite compaction loops
+            if attempt > 3 {
+                return false;
+            }
             self.output
                 .on_text(
                     "[System] LLM context overflow detected. Running compaction and truncating large tool outputs...\n",
@@ -282,11 +286,15 @@ impl AgentLoop {
         }
 
         if Self::is_transient_llm_error(err) && attempt < Self::MAX_LLM_RECOVERY_ATTEMPTS {
-            let backoff_ms = (attempt as u64).saturating_mul(800);
+            // For 503/429 errors, we want to be very patient (up to 25 attempts).
+            // Use exponential backoff: 500ms * 2^attempt, capped at 32s per wait.
+            let exponent = (attempt as u32).min(6); // 2^6 = 64
+            let backoff_ms = 500u64.saturating_mul(2u64.pow(exponent));
+
             self.output
                 .on_text(&format!(
-                    "[System] Transient LLM error. Retrying in {} ms...\n",
-                    backoff_ms
+                    "[System] Transient LLM error. Retrying in {} ms... (Attempt {}/{})\n",
+                    backoff_ms, attempt, Self::MAX_LLM_RECOVERY_ATTEMPTS
                 ))
                 .await;
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -295,6 +303,7 @@ impl AgentLoop {
 
         false
     }
+
 
     fn should_run_memory_retrieval(query: &str) -> bool {
         let trimmed = query.trim();
