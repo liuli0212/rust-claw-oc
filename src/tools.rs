@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::time::timeout;
 
+use crate::utils::truncate_log;
 // Helper to clean up JSON schema for strict LLM APIs like Gemini
 pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = schema_val.as_object_mut() {
@@ -227,7 +228,7 @@ impl Tool for BashTool {
                 let clean_output = re.replace_all(&raw_output, "").into_owned();
                 let clean_output = clean_output.replace("\r\n", "\n");
                 let raw_trimmed = clean_output.trim().to_string();
-                let truncated_stdout = truncate_log(&raw_trimmed);
+                let truncated_stdout = crate::utils::truncate_tool_output(&raw_trimmed);
                 let truncated = truncated_stdout != raw_trimmed;
                 let result = BashExecutionResult {
                     ok: status_res.success(),
@@ -269,42 +270,6 @@ impl Tool for BashTool {
 }
 
 // Log truncation logic
-fn truncate_log(log: &str) -> String {
-    let lines: Vec<&str> = log.lines().collect();
-    let max_lines = 200;
-
-    // First pass: line-based truncation
-    let truncated_str = if lines.len() <= max_lines {
-        log.to_string()
-    } else {
-        let head = lines[0..100].join("\n");
-        let tail = lines[lines.len() - 100..].join("\n");
-        format!(
-            "{}\n\n[... Truncated {} lines ...]\n\n{}",
-            head,
-            lines.len() - max_lines,
-            tail
-        )
-    };
-
-    // Second pass: character-based truncation (e.g., max 15000 chars)
-    let max_chars = 15000;
-    if truncated_str.len() <= max_chars {
-        truncated_str
-    } else {
-        let head: String = truncated_str.chars().take(max_chars / 2).collect();
-        let tail: String = truncated_str
-            .chars()
-            .skip(truncated_str.len() - (max_chars / 2))
-            .collect();
-        format!(
-            "{}\n\n[... Truncated {} characters ...]\n\n{}",
-            head,
-            truncated_str.len() - max_chars,
-            tail
-        )
-    }
-}
 
 // Read Memory Tool
 pub struct ReadMemoryTool {
@@ -604,14 +569,18 @@ impl Tool for ReadFileTool {
         let parsed: ReadFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         match std::fs::read_to_string(&parsed.path) {
-            Ok(content) => serialize_tool_envelope(
-                "read_file",
-                true,
-                content,
-                None,
-                Some(start.elapsed().as_millis()),
-                false,
-            ),
+            Ok(content) => {
+                let truncated_content = crate::utils::truncate_tool_output(&content);
+                let truncated = truncated_content.len() != content.len();
+                serialize_tool_envelope(
+                    "read_file",
+                    true,
+                    truncated_content,
+                    None,
+                    Some(start.elapsed().as_millis()),
+                    truncated,
+                )
+            }
             Err(e) => serialize_tool_envelope(
                 "read_file",
                 false,
@@ -865,6 +834,7 @@ impl Tool for TavilySearchTool {
             payload["search_depth"] = serde_json::Value::String(depth);
         }
 
+        tracing::info!("TavilySearchTool executing: {}", query);
         let response = self
             .client
             .post("https://api.tavily.com/search")
