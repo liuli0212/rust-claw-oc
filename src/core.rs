@@ -974,7 +974,23 @@ impl AgentLoop {
                 .await;
         }
 
-        self.context.start_turn(user_input);
+        self.context.start_turn(user_input.clone());
+        let plan_path = std::path::Path::new(".rusty_claw_task_plan.json");
+        if !plan_path.exists() {
+             let is_complex = user_input.len() > 100 || ["plan", "complex", "refactor", "feature", "implement", "architect"].iter().any(|k| user_input.to_lowercase().contains(k));
+             if is_complex {
+                 self.output.on_text("\n\x1b[36m[System] Detected complex task. Suggesting `task_plan` creation to the agent.\x1b[0m\n").await;
+                 self.context.add_message_to_current_turn(Message {
+                     role: "user".to_string(),
+                     parts: vec![Part {
+                         text: Some("SYSTEM SUGGESTION: This task seems complex. Consider using the `task_plan` tool to create a structured plan (use action='add' to start). This helps track progress and ensures nothing is missed.".to_string()),
+                         function_call: None,
+                         function_response: None,
+                         thought_signature: None,
+                     }],
+                 });
+             }
+        }
         let mut task_state = TaskState {
             goal: self
                 .context
@@ -1366,6 +1382,21 @@ impl AgentLoop {
                         .await;
                 }
 
+                if tool_name == "task_plan" {
+                    if let Some(action) = tool_args.get("action").and_then(|v| v.as_str()) {
+                        let step = tool_args.get("step").and_then(|v| v.as_str()).unwrap_or("");
+                        let status = tool_args.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        let index = tool_args.get("index").and_then(|v| v.as_u64()).map(|v| v.to_string()).unwrap_or_default();
+                        
+                        let msg = match action {
+                            "add" => format!("[Plan] Added step: \"{}\"", step),
+                            "update_status" => format!("[Plan] Updated step {} status to '{}'", index, status),
+                            "remove" => format!("[Plan] Removed step {}", index),
+                            _ => format!("[Plan] Action: {}", action),
+                        };
+                        self.output.on_text(&format!("\n\x1b[32m{}\x1b[0m\n", msg)).await;
+                    }
+                }
                 self.output
                     .on_tool_start(&tool_name, &tool_args.to_string())
                     .await;
