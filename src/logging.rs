@@ -22,22 +22,20 @@ pub fn init_logging(
                 .clone()
                 .or_else(|| std::env::var("CLAW_LOG_LEVEL").ok())
                 .unwrap_or_else(|| "info".to_string());
-            if !level.contains("rustyline=") {
-                level.push_str(",rustyline=warn");
-            }
+            // Force rustyline off regardless of user config
+            level.push_str(",rustyline=off");
             EnvFilter::try_new(level)
         })
-        .unwrap_or_else(|_| EnvFilter::new("info,rustyline=warn"));
+        .unwrap_or_else(|_| EnvFilter::new("info,rustyline=off"));
 
     let console_filter = std::env::var("CLAW_CONSOLE_LOG_LEVEL")
         .ok()
         .and_then(|mut v| {
-            if !v.contains("rustyline=") {
-                v.push_str(",rustyline=warn");
-            }
+            // Force rustyline off
+            v.push_str(",rustyline=off");
             EnvFilter::try_new(v).ok()
         })
-        .unwrap_or_else(|| EnvFilter::new("warn,rustyline=warn"));
+        .unwrap_or_else(|| EnvFilter::new("warn,rustyline=off"));
 
     let enable_file = config.file_log.unwrap_or_else(|| {
         std::env::var("CLAW_FILE_LOG")

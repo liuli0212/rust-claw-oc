@@ -126,6 +126,20 @@ impl AgentLoop {
             max_tokens,
         )
     }
+    pub fn get_context_status(&self) -> (usize, usize, usize, usize, usize) {
+        self.context.get_context_status()
+    }
+    pub fn get_context_details(&self) -> String {
+        self.context.get_context_details()
+    }
+
+    pub async fn force_compact(&mut self) -> Result<String, String> {
+        match self.maybe_compact_history(true).await {
+             Some(reason) => Ok(reason),
+             None => Err("Compaction failed or not needed (too few turns)".to_string())
+        }
+    }
+
 
 
     fn should_emit_prompt_report() -> bool {
@@ -241,7 +255,7 @@ impl AgentLoop {
                 )
                 .await;
 
-            let _ = self.maybe_compact_history().await;
+            let _ = self.maybe_compact_history(true).await;
             let truncated = self.context.truncate_current_turn_tool_results(2_000);
             if truncated > 0 {
                 self.output
@@ -734,7 +748,7 @@ impl AgentLoop {
         summary_prompt
     }
 
-    async fn maybe_compact_history(&mut self) -> Option<String> {
+    async fn maybe_compact_history(&mut self, force: bool) -> Option<String> {
         let trigger_tokens = self.context.max_history_tokens * Self::COMPACTION_TRIGGER_RATIO_NUM
             / Self::COMPACTION_TRIGGER_RATIO_DEN;
         let target_tokens = self.context.max_history_tokens * Self::COMPACTION_TARGET_RATIO_NUM
@@ -743,7 +757,8 @@ impl AgentLoop {
 
         for _ in 0..Self::MAX_COMPACTION_ATTEMPTS_PER_STEP {
             let history_tokens = self.context.dialogue_history_token_estimate();
-            if history_tokens <= trigger_tokens
+            if !force && (history_tokens <= trigger_tokens
+                || self.context.dialogue_history.len() < Self::COMPACTION_MIN_TURNS)
                 || self.context.dialogue_history.len() < Self::COMPACTION_MIN_TURNS
             {
                 break;
@@ -949,7 +964,7 @@ impl AgentLoop {
         };
 
         let compaction_started = Instant::now();
-        let compaction_reason = self.maybe_compact_history().await;
+        let compaction_reason = self.maybe_compact_history(false).await;
         let compaction_ms = compaction_started.elapsed().as_millis();
         if Self::should_emit_verbose_progress() && compaction_reason.is_some() {
             self.output
@@ -996,6 +1011,13 @@ impl AgentLoop {
                 break;
             }
 
+            tracing::info!(
+                "Starting iteration {}/{}. Energy: {}. Goal: {}",
+                task_state.iterations + 1,
+                Self::max_task_iterations(),
+                task_state.energy_points,
+                crate::utils::truncate_log(&task_state.goal)
+            );
             task_state.iterations += 1;
             task_state.energy_points = task_state.energy_points.saturating_sub(1);
             if Self::should_emit_verbose_progress() {
@@ -1323,10 +1345,10 @@ impl AgentLoop {
                     .await;
                 tool_exec_ms_acc += tool_exec_started.elapsed().as_millis();
                 if !tool_result.ok {
-                    tracing::warn!("Tool execution failed: {} - {}", tool_name, tool_result.output);
+                    tracing::error!("Tool execution failed: {} - {}", tool_name, crate::utils::truncate_log(&tool_result.output));
                     task_state.last_error = Some(tool_result.output.clone());
                 } else {
-                    tracing::debug!("Tool execution succeeded: {}", tool_name);
+                    tracing::info!("Tool execution succeeded: {}", tool_name);
                 }
                 let result_str = if tool_result.recovery_attempted {
                     format!(

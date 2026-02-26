@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use crate::utils::{truncate_log, truncate_log_error};
 #[derive(Error, Debug)]
 pub enum LlmError {
     #[error("Network error: {0}")]
@@ -143,10 +144,10 @@ impl LlmClient for GeminiClient {
             self.model_name, self.api_key
         );
 
-        tracing::debug!(
+        tracing::info!(
             "Gemini generate_text request: url={}, body={}",
             url,
-            serde_json::to_string(&req_body).unwrap_or_default()
+            truncate_log(&serde_json::to_string(&req_body).unwrap_or_default())
         );
 
         let response = self
@@ -158,7 +159,9 @@ impl LlmClient for GeminiClient {
             .await?;
 
         if !response.status().is_success() {
-            return Err(LlmError::ApiError(response.text().await?));
+            let error_text = response.text().await?;
+            tracing::error!("Gemini API Error: {}", truncate_log_error(&error_text));
+            return Err(LlmError::ApiError(error_text));
         }
 
         let resp_json: Value = response.json().await?;
@@ -166,6 +169,7 @@ impl LlmClient for GeminiClient {
             .as_str()
             .unwrap_or("")
             .to_string();
+        tracing::info!("Gemini Response: {}", truncate_log(&text));
         Ok(text)
     }
 
@@ -202,7 +206,7 @@ impl LlmClient for GeminiClient {
             );
 
             let body_json_string = serde_json::to_string(&req_body).unwrap_or_default();
-            tracing::debug!("Gemini stream request: url={}, body={}", url, body_json_string);
+            tracing::info!("Gemini stream request: url={}, body={}", url, truncate_log(&body_json_string));
             let resp = match client
                 .post(&url)
                 .header(CONTENT_TYPE, "application/json")
@@ -214,15 +218,17 @@ impl LlmClient for GeminiClient {
                 Ok(r) => {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
+                    tracing::error!("Gemini Stream API Error: status={} body={}", status, truncate_log_error(&body));
                     let _ = tx
                         .send(StreamEvent::Error(format!(
                             "Gemini API error: {} body={}",
                             status, body
-                        )))
-                        .await;
+                        ))).await;
                     return;
                 }
                 Err(e) => {
+                    tracing::error!("Gemini Network Error: {}", e);
+                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
                     let _ = tx.send(StreamEvent::Error(e.to_string())).await;
                     return;
                 }
@@ -414,7 +420,9 @@ impl LlmClient for OpenAiCompatClient {
             .await?;
 
         if !response.status().is_success() {
-            return Err(LlmError::ApiError(response.text().await?));
+            let error_text = response.text().await?;
+            tracing::error!("OpenAI API Error: {}", truncate_log_error(&error_text));
+            return Err(LlmError::ApiError(error_text));
         }
 
         let resp_json: Value = response.json().await?;
@@ -422,6 +430,7 @@ impl LlmClient for OpenAiCompatClient {
             .as_str()
             .unwrap_or("")
             .to_string();
+        tracing::info!("OpenAI Response: {}", truncate_log(&text));
         Ok(text)
     }
 
@@ -485,7 +494,7 @@ impl LlmClient for OpenAiCompatClient {
 
         tokio::spawn(async move {
             let body_json_string = serde_json::to_string(&body_map).unwrap_or_default();
-            tracing::trace!("Sending request to OpenAI compat API: url={}, payload_size={} bytes", base_url, body_json_string.len());
+            tracing::info!("Sending request to OpenAI compat API: url={}, body={}", base_url, truncate_log(&body_json_string));
             let resp = match client
                 .post(&base_url)
                 .header(AUTHORIZATION, format!("Bearer {}", api_key))
@@ -496,15 +505,19 @@ impl LlmClient for OpenAiCompatClient {
             {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    tracing::error!("OpenAI Stream API Error: status={} body={}", status, truncate_log_error(&body));
                     let _ = tx
                         .send(StreamEvent::Error(format!(
-                            "OpenAI API error: {}",
-                            r.status()
-                        )))
-                        .await;
+                            "OpenAI API error: {} body={}",
+                            status, body
+                        ))).await;
                     return;
                 }
                 Err(e) => {
+                    tracing::error!("OpenAI Network Error: {}", e);
+                    let _ = tx.send(StreamEvent::Error(e.to_string())).await;
                     let _ = tx.send(StreamEvent::Error(e.to_string())).await;
                     return;
                 }

@@ -10,6 +10,7 @@ mod session_manager;
 mod skills;
 mod telegram;
 mod tools;
+mod utils;
 
 use crate::core::{AgentOutput, RunExit};
 use crate::llm_client::{GeminiClient, LlmClient, OpenAiCompatClient};
@@ -349,6 +350,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Provider: {}", provider);
                     println!("Model:    {}", model);
                     println!("Context:  {} / {} tokens ({:.1}%)", tokens, max_tokens, percentage);
+                    continue;
+                }
+                if line.starts_with("/context") {
+                    let agent = session_manager
+                        .get_or_create_session("cli", output.clone())
+                        .await;
+                    let mut agent_guard = agent.lock().await;
+                    
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    let subcommand = parts.get(1).map(|s| *s).unwrap_or("");
+
+                    match subcommand {
+                        "detail" => {
+                             let details = agent_guard.get_context_details();
+                             println!("{}", details);
+                        }
+                        "compact" => {
+                             match agent_guard.force_compact().await {
+                                 Ok(reason) => println!("\x1b[32m[System] Context compacted: {}\x1b[0m", reason),
+                                 Err(e) => println!("\x1b[31m[System] Compaction skipped: {}\x1b[0m", e)
+                             }
+                        }
+                        _ => {
+                            let (total, max, history, current, system) = agent_guard.get_context_status();
+                            let percentage = (total as f64 / max as f64) * 100.0;
+                            println!("\x1b[36m[Context Usage]\x1b[0m");
+                            println!("Total Used:   {} / {} tokens ({:.1}%)", total, max, percentage);
+                            println!("  - History:  {} tokens", history);
+                            println!("  - Current:  {} tokens", current);
+                            println!("  - System:   {} tokens", system);
+                        }
+                    }
                     continue;
                 }
                 if line.is_empty() {

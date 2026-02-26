@@ -383,6 +383,55 @@ impl AgentContext {
             .sum()
     }
 
+    pub fn get_context_status(&self) -> (usize, usize, usize, usize, usize) {
+        let bpe = tiktoken_rs::cl100k_base().unwrap();
+        let history_tokens = self.dialogue_history_token_estimate();
+        let current_turn_tokens = if let Some(turn) = &self.current_turn {
+            Self::turn_token_estimate(turn, &bpe)
+        } else {
+            0
+        };
+        let system_msg = Message {
+            role: "system".to_string(),
+            parts: vec![Part {
+                thought_signature: None,
+                text: Some(self.build_system_prompt()),
+                function_call: None,
+                function_response: None,
+            }],
+        };
+        let system_tokens = Self::estimate_tokens(&bpe, &system_msg);
+        let total_tokens = history_tokens + current_turn_tokens + system_tokens;
+        
+        (total_tokens, self.max_history_tokens, history_tokens, current_turn_tokens, system_tokens)
+    }
+    pub fn get_context_details(&self) -> String {
+        let mut details = String::new();
+        details.push_str("--- Context Details ---\n");
+        
+        // System Prompt Summary
+        let sys_prompt = self.build_system_prompt();
+        let sys_len = sys_prompt.len();
+        details.push_str(&format!("System Prompt Length: {} chars\n", sys_len));
+        details.push_str(&format!("System Prompt Head:\n{}\n...\n", Self::truncate_chars(&sys_prompt, 200)));
+
+        // History Summary
+        details.push_str(&format!("History Turns: {}\n", self.dialogue_history.len()));
+        if let Some(last) = self.dialogue_history.last() {
+             details.push_str(&format!("Last History Turn User: {}\n", Self::truncate_chars(&last.user_message, 100)));
+        }
+
+        // Current Turn
+        if let Some(curr) = &self.current_turn {
+             details.push_str(&format!("Current Turn User: {}\n", Self::truncate_chars(&curr.user_message, 100)));
+             details.push_str(&format!("Current Turn Messages: {}\n", curr.messages.len()));
+        } else {
+             details.push_str("Current Turn: None\n");
+        }
+        
+        details
+    }
+
     pub fn oldest_turns_for_compaction(&self, target_tokens: usize, min_turns: usize) -> usize {
         if self.dialogue_history.is_empty() {
             return 0;
