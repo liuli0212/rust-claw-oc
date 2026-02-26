@@ -50,9 +50,25 @@ To reduce latency and API costs:
 -   **Standard Lib:** Provide a robust standard library of tools (File I/O, Web Search, Bash) that are highly optimized and safe.
 ## 6. Configuration & Extensibility
 - **Config Loader:** `src/config.rs` handles TOML parsing and provider resolution. It supports cascading overrides (CLI > Config > Defaults).
-- **Dynamic Providers:** The system abstracts LLM interaction via the `LlmClient` trait, allowing seamless switching between Gemini, Aliyun, and OpenAI-compatible endpoints at runtime.
+- **Dynamic Providers:** The system abstracts LLM interaction via the `LlmClient` trait, allowing seamless switching between Gemini, Aliyun, and OpenAI-compatible endpoints at runtime. It supports both standard DashScope and specialized Aliyun Coding Plan endpoints by providing the full path in `base_url`.
 
 ## 7. Operational Safety
 - **Strict Plan Enforcement:** The `TaskPlanTool` is integrated into the system prompt. If a plan exists (`.rusty_claw_task_plan.json`), it is injected into the context, and the model is explicitly instructed to follow it.
 - **State Persistence:** Plan state is persisted to disk JSON, ensuring recovery after restart.
 
+## 8. Dual-Phase Task Execution Flow
+
+To optimize for both intelligence and token efficiency, Rusty-Claw implements a two-stage processing pipeline for every user request:
+
+### Phase 1: Pre-Analysis (The Lead Architect)
+- **Tool:** `src/core.rs -> analyze_request()`
+- **Prompt:** Minimalist "Senior Technical Lead" instruction.
+- **Context:** User input only (no project files or environment data).
+- **Output:** A JSON plan containing `is_complex`, `reasoning`, and a list of `plan` steps.
+- **Goal:** Determine if the task needs a structured multi-step approach without wasting tokens on the full identity prompt.
+
+### Phase 2: Execution (The Engineer)
+- **Tool:** `src/core.rs -> step()` loop.
+- **Prompt:** Full "Rusty-Claw Engineer" identity.
+- **Context:** Comprehensive assembly including `AGENTS.md`, `README.md`, Runtime Environment, Task Plan, and RAG-retrieved memory.
+- **Goal:** Execute the plan, handle errors, and autonomously call tools until the goal is achieved.

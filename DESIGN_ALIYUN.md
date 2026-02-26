@@ -32,6 +32,9 @@ pub trait LlmClient: Send + Sync {
 - 将 `Message` 转换为 OpenAI 格式。
 - 将我们的工具定义 (JSON Schema) 转换为 OpenAI 的 `tools` 格式。
 - 解析 SSE 流，并将 OpenAI 的响应映射回我们的 `StreamEvent`。
+- **配置要点**：由于阿里云有多个子产品，`base_url` 必须根据产品类型填写：
+  - **标准 DashScope**: `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`
+  - **Coding Plan**: `https://coding.dashscope.aliyuncs.com/v1/chat/completions` (注意必须包含 `/chat/completions`)
 
 ## 3. 命令行切换模型
 为了支持命令行动态切换，我们需要修改 `main.rs` 中的 `CliArgs` 和初始化逻辑：
