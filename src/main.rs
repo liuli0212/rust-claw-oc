@@ -13,7 +13,7 @@ mod tools;
 mod utils;
 
 use crate::core::{AgentOutput, RunExit};
-use crate::llm_client::{GeminiClient, LlmClient, OpenAiCompatClient};
+use crate::llm_client::LlmClient;
 use crate::logging::LoggingConfig;
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
@@ -342,7 +342,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Show available providers from config
                         let config = crate::config::AppConfig::load();
                         let providers: Vec<&String> = config.providers.keys().collect();
-                        println!("Available providers: {}", providers.join(", "));
+                        let providers_str = providers.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+                        println!("Available providers: {}", providers_str);
                         continue;
                     }
                     let provider = parts[1];

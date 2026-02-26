@@ -17,7 +17,7 @@ pub fn init_logging(
 ) -> Result<Option<WorkerGuard>, Box<dyn std::error::Error>> {
     let file_filter = EnvFilter::try_from_default_env()
         .or_else(|_| {
-            let mut level = config
+            let level = config
                 .log_level
                 .clone()
                 .or_else(|| std::env::var("CLAW_LOG_LEVEL").ok())
