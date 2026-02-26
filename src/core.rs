@@ -86,6 +86,15 @@ struct StructuredToolResult {
     recovery_rule: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AnalysisOutput {
+    is_complex: bool,
+    #[serde(default)]
+    reasoning: String,
+    #[serde(default)]
+    plan: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct RecoveryRule {
     name: &'static str,
@@ -904,6 +913,40 @@ impl AgentLoop {
         let text = format!("[Recovery Stats] {}\n", stats.join(", "));
         self.output.on_text(&text).await;
     }
+    async fn analyze_request(&self, user_input: &str) -> Option<Vec<String>> {
+        let sys_msg = Message {
+            role: "system".to_string(),
+            parts: vec![Part {
+                text: Some("You are a Senior Technical Lead. Analyze the user's request.\nOutput a JSON object with:\n- `is_complex`: bool (true if > 1 step or ambiguous)\n- `reasoning`: string (brief explanation)\n- `plan`: optional list of strings (steps), required if is_complex is true\n\nResponse must be ONLY valid JSON.".to_string()),
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+            }],
+        };
+        let user_msg = Message {
+            role: "user".to_string(),
+            parts: vec![Part {
+                text: Some(format!("Request: {}", user_input)),
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+            }],
+        };
+
+        match self.llm.generate_text(vec![user_msg], Some(sys_msg)).await {
+            Ok(text) => {
+                let cleaned = text.trim().trim_start_matches("```json").trim_end_matches("```").trim();
+                if let Ok(parsed) = serde_json::from_str::<AnalysisOutput>(cleaned) {
+                    if parsed.is_complex && !parsed.plan.is_empty() {
+                        return Some(parsed.plan);
+                    }
+                }
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
 
     pub async fn step(
         &mut self,
@@ -973,6 +1016,29 @@ impl AgentLoop {
                 .on_text("[Progress] 上下文已压缩，继续执行主任务。\n")
                 .await;
         }
+        // Analysis Phase
+        if !std::path::Path::new(".rusty_claw_task_plan.json").exists() {
+             if Self::should_emit_verbose_progress() {
+                 self.output.on_text("[System] Analyzing request complexity...\n").await;
+             }
+             if let Some(plan) = self.analyze_request(&user_input).await {
+                 if Self::should_emit_verbose_progress() {
+                     self.output.on_text(&format!("[System] Complex task detected. Generated {}-step plan.\n", plan.len())).await;
+                 }
+                 // Write plan file
+                 let state = crate::tools::TaskPlanState {
+                     items: plan.into_iter().map(|step| crate::tools::TaskPlanItem {
+                         step,
+                         status: "pending".to_string(),
+                         note: None
+                     }).collect()
+                 };
+                 if let Ok(json) = serde_json::to_string_pretty(&state) {
+                     let _ = std::fs::write(".rusty_claw_task_plan.json", json);
+                 }
+             }
+        }
+
 
         self.context.start_turn(user_input.clone());
         let plan_path = std::path::Path::new(".rusty_claw_task_plan.json");
