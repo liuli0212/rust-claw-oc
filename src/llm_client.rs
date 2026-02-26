@@ -410,6 +410,12 @@ impl LlmClient for OpenAiCompatClient {
             "messages": openai_messages,
         });
 
+        let body_json = serde_json::to_string(&body).unwrap_or_default();
+        tracing::info!(
+            "OpenAI generate_text request: url={}, body={}",
+            self.base_url,
+            truncate_log(&body_json)
+        );
         let response = self
             .client
             .post(&self.base_url)
