@@ -83,7 +83,7 @@ impl AgentContext {
             ],
             dialogue_history: Vec::new(),
             current_turn: None,
-            max_history_tokens: 1_500_000,
+            max_history_tokens: 1_000_000,
             transcript_path: None,
             retrieved_memory: None,
             retrieved_memory_sources: Vec::new(),
