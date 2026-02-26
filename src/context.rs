@@ -221,6 +221,10 @@ impl AgentContext {
 
 
         let mut project_context = String::new();
+        // Add Task Plan Instruction
+        project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
+        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
+        project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n\n");
         if let Ok(content) = fs::read_to_string("AGENTS.md") {
             project_context.push_str("### AGENTS.md\n");
             project_context.push_str(&Self::truncate_chars(&content, 3_000));
