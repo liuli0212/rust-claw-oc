@@ -30,6 +30,23 @@ pub enum StreamEvent {
     Done,
 }
 
+    fn estimate_context_window(model: &str) -> usize {
+        let m = model.to_lowercase();
+        if m.contains("1.5-pro") || m.contains("1.5-flash") {
+            1_000_000
+        } else if m.contains("gpt-4o") || m.contains("gpt-4-turbo") {
+            128_000
+        } else if m.contains("claude-3-5") || m.contains("claude-3-opus") {
+            200_000
+        } else if m.contains("deepseek") {
+            64_000
+        } else if m.contains("qwen-plus") || m.contains("qwen-max") {
+            30_000
+        } else {
+            32_000
+        }
+    }
+
     pub fn create_llm_client(
         provider: &str,
         model: Option<String>,
@@ -53,7 +70,10 @@ pub enum StreamEvent {
                         .or(model)
                         .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
 
-                    Ok(Arc::new(OpenAiCompatClient::new(api_key, base_url, model_final, provider.to_string())))
+                    let context_window = prov_config.context_window
+                        .unwrap_or_else(|| estimate_context_window(&model_final));
+
+                    Ok(Arc::new(OpenAiCompatClient::new_with_window(api_key, base_url, model_final, provider.to_string(), context_window)))
                 }
                 "gemini" => {
                     let api_key = if let Some(env_var) = &prov_config.api_key_env {
@@ -64,7 +84,11 @@ pub enum StreamEvent {
                         prov_config.api_key.clone().expect("API key must be provided")
                     };
                     let model_final = model.or(prov_config.model.clone());
-                    Ok(Arc::new(GeminiClient::new(api_key, model_final)))
+                    let model_str = model_final.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+                    let context_window = prov_config.context_window
+                        .unwrap_or_else(|| estimate_context_window(&model_str));
+
+                    Ok(Arc::new(GeminiClient::new_with_window(api_key, model_final, context_window)))
                 }
                 _ => Err(format!("Unknown provider type '{}'", prov_config.type_name)),
             }
@@ -76,11 +100,13 @@ pub enum StreamEvent {
                         .map_err(|_| "DASHSCOPE_API_KEY must be set for aliyun provider")?;
                     let model_final = model.unwrap_or_else(|| "qwen-plus".to_string());
                     tracing::info!("Using Aliyun provider with model: {}", model_final);
-                    Ok(Arc::new(OpenAiCompatClient::new(
+                    let context_window = estimate_context_window(&model_final);
+                    Ok(Arc::new(OpenAiCompatClient::new_with_window(
                         api_key,
                         "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string(),
                         model_final,
-                        "aliyun".to_string()
+                        "aliyun".to_string(),
+                        context_window
                     )))
                 }
                 "gemini" | _ => {
@@ -90,7 +116,9 @@ pub enum StreamEvent {
                         "Using Gemini provider with model: {:?}",
                         model.as_deref().unwrap_or("default")
                     );
-                    Ok(Arc::new(GeminiClient::new(api_key, model)))
+                    let model_str = model.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+                    let context_window = estimate_context_window(&model_str);
+                    Ok(Arc::new(GeminiClient::new_with_window(api_key, model, context_window)))
                 }
             }
         }
@@ -100,6 +128,7 @@ pub enum StreamEvent {
 pub trait LlmClient: Send + Sync {
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
+    fn context_window_size(&self) -> usize;
     async fn generate_text(
         &self,
         messages: Vec<Message>,
@@ -122,6 +151,7 @@ pub struct GeminiClient {
     model_name: String,
     #[allow(dead_code)]
     function_declarations_cache: Mutex<Option<CachedFunctionDeclarations>>,
+    context_window: usize,
 }
 
 #[derive(Clone)]
@@ -163,6 +193,17 @@ impl GeminiClient {
             client: Client::new(),
             model_name: model_name.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
             function_declarations_cache: Mutex::new(None),
+            context_window: 1_000_000,
+        }
+    }
+
+    pub fn new_with_window(api_key: String, model_name: Option<String>, context_window: usize) -> Self {
+        Self {
+            api_key,
+            client: Client::new(),
+            model_name: model_name.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
+            function_declarations_cache: Mutex::new(None),
+            context_window,
         }
     }
 
@@ -192,6 +233,9 @@ impl LlmClient for GeminiClient {
     }
     fn provider_name(&self) -> &str {
         "gemini"
+    }
+    fn context_window_size(&self) -> usize {
+        self.context_window
     }
     async fn generate_text(
         &self,
@@ -467,6 +511,7 @@ pub struct OpenAiCompatClient {
     model_name: String,
     provider_name: String,
     client: Client,
+    context_window: usize,
 }
 
 impl OpenAiCompatClient {
@@ -477,6 +522,18 @@ impl OpenAiCompatClient {
             model_name,
             provider_name,
             client: Client::new(),
+            context_window: 32_000, // Default fallback
+        }
+    }
+
+    pub fn new_with_window(api_key: String, base_url: String, model_name: String, provider_name: String, context_window: usize) -> Self {
+        Self {
+            api_key,
+            base_url,
+            model_name,
+            provider_name,
+            client: Client::new(),
+            context_window,
         }
     }
 }
@@ -488,6 +545,9 @@ impl LlmClient for OpenAiCompatClient {
     }
     fn provider_name(&self) -> &str {
         &self.provider_name
+    }
+    fn context_window_size(&self) -> usize {
+        self.context_window
     }
     async fn generate_text(
         &self,
@@ -844,6 +904,17 @@ mod tests {
             Ok(text) => println!("Aliyun Success: {}", text),
             Err(e) => panic!("Aliyun Failed: {}", e),
         }
+    }
+    #[test]
+    fn test_estimate_context_window() {
+        assert_eq!(estimate_context_window("gemini-1.5-pro"), 1_000_000);
+        assert_eq!(estimate_context_window("gemini-1.5-flash"), 1_000_000);
+        assert_eq!(estimate_context_window("gpt-4o"), 128_000);
+        assert_eq!(estimate_context_window("gpt-4-turbo"), 128_000);
+        assert_eq!(estimate_context_window("claude-3-5-sonnet"), 200_000);
+        assert_eq!(estimate_context_window("deepseek-chat"), 64_000);
+        assert_eq!(estimate_context_window("qwen-plus"), 30_000);
+        assert_eq!(estimate_context_window("unknown-model"), 32_000);
     }
 }
 
