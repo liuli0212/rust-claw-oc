@@ -396,147 +396,202 @@ impl AgentContext {
         keywords.iter().any(|k| lower.contains(k))
     }
 
-    fn remove_ephemeral_injections(msg: &mut Message) {
-        if msg.role != "user" {
-            return;
-        }
-        for part in &mut msg.parts {
-            if let Some(text) = &mut part.text {
-                let markers = [
-                    "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]",
-                    "[SYSTEM ALERT: CRITICAL INSTRUCTION. IGNORE PREVIOUS CONTEXT IF CONFLICTING.]",
-                    "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE.]"
-                ];
 
-                for marker in markers {
-                    if text.contains(marker) {
-                        *text = text.replace(marker, "").trim().to_string();
-                    }
-                }
+
+
+    fn strip_thinking_tags(text: &str) -> String {
+        let mut result = text.to_string();
+        while let Some(start) = result.find("<think>") {
+            if let Some(end) = result.find("</think>") {
+                let before = &result[..start];
+                let after = &result[end + 8..]; // 8 is len of </think>
+                result = format!("{}{}", before, after);
+            } else {
+                break;
             }
         }
+        result.trim().to_string()
     }
 
-    fn strip_tool_results_for_history(turn: &Turn) -> Turn {
-        let mut cloned = turn.clone();
-        
-        for msg in &mut cloned.messages {
-            Self::remove_ephemeral_injections(msg);
-        }
+    fn strip_response_payload(fr: &mut FunctionResponse) {
+        if let Some(obj) = fr.response.as_object_mut() {
+            match fr.name.as_str() {
+                "read_file" => {
+                    let content_val = if let Some(v) = obj.get_mut("content") {
+                        Some(v)
+                    } else {
+                        obj.get_mut("result")
+                    };
 
-        for msg in &mut cloned.messages {
-            for part in &mut msg.parts {
-                if let Some(fr) = &mut part.function_response {
-                    if let Some(obj) = fr.response.as_object_mut() {
-                        match fr.name.as_str() {
-                            "read_file" => {
-                                let content_val = if let Some(v) = obj.get_mut("content") {
-                                    Some(v)
-                                } else {
-                                    obj.get_mut("result")
-                                };
-
-                                if let Some(content_val) = content_val {
-                                    if let Some(s) = content_val.as_str() {
-                                        let line_count = s.lines().count();
-                                        if line_count > 10 {
-                                            let head: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
-                                            let tail: String = s.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-                                            *content_val = serde_json::Value::String(format!(
-                                                "{}\n... [History: Content stripped - {} lines total] ...\n{}",
-                                                head, line_count, tail
-                                            ));
-                                        }
-                                    }
+                    if let Some(content_val) = content_val {
+                        if let Some(s) = content_val.as_str() {
+                            let line_count = s.lines().count();
+                            if line_count > 10 {
+                                let head: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
+                                let tail: String = s.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                                *content_val = serde_json::Value::String(format!(
+                                    "{}\n... [History: Content stripped - {} lines total] ...\n{}",
+                                    head, line_count, tail
+                                ));
+                            }
+                        }
+                    }
+                },
+                "execute_bash" => {
+                    for field in ["stdout", "stderr", "result"] {
+                        if let Some(val) = obj.get_mut(field) {
+                            if let Some(s) = val.as_str() {
+                                let char_count = s.chars().count();
+                                if char_count > 500 {
+                                    let head: String = s.chars().take(200).collect();
+                                    let tail: String = s.chars().skip(char_count - 200).collect();
+                                    *val = serde_json::Value::String(format!(
+                                        "{}\n... [History: Output stripped - {} chars total] ...\n{}",
+                                        head, char_count, tail
+                                    ));
                                 }
-                            },
-                            "execute_bash" => {
-                                for field in ["stdout", "stderr", "result"] {
-                                    if let Some(val) = obj.get_mut(field) {
-                                        if let Some(s) = val.as_str() {
-                                            let char_count = s.chars().count();
-                                            if char_count > 500 {
-                                                let head: String = s.chars().take(200).collect();
-                                                let tail: String = s.chars().skip(char_count - 200).collect();
-                                                *val = serde_json::Value::String(format!(
-                                                    "{}\n... [History: Output stripped - {} chars total] ...\n{}",
-                                                    head, char_count, tail
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            "ls" | "find" | "grep" => {
-                                 if let Some(files) = obj.get_mut("files").and_then(|v| v.as_array_mut()) {
-                                     if files.len() > 10 {
-                                         let total = files.len();
-                                         files.truncate(10);
-                                         files.push(serde_json::json!(format!("... [History: List truncated - {} items total] ...", total)));
-                                     }
+                            }
+                        }
+                    }
+                },
+                "ls" | "find" | "grep" => {
+                     if let Some(files) = obj.get_mut("files").and_then(|v| v.as_array_mut()) {
+                         if files.len() > 10 {
+                             let total = files.len();
+                             files.truncate(10);
+                             files.push(serde_json::json!(format!("... [History: List truncated - {} items total] ...", total)));
+                         }
+                     }
+                },
+                "web_search" => {
+                     if let Some(results) = obj.get_mut("results").and_then(|v| v.as_array_mut()) {
+                         if results.len() > 3 {
+                             results.truncate(3);
+                             results.push(serde_json::json!("... [History: Search results truncated] ..."));
+                         }
+                         for res in results.iter_mut() {
+                             if let Some(res_obj) = res.as_object_mut() {
+                                 if res_obj.contains_key("content") {
+                                     res_obj.insert("content".to_string(), serde_json::json!("[Snippet stripped]"));
                                  }
-                            },
-                            "web_search" => {
-                                 if let Some(results) = obj.get_mut("results").and_then(|v| v.as_array_mut()) {
-                                     if results.len() > 3 {
-                                         results.truncate(3);
-                                         results.push(serde_json::json!("... [History: Search results truncated] ..."));
-                                     }
-                                     for res in results.iter_mut() {
-                                         if let Some(res_obj) = res.as_object_mut() {
-                                             if res_obj.contains_key("content") {
-                                                 res_obj.insert("content".to_string(), serde_json::json!("[Snippet stripped]"));
-                                             }
-                                         }
-                                     }
-                                 }
-                            },
-                            "web_fetch" => {
-                                let content_val = if let Some(v) = obj.get_mut("content") {
-                                    Some(v)
-                                } else {
-                                    obj.get_mut("result")
-                                };
+                             }
+                         }
+                     }
+                },
+                "web_fetch" => {
+                    let content_val = if let Some(v) = obj.get_mut("content") {
+                        Some(v)
+                    } else {
+                        obj.get_mut("result")
+                    };
 
-                                if let Some(content) = content_val {
-                                    if let Some(s) = content.as_str() {
-                                        *content = serde_json::Value::String(format!(
-                                            "[History: Web content stripped - {} chars]", s.len()
-                                        ));
-                                    }
-                                }
-                            },
-                            "skill" | "use_skill" => {
-                                let msg_val = if let Some(v) = obj.get_mut("message") {
-                                    Some(v)
-                                } else {
-                                    obj.get_mut("result")
-                                };
+                    if let Some(content) = content_val {
+                        if let Some(s) = content.as_str() {
+                            *content = serde_json::Value::String(format!(
+                                "[History: Web content stripped - {} chars]", s.len()
+                            ));
+                        }
+                    }
+                },
+                "skill" | "use_skill" => {
+                    let msg_val = if let Some(v) = obj.get_mut("message") {
+                        Some(v)
+                    } else {
+                        obj.get_mut("result")
+                    };
 
-                                if let Some(msg) = msg_val {
-                                     *msg = serde_json::Value::String("Skill loaded and active.".to_string());
-                                }
-                            },
-                            _ => {
-                                for (_k, v) in obj.iter_mut() {
-                                    if let Some(s) = v.as_str() {
-                                        if s.len() > 1000 {
-                                            let head: String = s.chars().take(500).collect();
-                                            let tail: String = s.chars().skip(s.chars().count() - 200).collect();
-                                            *v = serde_json::Value::String(format!(
-                                                "{}\n... [History: Value stripped - {} chars] ...\n{}",
-                                                head, s.len(), tail
-                                            ));
-                                        }
-                                    }
-                                }
+                    if let Some(msg) = msg_val {
+                         *msg = serde_json::Value::String("Skill loaded and active.".to_string());
+                    }
+                },
+                _ => {
+                    for (_k, v) in obj.iter_mut() {
+                        if let Some(s) = v.as_str() {
+                            if s.len() > 1000 {
+                                let head: String = s.chars().take(500).collect();
+                                let tail: String = s.chars().skip(s.chars().count() - 200).collect();
+                                *v = serde_json::Value::String(format!(
+                                    "{}\n... [History: Value stripped - {} chars] ...\n{}",
+                                    head, s.len(), tail
+                                ));
                             }
                         }
                     }
                 }
             }
         }
-        cloned
+    }
+
+    fn reconstruct_turn_for_history(turn: &Turn) -> Turn {
+        let mut new_messages = Vec::new();
+
+        for msg in &turn.messages {
+            let mut new_parts = Vec::new();
+
+            for part in &msg.parts {
+                let mut new_part = Part {
+                    text: None,
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None, // ALWAYS None for history
+                };
+
+                // 1. Function Call (Action) - KEEP
+                if let Some(fc) = &part.function_call {
+                    new_part.function_call = Some(fc.clone());
+                }
+
+                // 2. Function Response (Result) - KEEP (Stripped)
+                if let Some(fr) = &part.function_response {
+                    let mut stripped_fr = fr.clone();
+                    Self::strip_response_payload(&mut stripped_fr);
+                    new_part.function_response = Some(stripped_fr);
+                }
+
+                // 3. Text (Intent/Reply) - SELECTIVE KEEP
+                if let Some(text) = &part.text {
+                    if msg.role == "user" {
+                        // User text: Keep, but clean system tags
+                        let mut cleaned_text = text.clone();
+                        let markers = [
+                            "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]",
+                            "[SYSTEM ALERT: CRITICAL INSTRUCTION. IGNORE PREVIOUS CONTEXT IF CONFLICTING.]",
+                            "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE.]"
+                        ];
+                        for marker in markers {
+                            if cleaned_text.contains(marker) {
+                                cleaned_text = cleaned_text.replace(marker, "").trim().to_string();
+                            }
+                        }
+                        new_part.text = Some(cleaned_text);
+
+                    } else if msg.role == "model" {
+                        // Model text: Only keep if NO function call, and strip <think>
+                        if new_part.function_call.is_none() {
+                            let cleaned = Self::strip_thinking_tags(text);
+                            if !cleaned.is_empty() {
+                                new_part.text = Some(cleaned);
+                            }
+                        }
+                    }
+                }
+                
+                // Only add part if it has content
+                if new_part.text.is_some() || new_part.function_call.is_some() || new_part.function_response.is_some() {
+                    new_parts.push(new_part);
+                }
+            }
+
+            if !new_parts.is_empty() {
+                 new_messages.push(Message { role: msg.role.clone(), parts: new_parts });
+            }
+        }
+        
+        Turn {
+            turn_id: turn.turn_id.clone(),
+            user_message: turn.user_message.clone(),
+            messages: new_messages,
+        }
     }
 
     fn build_history_with_budget(&self) -> (Vec<Message>, usize, usize) {
@@ -564,7 +619,7 @@ impl AgentContext {
             let should_strip = i >= 3 && !protect_next_turn;
 
             let turn = if should_strip {
-                Self::strip_tool_results_for_history(&sanitized)
+                Self::reconstruct_turn_for_history(&sanitized)
             } else {
                 Self::truncate_old_tool_results(&sanitized)
             };
@@ -994,37 +1049,66 @@ mod tests {
         assert!(serialized.contains("Truncated by context recovery"));
         assert!(serialized.contains("original_chars"));
     }
+
     #[test]
-    fn test_strip_tool_results_for_history() {
+    fn test_reconstruct_turn_for_history_whitelist() {
         let mut turn = Turn {
             turn_id: "test".to_string(),
-            user_message: "read file".to_string(),
+            user_message: "do it".to_string(),
             messages: vec![
                 Message {
-                    role: "function".to_string(),
+                    role: "model".to_string(),
                     parts: vec![Part {
-                        text: None,
-                        function_call: None,
-                        function_response: Some(FunctionResponse {
-                            name: "read_file".to_string(),
-                            response: serde_json::json!({
-                                "content": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12"
-                            }),
+                        text: Some("<think>reasoning</think> I will run ls".to_string()),
+                        function_call: Some(FunctionCall {
+                            name: "ls".to_string(),
+                            args: serde_json::json!({}),
                         }),
+                        function_response: None,
+                        thought_signature: Some("signature".to_string()),
+                    }],
+                }
+            ],
+        };
+
+        let reconstructed = AgentContext::reconstruct_turn_for_history(&turn);
+        let msg = &reconstructed.messages[0];
+        let part = &msg.parts[0];
+
+        // 1. Thought signature should be gone
+        assert!(part.thought_signature.is_none());
+        
+        // 2. Text should be gone because function call exists
+        assert!(part.text.is_none());
+        
+        // 3. Function call should remain
+        assert!(part.function_call.is_some());
+    }
+
+    #[test]
+    fn test_reconstruct_turn_for_history_text_only() {
+        let mut turn = Turn {
+            turn_id: "test".to_string(),
+            user_message: "hi".to_string(),
+            messages: vec![
+                Message {
+                    role: "model".to_string(),
+                    parts: vec![Part {
+                        text: Some("<think>reasoning</think> Hello world".to_string()),
+                        function_call: None,
+                        function_response: None,
                         thought_signature: None,
                     }],
                 }
             ],
         };
 
-        let stripped = AgentContext::strip_tool_results_for_history(&turn);
-        let fr = stripped.messages[0].parts[0].function_response.as_ref().unwrap();
-        let content = fr.response["content"].as_str().unwrap();
-        
-        assert!(content.contains("History: Content stripped"));
-        assert!(content.contains("line1")); // Head
-        assert!(content.contains("line12")); // Tail
-        assert!(!content.contains("line6")); // Middle should be gone
+        let reconstructed = AgentContext::reconstruct_turn_for_history(&turn);
+        let msg = &reconstructed.messages[0];
+        let part = &msg.parts[0];
+
+        // Text should remain but without thinking
+        assert_eq!(part.text.as_ref().unwrap(), "Hello world");
     }
 
     #[test]
