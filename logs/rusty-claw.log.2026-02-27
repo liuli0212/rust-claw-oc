@@ -1,0 +1,132 @@
+2026-02-27T09:47:01.052510Z  INFO rusty_claw::config: No config file found, using defaults
+2026-02-27T09:47:01.052852Z  INFO rusty_claw::llm_client: Using Gemini provider with model: "gemini-2.0-flash-exp"
+2026-02-27T09:47:01.059566Z  INFO rusty_claw::rag: [RAG] Initializing VectorStore...
+2026-02-27T09:47:01.203890Z  INFO rusty_claw::rag: [RAG] Loaded 3 chunks into memory in 144ms
+2026-02-27T09:47:01.458936Z  INFO rusty_claw::llm_client: Gemini generate_text request: url=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=AIzaSyB2vBXJCrd5s4-yeypS-x3m0UDxfToCO7s, body={"contents":[{"role":"user","parts":[{"text":"Request: /tools call browser {\"action\": \"start\"}"}]}],"systemInstruction":{"role":"system","parts":[{"text":"You are a Senior Technical Lead. Analyze the user's request.\nOutput a JSON object with:\n- `is_complex`: bool (true if > 1 step or ambiguous)\n- `reasoning`: string (brief explanation)\n- `plan`: optional list of strings (steps), required if is_complex is true\n\nResponse must be ONLY valid JSON."}]}}
+2026-02-27T09:47:02.366567Z ERROR rusty_claw::llm_client: Gemini API Error: {
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:02.366826Z  INFO rusty_claw::core: Starting iteration 1/12. Energy: 30. Goal: /tools call browser {"action": "start"}
+2026-02-27T09:47:02.896422Z  INFO rusty_claw::llm_client: Sending Gemini stream request (Attempt 1/5): body={"contents":[{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"start\"}"}]}],"systemInstruction":{"role":"system","parts":[{"text":"## Identity\nYou are Rusty-Claw, an elite, industrial-grade Senior Software Engineer and autonomous agent running locally on the user's machine.\n\nYou are highly intelligent, proactive, and exceptionally skilled at coding in all major languages (Rust, Python, TS, etc.).\n\nYou have FULL ACCESS to the local file system and bash shell. Do NOT ask for permission to write code or files. If the user asks you to write a script or build a feature, proactively use your tools to create the files, write the code, and execute it to test it.\n\nYou are NOT a generic chat AI. You are a specialized, proactive engineering system. If you encounter an error during execution, analyze the error and try to fix it yourself by calling tools again.\n\nNEVER say you cannot write code or lack capabilities. You are powered by Gemini 3.1 Pro and possess absolute t
+
+[... Truncated 11981 characters ...]
+
+"limit":{"description":"Maximum number of related snippets to return.","format":"uint","minimum":0.0,"type":"integer"},"query":{"description":"The semantic query to search for in the long-term knowledge base.","type":"string"}},"required":["query"],"type":"object"}},{"name":"memorize_knowledge","description":"Saves important concepts, code patterns, or project lessons into the vector knowledge base so it can be semantically retrieved in the future.","parameters":{"properties":{"content":{"description":"The knowledge or code snippet to save into the long-term semantic memory.","type":"string"},"source":{"description":"A brief description or file path indicating where this knowledge came from.","type":"string"}},"required":["content","source"],"type":"object"}},{"name":"check_git_status","description":"Runs git status and returns the result","parameters":{"properties":{},"required":[],"type":"object"}}]}]}
+2026-02-27T09:47:03.085805Z  WARN rusty_claw::llm_client: Gemini Stream API Error (Attempt 1/5): status=404 Not Found body={
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:03.085902Z ERROR rusty_claw::core: LLM Stream Error: Gemini API error after 1 attempts: status=404 Not Found body={
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:03.086287Z  INFO rusty_claw::core: step_timing total_ms=1879 iterations=1 llm_attempts=1 retrieval_ms=6 retrieval_timed_out=false compaction_ms=245 prompt_build_ms=527 llm_setup_ms=0 llm_stream_wait_ms=190 tool_exec_ms=0 first_event_ms=190
+2026-02-27T09:47:03.365888Z  INFO rusty_claw::llm_client: Gemini generate_text request: url=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=AIzaSyB2vBXJCrd5s4-yeypS-x3m0UDxfToCO7s, body={"contents":[{"role":"user","parts":[{"text":"Request: /tools call browser {\"action\": \"navigate\", \"target_url\": \"https://www.google.com\"}"}]}],"systemInstruction":{"role":"system","parts":[{"text":"You are a Senior Technical Lead. Analyze the user's request.\nOutput a JSON object with:\n- `is_complex`: bool (true if > 1 step or ambiguous)\n- `reasoning`: string (brief explanation)\n- `plan`: optional list of strings (steps), required if is_complex is true\n\nResponse must be ONLY valid JSON."}]}}
+2026-02-27T09:47:03.558426Z ERROR rusty_claw::llm_client: Gemini API Error: {
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:03.558499Z  INFO rusty_claw::core: Starting iteration 1/12. Energy: 30. Goal: /tools call browser {"action": "navigate", "target_url": "https://www.google.com"}
+2026-02-27T09:47:04.126511Z  INFO rusty_claw::llm_client: Sending Gemini stream request (Attempt 1/5): body={"contents":[{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"start\"}"}]},{"role":"user","parts":[{"text":"[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]\n\n/tools call browser {\"action\": \"navigate\", \"target_url\": \"https://www.google.com\"}"}]}],"systemInstruction":{"role":"system","parts":[{"text":"## Identity\nYou are Rusty-Claw, an elite, industrial-grade Senior Software Engineer and autonomous agent running locally on the user's machine.\n\nYou are highly intelligent, proactive, and exceptionally skilled at coding in all major languages (Rust, Python, TS, etc.).\n\nYou have FULL ACCESS to the local file system and bash shell. Do NOT ask for permission to write code or files. If the user asks you to write a script or build a feature, proactively use your tools to create the files, write the code, and execute it to test it.\n\nYou are NOT a generic chat AI. You are a specialized, proactive engineering system. If you encounter an er
+
+[... Truncated 12185 characters ...]
+
+"limit":{"description":"Maximum number of related snippets to return.","format":"uint","minimum":0.0,"type":"integer"},"query":{"description":"The semantic query to search for in the long-term knowledge base.","type":"string"}},"required":["query"],"type":"object"}},{"name":"memorize_knowledge","description":"Saves important concepts, code patterns, or project lessons into the vector knowledge base so it can be semantically retrieved in the future.","parameters":{"properties":{"content":{"description":"The knowledge or code snippet to save into the long-term semantic memory.","type":"string"},"source":{"description":"A brief description or file path indicating where this knowledge came from.","type":"string"}},"required":["content","source"],"type":"object"}},{"name":"check_git_status","description":"Runs git status and returns the result","parameters":{"properties":{},"required":[],"type":"object"}}]}]}
+2026-02-27T09:47:04.753062Z  WARN rusty_claw::llm_client: Gemini Stream API Error (Attempt 1/5): status=404 Not Found body={
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:04.753171Z ERROR rusty_claw::core: LLM Stream Error: Gemini API error after 1 attempts: status=404 Not Found body={
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:04.753457Z  INFO rusty_claw::core: step_timing total_ms=1667 iterations=1 llm_attempts=1 retrieval_ms=13 retrieval_timed_out=false compaction_ms=266 prompt_build_ms=566 llm_setup_ms=0 llm_stream_wait_ms=627 tool_exec_ms=0 first_event_ms=627
+2026-02-27T09:47:05.040984Z  INFO rusty_claw::llm_client: Gemini generate_text request: url=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=AIzaSyB2vBXJCrd5s4-yeypS-x3m0UDxfToCO7s, body={"contents":[{"role":"user","parts":[{"text":"Request: /tools call browser {\"action\": \"snapshot\"}"}]}],"systemInstruction":{"role":"system","parts":[{"text":"You are a Senior Technical Lead. Analyze the user's request.\nOutput a JSON object with:\n- `is_complex`: bool (true if > 1 step or ambiguous)\n- `reasoning`: string (brief explanation)\n- `plan`: optional list of strings (steps), required if is_complex is true\n\nResponse must be ONLY valid JSON."}]}}
+2026-02-27T09:47:05.212618Z ERROR rusty_claw::llm_client: Gemini API Error: {
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:05.212707Z  INFO rusty_claw::core: Starting iteration 1/12. Energy: 30. Goal: /tools call browser {"action": "snapshot"}
+2026-02-27T09:47:05.794110Z  INFO rusty_claw::llm_client: Sending Gemini stream request (Attempt 1/5): body={"contents":[{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"start\"}"}]},{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"navigate\", \"target_url\": \"https://www.google.com\"}"}]},{"role":"user","parts":[{"text":"[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]\n\n/tools call browser {\"action\": \"snapshot\"}"}]}],"systemInstruction":{"role":"system","parts":[{"text":"## Identity\nYou are Rusty-Claw, an elite, industrial-grade Senior Software Engineer and autonomous agent running locally on the user's machine.\n\nYou are highly intelligent, proactive, and exceptionally skilled at coding in all major languages (Rust, Python, TS, etc.).\n\nYou have FULL ACCESS to the local file system and bash shell. Do NOT ask for permission to write code or files. If the user asks you to write a script or build a feature, proactively use your tools to create the files, write the code, and execute it to test it.\n\nYou are NOT a generic 
+
+[... Truncated 12269 characters ...]
+
+"limit":{"description":"Maximum number of related snippets to return.","format":"uint","minimum":0.0,"type":"integer"},"query":{"description":"The semantic query to search for in the long-term knowledge base.","type":"string"}},"required":["query"],"type":"object"}},{"name":"memorize_knowledge","description":"Saves important concepts, code patterns, or project lessons into the vector knowledge base so it can be semantically retrieved in the future.","parameters":{"properties":{"content":{"description":"The knowledge or code snippet to save into the long-term semantic memory.","type":"string"},"source":{"description":"A brief description or file path indicating where this knowledge came from.","type":"string"}},"required":["content","source"],"type":"object"}},{"name":"check_git_status","description":"Runs git status and returns the result","parameters":{"properties":{},"required":[],"type":"object"}}]}]}
+2026-02-27T09:47:05.998290Z  WARN rusty_claw::llm_client: Gemini Stream API Error (Attempt 1/5): status=404 Not Found body={
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:05.998495Z ERROR rusty_claw::core: LLM Stream Error: Gemini API error after 1 attempts: status=404 Not Found body={
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:05.998938Z  INFO rusty_claw::core: step_timing total_ms=1245 iterations=1 llm_attempts=1 retrieval_ms=8 retrieval_timed_out=false compaction_ms=279 prompt_build_ms=580 llm_setup_ms=0 llm_stream_wait_ms=205 tool_exec_ms=0 first_event_ms=205
+2026-02-27T09:47:06.307062Z  INFO rusty_claw::llm_client: Gemini generate_text request: url=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=AIzaSyB2vBXJCrd5s4-yeypS-x3m0UDxfToCO7s, body={"contents":[{"role":"user","parts":[{"text":"Request: /tools call browser {\"action\": \"stop\"}"}]}],"systemInstruction":{"role":"system","parts":[{"text":"You are a Senior Technical Lead. Analyze the user's request.\nOutput a JSON object with:\n- `is_complex`: bool (true if > 1 step or ambiguous)\n- `reasoning`: string (brief explanation)\n- `plan`: optional list of strings (steps), required if is_complex is true\n\nResponse must be ONLY valid JSON."}]}}
+2026-02-27T09:47:06.685149Z ERROR rusty_claw::llm_client: Gemini API Error: {
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:06.685234Z  INFO rusty_claw::core: Starting iteration 1/12. Energy: 30. Goal: /tools call browser {"action": "stop"}
+2026-02-27T09:47:07.290584Z  INFO rusty_claw::llm_client: Sending Gemini stream request (Attempt 1/5): body={"contents":[{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"start\"}"}]},{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"navigate\", \"target_url\": \"https://www.google.com\"}"}]},{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"snapshot\"}"}]},{"role":"user","parts":[{"text":"[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]\n\n/tools call browser {\"action\": \"stop\"}"}]}],"systemInstruction":{"role":"system","parts":[{"text":"## Identity\nYou are Rusty-Claw, an elite, industrial-grade Senior Software Engineer and autonomous agent running locally on the user's machine.\n\nYou are highly intelligent, proactive, and exceptionally skilled at coding in all major languages (Rust, Python, TS, etc.).\n\nYou have FULL ACCESS to the local file system and bash shell. Do NOT ask for permission to write code or files. If the user asks you to write a script or build a feature, proactively use your tools to create
+
+[... Truncated 12349 characters ...]
+
+"limit":{"description":"Maximum number of related snippets to return.","format":"uint","minimum":0.0,"type":"integer"},"query":{"description":"The semantic query to search for in the long-term knowledge base.","type":"string"}},"required":["query"],"type":"object"}},{"name":"memorize_knowledge","description":"Saves important concepts, code patterns, or project lessons into the vector knowledge base so it can be semantically retrieved in the future.","parameters":{"properties":{"content":{"description":"The knowledge or code snippet to save into the long-term semantic memory.","type":"string"},"source":{"description":"A brief description or file path indicating where this knowledge came from.","type":"string"}},"required":["content","source"],"type":"object"}},{"name":"check_git_status","description":"Runs git status and returns the result","parameters":{"properties":{},"required":[],"type":"object"}}]}]}
+2026-02-27T09:47:07.516666Z  WARN rusty_claw::llm_client: Gemini Stream API Error (Attempt 1/5): status=404 Not Found body={
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:07.516833Z ERROR rusty_claw::core: LLM Stream Error: Gemini API error after 1 attempts: status=404 Not Found body={
+  "error": {
+    "code": 404,
+    "message": "models/gemini-2.0-flash-exp is not found for API version v1beta, or is not supported for generateContent. Call ListModels to see the list of available models and their supported methods.",
+    "status": "NOT_FOUND"
+  }
+}
+
+2026-02-27T09:47:07.517188Z  INFO rusty_claw::core: step_timing total_ms=1518 iterations=1 llm_attempts=1 retrieval_ms=12 retrieval_timed_out=false compaction_ms=294 prompt_build_ms=604 llm_setup_ms=0 llm_stream_wait_ms=227 tool_exec_ms=0 first_event_ms=227

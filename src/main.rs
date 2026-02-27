@@ -259,7 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
 
     let mut rl = DefaultEditor::new()?;
-    println!("Welcome to Rusty-Claw! (type 'exit' to quit)");
+    println!("Welcome to Rusty-Claw! (type '/exit' to quit)");
     if loaded_count > 0 {
         println!(
             "Loaded {} dynamic skills from 'skills/' directory.",
@@ -288,7 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match readline {
             Ok(line) => {
                 let line = line.trim();
-                if line == "exit" {
+                if line == "/exit" {
                     break;
                 }
                 if line == "/new" {
@@ -339,13 +339,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              }
                         }
                         _ => {
-                            let (total, max, history, current, system) = agent_guard.get_context_status();
-                            let percentage = (total as f64 / max as f64) * 100.0;
+                            let stats = agent_guard.get_detailed_stats();
+                            let percentage = (stats.total as f64 / stats.max as f64) * 100.0;
+                            
                             println!("\x1b[36m[Context Usage]\x1b[0m");
-                            println!("Total Used:   {} / {} tokens ({:.1}%)", total, max, percentage);
-                            println!("  - History:  {} tokens", history);
-                            println!("  - Current:  {} tokens", current);
-                            println!("  - System:   {} tokens", system);
+                            println!("Total Used:   {} / {} tokens ({:.1}%)", stats.total, stats.max, percentage);
+                            
+                            println!("\n\x1b[33m--- System Instruction Breakdown ---\x1b[0m");
+                            println!("  Identity (Static):    {} tokens", stats.system_static);
+                            println!("  Runtime Env:         {} tokens", stats.system_runtime);
+                            println!("  Custom Instructions: {} tokens (.claw_prompt.md)", stats.system_custom);
+                            println!("  Task Plan:           {} tokens", stats.system_task_plan);
+                            println!("  Project Context:     {} tokens (AGENTS.md, etc.)", stats.system_project);
+                            println!("  Retrieved Memory:    {} tokens (RAG)", stats.memory);
+                            
+                            println!("\n\x1b[33m--- Conversation Breakdown ---\x1b[0m");
+                            println!("  History:             {} tokens", stats.history);
+                            println!("  Current Turn:        {} tokens", stats.current_turn);
+                            
+                            let tool_stats = agent_guard.get_tool_stats();
+                            let tool_total: usize = tool_stats.values().sum();
+                            println!("\n\x1b[33m--- Tools Breakdown ({} total) ---\x1b[0m", tool_total);
+                            let mut sorted_tools: Vec<_> = tool_stats.into_iter().collect();
+                            sorted_tools.sort_by(|a, b| b.1.cmp(&a.1));
+                            for (name, tokens) in sorted_tools {
+                                println!("  - {:<18} {} tokens", name, tokens);
+                            }
                         }
                     }
                     continue;

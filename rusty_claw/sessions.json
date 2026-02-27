@@ -1,0 +1,9 @@
+{
+  "sessions": {
+    "cli": {
+      "transcript_path": "rusty_claw/sessions/cli.jsonl",
+      "updated_at_unix": 1772185625,
+      "loaded_turns": 0
+    }
+  }
+}

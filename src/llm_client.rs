@@ -88,7 +88,7 @@ pub enum StreamEvent {
                     let context_window = prov_config.context_window
                         .unwrap_or_else(|| estimate_context_window(&model_str));
 
-                    Ok(Arc::new(GeminiClient::new_with_window(api_key, model_final, context_window)))
+                    Ok(Arc::new(GeminiClient::new_with_window(api_key, model_final, context_window, provider.to_string())))
                 }
                 _ => Err(format!("Unknown provider type '{}'", prov_config.type_name)),
             }
@@ -118,7 +118,7 @@ pub enum StreamEvent {
                     );
                     let model_str = model.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
                     let context_window = estimate_context_window(&model_str);
-                    Ok(Arc::new(GeminiClient::new_with_window(api_key, model, context_window)))
+                    Ok(Arc::new(GeminiClient::new_with_window(api_key, model, context_window, provider.to_string())))
                 }
             }
         }
@@ -149,6 +149,7 @@ pub struct GeminiClient {
     api_key: String,
     client: Client,
     model_name: String,
+    provider_name: String,
     #[allow(dead_code)]
     function_declarations_cache: Mutex<Option<CachedFunctionDeclarations>>,
     context_window: usize,
@@ -187,21 +188,23 @@ pub struct FunctionDeclaration {
 }
 
 impl GeminiClient {
-    pub fn new(api_key: String, model_name: Option<String>) -> Self {
+    pub fn new(api_key: String, model_name: Option<String>, provider_name: String) -> Self {
         Self {
             api_key,
             client: Client::new(),
             model_name: model_name.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
+            provider_name,
             function_declarations_cache: Mutex::new(None),
             context_window: 1_000_000,
         }
     }
 
-    pub fn new_with_window(api_key: String, model_name: Option<String>, context_window: usize) -> Self {
+    pub fn new_with_window(api_key: String, model_name: Option<String>, context_window: usize, provider_name: String) -> Self {
         Self {
             api_key,
             client: Client::new(),
             model_name: model_name.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
+            provider_name,
             function_declarations_cache: Mutex::new(None),
             context_window,
         }
@@ -232,7 +235,7 @@ impl LlmClient for GeminiClient {
         &self.model_name
     }
     fn provider_name(&self) -> &str {
-        "gemini"
+        &self.provider_name
     }
     fn context_window_size(&self) -> usize {
         self.context_window

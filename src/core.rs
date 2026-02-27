@@ -151,8 +151,22 @@ impl AgentLoop {
             max_tokens,
         )
     }
-    pub fn get_context_status(&self) -> (usize, usize, usize, usize, usize) {
-        self.context.get_context_status()
+    pub fn get_detailed_stats(&self) -> crate::context::DetailedContextStats {
+        self.context.get_detailed_stats()
+    }
+    pub fn get_tool_stats(&self) -> HashMap<String, usize> {
+        let bpe = crate::context::AgentContext::get_bpe();
+        let mut stats = HashMap::new();
+        for tool in &self.tools {
+            let name = tool.name();
+            let desc = tool.description();
+            let schema = tool.parameters_schema().to_string();
+            // Estimate tokens for function declaration
+            let content = format!("{}{}{}", name, desc, schema);
+            let tokens = bpe.encode_with_special_tokens(&content).len();
+            stats.insert(name, tokens);
+        }
+        stats
     }
     pub fn get_context_details(&self) -> String {
         self.context.get_context_details()
