@@ -1289,9 +1289,8 @@ impl AgentLoop {
                             full_text.push_str(&visible_text);
                         }
                     }
-                    StreamEvent::ToolCall(call, _signature) => {
-                        tool_calls.push(call);
-                        // If signature is needed we would use it here, but we are skipping it for now to fix the payload error.
+                    StreamEvent::ToolCall(call, signature) => {
+                        tool_calls.push((call, signature));
                     }
                     StreamEvent::Error(e) => {
                         tracing::error!("LLM Stream Error: {}", e);
@@ -1308,7 +1307,7 @@ impl AgentLoop {
 
             tracing::debug!("Raw LLM Output (full_text):\n{}", raw_full_text);
             for (i, call) in tool_calls.iter().enumerate() {
-                tracing::debug!("Parsed ToolCall [{}]: name={}, args={}", i, call.name, call.args);
+                tracing::debug!("Parsed ToolCall [{}]: name={}, args={}", i, call.0.name, call.0.args);
             }
 
             if Self::enforce_final_tag_enabled() {
@@ -1362,7 +1361,7 @@ impl AgentLoop {
                 break;
             }
 
-            for call in &tool_calls {
+            for (call, signature) in &tool_calls {
                 if call.name.trim().is_empty() {
                     continue; // Skip hallucinated empty tool calls
                 }
@@ -1370,7 +1369,7 @@ impl AgentLoop {
                     text: None,
                     function_call: Some(call.clone()),
                     function_response: None,
-                    thought_signature: None,
+                    thought_signature: signature.clone(),
                 });
             }
             if !parts.is_empty() {
@@ -1460,7 +1459,7 @@ self.output
             if full_text.trim().is_empty()
                 && tool_calls
                     .iter()
-                    .all(|c| Self::is_message_delivery_tool(&c.name))
+                    .all(|(c, _)| Self::is_message_delivery_tool(&c.name))
             {
                 silent_cause_hint = Some("message_tool_suppressed_main_reply".to_string());
             }
@@ -1470,7 +1469,7 @@ self.output
             let mut requested_finish = false;
             let mut executed_signatures = std::collections::HashSet::new();
 
-            for call in tool_calls {
+            for (call, _signature) in tool_calls {
                 let sig = format!("{}:{}", call.name, call.args.to_string());
                 if !executed_signatures.insert(sig) {
                     // Deduplicate identical parallel tool calls (common hallucination in Qwen/OpenAI compat)
