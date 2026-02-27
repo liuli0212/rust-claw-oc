@@ -70,9 +70,15 @@ pub async fn run_telegram_bot(token: String, session_manager: Arc<SessionManager
                     chat_id,
                 });
 
-                let agent = session_manager
+                let agent = match session_manager
                     .get_or_create_session(&session_id, output)
-                    .await;
+                    .await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            let _ = bot.send_message(chat_id, format!("❌ Error: {}", e)).await;
+                            return Ok(());
+                        }
+                    };
 
                 let mut agent_guard = agent.lock().await;
                 match agent_guard.step(text.to_string()).await {

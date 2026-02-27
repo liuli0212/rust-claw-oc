@@ -22,7 +22,7 @@ struct SessionEntry {
 }
 
 pub struct SessionManager {
-    llm: Arc<dyn LlmClient>,
+    llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     tools: Vec<Arc<dyn Tool>>,
     // Active agent sessions (In-Memory) + their cancel tokens
     sessions: AsyncMutex<HashMap<String, (Arc<AsyncMutex<AgentLoop>>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>,
@@ -33,7 +33,7 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub fn new(llm: Arc<dyn LlmClient>, tools: Vec<Arc<dyn Tool>>) -> Self {
+    pub fn new(llm: Option<Arc<dyn LlmClient>>, tools: Vec<Arc<dyn Tool>>) -> Self {
         let transcript_dir = PathBuf::from("rusty_claw").join("sessions");
         let registry_path = PathBuf::from("rusty_claw").join("sessions.json");
 
@@ -50,7 +50,7 @@ impl SessionManager {
         };
 
         Self {
-            llm,
+            llm: Arc::new(RwLock::new(llm)),
             tools,
             sessions: AsyncMutex::new(HashMap::new()),
             transcript_dir,
@@ -89,13 +89,13 @@ impl SessionManager {
         &self,
         session_id: &str,
         output: Arc<dyn AgentOutput>,
-    ) -> Arc<AsyncMutex<AgentLoop>> {
+    ) -> Result<Arc<AsyncMutex<AgentLoop>>, String> {
         let mut sessions = self.sessions.lock().await;
         if let Some((agent, _)) = sessions.get(session_id) {
             // Update timestamp in memory only (fast)
             self.update_registry_entry(session_id, None, None);
             self.persist_registry_async();
-            return agent.clone();
+            return Ok(agent.clone());
         }
 
         let transcript_path = transcript_path_for_session(&self.transcript_dir, session_id);
@@ -106,11 +106,14 @@ impl SessionManager {
         self.update_registry_entry(session_id, Some(transcript_path), Some(loaded_turns));
         self.persist_registry_async();
 
-        let agent_loop = AgentLoop::new(self.llm.clone(), self.tools.clone(), context, output);
+        let llm_guard = self.llm.read().unwrap();
+        let llm = llm_guard.as_ref().ok_or_else(|| "No LLM provider configured. Use /model <provider> to set one.".to_string())?;
+
+        let agent_loop = AgentLoop::new(llm.clone(), self.tools.clone(), context, output);
         let token = agent_loop.cancel_token.clone();
         let agent = Arc::new(AsyncMutex::new(agent_loop));
         sessions.insert(session_id.to_string(), (agent.clone(), token));
-        agent
+        Ok(agent)
     }
 
     fn update_registry_entry(
@@ -161,13 +164,20 @@ impl SessionManager {
         // We use the factory function from llm_client
         match crate::llm_client::create_llm_client(provider, model.clone(), &config) {
             Ok(new_llm) => {
+                // Update global default for new sessions
+                {
+                    let mut llm_guard = self.llm.write().unwrap();
+                    *llm_guard = Some(new_llm.clone());
+                }
+
                 let sessions = self.sessions.lock().await;
                 if let Some((agent_mutex, _)) = sessions.get(session_id) {
                     let mut agent = agent_mutex.lock().await;
                     agent.update_llm(new_llm);
-                    Ok(format!("Updated session '{}' to provider '{}' model '{:?}'", session_id, provider, model))
+                    Ok(format!("Updated session '{}' and global default to provider '{}' model '{:?}'", session_id, provider, model))
                 } else {
-                    Err(format!("Session '{}' not found", session_id))
+                    // Even if session doesn't exist, we updated the global default.
+                    Ok(format!("Updated global default to provider '{}' model '{:?}'. (Session '{}' not yet active)", provider, model, session_id))
                 }
             }
             Err(e) => Err(e)

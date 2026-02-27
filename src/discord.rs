@@ -73,10 +73,16 @@ impl EventHandler for Handler {
             channel_id: msg.channel_id,
         });
 
-        let agent = self
+        let agent = match self
             .session_manager
             .get_or_create_session(&session_id, output)
-            .await;
+            .await {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = msg.channel_id.say(&ctx.http, format!("❌ Error: {}", e)).await;
+                    return;
+                }
+            };
         let mut agent = agent.lock().await;
         match agent.step(msg.content).await {
             Ok(exit) => {
