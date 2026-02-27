@@ -47,6 +47,20 @@ pub struct Turn {
     pub messages: Vec<Message>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DetailedContextStats {
+    pub system_static: usize,
+    pub system_runtime: usize,
+    pub system_custom: usize, // .claw_prompt.md
+    pub system_project: usize, // AGENTS.md, etc.
+    pub system_task_plan: usize,
+    pub memory: usize,
+    pub history: usize,
+    pub current_turn: usize,
+    pub total: usize,
+    pub max: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct PromptReport {
     pub max_history_tokens: usize,
@@ -57,6 +71,7 @@ pub struct PromptReport {
     pub total_prompt_tokens: usize,
     pub retrieved_memory_snippets: usize,
     pub retrieved_memory_sources: Vec<String>,
+    pub detailed_stats: DetailedContextStats,
 }
 
 pub struct AgentContext {
@@ -90,9 +105,82 @@ impl AgentContext {
         }
     }
 
+    pub fn get_bpe() -> CoreBPE {
+        tiktoken_rs::cl100k_base().unwrap()
+    }
+
     pub fn with_transcript_path(mut self, transcript_path: PathBuf) -> Self {
         self.transcript_path = Some(transcript_path);
         self
+    }
+
+    pub fn get_detailed_stats(&self) -> DetailedContextStats {
+        let mut stats = DetailedContextStats::default();
+        let bpe = Self::get_bpe();
+
+        // 1. Static Identity
+        let identity = self.system_prompts.join("\n\n");
+        stats.system_static = bpe.encode_with_special_tokens(&identity).len();
+
+        // 2. Runtime
+        let mut runtime = String::new();
+        runtime.push_str(&format!("OS: {}\n", std::env::consts::OS));
+        runtime.push_str(&format!("Architecture: {}\n", std::env::consts::ARCH));
+        if let Ok(dir) = std::env::current_dir() {
+            runtime.push_str(&format!("Current Directory: {}\n", dir.display()));
+        }
+        if let Some(path) = &self.transcript_path {
+            runtime.push_str(&format!("Session Transcript: {}\n", path.display()));
+        }
+        stats.system_runtime = bpe.encode_with_special_tokens(&runtime).len();
+
+        // 3. Custom
+        if let Ok(custom_prompt) = fs::read_to_string(".claw_prompt.md") {
+            stats.system_custom = bpe.encode_with_special_tokens(&custom_prompt).len();
+        }
+
+        // 4. Task Plan
+        if let Ok(plan_content) = fs::read_to_string(".rusty_claw_task_plan.json") {
+            stats.system_task_plan = bpe.encode_with_special_tokens(&plan_content).len();
+        }
+
+        // 5. Project Context (AGENTS.md, SOUL.md, etc.)
+        let mut project_context = String::new();
+        if let Ok(content) = fs::read_to_string("AGENTS.md") {
+            project_context.push_str(&content);
+        }
+        if let Ok(content) = fs::read_to_string("README.md") {
+            project_context.push_str(&content);
+        }
+        if let Ok(content) = fs::read_to_string("MEMORY.md") {
+            project_context.push_str(&content);
+        }
+        stats.system_project = bpe.encode_with_special_tokens(&project_context).len();
+
+        // 6. Memory (RAG)
+        if let Some(memory) = &self.retrieved_memory {
+            stats.memory = bpe.encode_with_special_tokens(memory).len();
+        }
+
+        // 7. History
+        let (_, history_tokens, _) = self.build_history_with_budget();
+        stats.history = history_tokens;
+
+        // 8. Current Turn
+        if let Some(turn) = &self.current_turn {
+             for msg in &turn.messages {
+                 for part in &msg.parts {
+                     if let Some(text) = &part.text {
+                         stats.current_turn += bpe.encode_with_special_tokens(text).len();
+                     }
+                 }
+             }
+        }
+
+        stats.total = self.get_context_status().0;
+        stats.max = self.max_history_tokens;
+
+        stats
     }
 
     pub fn load_transcript(&mut self) -> std::io::Result<usize> {
@@ -865,6 +953,7 @@ impl AgentContext {
             total_prompt_tokens: history_tokens_used + current_turn_tokens + system_prompt_tokens,
             retrieved_memory_snippets,
             retrieved_memory_sources: self.retrieved_memory_sources.clone(),
+            detailed_stats: self.get_detailed_stats(),
         };
 
         (messages, Some(system_msg), report)
