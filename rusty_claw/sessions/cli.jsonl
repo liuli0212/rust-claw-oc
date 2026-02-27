@@ -1,4 +1,0 @@
-{"turn_id":"b23820f4-2379-4c6a-8981-a01238006024","user_message":"/tools call browser {\"action\": \"start\"}","messages":[{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"start\"}"}]}]}
-{"turn_id":"c47ec283-1dff-4365-a873-fe5373419085","user_message":"/tools call browser {\"action\": \"navigate\", \"target_url\": \"https://www.google.com\"}","messages":[{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"navigate\", \"target_url\": \"https://www.google.com\"}"}]}]}
-{"turn_id":"523956f6-df06-4a9d-972e-84fbb77d346f","user_message":"/tools call browser {\"action\": \"snapshot\"}","messages":[{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"snapshot\"}"}]}]}
-{"turn_id":"164a0764-ac92-4d0a-bd59-d837adb91ec8","user_message":"/tools call browser {\"action\": \"stop\"}","messages":[{"role":"user","parts":[{"text":"/tools call browser {\"action\": \"stop\"}"}]}]}
