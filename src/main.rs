@@ -1,3 +1,5 @@
+pub mod browser;
+
 mod context;
 mod config;
 mod core;
@@ -201,6 +203,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tools: Vec<Arc<dyn tools::Tool>> = Vec::new();
     tools.push(Arc::new(BashTool::new()));
+    tools.push(Arc::new(crate::browser::BrowserTool::new()));
     tools.push(Arc::new(WriteFileTool));
     tools.push(Arc::new(ReadFileTool));
     tools.push(Arc::new(FinishTaskTool));
