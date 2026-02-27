@@ -266,13 +266,7 @@ impl AgentContext {
         let mut cleaned_parts = Vec::new();
         for part in &msg.parts {
             let mut cleaned = part.clone();
-            if cleaned
-                .function_call
-                .as_ref()
-                .is_some_and(|_fc| cleaned.thought_signature.is_none())
-            {
-                cleaned.function_call = None;
-            }
+
 
             if role == "function" {
                 cleaned.text = None;
@@ -1004,11 +998,11 @@ mod tests {
         );
 
         assert!(
-            !payload.iter().any(|m| m.parts.iter().any(|p| p
+            payload.iter().any(|m| m.parts.iter().any(|p| p
                 .function_call
                 .as_ref()
-                .is_some_and(|_fc| p.thought_signature.is_none()))),
-            "payload must not contain functionCall parts without thought_signature"
+                .is_some_and(|fc| fc.name == "execute_bash"))),
+            "expected tool calls to be preserved in payload"
         );
         assert!(
             payload.iter().filter(|m| m.role == "user").any(|m| m
