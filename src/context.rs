@@ -386,6 +386,159 @@ impl AgentContext {
         cloned
     }
 
+    fn is_user_referencing_history(msg: &str) -> bool {
+        let lower = msg.to_lowercase();
+        let keywords = [
+            "previous command", "last command", "previous output", "last output",
+            "what did it say", "fix the error", "look above", "check the error",
+            "what was the error", "show me the output", "full output"
+        ];
+        keywords.iter().any(|k| lower.contains(k))
+    }
+
+    fn remove_ephemeral_injections(msg: &mut Message) {
+        if msg.role != "user" {
+            return;
+        }
+        for part in &mut msg.parts {
+            if let Some(text) = &mut part.text {
+                let markers = [
+                    "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]",
+                    "[SYSTEM ALERT: CRITICAL INSTRUCTION. IGNORE PREVIOUS CONTEXT IF CONFLICTING.]",
+                    "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE.]"
+                ];
+
+                for marker in markers {
+                    if text.contains(marker) {
+                        *text = text.replace(marker, "").trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    fn strip_tool_results_for_history(turn: &Turn) -> Turn {
+        let mut cloned = turn.clone();
+        
+        for msg in &mut cloned.messages {
+            Self::remove_ephemeral_injections(msg);
+        }
+
+        for msg in &mut cloned.messages {
+            for part in &mut msg.parts {
+                if let Some(fr) = &mut part.function_response {
+                    if let Some(obj) = fr.response.as_object_mut() {
+                        match fr.name.as_str() {
+                            "read_file" => {
+                                let content_val = if let Some(v) = obj.get_mut("content") {
+                                    Some(v)
+                                } else {
+                                    obj.get_mut("result")
+                                };
+
+                                if let Some(content_val) = content_val {
+                                    if let Some(s) = content_val.as_str() {
+                                        let line_count = s.lines().count();
+                                        if line_count > 10 {
+                                            let head: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
+                                            let tail: String = s.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                                            *content_val = serde_json::Value::String(format!(
+                                                "{}\n... [History: Content stripped - {} lines total] ...\n{}",
+                                                head, line_count, tail
+                                            ));
+                                        }
+                                    }
+                                }
+                            },
+                            "execute_bash" => {
+                                for field in ["stdout", "stderr", "result"] {
+                                    if let Some(val) = obj.get_mut(field) {
+                                        if let Some(s) = val.as_str() {
+                                            let char_count = s.chars().count();
+                                            if char_count > 500 {
+                                                let head: String = s.chars().take(200).collect();
+                                                let tail: String = s.chars().skip(char_count - 200).collect();
+                                                *val = serde_json::Value::String(format!(
+                                                    "{}\n... [History: Output stripped - {} chars total] ...\n{}",
+                                                    head, char_count, tail
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            "ls" | "find" | "grep" => {
+                                 if let Some(files) = obj.get_mut("files").and_then(|v| v.as_array_mut()) {
+                                     if files.len() > 10 {
+                                         let total = files.len();
+                                         files.truncate(10);
+                                         files.push(serde_json::json!(format!("... [History: List truncated - {} items total] ...", total)));
+                                     }
+                                 }
+                            },
+                            "web_search" => {
+                                 if let Some(results) = obj.get_mut("results").and_then(|v| v.as_array_mut()) {
+                                     if results.len() > 3 {
+                                         results.truncate(3);
+                                         results.push(serde_json::json!("... [History: Search results truncated] ..."));
+                                     }
+                                     for res in results.iter_mut() {
+                                         if let Some(res_obj) = res.as_object_mut() {
+                                             if res_obj.contains_key("content") {
+                                                 res_obj.insert("content".to_string(), serde_json::json!("[Snippet stripped]"));
+                                             }
+                                         }
+                                     }
+                                 }
+                            },
+                            "web_fetch" => {
+                                let content_val = if let Some(v) = obj.get_mut("content") {
+                                    Some(v)
+                                } else {
+                                    obj.get_mut("result")
+                                };
+
+                                if let Some(content) = content_val {
+                                    if let Some(s) = content.as_str() {
+                                        *content = serde_json::Value::String(format!(
+                                            "[History: Web content stripped - {} chars]", s.len()
+                                        ));
+                                    }
+                                }
+                            },
+                            "skill" | "use_skill" => {
+                                let msg_val = if let Some(v) = obj.get_mut("message") {
+                                    Some(v)
+                                } else {
+                                    obj.get_mut("result")
+                                };
+
+                                if let Some(msg) = msg_val {
+                                     *msg = serde_json::Value::String("Skill loaded and active.".to_string());
+                                }
+                            },
+                            _ => {
+                                for (_k, v) in obj.iter_mut() {
+                                    if let Some(s) = v.as_str() {
+                                        if s.len() > 1000 {
+                                            let head: String = s.chars().take(500).collect();
+                                            let tail: String = s.chars().skip(s.chars().count() - 200).collect();
+                                            *v = serde_json::Value::String(format!(
+                                                "{}\n... [History: Value stripped - {} chars] ...\n{}",
+                                                head, s.len(), tail
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cloned
+    }
+
     fn build_history_with_budget(&self) -> (Vec<Message>, usize, usize) {
         let bpe = tiktoken_rs::cl100k_base().unwrap();
         let history_budget = self.max_history_tokens.saturating_mul(85) / 100;
@@ -393,12 +546,31 @@ impl AgentContext {
         let mut current_tokens = 0;
         let mut turns_included = 0;
 
-        for turn in self.dialogue_history.iter().rev() {
+        let mut protect_next_turn = false;
+
+        for (i, turn) in self.dialogue_history.iter().rev().enumerate() {
             let sanitized = match Self::sanitize_turn(turn) {
                 Some(v) => v,
                 None => continue,
             };
-            let turn = Self::truncate_old_tool_results(&sanitized);
+            
+            // Heuristic: If this turn asks about history, protect the *next* turn we process (which is the older one)
+            let user_asks_for_context = Self::is_user_referencing_history(&turn.user_message);
+
+            // Context Optimization:
+            // 1. Safety Buffer (Hot State): Keep last 3 turns in Full Fidelity.
+            // 2. Heuristic Protection: If user asked "what did it say?", keep the older turn full.
+            // 3. History (Cool State): Otherwise, apply Smart Stripping.
+            let should_strip = i >= 3 && !protect_next_turn;
+
+            let turn = if should_strip {
+                Self::strip_tool_results_for_history(&sanitized)
+            } else {
+                Self::truncate_old_tool_results(&sanitized)
+            };
+            
+            protect_next_turn = user_asks_for_context;
+
             let turn_tokens: usize = turn
                 .messages
                 .iter()
@@ -595,12 +767,20 @@ impl AgentContext {
         let mut current_turn_tokens = 0;
         if let Some(turn) = &self.current_turn {
             if let Some(mut sanitized_turn) = Self::sanitize_turn(turn) {
-                // FOCUS BOOSTER: Reinforce the new instruction. Too many history turns can make the model forget the new instruction.
+                // FOCUS BOOSTER: Reinforce the new instruction based on history length.
                 if history_turns_included >= 1 {
+                    let booster_msg = if history_turns_included > 20 {
+                        "[SYSTEM ALERT: CRITICAL INSTRUCTION. IGNORE PREVIOUS CONTEXT IF CONFLICTING.]"
+                    } else if history_turns_included > 10 {
+                        "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE.]"
+                    } else {
+                        "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]"
+                    };
+
                     if let Some(user_msg) = sanitized_turn.messages.iter_mut().find(|m| m.role == "user") {
                         if let Some(part) = user_msg.parts.first_mut() {
                             if let Some(text) = &mut part.text {
-                                *text = format!("[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]\n\n{}", text);
+                                *text = format!("{}\n\n{}", booster_msg, text);
                             }
                         }
                     }
@@ -813,5 +993,46 @@ mod tests {
         let serialized = fr.response.to_string();
         assert!(serialized.contains("Truncated by context recovery"));
         assert!(serialized.contains("original_chars"));
+    }
+    #[test]
+    fn test_strip_tool_results_for_history() {
+        let mut turn = Turn {
+            turn_id: "test".to_string(),
+            user_message: "read file".to_string(),
+            messages: vec![
+                Message {
+                    role: "function".to_string(),
+                    parts: vec![Part {
+                        text: None,
+                        function_call: None,
+                        function_response: Some(FunctionResponse {
+                            name: "read_file".to_string(),
+                            response: serde_json::json!({
+                                "content": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12"
+                            }),
+                        }),
+                        thought_signature: None,
+                    }],
+                }
+            ],
+        };
+
+        let stripped = AgentContext::strip_tool_results_for_history(&turn);
+        let fr = stripped.messages[0].parts[0].function_response.as_ref().unwrap();
+        let content = fr.response["content"].as_str().unwrap();
+        
+        assert!(content.contains("History: Content stripped"));
+        assert!(content.contains("line1")); // Head
+        assert!(content.contains("line12")); // Tail
+        assert!(!content.contains("line6")); // Middle should be gone
+    }
+
+    #[test]
+    fn test_is_user_referencing_history() {
+        assert!(AgentContext::is_user_referencing_history("what did the previous command say?"));
+        assert!(AgentContext::is_user_referencing_history("fix the error above"));
+        assert!(AgentContext::is_user_referencing_history("show me the output"));
+        assert!(!AgentContext::is_user_referencing_history("run ls"));
+        assert!(!AgentContext::is_user_referencing_history("hello world"));
     }
 }
