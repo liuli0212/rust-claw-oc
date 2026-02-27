@@ -78,7 +78,16 @@ To prevent context overflow while maintaining logical continuity:
 -   **Tiered Truncation:**
     -   **Tool Result Compression:** Large tool outputs (e.g., `cat` of a huge file) in history are compressed to "Head 6k + Tail 6k" chars to preserve context and potential errors while discarding middle noise.
     -   **History Squashing:** Oldest turns are dropped first if the budget is exceeded.
+    -   **Smart Stripping (Whitelist Strategy):** For turns older than the "Safety Buffer" (last 3 turns), we reconstruct the turn using a strict whitelist:
+        -   **Role:** Kept.
+        -   **Function Call:** Kept (Args preserved).
+        -   **Function Response:** Stripped to summary (Head 5 lines + Tail 5 lines).
+        -   **Text:**
+            -   **User:** Kept (Ephemeral tags like `[SYSTEM NOTE]` removed).
+            -   **Model:** Kept ONLY if no function call exists. `<think>` tags are removed.
+        -   **Thought Signature:** Explicitly set to `None` (not needed for history).
 -   **Focus Booster:** When history is long, the system injects a `[SYSTEM NOTE]` into the latest user message to refocus the model on the new instruction.
+-   **Safety Buffer:** The last 3 turns are kept in "Full Fidelity" (Hot State) to preserve immediate context and implicit references.
 
 ### 8.3 Context Persistence
 -   **Session Transcripts:** Every turn is serialized to a `.jsonl` transcript file (`logs/{session_id}.jsonl`).
@@ -114,6 +123,10 @@ Rusty-Claw doesn't just execute; it monitors its own progress and intervenes whe
 The `LlmClient` implements an **Exponential Backoff Retry** strategy for network-level failures:
 -   **Transient Errors:** 429 (Rate Limit) and 5xx (Server Error) trigger up to 5 retries.
 -   **Visibility:** Detailed diagnostic logs record every attempt, status code, and error body for transparent debugging.
+
+### 10.3 Dynamic Configuration
+-   **Context Window:** Automatically detects model limits (e.g., Gemini 1M, GPT-4o 128k) and adjusts `max_history_tokens` accordingly. Can be overridden in `config.toml`.
+-   **Provider Compatibility:** Robustly handles both Gemini (requires `thought_signature`) and OpenAI/Aliyun (no signature) by capturing signatures in the core loop but allowing history reconstruction to strip them safely.
 ## 8. Dual-Phase Task Execution Flow
 
 To optimize for both intelligence and token efficiency, Rusty-Claw implements a two-stage processing pipeline for every user request:
