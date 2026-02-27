@@ -23,6 +23,16 @@ This project is a Rust-native implementation of an AI agent, closely following t
 - **🔌 Multi-Platform & Multi-Provider:**
   - **Providers:** Supports Google Gemini, Aliyun Qwen, and any OpenAI-compatible API (DeepSeek, LocalAI, vLLM).
   - **Platforms:** Supports CLI, Telegram, and Discord concurrently.
+- **🛡️ Active Context Curation:**
+  - **Smart Stripping:** Automatically compresses historical tool outputs like `read_file` or `ls` to keep only essential summaries. This saves lots of tokens.
+  - **Focus Booster:** Injects attention prompts like "Focus on this new message" when history gets long.
+  - **Safety Buffer:** Keeps the last 3 turns in full detail to handle references like "what did that error say?" while optimizing older history.
+- **🔄 Reliable & Self-Healing:**
+  - **Exponential Backoff:** API calls automatically retry with exponential delays on failure (429, 5xx).
+  - **Dynamic Context Window:** Detects model limits like 1M for Gemini or 128k for GPT-4o and adjusts buffers to prevent overflow.
+- **🌐 Full-Featured Browser Automation:**
+  - **Persistent Session:** Keeps a browser instance across turns for complex workflows like login, navigation, and extraction.
+  - **See-Act Loop:** Uses `snapshot` to parse DOM into JSON and `act` to interact with elements using stable IDs.
 
 ## 🛠️ Setup & Configuration
 
@@ -61,6 +71,7 @@ You can configure providers using a `config.toml` file in the current directory 
 **Example `config.toml`:**
 ```toml
 default_provider = "deepseek"
+context_window = 64000 # Optional: Override auto-detected window size
 
 [providers.deepseek]
 type = "openai_compat"
