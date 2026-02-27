@@ -265,7 +265,6 @@ impl Tool for BrowserTool {
 mod tests {
     use super::*;
     use serde_json::json;
-    use crate::tools::Tool;
 
     #[tokio::test]
     async fn test_browser_lifecycle() {
@@ -286,5 +285,103 @@ mod tests {
         // 4. Stop
         let stop_res = browser_tool.execute(json!({"action": "stop"})).await.unwrap();
         assert!(stop_res.contains("stopped"));
+    }
+
+    #[tokio::test]
+    async fn test_browser_flow() {
+        let tool = BrowserTool::new();
+        
+        println!("--- Starting Browser ---");
+        let res = tool.execute(json!({"action": "start"})).await.unwrap();
+        println!("{}", res);
+        
+        println!("--- Navigating ---");
+        let res = tool.execute(json!({"action": "navigate", "target_url": "https://example.com"})).await.unwrap();
+        println!("{}", res);
+        
+        println!("--- Waiting for render ---");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        
+        println!("--- Taking Snapshot ---");
+        let res = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        println!("Snapshot Result:\n{}", res);
+        
+        println!("--- Stopping Browser ---");
+        let res = tool.execute(json!({"action": "stop"})).await.unwrap();
+        println!("{}", res);
+    }
+
+    #[tokio::test]
+    async fn test_google_access() {
+        let tool = BrowserTool::new();
+        println!("--- Starting Browser for Google ---");
+        tool.execute(json!({"action": "start"})).await.unwrap();
+        println!("--- Navigating to Google ---");
+        tool.execute(json!({"action": "navigate", "target_url": "https://www.google.com"})).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        println!("--- Taking Google Snapshot ---");
+        let snapshot = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        println!("GOOGLE SNAPSHOT:\n{}", snapshot);
+        tool.execute(json!({"action": "stop"})).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_google_search_flow() {
+        let tool = BrowserTool::new();
+        println!("--- Phase 1: Start & Navigate ---");
+        tool.execute(json!({"action": "start"})).await.unwrap();
+        tool.execute(json!({"action": "navigate", "target_url": "https://www.google.com"})).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        println!("--- Phase 2: Identify Search Box ---");
+        let snapshot = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        // Look for the input. On Google it's usually an input.
+        // Based on previous test, it was [5] or similar.
+        println!("Snapshot:\n{}", snapshot);
+
+        // We'll search for 'input' in the snapshot to be dynamic
+        let search_id = snapshot.lines()
+            .find(|l| l.contains("input"))
+            .and_then(|l| l.split(']').next())
+            .map(|s| s.trim_start_matches('['))
+            .unwrap_or("5"); // Fallback to 5 if parsing fails
+
+        println!("--- Phase 3: Typing Search Query ---");
+        let res = tool.execute(json!({
+            "action": "act",
+            "request": {
+                "kind": "type",
+                "target_id": search_id,
+                "text": "OpenClaw github"
+            }
+        })).await.unwrap();
+        println!("{}", res);
+
+        println!("--- Phase 4: Submit Search ---");
+        // We can either find the search button or just press Enter. 
+        // Our 'act' tool 'type' currently doesn't simulate Enter key easily in the simplified JS fallback 
+        // unless we add it, but we can just click the 'Google 搜索' button.
+        let button_id = snapshot.lines()
+            .find(|l| l.contains("Google 搜索"))
+            .and_then(|l| l.split(']').next())
+            .map(|s| s.trim_start_matches('['))
+            .unwrap_or("6");
+
+        tool.execute(json!({
+            "action": "act",
+            "request": {
+                "kind": "click",
+                "target_id": button_id
+            }
+        })).await.unwrap();
+
+        println!("--- Phase 5: Waiting for Results ---");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        println!("--- Phase 6: Result Snapshot ---");
+        let results = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        println!("SEARCH RESULTS:\n{}", results);
+
+        tool.execute(json!({"action": "stop"})).await.unwrap();
     }
 }
