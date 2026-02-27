@@ -129,9 +129,10 @@ impl AgentLoop {
     pub fn new(
         llm: Arc<dyn LlmClient>,
         tools: Vec<Arc<dyn Tool>>,
-        context: AgentContext,
+        mut context: AgentContext,
         output: Arc<dyn AgentOutput>,
     ) -> Self {
+        context.max_history_tokens = llm.context_window_size();
         Self {
             llm,
             tools,
@@ -157,6 +158,7 @@ impl AgentLoop {
         self.context.get_context_details()
     }
     pub fn update_llm(&mut self, new_llm: Arc<dyn LlmClient>) {
+        self.context.max_history_tokens = new_llm.context_window_size();
         self.llm = new_llm;
     }
 
