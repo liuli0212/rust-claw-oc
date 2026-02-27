@@ -180,11 +180,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.default_provider.clone().unwrap_or(args.provider.clone())
     };
 
-    let llm = match llm_client::create_llm_client(&provider_name, args.model.clone(), &config) {
-        Ok(client) => client,
+    let llm_init_result = llm_client::create_llm_client(&provider_name, args.model.clone(), &config);
+    let llm_opt = match llm_init_result {
+        Ok(client) => Some(client),
         Err(e) => {
-            eprintln!("Error initializing LLM client: {}", e);
-            std::process::exit(1);
+            eprintln!("\x1b[33m[Warning] LLM initialization failed: {}. You can still use /model to switch later.\x1b[0m", e);
+            None
         }
     };
 
@@ -232,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tools.push(Arc::new(skill));
     }
 
-    let session_manager = Arc::new(SessionManager::new(llm.clone(), tools.clone()));
+    let session_manager = Arc::new(SessionManager::new(llm_opt, tools.clone()));
 
     // Start Telegram Bot
     if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
@@ -253,6 +254,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let output = Arc::new(CliOutput);
+
+    // Pre-initialize CLI session to avoid lazy-loading issues
+    let _ = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
 
     let mut rl = DefaultEditor::new()?;
     println!("Welcome to Rusty-Claw! (type 'exit' to quit)");
@@ -294,9 +298,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if line == "/status" {
-                    let agent = session_manager
-                        .get_or_create_session("cli", output.clone())
-                        .await;
+                    let agent = match session_manager.get_or_create_session("cli", output.clone()).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("\x1b[31m[System] Error: {}\x1b[0m", e);
+                            continue;
+                        }
+                    };
                     let agent_guard = agent.lock().await;
                     let (provider, model, tokens, max_tokens) = agent_guard.get_status();
                     let percentage = (tokens as f64 / max_tokens as f64) * 100.0;
@@ -307,9 +315,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if line.starts_with("/context") {
-                    let agent = session_manager
-                        .get_or_create_session("cli", output.clone())
-                        .await;
+                    let agent = match session_manager.get_or_create_session("cli", output.clone()).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("\x1b[31m[System] Error: {}\x1b[0m", e);
+                            continue;
+                        }
+                    };
                     let mut agent_guard = agent.lock().await;
                     
                     let parts: Vec<&str> = line.split_whitespace().collect();
@@ -352,10 +364,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let provider = parts[1];
                     let model = parts.get(2).map(|s| s.to_string());
                     
-                    // Ensure session exists first
-                    let _agent = session_manager
-                        .get_or_create_session("cli", output.clone())
-                        .await;
+
                     
                     match session_manager.update_session_llm("cli", provider, model).await {
                         Ok(msg) => println!("\x1b[32m[System] {}\x1b[0m", msg),
@@ -369,9 +378,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let _ = rl.add_history_entry(line);
 
-                let agent = session_manager
-                    .get_or_create_session("cli", output.clone())
-                    .await;
+                let agent = match session_manager.get_or_create_session("cli", output.clone()).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        println!("\x1b[31m[System] Error: {}\x1b[0m", e);
+                        continue;
+                    }
+                };
                 let mut agent_guard = agent.lock().await;
 
                 match agent_guard.step(line.to_string()).await {
