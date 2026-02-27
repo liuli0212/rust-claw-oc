@@ -219,23 +219,32 @@ impl Tool for BrowserTool {
                                 "click" => {
                                     // Actually execute click using js fallback since CDP dispatchMouseEvent is lower level
                                     // and requires chromiumoxide advanced mapping. For now, we inject a click payload.
-                                    let click_js = format!(
-                                        "let el = document.querySelector('[data-oc-id=\"{}\"]'); if (el) {{ el.click(); true; }} else {{ false; }}",
-                                        target_id
-                                    );
-                                    page.evaluate(click_js).await
-                                        .map_err(|e| ToolError::ExecutionFailed(format!("Click execution failed: {}", e)))?;
-                                    return Ok(format!("Clicked on element [{}] at ({}, {})", target_id, x, y));
+                                    // Phase 4: Use pure CDP coordinates for interaction
+                                    use chromiumoxide::layout::Point;
+                                    page.click(Point { x, y }).await
+                                        .map_err(|e| ToolError::ExecutionFailed(format!("CDP click failed: {}", e)))?;
+                                    
+                                    // Wait a bit for potential navigation or DOM mutations
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                                    
+                                    return Ok(format!("Successfully clicked on element [{}] at CDP coordinates ({}, {})", target_id, x, y));
                                 },
                                 "type" => {
-                                    let text = req.text.unwrap_or_default();
-                                    let type_js = format!(
-                                        "let el = document.querySelector('[data-oc-id=\"{}\"]'); if (el) {{ el.focus(); el.value = {}; el.dispatchEvent(new Event('input', {{ bubbles: true }})); el.dispatchEvent(new Event('change', {{ bubbles: true }})); true; }} else {{ false; }}",
-                                        target_id, serde_json::to_string(&text).unwrap()
+                                    // Phase 4: Focus via JS, type via CDP
+                                    let focus_js = format!(
+                                        "let el = document.querySelector('[data-oc-id=\"{}\"]'); if (el) {{ el.focus(); el.value = ''; true; }} else {{ false; }}",
+                                        target_id
                                     );
-                                    page.evaluate(type_js).await
-                                        .map_err(|e| ToolError::ExecutionFailed(format!("Type execution failed: {}", e)))?;
-                                    return Ok(format!("Typed text into element [{}]", target_id));
+                                    page.evaluate(focus_js).await
+                                        .map_err(|e| ToolError::ExecutionFailed(format!("Focus execution failed: {}", e)))?;
+                                    
+                                    let text = req.text.unwrap_or_default();
+                                    use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+                                    let _res = page.execute(InsertTextParams::new(text)).await
+                                        .map_err(|e| ToolError::ExecutionFailed(format!("CDP insert text failed: {}", e)))?;
+                                    
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                                    return Ok(format!("Successfully typed text into element [{}] via CDP", target_id));
                                 },
                                 _ => {
                                     return Err(ToolError::InvalidArguments(format!("Unsupported act kind: {}", req.kind)));
@@ -249,5 +258,33 @@ impl Tool for BrowserTool {
             },
             _ => Err(ToolError::InvalidArguments(format!("Unknown action: {}", params.action))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use crate::tools::Tool;
+
+    #[tokio::test]
+    async fn test_browser_lifecycle() {
+        let browser_tool = BrowserTool::new();
+
+        // 1. Status - Should be stopped
+        let status_res = browser_tool.execute(json!({"action": "status"})).await.unwrap();
+        assert!(status_res.contains("stopped"));
+
+        // 2. Start
+        let start_res = browser_tool.execute(json!({"action": "start"})).await.unwrap();
+        assert!(start_res.contains("ready"));
+
+        // 3. Status - Should be running
+        let status_res2 = browser_tool.execute(json!({"action": "status"})).await.unwrap();
+        assert!(status_res2.contains("running"));
+
+        // 4. Stop
+        let stop_res = browser_tool.execute(json!({"action": "stop"})).await.unwrap();
+        assert!(stop_res.contains("stopped"));
     }
 }

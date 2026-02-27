@@ -72,6 +72,7 @@ struct TaskState {
 
 }
 
+#[derive(Debug, PartialEq, Clone)]
 pub enum InterventionAction {
     None,
     Warn(String),
