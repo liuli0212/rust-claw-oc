@@ -34,6 +34,22 @@ This project is a Rust-native implementation of an AI agent, closely following t
   - **Persistent Session:** Keeps a browser instance across turns for complex workflows like login, navigation, and extraction.
   - **See-Act Loop:** Uses `snapshot` to parse DOM into JSON and `act` to interact with elements using stable IDs.
 
+## 🧰 Built-in Tools
+
+Rusty-Claw comes equipped with a comprehensive suite of engineering tools:
+
+| Category | Tool | Description |
+|----------|------|-------------|
+| **System** | `execute_bash` | Execute shell commands in a secure PTY environment. |
+| | `finish_task` | Signal completion of the user's request. |
+| **File I/O** | `read_file` | Read file contents with automatic large-file handling. |
+| | `write_file` | Create or overwrite files with precision. |
+| **Browser** | `browser` | Full browser automation: `start`, `stop`, `navigate`, `snapshot` (DOM extraction), `act` (click/type). |
+| **Web** | `web_search` | Real-time internet search via Tavily API. |
+| | `web_fetch` | Fetch webpages and convert HTML to Markdown. |
+| **Planning** | `task_plan` | Manage the structured `.rusty_claw_task_plan.json` (add/update/complete steps). |
+| **Memory** | `rag_search` | Semantic search over the project's vector database. |
+| | `rag_insert` | Index new knowledge into long-term memory. |,
 ## 🛠️ Setup & Configuration
 
 ### Prerequisites
