@@ -1,0 +1,27 @@
+# Rusty-Claw Configuration
+
+# Default provider to use if not specified via CLI
+default_provider = "gemini"
+
+[providers.gemini]
+type = "gemini"
+api_key_env = "GEMINI_API_KEY"
+model = "gemini-3-flash-preview"
+context_window = 1048576
+
+[providers.aliyun]
+type = "openai_compat"
+api_key_env = "DASHSCOPE_API_KEY"
+# Aliyun base_url should NOT include /chat/completions if the client appends it,
+# BUT my client implementation (OpenAiCompatClient) USES base_url AS THE FULL URL.
+# Wait, let me check the code again.
+base_url = "https://coding.dashscope.aliyuncs.com/v1/chat/completions"
+model = "qwen3.5-plus"
+context_window = 1000000
+
+[providers.deepseek]
+type = "openai_compat"
+api_key_env = "DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com/chat/completions"
+model = "deepseek-chat"
+context_window = 32000
