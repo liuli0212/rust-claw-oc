@@ -58,13 +58,14 @@ pub enum StreamEvent {
             tracing::info!("Initializing provider '{}' from config", provider);
             match prov_config.type_name.as_str() {
                 "openai_compat" | "aliyun" => {
-                    let api_key = if let Some(env_var) = &prov_config.api_key_env {
+                                        let raw_api_key = if let Some(env_var) = &prov_config.api_key_env {
                         std::env::var(env_var).or_else(|_| {
                             prov_config.api_key.clone().ok_or_else(|| format!("API key not found in env var '{}' or config", env_var))
                         })?
                     } else {
                         prov_config.api_key.clone().ok_or_else(|| "API key must be provided in config".to_string())?
                     };
+                    let api_key = raw_api_key.trim().to_string();
                     
                     let base_url = prov_config.base_url.clone()
                         .ok_or_else(|| "base_url required for openai_compat".to_string())?;
@@ -78,13 +79,14 @@ pub enum StreamEvent {
                     Ok(Arc::new(OpenAiCompatClient::new_with_window(api_key, base_url, model_final, provider.to_string(), context_window)))
                 }
                 "gemini" => {
-                    let api_key = if let Some(env_var) = &prov_config.api_key_env {
+                                        let raw_api_key = if let Some(env_var) = &prov_config.api_key_env {
                         std::env::var(env_var).or_else(|_| {
                             prov_config.api_key.clone().ok_or_else(|| format!("API key not found in env var '{}' or config", env_var))
                         })?
                     } else {
                         prov_config.api_key.clone().ok_or_else(|| "API key must be provided in config".to_string())?
                     };
+                    let api_key = raw_api_key.trim().to_string();
                     let model_final = model.or(prov_config.model.clone());
                     let model_str = model_final.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
                     let context_window = prov_config.context_window
@@ -98,7 +100,7 @@ pub enum StreamEvent {
             // Fallback defaults if not in config
             match provider {
                 "aliyun" => {
-                    let api_key = std::env::var("DASHSCOPE_API_KEY")
+                    let api_key = std::env::var("DASHSCOPE_API_KEY").map(|s| s.trim().to_string())
                         .map_err(|_| "DASHSCOPE_API_KEY must be set for aliyun provider")?;
                     let model_final = model.unwrap_or_else(|| "qwen-plus".to_string());
                     tracing::info!("Using Aliyun provider with model: {}", model_final);
@@ -112,7 +114,7 @@ pub enum StreamEvent {
                     )))
                 }
                 "gemini" | _ => {
-                    let api_key = std::env::var("GEMINI_API_KEY")
+                    let api_key = std::env::var("GEMINI_API_KEY").map(|s| s.trim().to_string())
                         .map_err(|_| "GEMINI_API_KEY must be set for gemini provider")?;
                     tracing::info!(
                         "Using Gemini provider with model: {:?}",
