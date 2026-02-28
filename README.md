@@ -17,6 +17,18 @@ This project is a Rust-native implementation of an AI agent, closely following t
   - **Async Compaction:** History summarization runs in the background, never blocking the user's next turn.
   - **Soft Limits:** Allows temporary context overflow to maintain conversation flow while cleanup happens asynchronously.
   - **Verification:** Automatically validates context before applying changes, preventing accidental corruption of source files.
+  - **Smart Token Limits:** Automatically detects modern models (Gemini 2/3, Qwen, DeepSeek) and allocates appropriate context windows (1M+ for Gemini, 128k for others).
+  - **Crash-Proof Configuration:** Gracefully handles missing API keys or malformed configs without crashing the agent.
+- **⚡ Dual-Phase Task Execution:**
+- **🧠 Hybrid RAG Memory:**
+  - **In-Memory Vector Cache:** Startup loads all embeddings into RAM for sub-millisecond similarity search.
+  - **SQLite + FTS5:** Integrated full-text search for precise keyword matching (BM25).
+  - **Auto-Persistence:** All memory chunks are ACID-persisted to a local SQLite database (`.rusty_claw_memory.db`).
+- **🛡️ Secure Bash Sandbox:** Employs a true pseudo-terminal (`portable-pty`) wrapper for executing bash commands. It handles interactive TTY commands, strips ANSI codes, and enforces timeouts.
+- **🔄 Resilient Context Management:**
+  - **Async Compaction:** History summarization runs in the background, never blocking the user's next turn.
+  - **Soft Limits:** Allows temporary context overflow to maintain conversation flow while cleanup happens asynchronously.
+  - **Verification:** Automatically validates context before applying changes, preventing accidental corruption of source files.
 - **⚡ Dual-Phase Task Execution:**
   - **Phase 1 (Lead Architect):** Analyzes request complexity and generates a multi-step execution plan using a lightweight, low-token prompt.
   - **Phase 2 (Execution Engineer):** Executes the plan turn-by-turn with full project context (AGENTS.md, README, Environment) and autonomous tool usage.
@@ -82,6 +94,12 @@ TELEGRAM_BOT_TOKEN=12345:abcdef...
 DISCORD_BOT_TOKEN=MTAw...
 ```
 ### 3. Configuration (Optional)
+You can configure providers using a `config.toml` file in the current directory or `~/.config/rusty-claw/config.toml`.
+
+> **Note:** CLI arguments (e.g., `/model deepseek-coder`) now take precedence over `config.toml` settings.
+> **Note:** The default context window is now **128,000 tokens** (up from 32k) for unknown models.
+
+**Example `config.toml`:**
 You can configure providers using a `config.toml` file in the current directory or `~/.config/rusty-claw/config.toml`.
 
 **Example `config.toml`:**
