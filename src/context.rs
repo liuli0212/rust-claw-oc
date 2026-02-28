@@ -145,16 +145,7 @@ impl AgentContext {
         }
 
         // 5. Project Context (AGENTS.md, SOUL.md, etc.)
-        let mut project_context = String::new();
-        if let Ok(content) = fs::read_to_string("AGENTS.md") {
-            project_context.push_str(&content);
-        }
-        if let Ok(content) = fs::read_to_string("README.md") {
-            project_context.push_str(&content);
-        }
-        if let Ok(content) = fs::read_to_string("MEMORY.md") {
-            project_context.push_str(&content);
-        }
+        let project_context = Self::get_project_context_string();
         stats.system_project = bpe.encode_with_special_tokens(&project_context).len();
 
         // 6. Memory (RAG)
@@ -166,9 +157,17 @@ impl AgentContext {
         let (_, history_tokens, _) = self.build_history_with_budget();
         stats.history = history_tokens;
 
-        // 8. Current Turn
-        if let Some(turn) = &self.current_turn {
-             for msg in &turn.messages {
+        // 8. Current Turn (or Last Turn if idle)
+if let Some(turn) = &self.current_turn {
+for msg in &turn.messages {
+for part in &msg.parts {
+if let Some(text) = &part.text {
+stats.current_turn += bpe.encode_with_special_tokens(text).len();
+}
+}
+}
+        } else if let Some(last) = self.dialogue_history.last() {
+             for msg in &last.messages {
                  for part in &msg.parts {
                      if let Some(text) = &part.text {
                          stats.current_turn += bpe.encode_with_special_tokens(text).len();
@@ -258,6 +257,33 @@ impl AgentContext {
         Some(format!("## {title}\n{truncated}\n"))
     }
 
+    fn get_project_context_string() -> String {
+        let mut project_context = String::new();
+        
+        // Add Task Plan Instruction
+        project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
+        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
+        project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n");
+        project_context.push_str("HOWEVER, if the user explicitly issues a new, unrelated command or asks to change direction, you should prioritize the user's new request over the existing plan (ask for confirmation if unsure).\n\n");
+
+        if let Ok(content) = fs::read_to_string("AGENTS.md") {
+            project_context.push_str("### AGENTS.md\n");
+            project_context.push_str(&Self::truncate_chars(&content, 3_000));
+            project_context.push_str("\n\n");
+        }
+        if let Ok(content) = fs::read_to_string("README.md") {
+            project_context.push_str("### README.md\n");
+            project_context.push_str(&Self::truncate_chars(&content, 2_500));
+            project_context.push_str("\n\n");
+        }
+        if let Ok(content) = fs::read_to_string("MEMORY.md") {
+            project_context.push_str("### MEMORY.md\n");
+            project_context.push_str(&Self::truncate_chars(&content, 1_500));
+            project_context.push_str("\n\n");
+        }
+        
+        project_context
+    }
     fn build_system_prompt(&self) -> String {
         let mut sections = Vec::new();
 
@@ -308,29 +334,8 @@ impl AgentContext {
         }
 
 
-        let mut project_context = String::new();
-        // Add Task Plan Instruction
-        project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
-        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
-        project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n");
-        project_context.push_str("HOWEVER, if the user explicitly issues a new, unrelated command or asks to change direction, you should prioritize the user's new request over the existing plan (ask for confirmation if unsure).\n\n");
-        if let Ok(content) = fs::read_to_string("AGENTS.md") {
-            project_context.push_str("### AGENTS.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 3_000));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("README.md") {
-            project_context.push_str("### README.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 2_500));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("MEMORY.md") {
-            project_context.push_str("### MEMORY.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 1_500));
-            project_context.push_str("\n\n");
-        }
-        if let Some(section) = Self::build_prompt_section("Project Context", project_context, 7_000)
-        {
+        let project_context = Self::get_project_context_string();
+        if let Some(section) = Self::build_prompt_section("Project Context", project_context, 7_000) {
             sections.push(section);
         }
 
@@ -746,13 +751,15 @@ impl AgentContext {
     }
 
     pub fn get_context_status(&self) -> (usize, usize, usize, usize, usize) {
-        let bpe = tiktoken_rs::cl100k_base().unwrap();
-        let history_tokens = self.dialogue_history_token_estimate();
-        let current_turn_tokens = if let Some(turn) = &self.current_turn {
+let bpe = tiktoken_rs::cl100k_base().unwrap();
+let history_tokens = self.dialogue_history_token_estimate();
+let current_turn_tokens = if let Some(turn) = &self.current_turn {
             Self::turn_token_estimate(turn, &bpe)
-        } else {
-            0
-        };
+        } else if let Some(last) = self.dialogue_history.last() {
+            Self::turn_token_estimate(last, &bpe)
+} else {
+0
+};
         let system_msg = Message {
             role: "system".to_string(),
             parts: vec![Part {
