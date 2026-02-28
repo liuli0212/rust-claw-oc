@@ -1676,6 +1676,7 @@ self.output
                     function_response: Some(FunctionResponse {
                         name: tool_name,
                         response: serde_json::json!({ "result": result_str }),
+                        tool_call_id: call.id.clone(),
                     }),
                     thought_signature: None,
                 });

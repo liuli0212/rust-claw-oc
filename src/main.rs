@@ -105,6 +105,9 @@ impl CliOutput {
 #[async_trait]
 impl AgentOutput for CliOutput {
     async fn on_text(&self, text: &str) {
+        // Strip <final> tags for cleaner display
+        let text = text.replace("<final>", "").replace("</final>", "");
+        let text = text.as_str();
         if Self::is_prefixed_status(text) {
             print!("{}", Self::style_status(text));
         } else {
@@ -259,7 +262,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = session_manager.get_or_create_session("cli", output.clone()).await {
         eprintln!("\x1b[33m[Warning] Failed to pre-initialize CLI session: {}\x1b[0m", e);
     }
-    let _ = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
 
     let mut rl = DefaultEditor::new()?;
     println!("Welcome to Rusty-Claw! (type '/exit' to quit)");
@@ -339,11 +341,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                              match agent_guard.force_compact().await {
                                  Ok(reason) => println!("\x1b[32m[System] Context compacted: {}\x1b[0m", reason),
                                  Err(e) => println!("\x1b[31m[System] Compaction skipped: {}\x1b[0m", e)
-                             }
+                            }
                         }
                         _ => {
                             let stats = agent_guard.get_detailed_stats();
-                            let percentage = (stats.total as f64 / stats.max as f64) * 100.0;
+                            let percentage = if stats.max > 0 {
+                                (stats.total as f64 / stats.max as f64) * 100.0
+                            } else {
+                                0.0
+                            };
                             
                             println!("\x1b[36m[Context Usage]\x1b[0m");
                             println!("Total Used:   {} / {} tokens ({:.1}%)", stats.total, stats.max, percentage);
@@ -358,7 +364,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             
                             println!("\n\x1b[33m--- Conversation Breakdown ---\x1b[0m");
                             println!("  History:             {} tokens", stats.history);
-                            println!("  Current Turn:        {} tokens", stats.current_turn);
+                            if stats.current_turn > 0 {
+                                println!("  Current Turn:        {} tokens", stats.current_turn);
+                            }
                             
                             let tool_stats = agent_guard.get_tool_stats();
                             let tool_total: usize = tool_stats.values().sum();

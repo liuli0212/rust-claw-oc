@@ -23,12 +23,16 @@ pub struct Part {
 pub struct FunctionCall {
     pub name: String,
     pub args: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionResponse {
     pub name: String,
     pub response: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1072,6 +1076,7 @@ mod tests {
                 function_response: Some(FunctionResponse {
                     name: "execute_bash".to_string(),
                     response: serde_json::json!({"result":"/tmp"}),
+                    tool_call_id: None,
                 }),
                 thought_signature: None,
             }],
@@ -1123,6 +1128,7 @@ mod tests {
                     response: serde_json::json!({
                         "result": "x".repeat(5000)
                     }),
+                    tool_call_id: None,
                 }),
                 thought_signature: None,
             }],
