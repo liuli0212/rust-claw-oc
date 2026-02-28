@@ -256,6 +256,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = Arc::new(CliOutput);
 
     // Pre-initialize CLI session to avoid lazy-loading issues
+    if let Err(e) = session_manager.get_or_create_session("cli", output.clone()).await {
+        eprintln!("\x1b[33m[Warning] Failed to pre-initialize CLI session: {}\x1b[0m", e);
+    }
     let _ = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
 
     let mut rl = DefaultEditor::new()?;

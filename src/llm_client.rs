@@ -32,18 +32,20 @@ pub enum StreamEvent {
 
     fn estimate_context_window(model: &str) -> usize {
         let m = model.to_lowercase();
-        if m.contains("1.5-pro") || m.contains("1.5-flash") {
+        if m.contains("gemini-2") || m.contains("gemini-3") {
             1_000_000
-        } else if m.contains("gpt-4o") || m.contains("gpt-4-turbo") {
+        } else if m.contains("1.5-pro") || m.contains("1.5-flash") {
+            1_000_000
+        } else if m.contains("gpt-4o") || m.contains("gpt-4-turbo") || m.contains("o1") || m.contains("o3") {
             128_000
         } else if m.contains("claude-3-5") || m.contains("claude-3-opus") {
             200_000
         } else if m.contains("deepseek") {
             64_000
-        } else if m.contains("qwen-plus") || m.contains("qwen-max") {
-            30_000
+        } else if m.contains("qwen") {
+            128_000
         } else {
-            32_000
+            128_000
         }
     }
 
@@ -57,17 +59,17 @@ pub enum StreamEvent {
             match prov_config.type_name.as_str() {
                 "openai_compat" | "aliyun" => {
                     let api_key = if let Some(env_var) = &prov_config.api_key_env {
-                        std::env::var(env_var).unwrap_or_else(|_| {
-                            prov_config.api_key.clone().expect("API key not found in env or config")
-                        })
+                        std::env::var(env_var).or_else(|_| {
+                            prov_config.api_key.clone().ok_or_else(|| format!("API key not found in env var '{}' or config", env_var))
+                        })?
                     } else {
-                        prov_config.api_key.clone().expect("API key must be provided")
+                        prov_config.api_key.clone().ok_or_else(|| "API key must be provided in config".to_string())?
                     };
                     
                     let base_url = prov_config.base_url.clone()
-                        .expect("base_url required for openai_compat");
-                    let model_final = prov_config.model.clone()
-                        .or(model)
+                        .ok_or_else(|| "base_url required for openai_compat".to_string())?;
+                    let model_final = model
+                        .or(prov_config.model.clone())
                         .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
 
                     let context_window = prov_config.context_window
@@ -77,11 +79,11 @@ pub enum StreamEvent {
                 }
                 "gemini" => {
                     let api_key = if let Some(env_var) = &prov_config.api_key_env {
-                        std::env::var(env_var).unwrap_or_else(|_| {
-                            prov_config.api_key.clone().expect("API key not found")
-                        })
+                        std::env::var(env_var).or_else(|_| {
+                            prov_config.api_key.clone().ok_or_else(|| format!("API key not found in env var '{}' or config", env_var))
+                        })?
                     } else {
-                        prov_config.api_key.clone().expect("API key must be provided")
+                        prov_config.api_key.clone().ok_or_else(|| "API key must be provided in config".to_string())?
                     };
                     let model_final = model.or(prov_config.model.clone());
                     let model_str = model_final.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
@@ -912,12 +914,13 @@ mod tests {
     fn test_estimate_context_window() {
         assert_eq!(estimate_context_window("gemini-1.5-pro"), 1_000_000);
         assert_eq!(estimate_context_window("gemini-1.5-flash"), 1_000_000);
+        assert_eq!(estimate_context_window("gemini-2.0-flash"), 1_000_000);
         assert_eq!(estimate_context_window("gpt-4o"), 128_000);
         assert_eq!(estimate_context_window("gpt-4-turbo"), 128_000);
         assert_eq!(estimate_context_window("claude-3-5-sonnet"), 200_000);
         assert_eq!(estimate_context_window("deepseek-chat"), 64_000);
-        assert_eq!(estimate_context_window("qwen-plus"), 30_000);
-        assert_eq!(estimate_context_window("unknown-model"), 32_000);
+        assert_eq!(estimate_context_window("qwen-plus"), 128_000);
+        assert_eq!(estimate_context_window("unknown-model"), 128_000);
     }
 }
 
