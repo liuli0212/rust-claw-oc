@@ -116,6 +116,18 @@ struct RecoveryRule {
 }
 
 impl AgentLoop {
+    fn is_pure_final_reply(text: &str) -> bool {
+        let trimmed = text.trim();
+        if let Some(_final_start) = trimmed.find("<final>") {
+             if let Some(final_end) = trimmed.rfind("</final>") {
+                 if final_end + 8 >= trimmed.len() {
+                     return true;
+                 }
+             }
+        }
+        false
+    }
+
     const COMPACTION_TRIGGER_RATIO_NUM: usize = 80;
     const COMPACTION_TRIGGER_RATIO_DEN: usize = 100;
     const COMPACTION_TARGET_RATIO_NUM: usize = 25;
@@ -152,7 +164,7 @@ impl AgentLoop {
         )
     }
     pub fn get_detailed_stats(&self) -> crate::context::DetailedContextStats {
-        self.context.get_detailed_stats()
+        self.context.get_detailed_stats(None)
     }
     pub fn get_tool_stats(&self) -> HashMap<String, usize> {
         let bpe = crate::context::AgentContext::get_bpe();
@@ -1399,6 +1411,15 @@ impl AgentLoop {
 
 
             if tool_calls.is_empty() {
+                // Auto-Finish if reply is purely a <final> answer
+                if Self::is_pure_final_reply(&full_text) {
+                    if Self::should_emit_verbose_progress() {
+                        self.output.on_text("[Progress] Detected pure <final> response. Auto-finishing task.\n").await;
+                    }
+                    exit_state = RunExit::CompletedWithReply;
+                    break;
+                }
+
 
                 task_state.last_model_text = full_text.clone();
 

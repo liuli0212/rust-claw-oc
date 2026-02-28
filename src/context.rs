@@ -61,6 +61,7 @@ pub struct DetailedContextStats {
     pub memory: usize,
     pub history: usize,
     pub current_turn: usize,
+    pub last_turn: usize,
     pub total: usize,
     pub max: usize,
 }
@@ -118,7 +119,7 @@ impl AgentContext {
         self
     }
 
-    pub fn get_detailed_stats(&self) -> DetailedContextStats {
+    pub fn get_detailed_stats(&self, pending_user_input: Option<&str>) -> DetailedContextStats {
         let mut stats = DetailedContextStats::default();
         let bpe = Self::get_bpe();
 
@@ -148,8 +149,29 @@ impl AgentContext {
             stats.system_task_plan = bpe.encode_with_special_tokens(&plan_content).len();
         }
 
-        // 5. Project Context (AGENTS.md, SOUL.md, etc.)
-        let project_context = Self::get_project_context_string();
+        // 5. Project Context (FIXED LOGIC)
+        // Must match build_system_prompt truncation exactly
+        let mut project_context = String::new();
+        project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
+        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
+        project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n");
+        project_context.push_str("HOWEVER, if the user explicitly issues a new, unrelated command or asks to change direction, you should prioritize the user's new request over the existing plan (ask for confirmation if unsure).\n\n");
+        
+        if let Ok(content) = fs::read_to_string("AGENTS.md") {
+            project_context.push_str("### AGENTS.md\n");
+            project_context.push_str(&Self::truncate_chars(&content, 3_000));
+            project_context.push_str("\n\n");
+        }
+        if let Ok(content) = fs::read_to_string("README.md") {
+            project_context.push_str("### README.md\n");
+            project_context.push_str(&Self::truncate_chars(&content, 2_500));
+            project_context.push_str("\n\n");
+        }
+        if let Ok(content) = fs::read_to_string("MEMORY.md") {
+            project_context.push_str("### MEMORY.md\n");
+            project_context.push_str(&Self::truncate_chars(&content, 1_500));
+            project_context.push_str("\n\n");
+        }
         stats.system_project = bpe.encode_with_special_tokens(&project_context).len();
 
         // 6. Memory (RAG)
@@ -157,30 +179,38 @@ impl AgentContext {
             stats.memory = bpe.encode_with_special_tokens(memory).len();
         }
 
-        // 7. History
+        // 7. History (Net Load)
         let (_, history_tokens, _) = self.build_history_with_budget();
         stats.history = history_tokens;
 
-        // 8. Current Turn (or Last Turn if idle)
-if let Some(turn) = &self.current_turn {
-for msg in &turn.messages {
-for part in &msg.parts {
-if let Some(text) = &part.text {
-stats.current_turn += bpe.encode_with_special_tokens(text).len();
-}
-}
-}
-        } else if let Some(last) = self.dialogue_history.last() {
-             for msg in &last.messages {
+        // 8. Current Turn
+        if let Some(turn) = &self.current_turn {
+             for msg in &turn.messages {
                  for part in &msg.parts {
                      if let Some(text) = &part.text {
                          stats.current_turn += bpe.encode_with_special_tokens(text).len();
                      }
+                     if let Some(fc) = &part.function_call {
+                         stats.current_turn += bpe.encode_with_special_tokens(&fc.name).len();
+                         stats.current_turn += bpe.encode_with_special_tokens(&fc.args.to_string()).len();
+                     }
+                     if let Some(fr) = &part.function_response {
+                         stats.current_turn += bpe.encode_with_special_tokens(&fr.name).len();
+                         stats.current_turn += bpe.encode_with_special_tokens(&fr.response.to_string()).len();
+                     }
                  }
              }
+        } else if let Some(input) = pending_user_input {
+             stats.current_turn = bpe.encode_with_special_tokens(input).len();
         }
 
-        stats.total = self.get_context_status().0;
+        // 9. Last Turn
+        if let Some(last) = self.dialogue_history.last() {
+            stats.last_turn = Self::turn_token_estimate(last, &bpe);
+        }
+
+        // 10. Total (Sum of Net Breakdown)
+        stats.total = stats.system_static + stats.system_runtime + stats.system_custom + stats.system_project + stats.system_task_plan + stats.memory + stats.history + stats.current_turn;
         stats.max = self.max_history_tokens;
 
         stats
@@ -261,33 +291,6 @@ stats.current_turn += bpe.encode_with_special_tokens(text).len();
         Some(format!("## {title}\n{truncated}\n"))
     }
 
-    fn get_project_context_string() -> String {
-        let mut project_context = String::new();
-        
-        // Add Task Plan Instruction
-        project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
-        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
-        project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n");
-        project_context.push_str("HOWEVER, if the user explicitly issues a new, unrelated command or asks to change direction, you should prioritize the user's new request over the existing plan (ask for confirmation if unsure).\n\n");
-
-        if let Ok(content) = fs::read_to_string("AGENTS.md") {
-            project_context.push_str("### AGENTS.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 3_000));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("README.md") {
-            project_context.push_str("### README.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 2_500));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("MEMORY.md") {
-            project_context.push_str("### MEMORY.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 1_500));
-            project_context.push_str("\n\n");
-        }
-        
-        project_context
-    }
     fn build_system_prompt(&self) -> String {
         let mut sections = Vec::new();
 
@@ -338,8 +341,29 @@ stats.current_turn += bpe.encode_with_special_tokens(text).len();
         }
 
 
-        let project_context = Self::get_project_context_string();
-        if let Some(section) = Self::build_prompt_section("Project Context", project_context, 7_000) {
+        let mut project_context = String::new();
+        // Add Task Plan Instruction
+        project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
+        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
+        project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n");
+        project_context.push_str("HOWEVER, if the user explicitly issues a new, unrelated command or asks to change direction, you should prioritize the user's new request over the existing plan (ask for confirmation if unsure).\n\n");
+        if let Ok(content) = fs::read_to_string("AGENTS.md") {
+            project_context.push_str("### AGENTS.md\n");
+            project_context.push_str(&Self::truncate_chars(&content, 3_000));
+            project_context.push_str("\n\n");
+        }
+        if let Ok(content) = fs::read_to_string("README.md") {
+            project_context.push_str("### README.md\n");
+            project_context.push_str(&Self::truncate_chars(&content, 2_500));
+            project_context.push_str("\n\n");
+        }
+        if let Ok(content) = fs::read_to_string("MEMORY.md") {
+            project_context.push_str("### MEMORY.md\n");
+            project_context.push_str(&Self::truncate_chars(&content, 1_500));
+            project_context.push_str("\n\n");
+        }
+        if let Some(section) = Self::build_prompt_section("Project Context", project_context, 7_000)
+        {
             sections.push(section);
         }
 
@@ -754,16 +778,26 @@ stats.current_turn += bpe.encode_with_special_tokens(text).len();
             .sum()
     }
 
+    // Refactored to return accurate NET tokens (using compression)
     pub fn get_context_status(&self) -> (usize, usize, usize, usize, usize) {
-let bpe = tiktoken_rs::cl100k_base().unwrap();
-let history_tokens = self.dialogue_history_token_estimate();
-let current_turn_tokens = if let Some(turn) = &self.current_turn {
+        let bpe = tiktoken_rs::cl100k_base().unwrap();
+        
+        // 1. Calculate History (Net - Compressed)
+        // Note: build_history_with_budget already does token estimation on compressed turns
+        let (_, history_tokens, _) = self.build_history_with_budget();
+
+        // 2. Current Turn
+        let current_turn_tokens = if let Some(turn) = &self.current_turn {
             Self::turn_token_estimate(turn, &bpe)
         } else if let Some(last) = self.dialogue_history.last() {
+            // For status display when idle, show last turn
             Self::turn_token_estimate(last, &bpe)
-} else {
-0
-};
+        } else {
+            0
+        };
+
+        // 3. System Prompt (Net - Truncated)
+        // build_system_prompt applies truncation to files like AGENTS.md
         let system_msg = Message {
             role: "system".to_string(),
             parts: vec![Part {
@@ -774,6 +808,8 @@ let current_turn_tokens = if let Some(turn) = &self.current_turn {
             }],
         };
         let system_tokens = Self::estimate_tokens(&bpe, &system_msg);
+
+        // 4. Accurate Total
         let total_tokens = history_tokens + current_turn_tokens + system_tokens;
         
         (total_tokens, self.max_history_tokens, history_tokens, current_turn_tokens, system_tokens)
@@ -964,7 +1000,7 @@ let current_turn_tokens = if let Some(turn) = &self.current_turn {
             total_prompt_tokens: history_tokens_used + current_turn_tokens + system_prompt_tokens,
             retrieved_memory_snippets,
             retrieved_memory_sources: self.retrieved_memory_sources.clone(),
-            detailed_stats: self.get_detailed_stats(),
+            detailed_stats: self.get_detailed_stats(None), // During execution, current_turn is usually set, so pending is None
         };
 
         (messages, Some(system_msg), report)
@@ -1062,7 +1098,7 @@ mod tests {
                 text: Some("running tool".to_string()),
                 function_call: Some(FunctionCall {
                     name: "execute_bash".to_string(),
-                    args: serde_json::Value::Null,
+                    args: serde_json::Value::Null, id: None,
                 }),
                 function_response: None,
                 thought_signature: None,
@@ -1158,7 +1194,7 @@ mod tests {
                         text: Some("<think>reasoning</think> I will run ls".to_string()),
                         function_call: Some(FunctionCall {
                             name: "ls".to_string(),
-                            args: serde_json::json!({}),
+                            args: serde_json::json!({}), id: None,
                         }),
                         function_response: None,
                         thought_signature: Some("signature".to_string()),
