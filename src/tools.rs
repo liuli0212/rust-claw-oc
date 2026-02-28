@@ -1095,3 +1095,52 @@ impl Tool for FinishTaskTool {
         Ok(format!("Task marked as finished. Summary: {}", parsed.summary))
     }
 }
+
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CancelTaskArgs {
+    /// A detailed explanation of why the task is being cancelled or aborted.
+    pub reason: String,
+}
+
+pub struct CancelTaskTool;
+
+#[async_trait]
+impl Tool for CancelTaskTool {
+    fn name(&self) -> String {
+        "cancel_task".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Call this tool to immediately abort the current task if you have hit an unrecoverable roadblock, lack capabilities, or determine the user's request is impossible. This will end your execution loop.".to_string()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(CancelTaskArgs)).unwrap())
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: CancelTaskArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        Ok(format!("Task marked as cancelled. Reason: {}", parsed.reason))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_cancel_task_tool() {
+        let tool = CancelTaskTool;
+        assert_eq!(tool.name(), "cancel_task");
+        
+        let args = serde_json::json!({
+            "reason": "Mission impossible"
+        });
+        
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.contains("Mission impossible"));
+        assert!(result.contains("cancelled"));
+    }
+}
