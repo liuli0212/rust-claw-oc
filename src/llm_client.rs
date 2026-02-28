@@ -452,6 +452,7 @@ fn parse_function_call(part: &Value) -> Option<(FunctionCall, Option<String>)> {
     Some((FunctionCall {
         name,
         args,
+        id: None,
     }, thought_signature))
 }
 
@@ -567,15 +568,48 @@ impl LlmClient for OpenAiCompatClient {
             }));
         }
         for msg in messages {
-            let role = if msg.role == "user" {
-                "user"
-            } else {
-                "assistant"
-            };
-            openai_messages.push(serde_json::json!({
-                "role": role,
-                "content": msg.parts[0].text.as_deref().unwrap_or("")
-            }));
+            if msg.role == "user" {
+                openai_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": msg.parts[0].text.as_deref().unwrap_or("")
+                }));
+            } else if msg.role == "model" {
+                let text = msg.parts.iter().find_map(|p| p.text.as_deref()).unwrap_or("");
+                let mut tool_calls = Vec::new();
+                for part in &msg.parts {
+                    if let Some(fc) = &part.function_call {
+                        let call_id = fc.id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+                        tool_calls.push(serde_json::json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": fc.name,
+                                "arguments": fc.args.to_string()
+                            }
+                        }));
+                    }
+                }
+                
+                let mut message_json = serde_json::json!({
+                    "role": "assistant",
+                    "content": if text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(text.to_string()) }
+                });
+                
+                if !tool_calls.is_empty() {
+                    message_json["tool_calls"] = serde_json::Value::Array(tool_calls);
+                }
+                openai_messages.push(message_json);
+            } else if msg.role == "function" {
+                 for part in &msg.parts {
+                     if let Some(fr) = &part.function_response {
+                         openai_messages.push(serde_json::json!({
+                             "role": "tool",
+                             "tool_call_id": fr.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                             "content": fr.response.to_string()
+                         }));
+                     }
+                 }
+            }
         }
 
         let body = serde_json::json!({
@@ -635,20 +669,48 @@ impl LlmClient for OpenAiCompatClient {
             }));
         }
         for msg in messages {
-            let role = if msg.role == "user" {
-                "user"
-            } else {
-                "assistant"
-            };
-            let content = msg
-                .parts
-                .iter()
-                .find_map(|p| p.text.as_deref())
-                .unwrap_or("");
-            openai_messages.push(serde_json::json!({
-                "role": role,
-                "content": content
-            }));
+            if msg.role == "user" {
+                openai_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": msg.parts[0].text.as_deref().unwrap_or("")
+                }));
+            } else if msg.role == "model" {
+                let text = msg.parts.iter().find_map(|p| p.text.as_deref()).unwrap_or("");
+                let mut tool_calls = Vec::new();
+                for part in &msg.parts {
+                    if let Some(fc) = &part.function_call {
+                        let call_id = fc.id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+                        tool_calls.push(serde_json::json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": fc.name,
+                                "arguments": fc.args.to_string()
+                            }
+                        }));
+                    }
+                }
+                
+                let mut message_json = serde_json::json!({
+                    "role": "assistant",
+                    "content": if text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(text.to_string()) }
+                });
+                
+                if !tool_calls.is_empty() {
+                    message_json["tool_calls"] = serde_json::Value::Array(tool_calls);
+                }
+                openai_messages.push(message_json);
+            } else if msg.role == "function" {
+                 for part in &msg.parts {
+                     if let Some(fr) = &part.function_response {
+                         openai_messages.push(serde_json::json!({
+                             "role": "tool",
+                             "tool_call_id": fr.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                             "content": fr.response.to_string()
+                         }));
+                     }
+                 }
+            }
         }
 
         let mut body_map = serde_json::json!({
@@ -857,6 +919,7 @@ impl LlmClient for OpenAiCompatClient {
                         let _ = tx.send(StreamEvent::ToolCall(FunctionCall {
                             name,
                             args,
+                            id: None,
                         }, None)).await;
                     }
                 }
@@ -864,11 +927,9 @@ impl LlmClient for OpenAiCompatClient {
 
             let _ = tx.send(StreamEvent::Done).await;
         });
-
         Ok(rx)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
