@@ -23,7 +23,7 @@ use crate::session_manager::SessionManager;
 use crate::skills::load_skills;
 use crate::tools::{
     BashTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool,
-    TaskPlanTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool, FinishTaskTool, CancelTaskTool,
+    TaskPlanTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool, FinishTaskTool,
 };
 use async_trait::async_trait;
 use clap::Parser;
@@ -211,7 +211,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.push(Arc::new(WriteFileTool));
     tools.push(Arc::new(ReadFileTool));
     tools.push(Arc::new(FinishTaskTool));
-    tools.push(Arc::new(CancelTaskTool));
     tools.push(Arc::new(WebFetchTool::new()));
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
@@ -272,20 +271,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loaded_count
         );
     }
+    if std::path::Path::new(".rusty_claw_task_plan.json").exists() {
+        println!("\x1b[33m[System] Detected an existing task plan. If you no longer need it, use /cancel_task to clear it.\x1b[0m");
+    }
 
     let sm_clone = session_manager.clone();
     tokio::spawn(async move {
-        if let Ok(_) = tokio::signal::ctrl_c().await {
-            // First Ctrl+C: Cancel the current agent.
+        let mut sigs = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        while let Some(_) = sigs.recv().await {
             sm_clone.cancel_session("cli").await;
-
-            // If they press it again, exit?
-            // Actually, tokio::signal::ctrl_c() is a one-shot or stream.
-            // Let's loop it:
-            let mut sigs = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-            while let Some(_) = sigs.recv().await {
-                sm_clone.cancel_session("cli").await;
-            }
         }
     });
 
@@ -296,6 +290,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let line = line.trim();
                 if line == "/exit" {
                     break;
+                }
+                if line == "/cancel_task" {
+                    session_manager.cancel_session("cli").await;
+                    let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
+                    println!("\x1b[33m[System] Current task plan cancelled.\x1b[0m");
+                    continue;
                 }
                 if line == "/new" {
                     session_manager.reset_session("cli").await;
@@ -438,6 +438,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     },
                     Err(e) => eprintln!("Agent error: {}", e),
+                }
+
+                if std::path::Path::new(".rusty_claw_task_plan.json").exists() {
+                    println!("\x1b[33m[System] Current task plan is still active. Use /cancel_task if you want to abort it.\x1b[0m");
                 }
             }
             Err(ReadlineError::Interrupted) => {

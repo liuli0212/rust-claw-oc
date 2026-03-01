@@ -1520,18 +1520,6 @@ self.output
                 }
 
                 
-                if tool_name == "cancel_task" {
-                    requested_finish = true;
-                    let mut cancel_reason = tool_args.to_string();
-                    if let Some(obj) = tool_args.as_object() {
-                        if let Some(r) = obj.get("reason").and_then(|v| v.as_str()) {
-                            cancel_reason = r.to_string();
-                        }
-                    }
-                    self.output.on_text(&format!("\n[Task Cancelled] {}\n", cancel_reason)).await;
-                    exit_state = RunExit::HardStop { reason: format!("agent_cancelled: {}", cancel_reason) };
-                    break;
-                }
                 if tool_name == "finish_task" {
                     requested_finish = true;
                     // Provide explicit summary extraction so the user sees the final answer.
