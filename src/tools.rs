@@ -12,6 +12,7 @@ use thiserror::Error;
 use tokio::time::timeout;
 
 use crate::utils::truncate_log;
+
 // Helper to clean up JSON schema for strict LLM APIs like Gemini
 pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = schema_val.as_object_mut() {
@@ -269,7 +270,68 @@ impl Tool for BashTool {
     }
 }
 
-// Log truncation logic
+// --- Patch File Tool ---
+pub struct PatchFileTool;
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct PatchFileArgs {
+    /// Explain what changes you are making and why
+    pub thought: String,
+    /// Absolute or relative path to the file to edit
+    pub path: String,
+    /// The unified diff patch content to apply
+    pub patch: String,
+}
+
+#[async_trait]
+impl Tool for PatchFileTool {
+    fn name(&self) -> String {
+        "patch_file".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Applies a unified diff patch to a file. This is the preferred way to edit existing files.".to_string()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        clean_schema(serde_json::to_value(schema_for!(PatchFileArgs)).unwrap())
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let start = Instant::now();
+        let parsed: PatchFileArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        // Write patch to a temporary file
+        let patch_path = format!("{}.patch", parsed.path);
+        std::fs::write(&patch_path, &parsed.patch).map_err(ToolError::IoError)?;
+
+        // Run patch command
+        let output = std::process::Command::new("patch")
+            .arg("-u")
+            .arg(&parsed.path)
+            .arg("-i")
+            .arg(&patch_path)
+            .output()
+            .map_err(ToolError::IoError)?;
+
+        // Clean up patch file
+        let _ = std::fs::remove_file(&patch_path);
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let ok = output.status.success();
+
+        serialize_tool_envelope(
+            "patch_file",
+            ok,
+            if ok { stdout } else { format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr) },
+            output.status.code(),
+            Some(start.elapsed().as_millis()),
+            false,
+        )
+    }
+}
 
 // Read Memory Tool
 pub struct ReadMemoryTool {
@@ -359,10 +421,10 @@ impl Tool for WriteMemoryTool {
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let start = Instant::now();
-        let parsed_args: WriteMemoryArgs =
+        let parsed: WriteMemoryArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
-        self.workspace.write_memory(&parsed_args.content).await?;
+        self.workspace.write_memory(&parsed.content).await?;
         serialize_tool_envelope(
             "write_workspace_memory",
             true,
@@ -412,14 +474,14 @@ impl Tool for RagSearchTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let parsed_args: RagSearchArgs =
+        let parsed: RagSearchArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
-        let limit = parsed_args.limit.unwrap_or(3);
+        let limit = parsed.limit.unwrap_or(3);
 
         let results = self
             .store
-            .search(&parsed_args.query, limit)
+            .search(&parsed.query, limit)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         if results.is_empty() {
@@ -477,11 +539,11 @@ impl Tool for RagInsertTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let parsed_args: RagInsertArgs =
+        let parsed: RagInsertArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
         self.store
-            .insert_chunk(parsed_args.content, parsed_args.source)
+            .insert_chunk(parsed.content, parsed.source)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         Ok("Knowledge successfully embedded and saved into long-term vector memory.".to_string())
@@ -616,46 +678,6 @@ impl WebFetchTool {
     }
 }
 
-fn decode_common_html_entities(input: &str) -> String {
-    input
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-}
-
-fn extract_text_from_html(html: &str) -> String {
-    let script_re = Regex::new(r"(?is)<script\b[^>]*>.*?</script>").unwrap();
-    let style_re = Regex::new(r"(?is)<style\b[^>]*>.*?</style>").unwrap();
-    let tag_re = Regex::new(r"(?is)<[^>]+>").unwrap();
-    let ws_re = Regex::new(r"[ \t\r\f\v]+").unwrap();
-    let nl_re = Regex::new(r"\n{3,}").unwrap();
-
-    let without_script = script_re.replace_all(html, " ");
-    let without_style = style_re.replace_all(&without_script, " ");
-    let with_line_breaks = without_style
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br />", "\n")
-        .replace("</p>", "\n")
-        .replace("</div>", "\n")
-        .replace("</li>", "\n")
-        .replace("</h1>", "\n")
-        .replace("</h2>", "\n")
-        .replace("</h3>", "\n")
-        .replace("</h4>", "\n")
-        .replace("</h5>", "\n")
-        .replace("</h6>", "\n");
-    let without_tags = tag_re.replace_all(&with_line_breaks, " ");
-    let decoded = decode_common_html_entities(&without_tags);
-    let normalized_ws = ws_re.replace_all(&decoded, " ");
-    let normalized_newlines = normalized_ws.replace(" \n", "\n");
-    let squashed_newlines = nl_re.replace_all(&normalized_newlines, "\n\n");
-    squashed_newlines.trim().to_string()
-}
-
 #[async_trait]
 impl Tool for WebFetchTool {
     fn name(&self) -> String {
@@ -684,7 +706,6 @@ impl Tool for WebFetchTool {
         }
 
         let max_chars = parsed.max_chars.unwrap_or(12_000).clamp(500, 50_000);
-        let include_html = parsed.include_html.unwrap_or(false);
 
         let response = self
             .client
@@ -695,13 +716,6 @@ impl Tool for WebFetchTool {
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         let status = response.status();
-        let final_url = response.url().to_string();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string();
         let raw_body = response
             .text()
             .await
@@ -714,8 +728,8 @@ impl Tool for WebFetchTool {
                 format!(
                     "Failed to fetch URL. HTTP: {} | URL: {} | Body: {}",
                     status,
-                    final_url,
-                    truncate_log(&raw_body)
+                    url,
+                    raw_body
                 ),
                 Some(1),
                 Some(start.elapsed().as_millis()),
@@ -723,11 +737,7 @@ impl Tool for WebFetchTool {
             );
         }
 
-        let rendered = if include_html || !content_type.contains("text/html") {
-            raw_body
-        } else {
-            extract_text_from_html(&raw_body)
-        };
+        let rendered = raw_body; // For now just return raw body text
 
         let (content, truncated) = if rendered.chars().count() > max_chars {
             (rendered.chars().take(max_chars).collect::<String>(), true)
@@ -735,15 +745,10 @@ impl Tool for WebFetchTool {
             (rendered, false)
         };
 
-        let output = format!(
-            "URL: {}\nFinal URL: {}\nContent-Type: {}\n\n{}",
-            url, final_url, content_type, content
-        );
-
         serialize_tool_envelope(
             "web_fetch",
             true,
-            output,
+            content,
             Some(0),
             Some(start.elapsed().as_millis()),
             truncated,
@@ -860,46 +865,10 @@ impl Tool for TavilySearchTool {
             );
         }
 
-        let mut out = String::new();
-        if let Some(answer) = json.get("answer").and_then(|v| v.as_str()) {
-            if !answer.trim().is_empty() {
-                out.push_str("Answer:\n");
-                out.push_str(answer.trim());
-                out.push_str("\n\n");
-            }
-        }
-
-        if let Some(results) = json.get("results").and_then(|v| v.as_array()) {
-            out.push_str("Sources:\n");
-            for (i, item) in results.iter().enumerate() {
-                let title = item
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Untitled");
-                let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                let content = item
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                out.push_str(&format!("{}. {} ({})\n", i + 1, title, url));
-                if !content.is_empty() {
-                    out.push_str(&format!(
-                        "   {}\n",
-                        truncate_log(content).replace('\n', " ")
-                    ));
-                }
-            }
-        }
-
-        if out.trim().is_empty() {
-            out = json.to_string();
-        }
-
         serialize_tool_envelope(
             "web_search_tavily",
             true,
-            out,
+            json.to_string(),
             Some(0),
             Some(start.elapsed().as_millis()),
             false,
@@ -1093,5 +1062,32 @@ impl Tool for FinishTaskTool {
         let parsed: FinishTaskArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         Ok(format!("Task marked as finished. Summary: {}", parsed.summary))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_patch_file_tool() {
+        let tool = PatchFileTool;
+        let test_file = "test_patch.txt";
+        std::fs::write(test_file, "Line 1\nLine 2\nLine 3\n").unwrap();
+
+        let patch = "--- test_patch.txt\n+++ test_patch.txt\n@@ -1,3 +1,3 @@\n Line 1\n-Line 2\n+Line 2 edited\n Line 3\n";
+        let args = serde_json::json!({
+            "thought": "edit line 2",
+            "path": test_file,
+            "patch": patch
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.contains("true"));
+
+        let content = std::fs::read_to_string(test_file).unwrap();
+        assert_eq!(content, "Line 1\nLine 2 edited\nLine 3\n");
+
+        std::fs::remove_file(test_file).unwrap();
     }
 }

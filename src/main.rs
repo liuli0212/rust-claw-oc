@@ -24,6 +24,7 @@ use crate::skills::load_skills;
 use crate::tools::{
     BashTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool,
     TaskPlanTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool, FinishTaskTool,
+    PatchFileTool,
 };
 use async_trait::async_trait;
 use clap::Parser;
@@ -105,13 +106,11 @@ impl CliOutput {
 #[async_trait]
 impl AgentOutput for CliOutput {
     async fn on_text(&self, text: &str) {
-        // Strip <final> tags for cleaner display
         let text = text.replace("<final>", "").replace("</final>", "");
         let text = text.as_str();
         if Self::is_prefixed_status(text) {
             print!("{}", Self::style_status(text));
         } else {
-            // Highlight model-visible reply content so it stands out from progress logs.
             print!("\x1b[1;97m{}\x1b[0m", text);
         }
         use std::io::Write;
@@ -120,22 +119,14 @@ impl AgentOutput for CliOutput {
 
     async fn on_tool_start(&self, name: &str, args: &str) {
         let display_args = Self::truncate_to_three_lines(args);
-        // Suppress noisy output for basic file operations
         if name == "read_file" || name == "write_file" {
-            println!(
-                "\n\x1b[33m> [Tool Call]: {} ...\x1b[0m",
-                name
-            );
+            println!("\n\x1b[33m> [Tool Call]: {} ...\x1b[0m", name);
         } else {
-            println!(
-                "\n\x1b[33m> [Tool Call]: {} (args: {})\x1b[0m",
-                name, display_args
-            );
+            println!("\n\x1b[33m> [Tool Call]: {} (args: {})\x1b[0m", name, display_args);
         }
     }
 
     async fn on_tool_end(&self, result: &str) {
-        // Truncate the result to max 3 lines to avoid screen spam
         let display_result = Self::truncate_to_three_lines(result);
         println!("\x1b[32m> [Tool Result]: {}\x1b[0m", display_result);
     }
@@ -192,7 +183,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-
     let current_dir = std::env::current_dir()?;
     let current_dir_str = current_dir.to_str().unwrap_or(".");
     let workspace = Arc::new(WorkspaceMemory::new(current_dir_str));
@@ -210,13 +200,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.push(Arc::new(crate::browser::BrowserTool::new()));
     tools.push(Arc::new(WriteFileTool));
     tools.push(Arc::new(ReadFileTool));
+    tools.push(Arc::new(PatchFileTool));
     tools.push(Arc::new(FinishTaskTool));
     tools.push(Arc::new(WebFetchTool::new()));
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
-    tools.push(Arc::new(TaskPlanTool::new(
-        current_dir.join(".rusty_claw_task_plan.json"),
-    )));
+    tools.push(Arc::new(TaskPlanTool::new(current_dir.join(".rusty_claw_task_plan.json"))));
 
     if let Ok(tavily_api_key) = std::env::var("TAVILY_API_KEY") {
         if !tavily_api_key.trim().is_empty() {
@@ -229,7 +218,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tools.push(Arc::new(RagInsertTool::new(store.clone())));
     }
 
-    // Load dynamic skills
     let loaded_skills = load_skills("skills");
     let loaded_count = loaded_skills.len();
     for skill in loaded_skills {
@@ -238,39 +226,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let session_manager = Arc::new(SessionManager::new(llm_opt, tools.clone()));
 
-    // Start Telegram Bot
     if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
-        tracing::info!("Starting Telegram bot task");
         let sm = session_manager.clone();
-        tokio::spawn(async move {
-            telegram::run_telegram_bot(token, sm).await;
-        });
+        tokio::spawn(async move { telegram::run_telegram_bot(token, sm).await; });
     }
 
-    // Start Discord Bot
     if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN") {
-        tracing::info!("Starting Discord bot task");
         let sm = session_manager.clone();
-        tokio::spawn(async move {
-            discord::run_discord_bot(token, sm).await;
-        });
+        tokio::spawn(async move { discord::run_discord_bot(token, sm).await; });
     }
 
     let output = Arc::new(CliOutput);
-
-    // Pre-initialize CLI session to avoid lazy-loading issues
     if let Err(e) = session_manager.get_or_create_session("cli", output.clone()).await {
         eprintln!("\x1b[33m[Warning] Failed to pre-initialize CLI session: {}\x1b[0m", e);
     }
 
     let mut rl = DefaultEditor::new()?;
     println!("Welcome to Rusty-Claw! (type '/exit' to quit)");
-    if loaded_count > 0 {
-        println!(
-            "Loaded {} dynamic skills from 'skills/' directory.",
-            loaded_count
-        );
-    }
+    if loaded_count > 0 { println!("Loaded {} dynamic skills from 'skills/' directory.", loaded_count); }
     if std::path::Path::new(".rusty_claw_task_plan.json").exists() {
         println!("\x1b[33m[System] Detected an existing task plan. If you no longer need it, use /cancel_task to clear it.\x1b[0m");
     }
@@ -278,9 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sm_clone = session_manager.clone();
     tokio::spawn(async move {
         let mut sigs = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-        while let Some(_) = sigs.recv().await {
-            sm_clone.cancel_session("cli").await;
-        }
+        while let Some(_) = sigs.recv().await { sm_clone.cancel_session("cli").await; }
     });
 
     loop {
@@ -288,9 +259,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match readline {
             Ok(line) => {
                 let line = line.trim();
-                if line == "/exit" {
-                    break;
-                }
+                if line == "/exit" { break; }
                 if line == "/cancel_task" {
                     session_manager.cancel_session("cli").await;
                     let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
@@ -304,79 +273,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if line == "/status" {
-                    let agent = match session_manager.get_or_create_session("cli", output.clone()).await {
-                        Ok(a) => a,
-                        Err(e) => {
-                            println!("\x1b[31m[System] Error: {}\x1b[0m", e);
-                            continue;
-                        }
-                    };
+                    let agent = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
                     let agent_guard = agent.lock().await;
                     let (provider, model, tokens, max_tokens) = agent_guard.get_status();
                     let percentage = (tokens as f64 / max_tokens as f64) * 100.0;
-                    println!("\x1b[36m[Status]\x1b[0m");
-                    println!("Provider: {}", provider);
-                    println!("Model:    {}", model);
-                    println!("Context:  {} / {} tokens ({:.1}%)", tokens, max_tokens, percentage);
+                    println!("\x1b[36m[Status]\x1b[0m Provider: {}, Model: {}, Context: {}/{} tokens ({:.1}%)", provider, model, tokens, max_tokens, percentage);
                     continue;
                 }
                 if line.starts_with("/context") {
-                    let agent = match session_manager.get_or_create_session("cli", output.clone()).await {
-                        Ok(a) => a,
-                        Err(e) => {
-                            println!("\x1b[31m[System] Error: {}\x1b[0m", e);
-                            continue;
-                        }
-                    };
+                    let agent = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
                     let mut agent_guard = agent.lock().await;
-                    
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     let subcommand = parts.get(1).map(|s| *s).unwrap_or("");
 
                     match subcommand {
-                        "detail" => {
-                             let details = agent_guard.get_context_details();
-                             println!("{}", details);
+                        "audit" => { println!("{}", agent_guard.get_context_details()); }
+                        "diff" => {
+                            if let Some(diff) = agent_guard.diff_context() {
+                                println!("\n\x1b[1;36m=== Context Diff (vs start of turn) ===\x1b[0m");
+                                println!("  - Token Delta:         {:+}", diff.token_delta);
+                                println!("  - History Turns:       {:+}", diff.history_turns_delta);
+                                println!("  - System Prompt:       {}", if diff.system_prompt_changed { "\x1b[33mChanged\x1b[0m" } else { "Unchanged" });
+                                if diff.memory_changed {
+                                    println!("  - Memory Sources:");
+                                    for s in &diff.new_sources { println!("    \x1b[32m[+] {}\x1b[0m", s); }
+                                    for s in &diff.removed_sources { println!("    \x1b[31m[-] {}\x1b[0m", s); }
+                                } else {
+                                    println!("  - Memory:              Unchanged");
+                                }
+                            } else {
+                                println!("\x1b[33m[System] No snapshot available for diff. Run a command first.\x1b[0m");
+                            }
                         }
                         "compact" => {
                              match agent_guard.force_compact().await {
-                                 Ok(reason) => println!("\x1b[32m[System] Context compacted: {}\x1b[0m", reason),
+                                 Ok(r) => println!("\x1b[32m[System] Context compacted: {}\x1b[0m", r),
                                  Err(e) => println!("\x1b[31m[System] Compaction skipped: {}\x1b[0m", e)
                             }
                         }
                         _ => {
                             let stats = agent_guard.get_detailed_stats();
-                            let percentage = if stats.max > 0 {
-                                (stats.total as f64 / stats.max as f64) * 100.0
-                            } else {
-                                0.0
-                            };
-                            
-                            println!("\x1b[36m[Context Usage]\x1b[0m");
-                            println!("Total Used:   {} / {} tokens ({:.1}%)", stats.total, stats.max, percentage);
-                            
-                            println!("\n\x1b[33m--- System Instruction Breakdown ---\x1b[0m");
-                            println!("  Identity (Static):    {} tokens", stats.system_static);
-                            println!("  Runtime Env:         {} tokens", stats.system_runtime);
-                            println!("  Custom Instructions: {} tokens (.claw_prompt.md)", stats.system_custom);
-                            println!("  Task Plan:           {} tokens", stats.system_task_plan);
-                            println!("  Project Context:     {} tokens (AGENTS.md, etc.)", stats.system_project);
-                            println!("  Retrieved Memory:    {} tokens (RAG)", stats.memory);
-                            
-                            println!("\n\x1b[33m--- Conversation Breakdown ---\x1b[0m");
-                            println!("  History:             {} tokens", stats.history);
-                            if stats.current_turn > 0 {
-                                println!("  Current Turn:        {} tokens", stats.current_turn);
-                            }
-                            
-                            let tool_stats = agent_guard.get_tool_stats();
-                            let tool_total: usize = tool_stats.values().sum();
-                            println!("\n\x1b[33m--- Tools Breakdown ({} total) ---\x1b[0m", tool_total);
-                            let mut sorted_tools: Vec<_> = tool_stats.into_iter().collect();
-                            sorted_tools.sort_by(|a, b| b.1.cmp(&a.1));
-                            for (name, tokens) in sorted_tools {
-                                println!("  - {:<18} {} tokens", name, tokens);
-                            }
+                            println!("\x1b[36m[Context Usage]\x1b[0m {}/{} tokens ({:.1}%)", stats.total, stats.max, (stats.total as f64 / stats.max as f64) * 100.0);
+                            println!("  Identity: {} | Runtime: {} | Custom: {} | Plan: {} | Project: {} | Memory: {} | History: {} | Current: {}", 
+                                stats.system_static, stats.system_runtime, stats.system_custom, stats.system_task_plan, stats.system_project, stats.memory, stats.history, stats.current_turn);
+                            println!("  Use '/context audit' for deep dive or '/context diff' to see changes.");
                         }
                     }
                     continue;
@@ -384,58 +324,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line.starts_with("/model") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() < 2 {
-                        println!("\x1b[31mUsage: /model <provider> [model]\x1b[0m");
-                        // Show available providers from config
                         let config = crate::config::AppConfig::load();
-                        let providers: Vec<&String> = config.providers.keys().collect();
-                        let providers_str = providers.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
-                        println!("Available providers: {}", providers_str);
+                        println!("Usage: /model <provider> [model]\nAvailable: {}", config.providers.keys().cloned().collect::<Vec<_>>().join(", "));
                         continue;
                     }
-                    let provider = parts[1];
-                    let model = parts.get(2).map(|s| s.to_string());
-                    
-
-                    
-                    match session_manager.update_session_llm("cli", provider, model).await {
+                    match session_manager.update_session_llm("cli", parts[1], parts.get(2).map(|s| s.to_string())).await {
                         Ok(msg) => println!("\x1b[32m[System] {}\x1b[0m", msg),
-                        Err(e) => println!("\x1b[31m[System] Failed to switch model: {}\x1b[0m", e),
+                        Err(e) => println!("\x1b[31m[System] Failed: {}\x1b[0m", e),
                     }
                     continue;
                 }
-
-                if line.is_empty() {
-                    continue;
-                }
+                if line.is_empty() { continue; }
                 let _ = rl.add_history_entry(line);
-
-                let agent = match session_manager.get_or_create_session("cli", output.clone()).await {
-                    Ok(a) => a,
-                    Err(e) => {
-                        println!("\x1b[31m[System] Error: {}\x1b[0m", e);
-                        continue;
-                    }
-                };
+                let agent = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
                 let mut agent_guard = agent.lock().await;
 
                 match agent_guard.step(line.to_string()).await {
                     Ok(exit) => match exit {
                         RunExit::CompletedWithReply => {}
-                        RunExit::CompletedSilent { cause } => {
-                            println!("\n[Run Exit] completed_silent ({})", cause);
-                        }
-                        RunExit::RecoverableFailed { reason, attempts } => {
-                            println!(
-                                "\n[Run Exit] recoverable_failed (reason={}, attempts={})",
-                                reason, attempts
-                            );
-                        }
-                        RunExit::HardStop { reason } => {
-                            println!("\n[Run Exit] hard_stop ({})", reason);
-                        }
-                        RunExit::YieldedToUser => {
-                            // Message is already printed by core.rs
-                        }
+                        _ => println!("\n[Run Exit] {}", exit.label()),
                     },
                     Err(e) => eprintln!("Agent error: {}", e),
                 }
@@ -444,20 +351,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("\x1b[33m[System] Current task plan is still active. Use /cancel_task if you want to abort it.\x1b[0m");
                 }
             }
-            Err(ReadlineError::Interrupted) => {
-                println!("CTRL-C");
-                break;
-            }
-            Err(ReadlineError::Eof) => {
-                println!("CTRL-D");
-                break;
-            }
-            Err(err) => {
-                println!("Error: {:?}", err);
-                break;
-            }
+            Err(ReadlineError::Interrupted) => { println!("CTRL-C"); break; }
+            Err(ReadlineError::Eof) => { println!("CTRL-D"); break; }
+            Err(err) => { println!("Error: {:?}", err); break; }
         }
     }
-
     Ok(())
 }
