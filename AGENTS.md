@@ -42,9 +42,17 @@ Rusty-Claw relies on a minimal-dependency, highly synchronous/asynchronous hybri
 ## 📝 Coding Style & Conventions
 
 ### 1. File Modification
-- **DO NOT** use brittle bash heredocs (`cat << 'EOF'`) to write code. 
-- **ALWAYS** use the native `write_file` tool to overwrite or create files.
-- For precise edits, use the `edit` tool (if available in your capabilities) or `sed`/`awk` ONLY for trivial 1-liners. Otherwise, use `write_file`.
+- **PREFERRED**: Use the `patch_file` tool for modifying existing files. It uses the system `patch` command and expects a unified diff format.
+  - Example:
+    ```json
+    {
+      "thought": "Update the version number",
+      "path": "Cargo.toml",
+      "patch": "--- Cargo.toml\n+++ Cargo.toml\n@@ -1,4 +1,4 @@\n [package]\n name = \"rusty-claw\"\n-version = \"0.1.0\"\n+version = \"0.1.1\"\n edition = \"2021\""
+    }
+    ```
+- **FALLBACK**: Use the native `write_file` tool to overwrite or create files ONLY if the file is small or if `patch_file` fails repeatedly.
+- For precise edits, use `sed`/`awk` ONLY for trivial 1-liners.
 
 ### 2. Rust Formatting & Idioms
 - Follow standard `rustfmt` guidelines. Indentation is 4 spaces.
@@ -55,21 +63,4 @@ Rusty-Claw relies on a minimal-dependency, highly synchronous/asynchronous hybri
 ### 3. Error Handling
 - Use `thiserror` for library-level error definitions (e.g., `ToolError`, `LlmError`).
 - Use the `?` operator extensively to propagate errors up to the caller.
-- Do NOT swallow errors silently. If an error must be ignored, log it explicitly or comment why it is safe to ignore.
-
-### 4. Asynchronous Programming
-- The project heavily uses `tokio`. 
-- Be mindful of `std::sync::Mutex` vs `tokio::sync::Mutex`. Do not hold `std::sync::Mutex` guards across `.await` yield points. If you must hold a lock across an await, use `tokio::sync::Mutex`.
-- Use `#[async_trait]` when adding async methods to traits (like `Tool`).
-
-### 5. Adding New Tools
-To add a new tool to Rusty-Claw:
-1. Define the argument struct and derive `Serialize, Deserialize, JsonSchema`.
-2. Define an empty struct for the tool state (or one with dependencies if needed).
-3. Implement `#[async_trait] impl Tool for MyNewTool`. Provide `name`, `description`, `parameters_schema` (via `schemars`), and the `execute` function.
-4. Register the tool in `src/main.rs` inside the `tools.push(...)` block.
-
-## 🧠 Agent Behavioral Rules
-1. **Be Proactive**: You have full system access. Do not ask "Would you like me to write the code?". Just write it, test it, and report the result.
-2. **Handle Context Size**: If a command produces massive output (like `npm i` or `cargo build`), use tools like `grep` or redirect output to a file and `head`/`tail` it. `Rusty-Claw` will auto-truncate outputs over 15k chars, but being precise saves your own token budget.
-3. **Diagnose and Fix**: If a test or command fails, do not just apologize. Read the error, understand the root cause, apply a fix, and run the test again until it passes.
+- Do NOT swallow errors silently. If an e
