@@ -68,16 +68,13 @@ struct CliArgs {
 struct CliOutput;
 
 impl CliOutput {
-    fn truncate_to_three_lines(input: &str) -> String {
-        let lines: Vec<&str> = input.lines().collect();
-        if lines.len() <= 3 {
-            return input.to_string();
+    fn truncate_to_one_line(input: &str) -> String {
+        let first_line = input.lines().next().unwrap_or("");
+        if first_line.len() > 60 {
+            format!("{}...", &first_line.chars().take(57).collect::<String>())
+        } else {
+            first_line.to_string()
         }
-        format!(
-            "{}\n... ({} more lines)",
-            lines[..3].join("\n"),
-            lines.len() - 3
-        )
     }
 
     fn is_prefixed_status(text: &str) -> bool {
@@ -118,21 +115,39 @@ impl AgentOutput for CliOutput {
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
-        let display_args = Self::truncate_to_three_lines(args);
-        if name == "read_file" || name == "write_file" {
-            println!("\n\x1b[33m> [Tool Call]: {} ...\x1b[0m", name);
+        let args_val: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::json!({}));
+        let summary = match name {
+            "read_file" | "write_file" | "patch_file" => {
+                args_val.get("path").and_then(|v| v.as_str()).unwrap_or("unknown").to_string()
+            }
+            "execute_bash" => {
+                let cmd = args_val.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                Self::truncate_to_one_line(cmd)
+            }
+            "web_fetch" | "browser" => {
+                args_val.get("url").or_else(|| args_val.get("target_url")).and_then(|v| v.as_str()).unwrap_or("").to_string()
+            }
+            _ => Self::truncate_to_one_line(args),
+        };
+
+        if summary.is_empty() {
+            println!("\x1b[33m> [Tool]: {}\x1b[0m", name);
         } else {
-            println!("\n\x1b[33m> [Tool Call]: {} (args: {})\x1b[0m", name, display_args);
+            println!("\x1b[33m> [Tool]: {} ({})\x1b[0m", name, summary);
         }
     }
 
     async fn on_tool_end(&self, result: &str) {
-        let display_result = Self::truncate_to_three_lines(result);
-        println!("\x1b[32m> [Tool Result]: {}\x1b[0m", display_result);
+        let display_result = if result.len() > 100 {
+            format!("{}... (total {} chars)", &result.chars().take(80).collect::<String>(), result.len())
+        } else {
+            result.replace('\n', " ").to_string()
+        };
+        println!("\x1b[32m> [Result]: {}\x1b[0m", display_result);
     }
 
     async fn on_error(&self, error: &str) {
-        println!("\x1b[31m{}\x1b[0m", error);
+        tracing::error!("{}", error);
     }
 }
 
@@ -259,11 +274,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match readline {
             Ok(line) => {
                 let line = line.trim();
-                if line == "/exit" { break; }
-                if line == "/cancel_task" {
+                if line == "/exit" {
+                    break;
+                }
+                if line == "/new" {
+                    session_manager.reset_session("cli").await;
+                    let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
+                    println!("\x1b[32m[System] Session cleared. Starting fresh.\x1b[0m");
+                    continue;
+                }
+                if line == "/cancel" || line == "/cancel_task" {
                     session_manager.cancel_session("cli").await;
                     let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
-                    println!("\x1b[33m[System] Current task plan cancelled.\x1b[0m");
+                    println!("\x1b[33m[System] Task and plan cancelled.\x1b[0m");
                     continue;
                 }
                 if line == "/new" {

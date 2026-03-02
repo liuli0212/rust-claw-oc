@@ -25,10 +25,10 @@ pub struct VectorStore {
 impl VectorStore {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let start = Instant::now();
-        tracing::info!("[RAG] Initializing VectorStore...");
+        tracing::debug!("[RAG] Initializing VectorStore...");
 
         let mut opts = InitOptions::new(EmbeddingModel::AllMiniLML6V2);
-        opts.show_download_progress = true;
+        opts.show_download_progress = false;
         let model = TextEmbedding::try_new(opts)?;
 
         // Open a SQLite connection for hybrid search
@@ -93,7 +93,7 @@ impl VectorStore {
         // Drop the statement to release the borrow on conn
         drop(stmt);
 
-        tracing::info!(
+        tracing::debug!(
             "[RAG] Loaded {} chunks into memory in {}ms",
             loaded_chunks.len(),
             start.elapsed().as_millis()

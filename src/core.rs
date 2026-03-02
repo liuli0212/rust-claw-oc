@@ -1,8 +1,9 @@
 use crate::context::{
-    AgentContext, FunctionResponse, Message, Part, PromptReport, Turn, ContextSnapshot, ContextDiff
+    AgentContext, FunctionResponse, Message, Part, Turn, ContextDiff
 };
 use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;
+use crate::utils::truncate_log;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -104,8 +105,8 @@ impl AgentLoop {
     const COMPACTION_TARGET_RATIO_NUM: usize = 25;
     const COMPACTION_TARGET_RATIO_DEN: usize = 100;
     const COMPACTION_MIN_TURNS: usize = 3;
-    const DEFAULT_MAX_TASK_ITERATIONS: usize = 12;
-    const MAX_AUTO_RECOVERY_ATTEMPTS: usize = 2;
+    const DEFAULT_MAX_TASK_ITERATIONS: usize = 20;
+    const MAX_AUTO_RECOVERY_ATTEMPTS: usize = 5;
     const MAX_LLM_RECOVERY_ATTEMPTS: usize = 25;
 
     pub fn new(
@@ -423,12 +424,30 @@ impl AgentLoop {
                 let recovery_command = (rule.build_command)(original_command, &parsed.output);
                 task_state.recovery_attempts += 1;
                 *task_state.recovery_rule_hits.entry(rule.name.to_string()).or_insert(0) += 1;
-                let recovery_raw = match tool.execute(serde_json::json!({ "command": recovery_command, "timeout": 20 })).await { Ok(res) => res, Err(e) => format!("Error: {}", e) };
+                
+                tracing::info!(
+                    "Applying recovery rule '{}' (Attempt {}/{}): Original: '{}'",
+                    rule.name, task_state.recovery_attempts, Self::MAX_AUTO_RECOVERY_ATTEMPTS, original_command
+                );
+
+                let recovery_raw = match tool.execute(serde_json::json!({ "command": recovery_command, "timeout": 20 })).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        let err_msg = format!("Recovery tool execution failed: {}", e);
+                        tracing::error!("{}", err_msg);
+                        err_msg
+                    }
+                };
                 let recovery_parsed = Self::parse_structured_tool_result("execute_bash", &recovery_raw);
                 parsed.recovery_attempted = true;
                 parsed.recovery_output = Some(recovery_parsed.output.clone());
                 parsed.recovery_rule = Some(rule.name.to_string());
-                if recovery_parsed.ok { parsed.ok = true; }
+                if recovery_parsed.ok {
+                    tracing::info!("Recovery rule '{}' COMPLETED successfully", rule.name);
+                    parsed.ok = true;
+                } else {
+                    tracing::warn!("Recovery rule '{}' FAILED: {}", rule.name, truncate_log(&recovery_parsed.output));
+                }
                 return parsed;
             }
         }
@@ -442,7 +461,7 @@ impl AgentLoop {
 
         let mut task_state = TaskState {
             goal: goal.clone(),
-            energy_points: 20,
+            energy_points: 30, // Increased from 20 to allow more sub-steps
             ..Default::default()
         };
 
@@ -512,6 +531,7 @@ impl AgentLoop {
             }
 
             if !full_text.is_empty() {
+                tracing::info!("LLM Response (aggregated): {}", truncate_log(&full_text));
                 self.context.add_message_to_current_turn(Message {
                     role: "model".to_string(),
                     parts: vec![Part { text: Some(full_text.clone()), function_call: None, function_response: None, thought_signature: None }],
@@ -551,6 +571,7 @@ impl AgentLoop {
 
                 self.output.on_tool_start(&call.name, &call.args.to_string()).await;
                 let tool_result = self.execute_tool_call_with_recovery(&call.name, &call.args, &mut task_state).await;
+                tracing::info!("Tool '{}' result: {}", call.name, truncate_log(&tool_result.output));
                 if tool_result.ok { task_state.energy_points = (task_state.energy_points + 2).min(60); }
                 self.output.on_tool_end(&tool_result.output).await;
 
@@ -590,8 +611,8 @@ mod tests {
         fn provider_name(&self) -> &str { "mock" }
         fn model_name(&self) -> &str { "mock" }
         fn context_window_size(&self) -> usize { 1000 }
-        async fn generate_text(&self, _m: Vec<Message>, _s: Option<Message>, _t: Option<Vec<Arc<dyn Tool>>>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> { Ok("done".to_string()) }
-        async fn stream(&self, _m: Vec<Message>, _s: Option<Message>, _t: Vec<Arc<dyn Tool>>) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, Box<dyn std::error::Error + Send + Sync>> {
+        async fn generate_text(&self, _m: Vec<Message>, _s: Option<Message>) -> Result<String, crate::llm_client::LlmError> { Ok("done".to_string()) }
+        async fn stream(&self, _m: Vec<Message>, _s: Option<Message>, _t: Vec<Arc<dyn Tool>>) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, crate::llm_client::LlmError> {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let _ = tx.send(StreamEvent::Text("done".to_string())).await;
             Ok(rx)
