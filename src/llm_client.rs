@@ -261,11 +261,8 @@ impl LlmClient for GeminiClient {
             self.model_name, self.api_key
         );
 
-        tracing::info!(
-            "Gemini generate_text request: url={}, body={}",
-            url,
-            truncate_log(&serde_json::to_string(&req_body).unwrap_or_default())
-        );
+        tracing::info!("Gemini generate_text request: url={}", url);
+        tracing::debug!("Gemini generate_text body: {}", truncate_log(&serde_json::to_string(&req_body).unwrap_or_default()));
 
         let response = self
             .client
@@ -276,9 +273,11 @@ impl LlmClient for GeminiClient {
             .await?;
 
         if !response.status().is_success() {
-            let error_text = response.text().await?;
-            tracing::error!("Gemini API Error: {}", truncate_log_error(&error_text));
-            return Err(LlmError::ApiError(error_text));
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_else(|_| "Could not read error body".to_string());
+            let truncated_error = truncate_log_error(&error_text);
+            tracing::error!("Gemini API Error: status={}, body={}", status, truncated_error);
+            return Err(LlmError::ApiError(format!("Gemini API status={}: {}", status, truncated_error)));
         }
 
         let resp_json: Value = response.json().await?;
@@ -330,12 +329,8 @@ impl LlmClient for GeminiClient {
                 attempts += 1;
                 let body_json_string = serde_json::to_string(&req_body).unwrap_or_default();
                 
-                tracing::info!(
-                    "Sending Gemini stream request (Attempt {}/{}): body={}",
-                    attempts,
-                    max_attempts,
-                    truncate_log(&body_json_string)
-                );
+                tracing::info!("Sending Gemini stream request (Attempt {}/{})", attempts, max_attempts);
+                tracing::debug!("Gemini stream body: {}", truncate_log(&body_json_string));
 
                 let req_result = client
                     .post(&url)
@@ -620,11 +615,8 @@ impl LlmClient for OpenAiCompatClient {
         });
 
         let body_json = serde_json::to_string(&body).unwrap_or_default();
-        tracing::info!(
-            "OpenAI generate_text request: url={}, body={}",
-            self.base_url,
-            truncate_log(&body_json)
-        );
+        tracing::info!("OpenAI generate_text request: url={}", self.base_url);
+        tracing::debug!("OpenAI generate_text body: {}", truncate_log(&body_json));
         let response = self
             .client
             .post(&self.base_url)
@@ -637,13 +629,14 @@ impl LlmClient for OpenAiCompatClient {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_else(|_| "Could not read error body".to_string());
+            let truncated_error = truncate_log_error(&error_text);
             tracing::error!(
                 "OpenAI API Error: status={}, url={}, body={}",
                 status,
                 self.base_url,
-                truncate_log_error(&error_text)
+                truncated_error
             );
-            return Err(LlmError::ApiError(format!("OpenAI API error: {} body={}", status, error_text)));
+            return Err(LlmError::ApiError(format!("OpenAI API status={}: {}", status, truncated_error)));
         }
 
         let resp_json: Value = response.json().await?;
@@ -750,13 +743,8 @@ impl LlmClient for OpenAiCompatClient {
                 attempts += 1;
                 let body_json_string = serde_json::to_string(&body_map).unwrap_or_default();
                 
-                tracing::info!(
-                    "Sending stream request to {} (Attempt {}/{}): body={}",
-                    base_url,
-                    attempts,
-                    max_attempts,
-                    truncate_log(&body_json_string)
-                );
+                tracing::info!("Sending stream request to {} (Attempt {}/{})", base_url, attempts, max_attempts);
+                tracing::debug!("OpenAI stream body: {}", truncate_log(&body_json_string));
 
                 let req_result = client
                     .post(&base_url)

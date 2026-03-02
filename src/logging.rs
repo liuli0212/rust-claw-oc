@@ -32,7 +32,7 @@ pub fn init_logging(
     let console_filter = std::env::var("CLAW_CONSOLE_LOG_LEVEL")
         .ok()
         .and_then(|v| EnvFilter::try_new(v).ok())
-        .unwrap_or_else(|| EnvFilter::new("warn"))
+        .unwrap_or_else(|| EnvFilter::new("off"))
         // CRITICAL: Always suppress rustyline logs in console too
         .add_directive("rustyline=off".parse().unwrap());
 

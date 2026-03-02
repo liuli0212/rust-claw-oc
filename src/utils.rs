@@ -22,37 +22,43 @@ pub fn truncate_tool_output(log: &str) -> String {
 }
 
 fn truncate_impl(log: &str, max_lines: usize, max_chars: usize) -> String {
-    let lines: Vec<&str> = log.lines().collect();
+    let lines_raw: Vec<&str> = log.lines().collect();
 
-    let truncated_str = if lines.len() <= max_lines {
+    // Line-based truncation
+    let truncated_by_lines = if lines_raw.len() <= max_lines {
         log.to_string()
     } else {
         let keep_head = max_lines / 2;
         let keep_tail = max_lines - keep_head;
-        let head = lines[0..keep_head].join("\n");
-        let tail = lines[lines.len() - keep_tail..].join("\n");
+        let head = lines_raw[0..keep_head].join("\n");
+        let tail = lines_raw[lines_raw.len() - keep_tail..].join("\n");
         format!(
             "{}\n\n[... Truncated {} lines ...]\n\n{}",
             head,
-            lines.len() - max_lines,
+            lines_raw.len() - max_lines,
             tail
         )
     };
 
-    if truncated_str.len() <= max_chars {
-        truncated_str
+    // Character-based truncation (second pass)
+    if truncated_by_lines.len() <= max_chars {
+        truncated_by_lines
     } else {
+        // When truncating characters, we must be careful not to break multi-byte UTF-8 sequences.
+        // chars().collect() is safer than slicing bytes.
+        let chars: Vec<char> = truncated_by_lines.chars().collect();
         let keep = max_chars / 2;
-        let head: String = truncated_str.chars().take(keep).collect();
-        let tail: String = truncated_str
-            .chars()
-            .skip(truncated_str.len() - keep)
-            .collect();
-        format!(
-            "{}\n\n[... Truncated {} characters ...]\n\n{}",
-            head,
-            truncated_str.len() - max_chars,
-            tail
-        )
+        if chars.len() <= max_chars {
+             truncated_by_lines
+        } else {
+            let head: String = chars.iter().take(keep).collect();
+            let tail: String = chars.iter().skip(chars.len() - keep).collect();
+            format!(
+                "{}\n\n[... Truncated {} characters ...]\n\n{}",
+                head,
+                chars.len() - max_chars,
+                tail
+            )
+        }
     }
 }
