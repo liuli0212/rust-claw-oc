@@ -2,6 +2,7 @@
 
 # Default provider to use if not specified via CLI
 default_provider = "gemini"
+context_window = 64000 # Optional: Override auto-detected window size
 
 [providers.gemini]
 type = "gemini"

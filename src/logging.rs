@@ -1,85 +1,72 @@
+use crate::config::AppConfig;
+use std::fs;
+use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
-use tracing_subscriber::{fmt, EnvFilter};
-
-#[derive(Debug, Clone, Default)]
-pub struct LoggingConfig {
-    pub log_level: Option<String>,
-    pub file_log: Option<bool>,
-    pub log_dir: Option<String>,
-    pub log_file: Option<String>,
-}
+use tracing_subscriber::{
+    fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+};
 
 pub fn init_logging(
-    config: LoggingConfig,
-) -> Result<Option<WorkerGuard>, Box<dyn std::error::Error>> {
-    let file_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| {
-            let level = config
-                .log_level
-                .clone()
-                .or_else(|| std::env::var("CLAW_LOG_LEVEL").ok())
-                .unwrap_or_else(|| "info".to_string());
-            EnvFilter::try_new(level)
+    _config: &AppConfig,
+) -> Result<Option<WorkerGuard>, Box<dyn std::error::Error + Send + Sync>> {
+    // 1. File Logging
+    // We always want to log to file if possible, or if configured via ENV.
+    // Default to strict env filter for file logs (debug or info).
+    let file_filter = std::env::var("CLAW_LOG_LEVEL")
+        .ok()
+        .and_then(|v| {
+            // Validate the filter string by trying to parse it
+            EnvFilter::try_new(v).ok()
         })
-        .unwrap_or_else(|_| EnvFilter::new("info"))
-        // CRITICAL: Always suppress rustyline logs, as they spam "Search event" on every keystroke
+        .unwrap_or_else(|| EnvFilter::new("info"))
         .add_directive("rustyline=off".parse().unwrap());
 
-
+    // Only log ERROR to console by default to keep it clean, as per BOSS's request to not log to screen.
+    // Unless CLAW_CONSOLE_LOG_LEVEL is explicitly set.
     let console_filter = std::env::var("CLAW_CONSOLE_LOG_LEVEL")
         .ok()
         .and_then(|v| EnvFilter::try_new(v).ok())
-        .unwrap_or_else(|| EnvFilter::new("off"))
-        // CRITICAL: Always suppress rustyline logs in console too
+        .unwrap_or_else(|| EnvFilter::new("error"))
         .add_directive("rustyline=off".parse().unwrap());
 
-
-    let enable_file = config.file_log.unwrap_or_else(|| {
-        std::env::var("CLAW_FILE_LOG")
+    let enable_file = std::env::var("CLAW_FILE_LOG")
             .map(|v| v != "0")
-            .unwrap_or(true)
-    });
+            .unwrap_or(true);
 
-    if !enable_file {
-        let console_layer = fmt::layer()
-            .with_target(false)
-            .with_filter(console_filter);
-        tracing_subscriber::registry()
-            .with(console_layer)
-            .try_init()?;
-        return Ok(None);
+    let log_dir = std::env::var("CLAW_LOG_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("logs"));
+
+    if enable_file {
+        if !log_dir.exists() {
+            fs::create_dir_all(&log_dir)?;
+        }
     }
 
-    let log_dir = config
-        .log_dir
-        .or_else(|| std::env::var("CLAW_LOG_DIR").ok())
-        .unwrap_or_else(|| "logs".to_string());
-    let log_file = config
-        .log_file
-        .or_else(|| std::env::var("CLAW_LOG_FILE").ok())
-        .unwrap_or_else(|| "rusty-claw.log".to_string());
-    std::fs::create_dir_all(&log_dir)?;
-
-    let file_appender = tracing_appender::rolling::daily(log_dir, log_file);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "claw.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let file_layer = fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(true)
+        .with_filter(file_filter);
 
     let console_layer = fmt::layer()
         .with_target(false)
         .with_filter(console_filter);
 
-    let file_layer = fmt::layer()
-        .with_ansi(false)
-        .with_writer(non_blocking)
-        .with_target(true)
-        .with_filter(file_filter);
-
-    tracing_subscriber::registry()
-        .with(console_layer)
-        .with(file_layer)
-        .try_init()?;
-
-    Ok(Some(guard))
+    if enable_file {
+        tracing_subscriber::registry()
+            .with(console_layer)
+            .with(file_layer)
+            .try_init()?;
+        Ok(Some(guard))
+    } else {
+        tracing_subscriber::registry()
+            .with(console_layer)
+            .try_init()?;
+        Ok(None)
+    }
 }
