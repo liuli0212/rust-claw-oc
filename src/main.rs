@@ -313,19 +313,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "audit" => { println!("{}", agent_guard.get_context_details()); }
                         "diff" => {
                             if let Some(diff) = agent_guard.diff_context() {
-                                println!("\n\x1b[1;36m=== Context Diff (vs start of turn) ===\x1b[0m");
-                                println!("  - Token Delta:         {:+}", diff.token_delta);
-                                println!("  - History Turns:       {:+}", diff.history_turns_delta);
-                                println!("  - System Prompt:       {}", if diff.system_prompt_changed { "\x1b[33mChanged\x1b[0m" } else { "Unchanged" });
-                                if diff.memory_changed {
-                                    println!("  - Memory Sources:");
-                                    for s in &diff.new_sources { println!("    \x1b[32m[+] {}\x1b[0m", s); }
-                                    for s in &diff.removed_sources { println!("    \x1b[31m[-] {}\x1b[0m", s); }
-                                } else {
-                                    println!("  - Memory:              Unchanged");
-                                }
+                                println!("{}", agent_guard.format_diff(&diff));
                             } else {
                                 println!("\x1b[33m[System] No snapshot available for diff. Run a command first.\x1b[0m");
+                            }
+                        }
+                        "inspect" => {
+                            let section = parts.get(2).map(|s| *s).unwrap_or("");
+                            let arg = parts.get(3).map(|s| *s);
+                            if section.is_empty() {
+                                println!("\x1b[33m[System] Usage: /context inspect <system|history|memory|plan> [arg]\x1b[0m");
+                            } else {
+                                println!("{}", agent_guard.inspect_context(section, arg));
+                            }
+                        }
+                        "dump" => {
+                            let (payload, sys, report) = agent_guard.build_llm_payload();
+                            let dump_data = serde_json::json!({
+                                "system_prompt": sys,
+                                "messages": payload,
+                                "report": {
+                                    "max_history_tokens": report.max_history_tokens,
+                                    "history_tokens_used": report.history_tokens_used,
+                                    "history_turns_included": report.history_turns_included,
+                                    "current_turn_tokens": report.current_turn_tokens,
+                                    "system_prompt_tokens": report.system_prompt_tokens,
+                                    "total_prompt_tokens": report.total_prompt_tokens,
+                                    "retrieved_memory_snippets": report.retrieved_memory_snippets,
+                                    "retrieved_memory_sources": report.retrieved_memory_sources,
+                                }
+                            });
+                            if let Ok(json_str) = serde_json::to_string_pretty(&dump_data) {
+                                if let Ok(_) = std::fs::write("debug_context.json", json_str) {
+                                    println!("\x1b[32m[System] Context dumped to debug_context.json\x1b[0m");
+                                } else {
+                                    println!("\x1b[31m[System] Failed to write debug_context.json\x1b[0m");
+                                }
                             }
                         }
                         "compact" => {
