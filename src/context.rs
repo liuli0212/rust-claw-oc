@@ -208,8 +208,9 @@ impl AgentContext {
         }
 
         // 7. History (Net Load)
-        let (_, history_tokens, _) = self.build_history_with_budget();
+        let (_, history_tokens, _, truncated_chars) = self.build_history_with_budget();
         stats.history = history_tokens;
+        stats.truncated_chars = truncated_chars;
 
         // 8. Current Turn
         if let Some(turn) = &self.current_turn {
@@ -512,7 +513,7 @@ impl AgentContext {
         })
     }
 
-    fn truncate_old_tool_results(turn: &Turn) -> Turn {
+    fn truncate_old_tool_results(turn: &Turn) -> (Turn, usize) {
         let mut cloned = turn.clone();
         for msg in &mut cloned.messages {
             for part in &mut msg.parts {
@@ -575,7 +576,7 @@ impl AgentContext {
                 }
             }
         }
-        cloned
+        (cloned, 0)
     }
 
     fn is_user_referencing_history(msg: &str) -> bool {
@@ -693,7 +694,7 @@ impl AgentContext {
         }
     }
 
-    fn reconstruct_turn_for_history(turn: &Turn) -> Turn {
+    fn reconstruct_turn_for_history(turn: &Turn) -> (Turn, usize) {
         let mut new_messages = Vec::new();
 
         for msg in &turn.messages {
@@ -758,19 +759,20 @@ impl AgentContext {
             }
         }
         
-        Turn {
+        (Turn {
             turn_id: turn.turn_id.clone(),
             user_message: turn.user_message.clone(),
             messages: new_messages,
-        }
+        }, 0)
     }
 
-    fn build_history_with_budget(&self) -> (Vec<Message>, usize, usize) {
+    fn build_history_with_budget(&self) -> (Vec<Message>, usize, usize, usize) {
         let bpe = tiktoken_rs::cl100k_base().unwrap();
         let history_budget = self.max_history_tokens.saturating_mul(85) / 100;
         let mut history_messages = Vec::new();
         let mut current_tokens = 0;
         let mut turns_included = 0;
+        let mut total_truncated_chars = 0;
 
         let mut protect_next_turn = false;
 
@@ -789,11 +791,12 @@ impl AgentContext {
             // 3. History (Cool State): Otherwise, apply Smart Stripping.
             let should_strip = i >= 3 && !protect_next_turn;
 
-            let turn = if should_strip {
+            let (turn, truncated) = if should_strip {
                 Self::reconstruct_turn_for_history(&sanitized)
             } else {
                 Self::truncate_old_tool_results(&sanitized)
             };
+            total_truncated_chars += truncated;
             
             protect_next_turn = user_asks_for_context;
 
@@ -816,7 +819,7 @@ impl AgentContext {
         for block in history_messages {
             flattened.extend(block);
         }
-        (flattened, current_tokens, turns_included)
+        (flattened, current_tokens, turns_included, total_truncated_chars)
     }
 
     fn turn_token_estimate(turn: &Turn, bpe: &CoreBPE) -> usize {
@@ -839,7 +842,7 @@ impl AgentContext {
         let bpe = tiktoken_rs::cl100k_base().unwrap();
         
         // 1. Calculate History (Net - Compressed)
-        let (_, history_tokens, _) = self.build_history_with_budget();
+        let (_, history_tokens, _, _) = self.build_history_with_budget();
 
         // 2. Current Turn
         let current_turn_tokens = if let Some(turn) = &self.current_turn {
@@ -900,7 +903,7 @@ impl AgentContext {
         }
 
         details.push_str("\n\x1b[1;33m[Conversation History]\x1b[0m\n");
-        let (_, _, turns_included) = self.build_history_with_budget();
+        let (_, _, turns_included, _) = self.build_history_with_budget();
         details.push_str(&format!("  - History Load:       {} tokens ({} turns included)\n", stats.history, turns_included));
         details.push_str(&format!("  - Total History:      {} tokens ({} turns total)\n", self.dialogue_history_token_estimate(), self.dialogue_history.len()));
 
@@ -1018,7 +1021,7 @@ impl AgentContext {
 
     pub fn build_llm_payload(&self) -> (Vec<Message>, Option<Message>, PromptReport) {
         let bpe = tiktoken_rs::cl100k_base().unwrap();
-        let (mut messages, history_tokens_used, history_turns_included) =
+        let (mut messages, history_tokens_used, history_turns_included, _) =
             self.build_history_with_budget();
         let mut current_turn_tokens = 0;
         if let Some(turn) = &self.current_turn {
