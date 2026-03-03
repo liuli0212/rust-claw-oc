@@ -147,6 +147,20 @@ impl AgentLoop {
         self.context.last_snapshot.as_ref().map(|old| self.context.diff_snapshot(old))
     }
 
+    pub fn format_diff(&self, diff: &ContextDiff) -> String {
+        self.context.format_diff(diff)
+    }
+
+    pub fn inspect_context(&self, section: &str, arg: Option<&str>) -> String {
+        self.context.inspect_context(section, arg)
+    }
+
+    pub fn build_llm_payload(&self) -> (Vec<crate::context::Message>, Option<crate::context::Message>, crate::context::PromptReport) {
+        self.context.build_llm_payload()
+    }
+
+
+
     pub fn update_llm(&mut self, new_llm: Arc<dyn LlmClient>) {
         self.context.max_history_tokens = new_llm.context_window_size();
         self.llm = new_llm;

@@ -64,6 +64,7 @@ pub struct DetailedContextStats {
     pub last_turn: usize,
     pub total: usize,
     pub max: usize,
+    pub truncated_chars: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +86,7 @@ pub struct ContextDiff {
     pub new_sources: Vec<String>,
     pub removed_sources: Vec<String>,
     pub memory_changed: bool,
+    pub truncated_delta: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +287,7 @@ impl AgentContext {
             new_sources,
             removed_sources,
             memory_changed: self.retrieved_memory_sources != old.retrieved_memory_sources,
+            truncated_delta: current_stats.truncated_chars as i64 - old.stats.truncated_chars as i64,
         }
     }
 
@@ -1074,6 +1077,85 @@ impl AgentContext {
 
         (messages, Some(system_msg), report)
     }
+
+    pub fn format_diff(&self, diff: &ContextDiff) -> String {
+        let mut output = String::new();
+        output.push_str("\n\x1b[1;36m=== Context Diff ===\x1b[0m\n");
+        
+        // Token Delta
+        let token_sign = if diff.token_delta >= 0 { "+" } else { "" };
+        let token_color = if diff.token_delta > 0 { "\x1b[31m" } else if diff.token_delta < 0 { "\x1b[32m" } else { "\x1b[0m" };
+        output.push_str(&format!("  Tokens:       {}{}{}\x1b[0m\n", token_color, token_sign, diff.token_delta));
+
+        // Truncated Delta
+        let trunc_sign = if diff.truncated_delta >= 0 { "+" } else { "" };
+        let trunc_color = if diff.truncated_delta > 0 { "\x1b[31m" } else if diff.truncated_delta < 0 { "\x1b[32m" } else { "\x1b[0m" };
+        output.push_str(&format!("  Truncated:    {}{}{}\x1b[0m chars\n", trunc_color, trunc_sign, diff.truncated_delta));
+
+        // History Turns
+        let turn_sign = if diff.history_turns_delta >= 0 { "+" } else { "" };
+        output.push_str(&format!("  History:      {}{}\x1b[0m turns\n", turn_sign, diff.history_turns_delta));
+
+        // System Prompt
+        if diff.system_prompt_changed {
+            output.push_str("  System:       \x1b[33mCHANGED\x1b[0m\n");
+        } else {
+            output.push_str("  System:       Unchanged\n");
+        }
+
+        // Memory
+        if diff.memory_changed {
+            output.push_str("  Memory:       \x1b[33mCHANGED\x1b[0m\n");
+            for src in &diff.new_sources {
+                output.push_str(&format!("    + {}\n", src));
+            }
+            for src in &diff.removed_sources {
+                output.push_str(&format!("    - {}\n", src));
+            }
+        } else {
+            output.push_str("  Memory:       Unchanged\n");
+        }
+
+        output
+    }
+
+    pub fn inspect_context(&self, section: &str, arg: Option<&str>) -> String {
+        match section {
+            "system" => self.build_system_prompt(),
+            "history" => {
+                let count = arg.and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                let start = self.dialogue_history.len().saturating_sub(count);
+                let mut output = String::new();
+                for (i, turn) in self.dialogue_history.iter().enumerate().skip(start) {
+                    output.push_str(&format!("\n\x1b[1;33m[Turn {} - {}]\x1b[0m\n", i + 1, turn.turn_id));
+                    output.push_str(&format!("User: {}\n", turn.user_message));
+                    output.push_str(&format!("Messages: {}\n", turn.messages.len()));
+                }
+                if let Some(current) = &self.current_turn {
+                    output.push_str(&format!("\n\x1b[1;32m[Current Turn - {}]\x1b[0m\n", current.turn_id));
+                    output.push_str(&format!("User: {}\n", current.user_message));
+                    output.push_str(&format!("Messages: {}\n", current.messages.len()));
+                }
+                output
+            },
+            "memory" => {
+                if let Some(mem) = &self.retrieved_memory {
+                    format!("Sources: {:?}\n\n{}", self.retrieved_memory_sources, mem)
+                } else {
+                    "No memory retrieved.".to_string()
+                }
+            },
+            "plan" => {
+                 if let Ok(plan_content) = std::fs::read_to_string(".rusty_claw_task_plan.json") {
+                     plan_content
+                 } else {
+                     "No active plan.".to_string()
+                 }
+            },
+            _ => format!("Unknown section: {}", section)
+        }
+    }
+
 }
 
 pub fn transcript_path_for_session(base_dir: &Path, session_id: &str) -> PathBuf {
