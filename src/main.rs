@@ -16,7 +16,6 @@ mod utils;
 
 use crate::core::{AgentOutput, RunExit};
 use crate::llm_client::LlmClient;
-use crate::logging::LoggingConfig;
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::session_manager::SessionManager;
@@ -168,13 +167,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("CLAW_PROMPT_REPORT", "1");
     }
 
-    let log_config = LoggingConfig {
-        log_level: args.log_level.clone(),
-        file_log: if args.no_file_log { Some(false) } else { None },
-        log_dir: args.log_dir.clone(),
-        log_file: args.log_file.clone(),
-    };
-    let _log_guard = match logging::init_logging(log_config) {
+    let config = config::AppConfig::load();
+    let _log_guard = match logging::init_logging(&config) {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!("WARNING: failed to initialize logging: {}", e);
@@ -182,7 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let config = config::AppConfig::load();
     let provider_name = if args.provider != "gemini" {
         args.provider.clone()
     } else {
@@ -312,7 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match subcommand {
                         "audit" => { println!("{}", agent_guard.get_context_details()); }
                         "diff" => {
-                            if let Some(diff) = agent_guard.diff_context() {
+                            if let Some(diff) = agent_guard.diff_snapshot() {
                                 println!("{}", agent_guard.format_diff(&diff));
                             } else {
                                 println!("\x1b[33m[System] No snapshot available for diff. Run a command first.\x1b[0m");
@@ -387,7 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match agent_guard.step(line.to_string()).await {
                     Ok(exit) => match exit {
-                        RunExit::CompletedWithReply => {}
+                        RunExit::YieldedToUser => {}
                         _ => println!("\n[Run Exit] {}", exit.label()),
                     },
                     Err(e) => eprintln!("Agent error: {}", e),
