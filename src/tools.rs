@@ -276,7 +276,7 @@ pub struct PatchFileTool;
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct PatchFileArgs {
     /// Explain what changes you are making and why
-    pub thought: String,
+    pub thought: Option<String>,
     /// Absolute or relative path to the file to edit
     pub path: String,
     /// The unified diff patch content to apply
@@ -554,7 +554,7 @@ impl Tool for RagInsertTool {
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct WriteFileArgs {
     /// Explain what changes you are making and why
-    pub thought: String,
+    pub thought: Option<String>,
     /// Absolute or relative path to the file to write
     pub path: String,
     /// The complete content to write into the file
@@ -609,7 +609,7 @@ impl Tool for WriteFileTool {
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ReadFileArgs {
     /// Explain briefly why you need to read this file
-    pub thought: String,
+    pub thought: Option<String>,
     /// Path to the file to read
     pub path: String,
 }
