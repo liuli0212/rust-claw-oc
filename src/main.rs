@@ -104,7 +104,13 @@ impl AgentOutput for CliOutput {
     async fn on_text(&self, text: &str) {
         let text = text.replace("<final>", "").replace("</final>", "");
         let text = text.as_str();
-        if Self::is_prefixed_status(text) {
+        if text.is_empty() {
+            return;
+        }
+        // If already ANSI-styled (e.g. grey for thoughts), print as-is
+        if text.contains("\x1b[") {
+            print!("{}", text);
+        } else if Self::is_prefixed_status(text) {
             print!("{}", Self::style_status(text));
         } else {
             print!("\x1b[1;97m{}\x1b[0m", text);
@@ -262,10 +268,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(_) = sigs.recv().await { sm_clone.cancel_session("cli").await; }
     });
 
+    let mut ctrl_c_count = 0;
     loop {
         let readline = rl.readline(">> ");
         match readline {
             Ok(line) => {
+                ctrl_c_count = 0;
                 let line = line.trim();
                 if line == "/exit" {
                     break;
@@ -393,8 +401,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match agent_guard.step(line.to_string()).await {
                     Ok(exit) => match exit {
-                        RunExit::YieldedToUser => {}
-                        _ => println!("\n[Run Exit] {}", exit.label()),
+                        RunExit::YieldedToUser => { println!(); }
+                        RunExit::Finished(ref summary) => {
+                            println!("\n\x1b[1;32m{}\x1b[0m", summary);
+                            println!("\x1b[32m[Run Exit] finished\x1b[0m");
+                        }
+                        RunExit::StoppedByUser => {
+                            println!("\n\x1b[33m[Run Exit] execution_stopped_by_user\x1b[0m");
+                            println!("The current operation was manually cancelled.");
+                        }
+                        RunExit::AgentTurnLimitReached => {
+                            println!("\n\x1b[33m[Run Exit] turn_limit_reached\x1b[0m");
+                            println!("The agent reached the maximum allowed consecutive actions (to prevent infinite loops).");
+                            println!("👉 \x1b[1;36mAction required:\x1b[0m Review the recent actions. If the agent is on the right track, just type \x1b[32m'continue'\x1b[0m to let it proceed.");
+                        }
+                        RunExit::ContextLimitReached => {
+                            println!("\n\x1b[31m[Run Exit] context_limit_reached\x1b[0m");
+                            println!("The context window size is exceeding the model's limit.");
+                            println!("👉 \x1b[1;36mAction required:\x1b[0m Wait for auto-compaction, or use \x1b[33m/clear\x1b[0m to start a fresh session.");
+                        }
+                        RunExit::RecoverableFailed(ref msg) => {
+                            println!("\n\x1b[33m[Run Exit] recoverable_failure\x1b[0m: {}", msg);
+                        }
+                        RunExit::CriticallyFailed(ref msg) => {
+                            println!("\n\x1b[31m[Run Exit] critical_failure\x1b[0m: {}", msg);
+                            println!("The system encountered an unrecoverable error during execution.");
+                        }
                     },
                     Err(e) => eprintln!("Agent error: {}", e),
                 }
@@ -403,7 +435,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("\x1b[33m[System] Current task plan is still active. Use /cancel_task if you want to abort it.\x1b[0m");
                 }
             }
-            Err(ReadlineError::Interrupted) => { println!("CTRL-C"); break; }
+            Err(ReadlineError::Interrupted) => {
+                ctrl_c_count += 1;
+                if ctrl_c_count >= 2 {
+                    println!("Exiting.");
+                    break;
+                } else {
+                    println!("\n\x1b[33m[System] Press Ctrl-C again to exit (or type '/exit').\x1b[0m");
+                }
+            }
             Err(ReadlineError::Eof) => { println!("CTRL-D"); break; }
             Err(err) => { println!("Error: {:?}", err); break; }
         }

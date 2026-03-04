@@ -86,11 +86,17 @@ impl EventHandler for Handler {
         let mut agent = agent.lock().await;
         match agent.step(msg.content).await {
             Ok(exit) => {
-                if matches!(exit, crate::core::RunExit::RecoverableFailed { .. }) {
-                    let _ = msg
-                        .channel_id
-                        .say(&ctx.http, format!("Run stopped: {}", exit.label()))
-                        .await;
+                match exit {
+                    crate::core::RunExit::AgentTurnLimitReached => {
+                        let _ = msg.channel_id.say(&ctx.http, "⚠️ [Turn Limit Reached] The agent reached the maximum allowed consecutive actions. Please type 'continue' if you want it to proceed.").await;
+                    }
+                    crate::core::RunExit::RecoverableFailed(ref e) | crate::core::RunExit::CriticallyFailed(ref e) => {
+                        let _ = msg
+                            .channel_id
+                            .say(&ctx.http, format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), e))
+                            .await;
+                    }
+                    _ => {}
                 }
             }
             Err(e) => {
