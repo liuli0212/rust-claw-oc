@@ -6,7 +6,11 @@ try:
 except ImportError:
     pass # Handled in main
 
-from .models import TurnStats, AuditReport, TokenStats, ResourceUsage
+from .models import TurnStats, AuditReport, TokenStats, ResourceUsage, ContextMessage, MessageRole, OptimizationSuggestion
+from .rules.base import BaseRule
+from .rules.grep_bloat import GrepBloatRule
+from .rules.causal_chain import CausalChainRule
+from .rules.system_bloat import SystemPromptBloatRule
 
 class ContextEngine:
     def __init__(self, data: Dict[str, Any]):
@@ -22,6 +26,7 @@ class ContextEngine:
         self._analyze_turns()
         completeness = self._check_completeness()
         redundancy = self._check_redundancy()
+        suggestions = self._run_rules()
         
         return AuditReport(
             turns=self.turns,
@@ -29,8 +34,68 @@ class ContextEngine:
             redundant_turns=redundancy,
             resource_usage_summary=self.resource_usage_map,
             total_tokens=self.report.get("total_prompt_tokens", 0),
-            max_tokens=self.report.get("max_history_tokens", 0)
+            max_tokens=self.report.get("max_history_tokens", 0),
+            suggestions=suggestions
         )
+
+    def _build_context_messages(self) -> List[ContextMessage]:
+        ctx_msgs = []
+        for msg in self.messages:
+            role_str = msg.get("role", "user")
+            # map string to MessageRole
+            try:
+                role = MessageRole(role_str.lower())
+            except ValueError:
+                role = MessageRole.USER
+                
+            parts = msg.get("parts", [])
+            content = ""
+            tool_name = None
+            tool_args = None
+            
+            for part in parts:
+                if "text" in part:
+                    content += part["text"]
+                if "functionCall" in part:
+                    fc = part["functionCall"]
+                    tool_name = fc.get("name")
+                    tool_args = fc.get("args")
+                    # Model tool calls role is typically Model but rules might want to know it's a tool intent
+                if "functionResponse" in part:
+                    fr = part["functionResponse"]
+                    tool_name = fr.get("name")
+                    content += str(fr.get("response", ""))
+                    role = MessageRole.TOOL # Usually responses come with role=user in gemini, we override to TOOL for rules
+            
+            ctx_msgs.append(ContextMessage(
+                role=role,
+                content=content,
+                tool_name=tool_name,
+                tool_args=tool_args
+            ))
+        return ctx_msgs
+
+    def _run_rules(self) -> List[OptimizationSuggestion]:
+        ctx_messages = self._build_context_messages()
+        rules: List[BaseRule] = [
+            GrepBloatRule(),
+            CausalChainRule(),
+            SystemPromptBloatRule(),
+        ]
+        
+        all_suggestions = []
+        detailed_stats = self.report.get("detailed_stats", {})
+        
+        for rule in rules:
+            try:
+                suggestions = rule.evaluate(ctx_messages, detailed_stats=detailed_stats)
+                all_suggestions.extend(suggestions)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"Error running rule {rule.rule_id}: {e}")
+                
+        return all_suggestions
 
     def _analyze_turns(self):
         for idx, msg in enumerate(self.messages):

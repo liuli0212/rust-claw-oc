@@ -8,7 +8,7 @@ class GrepBloatRule(BaseRule):
     def rule_id(self) -> str:
         return "GREP_BLOAT"
 
-    def evaluate(self, messages: List[ContextMessage]) -> List[OptimizationSuggestion]:
+    def evaluate(self, messages: List[ContextMessage], **kwargs) -> List[OptimizationSuggestion]:
         suggestions = []
         for idx, msg in enumerate(messages):
             if msg.role != MessageRole.TOOL:
