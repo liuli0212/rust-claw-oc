@@ -334,6 +334,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "total_prompt_tokens": report.total_prompt_tokens,
                                     "retrieved_memory_snippets": report.retrieved_memory_snippets,
                                     "retrieved_memory_sources": report.retrieved_memory_sources,
+                                },
+                                "detailed_stats": {
+                                    "system_static": report.detailed_stats.system_static,
+                                    "system_runtime": report.detailed_stats.system_runtime,
+                                    "system_custom": report.detailed_stats.system_custom,
+                                    "system_project": report.detailed_stats.system_project,
+                                    "system_task_plan": report.detailed_stats.system_task_plan,
+                                    "memory": report.detailed_stats.memory,
+                                    "history": report.detailed_stats.history,
+                                    "current_turn": report.detailed_stats.current_turn,
+                                    "total": report.detailed_stats.total,
+                                    "max": report.detailed_stats.max,
+                                    "truncated_chars": report.detailed_stats.truncated_chars,
                                 }
                             });
                             if let Ok(json_str) = serde_json::to_string_pretty(&dump_data) {

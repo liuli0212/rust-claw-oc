@@ -138,14 +138,25 @@ impl AgentLoop {
         let (current_usage, max_tokens, _, _, _) = self.context.get_context_status();
         let threshold = (max_tokens as f64 * 0.85) as usize;
 
-        if force || current_usage > threshold {
-            tracing::info!("Compacting history... (usage={}, threshold={})", current_usage, threshold);
-            // The context's build_history_with_budget automatically handles truncation logic.
-            // So we don't need to do explicit compaction here unless we implement summarization.
-            // For now, we just log.
-            let (new_usage, _, _, _, _) = self.context.get_context_status();
-            tracing::info!("History compaction check done. Usage: {}", new_usage);
+        if !force && current_usage <= threshold {
+            return Ok(());
         }
+
+        // Target: free up ~30% of max tokens worth of history
+        let target_tokens = max_tokens.saturating_mul(30) / 100;
+        let min_turns = 2;
+        let num_to_compact = self.context.oldest_turns_for_compaction(target_tokens, min_turns);
+
+        if num_to_compact == 0 {
+            return Ok(());
+        }
+
+        tracing::info!("Compacting {} oldest turns (usage={}, threshold={})", num_to_compact, current_usage, threshold);
+
+        if let Some(reason) = self.context.rule_based_compact(num_to_compact) {
+            self.output.on_text(&format!("[System] {}\n", reason)).await;
+        }
+
         Ok(())
     }
 
@@ -178,6 +189,9 @@ impl AgentLoop {
             energy_points: Self::INITIAL_ENERGY,
         };
 
+        // [Risk 4] Only check compaction once per turn to avoid repeated O(n) tokenize scans
+        let mut compaction_checked = false;
+
         // Start the turn with user input
         self.context.start_turn(goal);
 
@@ -201,7 +215,10 @@ impl AgentLoop {
                  return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
             }
 
-            let _ = self.maybe_compact_history(false).await;
+            if !compaction_checked {
+                let _ = self.maybe_compact_history(false).await;
+                compaction_checked = true;
+            }
 
             // Note: build_llm_payload now returns (messages, system_msg, report)
             let (messages, system, _) = self.context.build_llm_payload();

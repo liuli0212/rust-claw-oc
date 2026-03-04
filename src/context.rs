@@ -144,13 +144,19 @@ impl AgentContext {
         self
     }
 
-    pub fn get_detailed_stats(&self, pending_user_input: Option<&str>) -> DetailedContextStats {
-        let mut stats = DetailedContextStats::default();
+    /// Single source of truth for system prompt sections.
+    /// Returns (assembled_prompt, per_section_token_counts).
+    fn build_prompt_sections(&self) -> (String, DetailedContextStats) {
         let bpe = Self::get_bpe();
+        let mut stats = DetailedContextStats::default();
+        let mut sections = Vec::new();
 
-        // 1. Static Identity
+        // 1. Identity
         let identity = self.system_prompts.join("\n\n");
-        stats.system_static = bpe.encode_with_special_tokens(&identity).len();
+        if let Some(section) = Self::build_prompt_section("Identity", identity.clone(), 4_000) {
+            stats.system_static = bpe.encode_with_special_tokens(&section).len();
+            sections.push(section);
+        }
 
         // 2. Runtime
         let mut runtime = String::new();
@@ -162,29 +168,51 @@ impl AgentContext {
         if let Some(path) = &self.transcript_path {
             runtime.push_str(&format!("Session Transcript: {}\n", path.display()));
         }
-        stats.system_runtime = bpe.encode_with_special_tokens(&runtime).len();
+        if let Some(section) = Self::build_prompt_section("Runtime Environment", runtime, 1_000) {
+            stats.system_runtime = bpe.encode_with_special_tokens(&section).len();
+            sections.push(section);
+        }
 
-        // 3. Custom
+        // 3. Custom Instructions
         if let Ok(custom_prompt) = fs::read_to_string(".claw_prompt.md") {
-            stats.system_custom = bpe.encode_with_special_tokens(&custom_prompt).len();
+            if let Some(section) = Self::build_prompt_section("User Custom Instructions", custom_prompt, 4_000) {
+                stats.system_custom = bpe.encode_with_special_tokens(&section).len();
+                sections.push(section);
+            }
         }
 
         // 4. Task Plan
         if let Ok(plan_content) = fs::read_to_string(".rusty_claw_task_plan.json") {
-             if let Ok(plan) = serde_json::from_str::<crate::tools::TaskPlanState>(&plan_content) {
-                 if plan.items.iter().any(|i| i.status != "completed") {
-                     stats.system_task_plan = bpe.encode_with_special_tokens(&plan_content).len();
-                 }
-             }
+            if let Ok(plan) = serde_json::from_str::<crate::tools::TaskPlanState>(&plan_content) {
+                if plan.items.iter().any(|i| i.status != "completed") {
+                    let mut plan_str = String::new();
+                    plan_str.push_str("You MUST follow this plan strictly. Do not skip steps without approval.\n\n");
+                    for (i, item) in plan.items.iter().enumerate() {
+                        let status_icon = match item.status.as_str() {
+                            "completed" => "[x]",
+                            "in_progress" => "[IN PROGRESS]",
+                            _ => "[ ]",
+                        };
+                        plan_str.push_str(&format!("{} {}. {}\n", status_icon, i + 1, item.step));
+                        if let Some(note) = &item.note {
+                            plan_str.push_str(&format!("   Note: {}\n", note));
+                        }
+                    }
+                    if let Some(section) = Self::build_prompt_section("Current Task Plan (STRICT)", plan_str, 4_000) {
+                        stats.system_task_plan = bpe.encode_with_special_tokens(&section).len();
+                        sections.push(section);
+                    }
+                }
+            }
         }
 
         // 5. Project Context
+        // [P1-1.4 Fix] Task Planning instruction only injected when NO active plan exists
         let mut project_context = String::new();
-        project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
-        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
-        project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n");
-        project_context.push_str("HOWEVER, if the user explicitly issues a new, unrelated command or asks to change direction, you should prioritize the user's new request over the existing plan (ask for confirmation if unsure).\n\n");
-        
+        if stats.system_task_plan == 0 {
+            project_context.push_str("### Task Planning\n");
+            project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n\n");
+        }
         if let Ok(content) = fs::read_to_string("AGENTS.md") {
             project_context.push_str("### AGENTS.md\n");
             project_context.push_str(&Self::truncate_chars(&content, 3_000));
@@ -200,19 +228,33 @@ impl AgentContext {
             project_context.push_str(&Self::truncate_chars(&content, 1_500));
             project_context.push_str("\n\n");
         }
-        stats.system_project = bpe.encode_with_special_tokens(&project_context).len();
-
-        // 6. Memory (RAG)
-        if let Some(memory) = &self.retrieved_memory {
-            stats.memory = bpe.encode_with_special_tokens(memory).len();
+        if let Some(section) = Self::build_prompt_section("Project Context", project_context, 7_000) {
+            stats.system_project = bpe.encode_with_special_tokens(&section).len();
+            sections.push(section);
         }
 
-        // 7. History (Net Load)
+        // 6. Retrieved Memory (RAG)
+        if let Some(memory) = &self.retrieved_memory {
+            if let Some(section) = Self::build_prompt_section("Retrieved Memory", memory.clone(), 3_000) {
+                stats.memory = bpe.encode_with_special_tokens(&section).len();
+                sections.push(section);
+            }
+        }
+
+        stats.max = self.max_history_tokens;
+        (sections.join("\n"), stats)
+    }
+
+    pub fn get_detailed_stats(&self, pending_user_input: Option<&str>) -> DetailedContextStats {
+        let (_, mut stats) = self.build_prompt_sections();
+        let bpe = Self::get_bpe();
+
+        // History (Net Load)
         let (_, history_tokens, _, truncated_chars) = self.build_history_with_budget();
         stats.history = history_tokens;
         stats.truncated_chars = truncated_chars;
 
-        // 8. Current Turn
+        // Current Turn
         if let Some(turn) = &self.current_turn {
              for msg in &turn.messages {
                  for part in &msg.parts {
@@ -233,14 +275,15 @@ impl AgentContext {
              stats.current_turn = bpe.encode_with_special_tokens(input).len();
         }
 
-        // 9. Last Turn
+        // Last Turn
         if let Some(last) = self.dialogue_history.last() {
             stats.last_turn = Self::turn_token_estimate(last, &bpe);
         }
 
-        // 10. Total
-        stats.total = stats.system_static + stats.system_runtime + stats.system_custom + stats.system_project + stats.system_task_plan + stats.memory + stats.history + stats.current_turn;
-        stats.max = self.max_history_tokens;
+        // Total
+        stats.total = stats.system_static + stats.system_runtime + stats.system_custom
+            + stats.system_project + stats.system_task_plan + stats.memory
+            + stats.history + stats.current_turn;
 
         stats
     }
@@ -368,92 +411,8 @@ impl AgentContext {
     }
 
     fn build_system_prompt(&self) -> String {
-        let mut sections = Vec::new();
-
-        let identity = self.system_prompts.join("\n\n");
-        if let Some(section) = Self::build_prompt_section("Identity", identity, 4_000) {
-            sections.push(section);
-        }
-
-        let mut runtime = String::new();
-        runtime.push_str(&format!("OS: {}\n", std::env::consts::OS));
-        runtime.push_str(&format!("Architecture: {}\n", std::env::consts::ARCH));
-        if let Ok(dir) = std::env::current_dir() {
-            runtime.push_str(&format!("Current Directory: {}\n", dir.display()));
-        }
-        if let Some(path) = &self.transcript_path {
-            runtime.push_str(&format!("Session Transcript: {}\n", path.display()));
-        }
-        if let Some(section) = Self::build_prompt_section("Runtime Environment", runtime, 1_000) {
-            sections.push(section);
-        }
-
-        if let Ok(custom_prompt) = fs::read_to_string(".claw_prompt.md") {
-            if let Some(section) =
-                Self::build_prompt_section("User Custom Instructions", custom_prompt, 4_000)
-            {
-                sections.push(section);
-            }
-        }
-        if let Ok(plan_content) = fs::read_to_string(".rusty_claw_task_plan.json") {
-             if let Ok(plan) = serde_json::from_str::<crate::tools::TaskPlanState>(&plan_content) {
-                 if plan.items.iter().any(|i| i.status != "completed") {
-                     let mut plan_str = String::new();
-                     plan_str.push_str("You MUST follow this plan strictly. Do not skip steps without approval.\n\n");
-                     for (i, item) in plan.items.iter().enumerate() {
-                         let status_icon = match item.status.as_str() {
-                             "completed" => "[x]",
-                             "in_progress" => "[IN PROGRESS]",
-                             _ => "[ ]",
-                         };
-                         plan_str.push_str(&format!("{} {}. {}\n", status_icon, i + 1, item.step));
-                         if let Some(note) = &item.note {
-                             plan_str.push_str(&format!("   Note: {}\n", note));
-                         }
-                     }
-                     if let Some(section) = Self::build_prompt_section("Current Task Plan (STRICT)", plan_str, 4_000) {
-                         sections.push(section);
-                     }
-                 }
-             }
-        }
-
-
-        let mut project_context = String::new();
-        // Add Task Plan Instruction
-        project_context.push_str("### CRITICAL INSTRUCTION: Task Planning\n");
-        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n");
-        project_context.push_str("You MUST keep this plan updated as you progress (using action='update_status').\n");
-        project_context.push_str("HOWEVER, if the user explicitly issues a new, unrelated command or asks to change direction, you should prioritize the user's new request over the existing plan (ask for confirmation if unsure).\n\n");
-        if let Ok(content) = fs::read_to_string("AGENTS.md") {
-            project_context.push_str("### AGENTS.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 3_000));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("README.md") {
-            project_context.push_str("### README.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 2_500));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("MEMORY.md") {
-            project_context.push_str("### MEMORY.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 1_500));
-            project_context.push_str("\n\n");
-        }
-        if let Some(section) = Self::build_prompt_section("Project Context", project_context, 7_000)
-        {
-            sections.push(section);
-        }
-
-        if let Some(memory) = &self.retrieved_memory {
-            if let Some(section) =
-                Self::build_prompt_section("Retrieved Memory", memory.clone(), 3_000)
-            {
-                sections.push(section);
-            }
-        }
-
-        sections.join("\n")
+        let (prompt, _) = self.build_prompt_sections();
+        prompt
     }
 
     fn sanitize_message(msg: &Message) -> Option<Message> {
@@ -582,9 +541,14 @@ impl AgentContext {
     fn is_user_referencing_history(msg: &str) -> bool {
         let lower = msg.to_lowercase();
         let keywords = [
+            // English
             "previous command", "last command", "previous output", "last output",
             "what did it say", "fix the error", "look above", "check the error",
-            "what was the error", "show me the output", "full output"
+            "what was the error", "show me the output", "full output",
+            // Chinese (P1-1.5 fix)
+            "上次", "之前", "刚才", "前面", "上面",
+            "修复错误", "看看输出", "检查错误", "什么错误",
+            "历史", "回顾", "重新看",
         ];
         keywords.iter().any(|k| lower.contains(k))
     }
@@ -940,6 +904,224 @@ impl AgentContext {
             }
         }
         selected.min(self.dialogue_history.len())
+    }
+
+    /// Rule-based compaction: compress oldest N turns into a single structured summary Turn.
+    /// No LLM call required. Preserves: user intent, tool names, key args, success/fail, errors.
+    pub fn rule_based_compact(&mut self, num_turns: usize) -> Option<String> {
+        if num_turns == 0 || self.dialogue_history.is_empty() {
+            return None;
+        }
+        let to_compact = num_turns.min(self.dialogue_history.len());
+
+        // [Risk 2] Archive turns to transcript before destructive drain
+        for turn in self.dialogue_history.iter().take(to_compact) {
+            if let Err(e) = self.append_turn_to_transcript(turn) {
+                tracing::warn!("Failed to archive turn before compaction: {}", e);
+            }
+        }
+
+        // Drain the oldest turns
+        let compacted_turns: Vec<Turn> = self.dialogue_history.drain(0..to_compact).collect();
+
+        // [Risk 3] Summary size cap
+        const MAX_SUMMARY_CHARS: usize = 4000;
+
+        // Build structured summary
+        let mut summary_lines = Vec::new();
+        let mut total_chars = 0;
+        let mut budget_exhausted = false;
+
+        summary_lines.push(format!("=== Compacted History ({} turns) ===", to_compact));
+        total_chars += summary_lines[0].len();
+
+        for (i, turn) in compacted_turns.iter().enumerate() {
+            if budget_exhausted {
+                summary_lines.push(format!("\n[Turns {}-{}] (omitted due to summary size limit)", i + 1, to_compact));
+                break;
+            }
+
+            // [Risk 1] Detect already-compacted turns — merge directly, don't re-extract
+            if turn.user_message == "[SYSTEM] History Compacted" {
+                for msg in &turn.messages {
+                    for part in &msg.parts {
+                        if let Some(text) = &part.text {
+                            summary_lines.push(format!("\n{}", Self::truncate_chars(text, 1500)));
+                            total_chars += text.len().min(1500);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            let header = format!("\n[Turn {}] User: {}", i + 1,
+                Self::truncate_chars(&turn.user_message, 120));
+            total_chars += header.len();
+            summary_lines.push(header);
+
+            let mut actions = Vec::new();
+
+            for msg in &turn.messages {
+                for part in &msg.parts {
+                    // Extract model's conclusion/reply (strip <think> blocks, keep first 200 chars)
+                    if msg.role == "model" {
+                        if let Some(text) = &part.text {
+                            let cleaned = Self::strip_thinking_tags(text);
+                            if !cleaned.is_empty() {
+                                let preview = Self::truncate_chars(&cleaned, 200);
+                                actions.push(format!("  💬 Agent: {}", preview));
+                            }
+                        }
+                    }
+                    // Extract tool calls
+                    if let Some(fc) = &part.function_call {
+                        let args_summary = Self::summarize_tool_args(&fc.name, &fc.args);
+                        actions.push(format!("  → {}({})", fc.name, args_summary));
+                    }
+                    // [Risk 5] Extract tool results with improved error detection
+                    if let Some(fr) = &part.function_response {
+                        let is_error = Self::detect_tool_error(&fr.response);
+
+                        if is_error {
+                            let result_str = fr.response.to_string();
+                            let error_preview = Self::truncate_chars(&result_str, 150);
+                            actions.push(format!("  ✗ {} FAILED: {}", fr.name, error_preview));
+                        } else {
+                            actions.push(format!("  ✓ {} OK", fr.name));
+                        }
+                    }
+                }
+            }
+
+            if actions.is_empty() {
+                summary_lines.push("  (text-only exchange, no tool calls)".to_string());
+            } else {
+                for action in &actions {
+                    total_chars += action.len();
+                }
+                summary_lines.extend(actions);
+            }
+
+            // [Risk 3] Check budget after each turn
+            if total_chars > MAX_SUMMARY_CHARS {
+                budget_exhausted = true;
+            }
+        }
+
+        // [Risk 6] Add system guidance prefix so LLM treats this as context, not a user request
+        let summary_text = format!(
+            "[System context: The following is an automated summary of earlier conversation history. Use it as background knowledge but do not respond to it directly.]\n\n{}",
+            summary_lines.join("\n")
+        );
+
+        // Create a single compacted Turn
+        let compacted_turn = Turn {
+            turn_id: format!("compacted-{}", uuid::Uuid::new_v4()),
+            user_message: "[SYSTEM] History Compacted".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                parts: vec![Part {
+                    text: Some(summary_text),
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None,
+                }],
+            }],
+        };
+
+        // Insert at beginning
+        self.dialogue_history.insert(0, compacted_turn);
+
+        let reason = format!("Compacted {} turns into structured summary", to_compact);
+        tracing::info!("{}", reason);
+        Some(reason)
+    }
+
+    /// Detect whether a tool response indicates an error using structured fields first,
+    /// falling back to keyword heuristics with false-positive guards.
+    fn detect_tool_error(response: &serde_json::Value) -> bool {
+        if let Some(obj) = response.as_object() {
+            // Priority 1: Structural indicators (most reliable)
+            if let Some(ok) = obj.get("ok").and_then(|v| v.as_bool()) {
+                return !ok;
+            }
+            if let Some(code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
+                return code != 0;
+            }
+            if let Some(success) = obj.get("success").and_then(|v| v.as_bool()) {
+                return !success;
+            }
+            if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
+                let s = status.to_lowercase();
+                if s == "error" || s == "failed" { return true; }
+                if s == "ok" || s == "success" { return false; }
+            }
+        }
+
+        // Priority 2: Keyword heuristic with false-positive exclusions
+        let result_str = response.to_string().to_lowercase();
+
+        // Short-circuit: if the response is small and contains no signal, it's likely OK
+        if result_str.len() < 20 { return false; }
+
+        let has_error_keyword = result_str.contains("error:")
+            || result_str.contains("failed:")
+            || result_str.contains("panicked at")
+            || result_str.contains("exception:")
+            || result_str.contains("traceback ");
+
+        // False-positive guards
+        let is_false_positive = result_str.contains("no error")
+            || result_str.contains("0 errors")
+            || result_str.contains("error_handler")
+            || result_str.contains("error.rs")
+            || result_str.contains("errors found: 0")
+            || result_str.contains("without error");
+
+        has_error_keyword && !is_false_positive
+    }
+
+    /// Summarize tool arguments into a brief string for compaction.
+    fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
+        if let Some(obj) = args.as_object() {
+            match tool_name {
+                "read_file" | "write_file" | "patch_file" => {
+                    obj.get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                }
+                "execute_bash" => {
+                    let cmd = obj.get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    Self::truncate_chars(cmd, 80)
+                }
+                "web_fetch" => {
+                    obj.get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                }
+                "browser" => {
+                    let action = obj.get("action").and_then(|v| v.as_str()).unwrap_or("?");
+                    let url = obj.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    format!("{} {}", action, Self::truncate_chars(url, 60))
+                }
+                "task_plan" => {
+                    obj.get("action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                }
+                _ => {
+                    let s = args.to_string();
+                    Self::truncate_chars(&s, 60)
+                }
+            }
+        } else {
+            Self::truncate_chars(&args.to_string(), 60)
+        }
     }
 
     pub fn set_retrieved_memory(&mut self, retrieved_memory: Option<String>, sources: Vec<String>) {
