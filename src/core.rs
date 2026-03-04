@@ -16,9 +16,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[async_trait]
 pub trait AgentOutput: Send + Sync {
     async fn on_text(&self, text: &str);
+    async fn on_thinking(&self, text: &str) {
+        // Default: treat thinking as regular text (backward compat)
+        self.on_text(text).await;
+    }
     async fn on_tool_start(&self, name: &str, args: &str);
     async fn on_tool_end(&self, result: &str);
     async fn on_error(&self, error: &str);
+    async fn flush(&self) {
+        // Default: no-op (CLI doesn't need buffering)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -252,16 +259,15 @@ impl AgentLoop {
                                     while !remaining.is_empty() {
                                         if in_think_block {
                                             if let Some(end_idx) = remaining.find("</think>") {
-                                                // Display content before </think> in grey
                                                 let before = &remaining[..end_idx];
                                                 if !before.is_empty() {
-                                                    self.output.on_text(&format!("\x1b[38;5;244m{}\x1b[0m", before)).await;
+                                                    self.output.on_thinking(before).await;
                                                 }
                                                 in_think_block = false;
                                                 remaining = &remaining[end_idx + 8..]; // skip </think>
                                             } else {
                                                 // Entire chunk is inside think block
-                                                self.output.on_text(&format!("\x1b[38;5;244m{}\x1b[0m", remaining)).await;
+                                                self.output.on_thinking(remaining).await;
                                                 break;
                                             }
                                         } else {
@@ -282,7 +288,7 @@ impl AgentLoop {
                                     }
                                 }
                                 StreamEvent::Thought(t) => {
-                                    self.output.on_text(&format!("\x1b[38;5;244m{}\x1b[0m", t)).await;
+                                    self.output.on_thinking(&t).await;
                                     current_turn_text.push_str(&format!("<think>{}</think>", t));
                                 }
                                 StreamEvent::ToolCall(tc, sig) => {
@@ -353,6 +359,7 @@ impl AgentLoop {
             if tool_calls_accumulated.is_empty() {
                 tracing::info!("Agent returned text without tool call. Yielding to user. text_len={}", full_text.len());
                 tracing::debug!("Agent text content: {}", crate::utils::truncate_log(&full_text));
+                self.output.flush().await;
                 self.context.end_turn();
                 return Ok(RunExit::YieldedToUser);
             }
@@ -363,7 +370,8 @@ impl AgentLoop {
                     if let Some(thought) = obj.remove("thought") {
                         if let Some(thought_str) = thought.as_str() {
                             if !thought_str.is_empty() {
-                                self.output.on_text(&format!("\x1b[38;5;244m{}\x1b[0m\n", thought_str)).await;
+                                self.output.on_thinking(thought_str).await;
+                                self.output.on_thinking("\n").await;
                             }
                         }
                     }
@@ -385,7 +393,9 @@ impl AgentLoop {
                             summary = s.to_string();
                         }
                     }
+                    self.output.flush().await;
                     self.output.on_text(&format!("\n{}\n", summary)).await;
+                    self.output.flush().await;
                     self.context.end_turn();
                     return Ok(RunExit::Finished(summary));
                 }
@@ -393,6 +403,7 @@ impl AgentLoop {
                 // Find tool
                 let tool_opt = self.tools.iter().find(|t| t.name() == call.name);
                 let (result, is_error) = if let Some(tool) = tool_opt {
+                    self.output.flush().await;
                     self.output.on_tool_start(&call.name, &call.args.to_string()).await;
                     match tool.execute(call.args.clone()).await {
                         Ok(res) => (res, false),
