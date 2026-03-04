@@ -107,14 +107,20 @@ impl AgentOutput for CliOutput {
         if text.is_empty() {
             return;
         }
-        // If already ANSI-styled (e.g. grey for thoughts), print as-is
-        if text.contains("\x1b[") {
-            print!("{}", text);
-        } else if Self::is_prefixed_status(text) {
+        if Self::is_prefixed_status(text) {
             print!("{}", Self::style_status(text));
         } else {
             print!("\x1b[1;97m{}\x1b[0m", text);
         }
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    async fn on_thinking(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        print!("\x1b[38;5;244m{}\x1b[0m", text);
         use std::io::Write;
         let _ = std::io::stdout().flush();
     }

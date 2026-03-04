@@ -2,14 +2,46 @@ use crate::core::{AgentOutput, RunExit};
 use crate::session_manager::SessionManager;
 use async_trait::async_trait;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use teloxide::{prelude::*, utils::command::BotCommands};
 
 struct TelegramOutput {
     bot: Bot,
     chat_id: ChatId,
+    text_buffer: Arc<Mutex<String>>,
 }
 
 impl TelegramOutput {
+    fn new(bot: Bot, chat_id: ChatId) -> Self {
+        Self {
+            bot,
+            chat_id,
+            text_buffer: Arc::new(Mutex::new(String::new())),
+        }
+    }
+
+    /// Strip ANSI escape codes (terminal color codes that leak from core.rs)
+    fn strip_ansi(text: &str) -> String {
+        let mut result = String::with_capacity(text.len());
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next(); // skip '['
+                    while let Some(&nc) = chars.peek() {
+                        chars.next();
+                        if nc.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            result.push(c);
+        }
+        result
+    }
+
     fn escape_markdown_v2(text: &str) -> String {
         let to_escape = r"_*[]()~`>#+-=|{}.!";
         let mut escaped = String::with_capacity(text.len());
@@ -26,16 +58,37 @@ impl TelegramOutput {
         text.replace('\\', "\\\\").replace('`', "\\`")
     }
 
-    fn truncate_to_three_lines(input: &str) -> String {
-        let lines: Vec<&str> = input.lines().collect();
-        if lines.len() <= 3 {
-            return input.to_string();
+    /// Summarize tool args for display (shared logic with CLI)
+    fn summarize_tool_args(name: &str, args: &str) -> String {
+        let args_val: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::json!({}));
+        let summary = match name {
+            "read_file" | "write_file" | "patch_file" => {
+                args_val.get("path").and_then(|v| v.as_str()).unwrap_or("unknown").to_string()
+            }
+            "execute_bash" => {
+                args_val.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string()
+            }
+            "web_fetch" | "browser" => {
+                args_val.get("url")
+                    .or_else(|| args_val.get("target_url"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("").to_string()
+            }
+            _ => {
+                let s = args_val.to_string();
+                if s.len() > 80 {
+                    format!("{}...", s.chars().take(80).collect::<String>())
+                } else {
+                    s
+                }
+            }
+        };
+        // Truncate to reasonable length for mobile
+        if summary.len() > 100 {
+            format!("{}...", summary.chars().take(100).collect::<String>())
+        } else {
+            summary
         }
-        format!(
-            "{}\n... ({} more lines)",
-            lines[..3].join("\n"),
-            lines.len() - 3
-        )
     }
 
     async fn send_long_message(&self, text: &str, parse_mode: Option<teloxide::types::ParseMode>) {
@@ -74,35 +127,82 @@ impl TelegramOutput {
 #[async_trait]
 impl AgentOutput for TelegramOutput {
     async fn on_text(&self, text: &str) {
-        // We don't use Markdown for streaming text to avoid partial tag issues
-        self.send_long_message(text, None).await;
+        let clean = Self::strip_ansi(text);
+        let clean = clean.replace("<final>", "").replace("</final>", "");
+        if !clean.is_empty() {
+            self.text_buffer.lock().await.push_str(&clean);
+        }
+    }
+
+    async fn on_thinking(&self, text: &str) {
+        let clean = Self::strip_ansi(text);
+        if !clean.is_empty() {
+            let mut buf = self.text_buffer.lock().await;
+            // Use Telegram blockquote format for visual distinction
+            for line in clean.lines() {
+                buf.push_str("> ");
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
+        // Flush any buffered text first
+        self.flush().await;
+        
+        let summary = Self::summarize_tool_args(name, args);
         let msg = format!(
-            "🛠️ *Tool Call*: `{}`\n*Args*:\n```\n{}\n```",
+            "🛠️ *{}*: `{}`",
             Self::escape_markdown_v2(name),
-            Self::escape_pre_code(&Self::truncate_to_three_lines(args))
+            Self::escape_markdown_v2(&summary)
         );
         self.send_long_message(&msg, Some(teloxide::types::ParseMode::MarkdownV2)).await;
     }
 
     async fn on_tool_end(&self, result: &str) {
-        let display_result = if result.len() > 3000 {
-            format!("{}... (truncated)", &result[..3000])
-        } else {
-            result.to_string()
-        };
-        let msg = format!(
-            "✅ *Tool Result*:\n```\n{}\n```",
-            Self::escape_pre_code(&display_result)
-        );
+        let mut ok = true;
+        let mut display_name = "Result".to_string();
+        
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(result) {
+            if let Some(b) = val.get("ok").and_then(|v| v.as_bool()) {
+                ok = b;
+            }
+            if let Some(n) = val.get("tool_name").and_then(|v| v.as_str()) {
+                display_name = n.to_string();
+            }
+        }
+
+        let status_emoji = if ok { "✅" } else { "❌" };
+        let mut msg = format!("{} *{}* completed", status_emoji, Self::escape_markdown_v2(&display_name));
+
+        // If failure or very short, show a snippet
+        if !ok || result.len() < 100 {
+            let lines: Vec<&str> = result.lines().collect();
+            let preview = lines.iter().take(2).cloned().collect::<Vec<_>>().join("\n");
+            if !preview.is_empty() {
+                msg.push_str(&format!("\n```\n{}\n```", Self::escape_pre_code(&preview)));
+            }
+        }
+
         self.send_long_message(&msg, Some(teloxide::types::ParseMode::MarkdownV2)).await;
     }
 
     async fn on_error(&self, error: &str) {
+        self.flush().await;
         let msg = format!("❌ *Error*: {}", Self::escape_markdown_v2(error));
         self.send_long_message(&msg, Some(teloxide::types::ParseMode::MarkdownV2)).await;
+    }
+
+    async fn flush(&self) {
+        let text = {
+            let mut buf = self.text_buffer.lock().await;
+            std::mem::take(&mut *buf)
+        };
+        if !text.is_empty() {
+            // Send as plain text to avoid MarkdownV2 escaping issues with LLM output
+            self.send_long_message(&text, None).await;
+        }
     }
 }
 
@@ -168,10 +268,7 @@ async fn handle_command(
                 .await?;
         }
         Command::Status => {
-            let output = Arc::new(TelegramOutput {
-                bot: bot.clone(),
-                chat_id,
-            });
+            let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
             let agent = match session_manager
                 .get_or_create_session(&session_id, output)
                 .await
@@ -226,10 +323,7 @@ async fn handle_message(
         let chat_id = msg.chat.id;
         let session_id = format!("telegram:{}", chat_id);
 
-        let output = Arc::new(TelegramOutput {
-            bot: bot.clone(),
-            chat_id,
-        });
+        let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
 
         let agent = match session_manager
             .get_or_create_session(&session_id, output)
