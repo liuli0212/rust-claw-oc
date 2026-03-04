@@ -9,5 +9,5 @@ class BaseRule(ABC):
         pass
 
     @abstractmethod
-    def evaluate(self, messages: List[ContextMessage]) -> List[OptimizationSuggestion]:
+    def evaluate(self, messages: List[ContextMessage], **kwargs) -> List[OptimizationSuggestion]:
         pass
