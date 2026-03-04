@@ -264,9 +264,14 @@ async fn handle_message(
 
         match result {
             Ok(exit) => {
-                if matches!(exit, RunExit::RecoverableFailed { .. }) {
-                    bot.send_message(chat_id, format!("⚠️ Run stopped: {}", exit.label()))
-                        .await?;
+                match exit {
+                    RunExit::AgentTurnLimitReached => {
+                        bot.send_message(chat_id, "⚠️ [Turn Limit Reached] The agent reached the maximum allowed consecutive actions. Please type 'continue' if you want it to proceed.").await?;
+                    }
+                    RunExit::RecoverableFailed(ref msg) | RunExit::CriticallyFailed(ref msg) => {
+                        bot.send_message(chat_id, format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), msg)).await?;
+                    }
+                    _ => {}
                 }
             }
             Err(e) => {

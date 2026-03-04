@@ -669,7 +669,7 @@ impl AgentContext {
                     text: None,
                     function_call: None,
                     function_response: None,
-                    thought_signature: None, // ALWAYS None for history
+                    thought_signature: None, // Strip for history — Gemini only validates current turn
                 };
 
                 // 1. Function Call (Action) - KEEP

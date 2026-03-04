@@ -388,6 +388,10 @@ impl LlmClient for GeminiClient {
 
             let mut stream = resp.bytes_stream();
             let mut buffer = String::new();
+            let mut total_text_len: usize = 0;
+            let mut total_tool_calls: usize = 0;
+            let mut chunk_count: usize = 0;
+            tracing::debug!("Gemini stream connected, starting to receive chunks");
 
             while let Some(chunk_res) = stream.next().await {
                 if let Ok(chunk) = chunk_res {
@@ -405,31 +409,84 @@ impl LlmClient for GeminiClient {
                         if line.starts_with("data: ") {
                             let data = &line[6..];
                             if data == "[DONE]" {
+                                tracing::debug!("Gemini stream received [DONE] signal");
                                 let _ = tx.send(StreamEvent::Done).await;
                                 return;
                             }
-                            if let Ok(json) = serde_json::from_str::<Value>(data) {
-                                if let Some(parts) =
-                                    json["candidates"][0]["content"]["parts"].as_array()
-                                {
-                                    for part in parts {
-                                        if let Some(thought) = part["thought"].as_str() {
-                                            let _ = tx.send(StreamEvent::Thought(thought.to_string())).await;
+                            match serde_json::from_str::<Value>(data) {
+                                Ok(json) => {
+                                    chunk_count += 1;
+                                    tracing::debug!("Gemini SSE chunk #{}: keys={:?}\nRaw: {}", chunk_count,
+                                        json.as_object().map(|m| m.keys().collect::<Vec<_>>()),
+                                        crate::utils::truncate_log(data));
+
+                                    // 1. Check for thinking at candidate level (some models/versions)
+                                    if let Some(candidate) = json["candidates"].as_array().and_then(|a| a.first()) {
+                                        if let Some(thought) = candidate.get("thought").and_then(|v| v.as_str()) {
+                                            if !thought.is_empty() {
+                                                let _ = tx.send(StreamEvent::Thought(thought.to_string())).await;
+                                            }
                                         }
-                                        if let Some(text) = part["text"].as_str() {
-                                            let _ =
-                                                tx.send(StreamEvent::Text(text.to_string())).await;
-                                        }
-                                        if let Some((func_call, signature)) = parse_function_call(part) {
-                                            let _ = tx.send(StreamEvent::ToolCall(func_call, signature)).await;
+                                        // Also check for 'thinking' field
+                                        if let Some(thinking) = candidate.get("thinking").and_then(|v| v.as_str()) {
+                                            if !thinking.is_empty() {
+                                                let _ = tx.send(StreamEvent::Thought(thinking.to_string())).await;
+                                            }
                                         }
                                     }
+
+                                    if let Some(parts) =
+                                        json["candidates"][0]["content"]["parts"].as_array()
+                                    {
+                                        // Capture thought_signature from candidate level if not found in part
+                                        let candidate_signature = json["candidates"][0]
+                                            .get("thoughtSignature")
+                                            .or_else(|| json["candidates"][0].get("thought_signature"))
+                                            .and_then(|ts| ts.as_str())
+                                            .map(|s| s.to_string());
+
+                                        for part in parts {
+                                            tracing::trace!("Gemini part: {}", part);
+                                            // Check if this is a thought part (Gemini sends thought: true boolean)
+                                            let is_thought = part["thought"].as_bool().unwrap_or(false);
+
+                                            // [Fix] Also check if 'thought' is a string itself (common in some API versions)
+                                            if let Some(thought_text) = part["thought"].as_str() {
+                                                let _ = tx.send(StreamEvent::Thought(thought_text.to_string())).await;
+                                            }
+
+                                            if is_thought {
+                                                // thought: true means the text field contains thinking content
+                                                if let Some(text) = part["text"].as_str() {
+                                                    let _ = tx.send(StreamEvent::Thought(text.to_string())).await;
+                                                    tracing::debug!("Gemini thought: {} chars, content={}", text.len(), crate::utils::truncate_log(text));
+                                                }
+                                            } else if let Some(text) = part["text"].as_str() {
+                                                total_text_len += text.len();
+                                                tracing::debug!("Gemini text: {} chars (total: {}), content={}", text.len(), total_text_len, crate::utils::truncate_log(text));
+                                                let _ =
+                                                    tx.send(StreamEvent::Text(text.to_string())).await;
+                                            }
+                                            if let Some(func_call) = parse_function_call_basic(part) {
+                                                total_tool_calls += 1;
+                                                tracing::debug!("Gemini tool_call: name={}", func_call.name);
+                                                let signature = capture_thought_signature(part).or_else(|| candidate_signature.clone());
+                                                let _ = tx.send(StreamEvent::ToolCall(func_call, signature)).await;
+                                            }
+                                        }
+                                    } else {
+                                        tracing::debug!("Gemini SSE chunk #{} has no candidates/parts. Raw: {}", chunk_count, truncate_log(data));
+                                    }
+                                }
+                                Err(parse_err) => {
+                                    tracing::warn!("Gemini SSE JSON parse error: {}. Raw data: {}", parse_err, truncate_log(data));
                                 }
                             }
                         }
                     }
                 }
             }
+            tracing::debug!("Gemini stream ended. chunks={}, total_text={} chars, tool_calls={}", chunk_count, total_text_len, total_tool_calls);
             let _ = tx.send(StreamEvent::Done).await;
         });
 
@@ -437,20 +494,23 @@ impl LlmClient for GeminiClient {
     }
 }
 
-fn parse_function_call(part: &Value) -> Option<(FunctionCall, Option<String>)> {
+fn parse_function_call_basic(part: &Value) -> Option<FunctionCall> {
     let func_call = part.get("functionCall")?;
     let name = func_call.get("name")?.as_str()?.to_string();
     let args = func_call.get("args")?.clone();
-    let thought_signature = part
-        .get("thoughtSignature")
-        .or_else(|| part.get("thought_signature"))
-        .and_then(|ts| ts.as_str())
-        .map(|s| s.to_string());
-    Some((FunctionCall {
+    Some(FunctionCall {
         name,
         args,
         id: None,
-    }, thought_signature))
+    })
+}
+
+fn capture_thought_signature(part: &Value) -> Option<String> {
+    part
+        .get("thoughtSignature")
+        .or_else(|| part.get("thought_signature"))
+        .and_then(|ts| ts.as_str())
+        .map(|s| s.to_string())
 }
 
 fn normalize_schema_for_gemini(value: &mut Value) {
@@ -827,14 +887,24 @@ impl LlmClient for OpenAiCompatClient {
                                 continue;
                             }
                             if let Ok(json) = serde_json::from_str::<Value>(data) {
+                                tracing::trace!("OpenAI SSE chunk: {}", crate::utils::truncate_log(data));
                                 if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
                                     for choice in choices {
                                         if let Some(delta) = choice.get("delta") {
+                                            // 1. Text content
                                             if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                                                 if !content.is_empty() {
                                                     let _ = tx.send(StreamEvent::Text(content.to_string())).await;
                                                 }
                                             }
+                                            // 2. Reasoning/Thinking content (DeepSeek/DashScope format)
+                                            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                                                if !reasoning.is_empty() {
+                                                    tracing::debug!("OpenAI reasoning chunk: {} chars", reasoning.len());
+                                                    let _ = tx.send(StreamEvent::Thought(reasoning.to_string())).await;
+                                                }
+                                            }
+                                            // 3. Tool calls
                                             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                                                 for tc in tool_calls {
                                                     let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -871,6 +941,11 @@ impl LlmClient for OpenAiCompatClient {
                                             if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                                                 if !content.is_empty() {
                                                     let _ = tx.send(StreamEvent::Text(content.to_string())).await;
+                                                }
+                                            }
+                                            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                                                if !reasoning.is_empty() {
+                                                    let _ = tx.send(StreamEvent::Thought(reasoning.to_string())).await;
                                                 }
                                             }
                                             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {

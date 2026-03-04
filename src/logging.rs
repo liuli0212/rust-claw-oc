@@ -14,6 +14,7 @@ pub fn init_logging(
     // Default to strict env filter for file logs (debug or info).
     let file_filter = std::env::var("CLAW_LOG_LEVEL")
         .ok()
+        .or_else(|| std::env::var("RUST_LOG").ok())
         .and_then(|v| {
             // Validate the filter string by trying to parse it
             EnvFilter::try_new(v).ok()
@@ -21,13 +22,6 @@ pub fn init_logging(
         .unwrap_or_else(|| EnvFilter::new("info"))
         .add_directive("rustyline=off".parse().unwrap());
 
-    // Only log ERROR to console by default to keep it clean, as per BOSS's request to not log to screen.
-    // Unless CLAW_CONSOLE_LOG_LEVEL is explicitly set.
-    let console_filter = std::env::var("CLAW_CONSOLE_LOG_LEVEL")
-        .ok()
-        .and_then(|v| EnvFilter::try_new(v).ok())
-        .unwrap_or_else(|| EnvFilter::new("error"))
-        .add_directive("rustyline=off".parse().unwrap());
 
     let enable_file = std::env::var("CLAW_FILE_LOG")
             .map(|v| v != "0")
@@ -53,9 +47,16 @@ pub fn init_logging(
         .with_target(true)
         .with_filter(file_filter);
 
-    let console_layer = fmt::layer()
-        .with_target(false)
-        .with_filter(console_filter);
+    // Only create console layer if explicitly requested.
+    // By default, stdout is reserved exclusively for CLI output (print!/println!).
+    let console_layer = std::env::var("CLAW_CONSOLE_LOG_LEVEL")
+        .ok()
+        .and_then(|v| EnvFilter::try_new(v).ok())
+        .map(|filter| {
+            fmt::layer()
+                .with_target(false)
+                .with_filter(filter.add_directive("rustyline=off".parse().unwrap()))
+        });
 
     if enable_file {
         tracing_subscriber::registry()

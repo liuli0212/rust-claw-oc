@@ -203,6 +203,7 @@ impl AgentLoop {
             }
 
             if task_state.iterations >= Self::MAX_ITERATIONS {
+                tracing::warn!("Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.", Self::MAX_ITERATIONS);
                 self.context.end_turn();
                 return Ok(RunExit::AgentTurnLimitReached);
             }
@@ -210,6 +211,7 @@ impl AgentLoop {
             task_state.energy_points = task_state.energy_points.saturating_sub(1);
 
             if task_state.energy_points == 0 {
+                 tracing::error!("Energy points depleted. This indicates repeated failures or excessive tool calling without progress.");
                  self.output.on_text("[System] Energy depleted. Stopping to prevent infinite loops.").await;
                  self.context.end_turn();
                  return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
@@ -225,16 +227,18 @@ impl AgentLoop {
 
             let mut llm_attempts = 0;
             let mut full_text = String::new();
-            let mut tool_calls_accumulated = Vec::new();
+            let mut tool_calls_accumulated: Vec<(crate::context::FunctionCall, Option<String>)> = Vec::new();
 
             loop {
                 llm_attempts += 1;
                 // Streaming response
                 let stream_result = self.llm.stream(messages.clone(), system.clone(), self.tools.clone()).await;
+                tracing::debug!("LLM stream call returned (attempt {})", llm_attempts);
                 
                 match stream_result {
                     Ok(mut rx) => {
                         let mut current_turn_text = String::new();
+                        let mut in_think_block = false;
                         while let Some(event) = rx.recv().await {
                             if self.cancel_token.load(Ordering::SeqCst) {
                                 self.context.end_turn();
@@ -242,15 +246,47 @@ impl AgentLoop {
                             }
                             match event {
                                 StreamEvent::Text(t) => {
-                                    self.output.on_text(&t).await;
                                     current_turn_text.push_str(&t);
+                                    // Track <think> block state and style accordingly
+                                    let mut remaining = t.as_str();
+                                    while !remaining.is_empty() {
+                                        if in_think_block {
+                                            if let Some(end_idx) = remaining.find("</think>") {
+                                                // Display content before </think> in grey
+                                                let before = &remaining[..end_idx];
+                                                if !before.is_empty() {
+                                                    self.output.on_text(&format!("\x1b[38;5;244m{}\x1b[0m", before)).await;
+                                                }
+                                                in_think_block = false;
+                                                remaining = &remaining[end_idx + 8..]; // skip </think>
+                                            } else {
+                                                // Entire chunk is inside think block
+                                                self.output.on_text(&format!("\x1b[38;5;244m{}\x1b[0m", remaining)).await;
+                                                break;
+                                            }
+                                        } else {
+                                            if let Some(start_idx) = remaining.find("<think>") {
+                                                // Display content before <think> normally
+                                                let before = &remaining[..start_idx];
+                                                if !before.is_empty() {
+                                                    self.output.on_text(before).await;
+                                                }
+                                                in_think_block = true;
+                                                remaining = &remaining[start_idx + 7..]; // skip <think>
+                                            } else {
+                                                // Normal text, no think tags
+                                                self.output.on_text(remaining).await;
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                                 StreamEvent::Thought(t) => {
-                                    self.output.on_text(&format!("\x1b[35m<think>\n{}\n</think>\x1b[0m\n", t)).await;
+                                    self.output.on_text(&format!("\x1b[38;5;244m{}\x1b[0m", t)).await;
+                                    current_turn_text.push_str(&format!("<think>{}</think>", t));
                                 }
-                                StreamEvent::ToolCall(tc, _) => {
-                                    // Ignoring the second element (likely ID or raw string)
-                                    tool_calls_accumulated.push(tc);
+                                StreamEvent::ToolCall(tc, sig) => {
+                                    tool_calls_accumulated.push((tc, sig));
                                 }
                                 StreamEvent::Done => break,
                                 StreamEvent::Error(e) => {
@@ -259,6 +295,7 @@ impl AgentLoop {
                             }
                         }
                         full_text = current_turn_text;
+                        tracing::debug!("Stream processing complete: text={} chars, tool_calls={}", full_text.len(), tool_calls_accumulated.len());
                         break; // Success
                     },
                     Err(e) => {
@@ -273,6 +310,7 @@ impl AgentLoop {
             if full_text.trim().is_empty() && tool_calls_accumulated.is_empty() {
                 task_state.consecutive_empty_responses += 1;
                 if task_state.consecutive_empty_responses >= Self::MAX_CONSECUTIVE_EMPTY_RESPONSES {
+                     tracing::error!("Exiting loop due to {} consecutive empty responses from the LLM.", Self::MAX_CONSECUTIVE_EMPTY_RESPONSES);
                      self.context.end_turn();
                      return Ok(RunExit::CriticallyFailed("Too many empty responses".to_string()));
                 }
@@ -292,12 +330,12 @@ impl AgentLoop {
                     thought_signature: None,
                 });
             }
-            for tc in &tool_calls_accumulated {
+            for (tc, sig) in &tool_calls_accumulated {
                  parts.push(Part {
                     text: None,
                     function_call: Some(tc.clone()),
                     function_response: None,
-                    thought_signature: None,
+                    thought_signature: sig.clone(),
                 });
             }
             
@@ -313,12 +351,24 @@ impl AgentLoop {
             
             // If no tools called but text was generated, just yield to user
             if tool_calls_accumulated.is_empty() {
-                tracing::info!("Agent returned text without tool call. Yielding to user.");
+                tracing::info!("Agent returned text without tool call. Yielding to user. text_len={}", full_text.len());
+                tracing::debug!("Agent text content: {}", crate::utils::truncate_log(&full_text));
                 self.context.end_turn();
                 return Ok(RunExit::YieldedToUser);
             }
 
-            for call in tool_calls_accumulated {
+            for (mut call, _thought_sig) in tool_calls_accumulated {
+                 // Extract and display thought from args if present
+                if let Some(obj) = call.args.as_object_mut() {
+                    if let Some(thought) = obj.remove("thought") {
+                        if let Some(thought_str) = thought.as_str() {
+                            if !thought_str.is_empty() {
+                                self.output.on_text(&format!("\x1b[38;5;244m{}\x1b[0m\n", thought_str)).await;
+                            }
+                        }
+                    }
+                }
+
                  // Check deduplication
                 let sig = format!("{}:{}", call.name, call.args);
                 if !executed_signatures.insert(sig) || call.name.trim().is_empty() { continue; }
@@ -335,6 +385,7 @@ impl AgentLoop {
                             summary = s.to_string();
                         }
                     }
+                    self.output.on_text(&format!("\n{}\n", summary)).await;
                     self.context.end_turn();
                     return Ok(RunExit::Finished(summary));
                 }
