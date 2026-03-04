@@ -1,94 +1,87 @@
+import argparse
 import json
-import typer
-from typing import Optional
-from pathlib import Path
+import sys
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
-from .engine import ContextAnalyzer
-from .models import ContextMessage, MessageRole
+from rich.layout import Layout
+from rich.text import Text
+from .engine import ContextEngine
 
-app = typer.Typer(help="Context Profiler - Optimize your LLM context.")
 console = Console()
 
-def load_messages(file_path: Path):
-    with open(file_path, 'r') as f:
-        data = json.load(f)
+def main():
+    parser = argparse.ArgumentParser(description="Audit Rust ClawOC Context Dumps")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    audit_parser = subparsers.add_parser("audit", help="Audit a single context dump file")
+    audit_parser.add_argument("file", help="Path to debug_context.json")
+
+    args = parser.parse_args()
+
+    if args.command == "audit":
+        try:
+            with open(args.file, 'r') as f:
+                data = json.load(f)
+            engine = ContextEngine(data)
+            report = engine.run_audit()
+            print_report(report)
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
+
+def print_report(report):
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=3),
+        Layout(name="main", ratio=1),
+        Layout(name="footer", size=3)
+    )
     
-    # Adapt simple list of messages to ContextMessage objects
-    messages = []
-    for m in data:
-        # Basic mapping for common LLM message formats
-        role = m.get("role", "unknown")
-        content = str(m.get("content", ""))
-        
-        msg = ContextMessage(
-            role=role,
-            content=content,
-            tool_name=m.get("name") or m.get("tool_name"),
-            tool_args=m.get("args") or m.get("tool_args") or m.get("metadata", {}),
-            raw_data=m
-        )
-        messages.append(msg)
-    return messages
+    total = report.total_tokens
+    max_t = report.max_tokens
+    layout["header"].update(Panel(f"[bold cyan]Claw-Context Audit[/bold cyan] | Total Tokens: [bold yellow]{total}/{max_t}[/bold yellow]", style="white"))
 
-@app.command()
-def analyze(
-    file: Path = typer.Argument(..., help="Path to the context JSON file"),
-    model: str = typer.Option("gemini-2.0-flash", help="Model name for token counting (default: gemini-2.0-flash)"),
-    ci: bool = typer.Option(False, help="Exit with code 1 if CRITICAL issues found")
-):
-    """Analyze a context dump and show optimization suggestions."""
-    if not file.exists():
-        console.print(f"[red]Error: File {file} not found.[/red]")
-        raise typer.Exit(1)
+    # Issues Panel
+    issues_text = "\n".join([f"- {i}" for i in report.completeness_issues]) if report.completeness_issues else "[green]No completeness issues found.[/green]"
+    issue_panel = Panel(issues_text, title="[bold red]Completeness Audit[/bold red]")
 
-    try:
-        messages = load_messages(file)
-    except Exception as e:
-        console.print(f"[red]Error parsing JSON: {e}[/red]")
-        raise typer.Exit(1)
+    # Timeline Panel
+    timeline_text = Text()
+    max_tokens = max((t.tokens for t in report.turns), default=1)
+    for t in report.turns:
+        bar_len = int((t.tokens / max_tokens) * 40)
+        bar = "█" * bar_len
+        color = "red" if t.tokens > 2000 else "green"
+        if t.is_redundant:
+            color = "yellow"
+        timeline_text.append(f"{t.index:02d} [{t.role[:4]}] {bar} ({t.tokens}) {t.redundancy_reason}\n", style=color)
+    timeline_panel = Panel(timeline_text, title="[bold blue]Token Timeline[/bold blue]")
 
-    analyzer = ContextAnalyzer(model_name=model)
-    report = analyzer.analyze(messages)
-
-    console.print(Panel(f"Analysis Report for {file.name}", style="bold blue"))
-    console.print(f"Total Messages: {report.total_messages}")
-    console.print(f"Total Tokens: {report.total_tokens}")
+    # Resource Usage Panel (Updated)
+    res_table = Table(title="Top Resource Consumers")
+    res_table.add_column("Type", style="cyan", width=8)
+    res_table.add_column("Identifier", style="white")
+    res_table.add_column("Tokens", style="yellow", justify="right")
+    res_table.add_column("Count", style="green", justify="right")
     
-    score_color = "green" if report.health_score > 80 else "yellow" if report.health_score > 50 else "red"
-    console.print(f"Health Score: [{score_color}]{report.health_score}/100[/{score_color}]")
-
-    if not report.suggestions:
-        console.print("\n[green]✅ No optimization suggestions found! Your context is clean.[/green]")
-        return
-
-    table = Table(title="\nOptimization Suggestions", show_header=True, header_style="bold magenta")
-    table.add_column("Rule ID", style="dim")
-    table.add_column("Severity")
-    table.add_column("Description")
-    table.add_column("Actionable Advice")
-    table.add_column("Est. Savings (Tokens)")
-
-    has_critical = False
-    for sug in report.suggestions:
-        sev_style = "bold red" if sug.severity == "CRITICAL" else "yellow"
-        if sug.severity == "CRITICAL":
-            has_critical = True
+    # Sort by total tokens consumed
+    sorted_resources = sorted(report.resource_usage_summary.values(), key=lambda r: r.tokens, reverse=True)
+    
+    for r in sorted_resources[:8]: # Show top 8
+        identifier = (r.identifier[:40] + '...') if len(r.identifier) > 40 else r.identifier
+        res_table.add_row(r.resource_type, identifier, str(r.tokens), str(r.count))
         
-        table.add_row(
-            sug.rule_id,
-            f"[{sev_style}]{sug.severity}[/{sev_style}]",
-            sug.description,
-            sug.actionable_advice,
-            str(sug.estimated_savings_tokens)
-        )
+    res_panel = Panel(res_table, title="[bold magenta]Resource Usage Analysis[/bold magenta]")
 
-    console.print(table)
+    layout["main"].split_row(
+        Layout(timeline_panel, ratio=1),
+        Layout(name="right_col", ratio=1)
+    )
+    layout["right_col"].split_column(issue_panel, res_panel)
+    
+    layout["footer"].update(Panel("[dim]Generated by context-profiler v0.3[/dim]", style="grey50"))
 
-    if ci and has_critical:
-        console.print("\n[red]CI Failure: Critical context issues detected.[/red]")
-        raise typer.Exit(1)
+    console.print(layout)
 
 if __name__ == "__main__":
-    app()
+    main()
