@@ -47,34 +47,25 @@
 
 Rust 侧数据已经精准完备（特别是新增了 `detailed_stats` 的 Dump 输出），但 Profiler (Python 侧) 自身的设计和架构依然存在**严重缺陷**，未能达到设计目标的要求。
 
-### 🔴 P0：Profiler 核心架构缺陷
+### 🔴 P0：Profiler 核心架构缺陷 (✅ 已修复 - 2026-03-04)
 
-#### 2.1 数据模型不兼容，Rule 系统完全断裂未能执行
+#### 2.1 数据模型不兼容，Rule 系统完全断裂未能执行 (✅ 修复)
 - **问题**: `rules/base.py` 引用了 `ContextMessage` 和 `OptimizationSuggestion`，但 `models.py` 中并没有定义这些类（反而定义的是 `TurnStats` 和 `AuditReport`）。
 - **结果**: `engine.py` 的 `run_audit()` 方法中**完全没有调用任何 Rule**。整个 Rule 诊断引擎是一个无法运行的空壳架子。
-- **修复方向**: 统一 `models.py` 的数据结构，修复 Import 错误，并在 `engine.py` 的主流程中添加 `_run_rules()` 将提取的数据真正喂给各 Rule 执行。
+- **修复**: 统一了 `models.py`，打通了 `engine.py` 到 `BaseRule` 的调用链，现在 Rule 系统已完全激活并在末尾渲染了 `Optimization Suggestions`。
 
-#### 2.2 Profiler 无法检测"关键历史信息丢失"
+#### 2.2 Profiler 无法检测"关键历史信息丢失" (✅ 已实装 CausalChainRule)
 - **对比设计目标**: "分析出context有没有缺重要的历史信息"。
-- **现状**: 当前仅仅简单检查了最后 3 轮有无 `user` 角色 以及 System Prompt 是否为空字符串。
-- **缺失的检测能力**:
-  - **因果断链检测**: 工具调用了 `patch_file` 尝试修 bug，但因为历史丢弃，上下文里根本找不到 `error`/`failed`/`panic` 的输出。导致 LLM "为了修而修"。
-  - **严重裁切预警**: `report.history_turns_included` 远小于对话总轮数，必须明确报警告。
-  - **计划偏离检测**: 检查上下文中的 Task Plan 内容是否在最近几次的 Tool Calls 中被实际推进。
+- **现状**: 已实装 `MISSING_CAUSAL_ERROR` 规则。当监测到最近几次在进行 `patch_file` 动作时（修复 Bug 语境），如果没有在之前的 Context 中找到任何 Error/Panic 的日志，便会发出严重的级别报警。
 
-#### 2.3 System Prompt 臃肿度深度分析缺失
+#### 2.3 System Prompt 臃肿度深度分析缺失 (✅ 已实装 SystemPromptBloatRule)
 - **对比设计目标**: "有没有放了太多不需要的信息在里面"。
-- **现状**: 尽管 Rust 侧 dump 文件现在已经提供了精准的 `detailed_stats`，Profiler 却**完全没有读取和分析这些分项数据**。
-- **缺失的检测能力**:
-  - 分析 System Prompt 各个维度（Project, Custom, Runtime, Task Plan）的 Token 占比情况并发出预警。
-  - 例如，如果 `system_project` (AGENTS.md 等内容) 占比总额度过高（> 25%），应建议用户删减不相关的知识库。
+- **现状**: 工具已介入读取 `detailed_stats`。当发现全局 System Prompt > 20000 Token、System Project (比如 AGENTS.md) 占比过大，或 Custom Instructions 过多时，会抛出精确的阈值警告。
 
-### 🟠 P1：Profiler 体验与建议缺陷
+### 🟠 P1：Profiler 体验与建议缺陷 (✅ 进展中)
 
-#### 2.4 冗余检测缺乏"可操作的改进意见" (Actionable Advice)
-- **现状**: 现有的冗余检查仅仅打了一个 `High Volume` 标签。
-- **设计目标要求**: "能给出明确问题和改进意见"。
-- **改进方向**: 规则不仅要标记问题，还需要抛出带引导性的建议方案，比如："Turn X 中 read_file 输出了 3000 Token，建议在 Rust 侧调整 `truncate_old_tool_results` 阈值，或建议 Agent 使用 grep 缩小范围。"
+#### 2.4 冗余检测缺乏"可操作的改进意见" (Actionable Advice) (✅ 修复)
+- **现状**: 所有的 Rules 都已被要求输出 `actionable_advice` 字段。输出不仅包括 "冗长"，还告诉了具体的 Unix 管道操作指令（如建议把 `grep` 换成 `grep -l`）。此外，抛弃了在 Rich Box 里会导致布局乱码和截断的横向 `split_row`，改成了流式输出。
 
 #### 2.5 缺乏累积趋势监控与预算警戒线
 - **现状**: Timeline 视图只孤立展示单次节点的 Token 数。
@@ -92,29 +83,24 @@ Rust 侧数据已经精准完备（特别是新增了 `detailed_stats` 的 Dump 
 
 | 设计目标 | Rust 侧提供的数据 (Dump) | Profiler 当前分析能力 | 对标进度 | 核心差距 |
 |----------|--------------------------|-----------------------|----------|----------|
-| **分析 context 是否合理** | 提供最精准的 Payload 与 Stats 分项 | Timeline 简单展示 | 🟡 40% | 没有结合模型进行上下文成分合理性校验；无健康度打分体系 |
-| **有没有缺重要历史信息** | 记录了被截断的内容与标记 | 简单检查 user 角色 | 🔴 10% | 规则系统断裂，完全未实现针对历史丢失的断链追踪分析 |
-| **有没有放太多没用信息** | 提供详尽的组件拆分统计与日志 | 按长度进行硬切分标记 | 🟡 30% | 未解析详细的 `detailed_stats` 数据，对 System Prompt 无洞察 |
-| **给出明确改进意见** | `/context audit` 已展示全面细节 | Redundancy 标签提示 | 🔴 10% | 缺少 Actionable Advice (明确指导建议) 引领用户排查 |
+| **分析 context 是否合理** | 提供最精准的 Payload 与 Stats 分项 | Timeline 简单展示 | 🟡 60% | 已经打磨完初步的 Rules；目前在 Health Check 大指标和 Trend 图表部分有所缺失 |
+| **有没有缺重要历史信息** | 记录了被截断的内容与标记 | **缺失因果连检出机制** | 🟢 80% | `MISSING_CAUSAL_ERROR` 已可捕捉修 bug 时失去报错文本的危险 |
+| **有没有放太多没用信息** | 提供详尽的组件拆分统计与日志 | **系统级臃肿洞察 Rule** | 🟢 80% | `SYSTEM_PROMPT_BLOAT` 规则已经能分析 `detailed_stats` 提供警告 |
+| **给出明确改进意见** | `/context audit` 已展示全面细节 | **已提供 Actionable Advice 模块** | 🟢 90% | 每一个触发红线的 Rule 都附带人工手写的解题方法 |
 | **确保 context 好的状态** | 兜底压缩机制已上线 (Rule-compact)| 评分机制真空 | 🟡 50% | Profiler 无法提炼综合指标，缺乏自动化的 Health Check Report |
 
 ---
 
-## 4. 下一步行动纲领：重塑 Profiler
+## 4. 下一步行动纲领：重塑 Profiler (部分已完成)
 
-Rust 侧 P0 已清零，下一步应 **100% 投入到 Context Profiler 的架构重构与能力加固上**，让其成为真正满足设计目标的专家级审计工具。
+Rust 侧 P0 已清零。Python Profiler 的 Rule 引擎已经完成断点续连。
 
-### 冲刺计划（预估 1-2 天）
+### 最新冲刺进度
+✅ **阶段 1: 修复基建断裂** (统一 Model，接通 `engine.py`，修正 Terminal 的 UI 渲染崩溃和截断报错)
+✅ **阶段 2: 注入灵魂检测模块** (编写 `SystemPromptAnalyzer` 和 `CausalChainDetector`)
+✅ **阶段 3: 输出实操意见** (添加 Actionable 建议)
 
-**阶段 1: 修复基建断裂**
-1. 统一 `context_profiler/models.py` 与规则系统的模型约束。
-2. 重写 `engine.py`：注入 Rule 调用链，把历史 Message 序列和详细 Report 数据喂给 Rule Engine 获取诊断结果。
-3. 清理废弃入口。
-
-**阶段 2: 注入灵魂检测模块 (Rules)**
-4. 开发 `SystemPromptAnalyzer` Rule：读取通过 Rust 侧新增的 `detailed_stats` 分项，分析各个模块（Identity / Project 等等）的臃肿情况。
-5. 开发 `CausalChainDetector` Rule：扫描历史流向，确保如果最近发生对某个文件的修复动作，前文必须有对应的 Error 或失败输出。（否则就是出现了信息剥落）
-
-**阶段 3: 输出实操意见**
-6. 将每个检测出的缺陷都封装成带 `Actionable Advice` (下一步怎么做) 的报告。
-7. 整合生成 **Context Health Score (0-100)** 评分雷达与优化提示墙，提升界面信息密度。
+### 遗留待办：
+- [ ] 整合生成 **Context Health Score (0-100)** 评分雷达。
+- [ ] Timeline 累计时间轴预警 (Accumulative view)。
+- [ ] 清理废弃入口 (`claw_audit.py` 老脚本)。
