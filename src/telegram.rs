@@ -3,7 +3,7 @@ use crate::session_manager::SessionManager;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use teloxide::{prelude::*, utils::command::BotCommands, types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode}};
+use teloxide::{prelude::*, utils::command::BotCommands, types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode}, net::Download};
 
 struct TelegramOutput {
     bot: Bot,
@@ -382,7 +382,35 @@ async fn handle_message(
     msg: Message,
     session_manager: Arc<SessionManager>,
 ) -> ResponseResult<()> {
+    let mut final_text = String::new();
+
     if let Some(text) = msg.text() {
+        final_text = text.to_string();
+    } else if let Some(caption) = msg.caption() {
+        final_text = caption.to_string();
+    }
+
+    if let Some(photos) = msg.photo() {
+        if let Some(photo) = photos.last() {
+            if let Ok(file) = bot.get_file(&photo.file.id).await {
+                let temp_dir = std::env::temp_dir();
+                let path = temp_dir.join(format!("{}.jpg", photo.file.id));
+                if let Ok(mut dest) = tokio::fs::File::create(&path).await {
+                    if let Ok(_) = bot.download_file(&file.path, &mut dest).await {
+                        let img_msg = format!("[User uploaded an image. Saved locally at: {}]", path.display());
+                        if final_text.is_empty() {
+                            final_text = img_msg;
+                        } else {
+                            final_text = format!("{}\n{}", final_text, img_msg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !final_text.is_empty() {
+        let text = final_text;
         let chat_id = msg.chat.id;
         let session_id = format!("telegram:{}", chat_id);
 
