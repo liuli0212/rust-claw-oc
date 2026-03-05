@@ -1050,7 +1050,42 @@ pub struct FinishTaskArgs {
     pub summary: String,
 }
 
+
 pub struct FinishTaskTool;
+
+// --- Send File Tool ---
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct SendFileArgs {
+    /// Explain what file you are sending and why
+    pub thought: Option<String>,
+    /// Absolute or relative path to the file to send
+    pub path: String,
+}
+
+pub struct SendFileTool;
+#[async_trait]
+impl Tool for SendFileTool {
+    fn name(&self) -> String { "send_file".to_string() }
+    fn description(&self) -> String { "Sends a file (image, document, audio, etc.) to the user's chat.".to_string() }
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(SendFileArgs)).unwrap())
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: SendFileArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        
+        if !std::path::Path::new(&parsed.path).exists() {
+             return Err(ToolError::ExecutionFailed(format!("File not found: {}", parsed.path)));
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "tool_name": "send_file",
+            "path": parsed.path,
+            "output": format!("File {} sent to user.", parsed.path)
+        }).to_string())
+    }
+}
 #[async_trait]
 impl Tool for FinishTaskTool {
     fn name(&self) -> String { "finish_task".to_string() }
