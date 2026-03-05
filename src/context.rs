@@ -643,8 +643,9 @@ impl AgentContext {
                 "task_plan" => {
                     // Task plan is always injected in the system prompt, so historical responses
                     // are redundant. Replace with minimal marker to save tokens.
-                    if let Some(output) = obj.get_mut("output") {
-                        *output = serde_json::Value::String("[History: plan state updated]".to_string());
+                    // Note: fr.response structure is { "result": "{...serialized envelope...}" }
+                    if let Some(result_val) = obj.get_mut("result") {
+                        *result_val = serde_json::Value::String("[plan updated]".to_string());
                     }
                 },
                 _ => {
@@ -679,9 +680,19 @@ impl AgentContext {
                     thought_signature: None, // Strip for history — Gemini only validates current turn
                 };
 
-                // 1. Function Call (Action) - KEEP
+                // 1. Function Call (Action) - KEEP (but strip task_plan args)
                 if let Some(fc) = &part.function_call {
-                    new_part.function_call = Some(fc.clone());
+                    if fc.name == "task_plan" {
+                        // For task_plan, only keep the action to save tokens
+                        let action = fc.args.get("action")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let mut stripped_fc = fc.clone();
+                        stripped_fc.args = serde_json::json!({ "action": action });
+                        new_part.function_call = Some(stripped_fc);
+                    } else {
+                        new_part.function_call = Some(fc.clone());
+                    }
                 }
 
                 // 2. Function Response (Result) - KEEP (Stripped)
