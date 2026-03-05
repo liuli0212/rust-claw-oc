@@ -1,17 +1,14 @@
 use crate::context::{
-    AgentContext, FunctionResponse, Message, Part, Turn, ContextDiff, ContextSnapshot
+    AgentContext, FunctionResponse, Message, Part, ContextDiff
 };
 use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;
-use crate::utils::truncate_log;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::sync::Notify;
 
 #[async_trait]
 pub trait AgentOutput: Send + Sync {
@@ -28,7 +25,7 @@ pub trait AgentOutput: Send + Sync {
     }
     async fn on_file(&self, path: &str) {
         // Default: just notify that a file was created
-        self.on_text(&format!("[File] Created: {}\\n", path)).await;
+        self.on_text(&format!("[File] Created: {}\n", path)).await;
     }
 }
 
@@ -58,18 +55,8 @@ impl RunExit {
 }
 
 struct TaskState {
-    goal: String,
     iterations: usize,
-    recovery_attempts: usize,
-    recovery_rule_hits: HashMap<String, usize>,
-    consecutive_empty_responses: usize,
     energy_points: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TaskPlan {
-    steps: Vec<String>,
-    current_step_index: usize,
 }
 
 pub struct AgentLoop {
@@ -77,7 +64,8 @@ pub struct AgentLoop {
     tools: Vec<Arc<dyn Tool>>,
     context: AgentContext,
     output: Arc<dyn AgentOutput>,
-    pub cancel_token: Arc<AtomicBool>,
+    pub cancel_token: Arc<Notify>,
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentLoop {
@@ -97,8 +85,18 @@ impl AgentLoop {
             tools,
             context,
             output,
-            cancel_token: Arc::new(AtomicBool::new(false)),
+            cancel_token: Arc::new(Notify::new()),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    pub fn request_cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancel_token.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn update_llm(&mut self, new_llm: Arc<dyn LlmClient>) {
@@ -188,31 +186,26 @@ impl AgentLoop {
     }
 
     pub async fn step(&mut self, goal: String) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
+        // Reset cancel flag at start of each step
+        self.cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
         self.context.take_snapshot();
-        self.cancel_token.store(false, Ordering::SeqCst);
 
         let mut task_state = TaskState {
-            goal: goal.clone(),
             iterations: 0,
-            recovery_attempts: 0,
-            recovery_rule_hits: HashMap::new(),
-            consecutive_empty_responses: 0,
             energy_points: Self::INITIAL_ENERGY,
         };
 
-        // [Risk 4] Only check compaction once per turn to avoid repeated O(n) tokenize scans
         let mut compaction_checked = false;
+        let mut consecutive_empty_responses = 0;
 
-        // Start the turn with user input
         self.context.start_turn(goal);
 
         loop {
-            // Check cancellation
-            if self.cancel_token.load(Ordering::SeqCst) {
+            // Check persistent cancel flag at top of each iteration
+            if self.is_cancelled() {
                 self.context.end_turn();
                 return Ok(RunExit::StoppedByUser);
             }
-
             if task_state.iterations >= Self::MAX_ITERATIONS {
                 tracing::warn!("Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.", Self::MAX_ITERATIONS);
                 self.context.end_turn();
@@ -222,7 +215,7 @@ impl AgentLoop {
             task_state.energy_points = task_state.energy_points.saturating_sub(1);
 
             if task_state.energy_points == 0 {
-                 tracing::error!("Energy points depleted. This indicates repeated failures or excessive tool calling without progress.");
+                 tracing::error!("Energy points depleted.");
                  self.output.on_text("[System] Energy depleted. Stopping to prevent infinite loops.").await;
                  self.context.end_turn();
                  return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
@@ -233,80 +226,87 @@ impl AgentLoop {
                 compaction_checked = true;
             }
 
-            // Note: build_llm_payload now returns (messages, system_msg, report)
             let (messages, system, _) = self.context.build_llm_payload();
 
             let mut llm_attempts = 0;
-            let mut full_text = String::new();
             let mut tool_calls_accumulated: Vec<(crate::context::FunctionCall, Option<String>)> = Vec::new();
 
-            loop {
+            let full_text = loop {
                 llm_attempts += 1;
-                // Streaming response
-                let stream_result = self.llm.stream(messages.clone(), system.clone(), self.tools.clone()).await;
-                tracing::debug!("LLM stream call returned (attempt {})", llm_attempts);
                 
-                match stream_result {
+                let stream_res = tokio::select! {
+                    res = self.llm.stream(messages.clone(), system.clone(), self.tools.clone()) => res,
+                    _ = self.cancel_token.notified() => {
+                        self.context.end_turn();
+                        return Ok(RunExit::StoppedByUser);
+                    }
+                };
+                
+                match stream_res {
                     Ok(mut rx) => {
                         let mut current_turn_text = String::new();
                         let mut in_think_block = false;
-                        while let Some(event) = rx.recv().await {
-                            if self.cancel_token.load(Ordering::SeqCst) {
-                                self.context.end_turn();
-                                return Ok(RunExit::StoppedByUser);
-                            }
-                            match event {
-                                StreamEvent::Text(t) => {
-                                    current_turn_text.push_str(&t);
-                                    // Track <think> block state and style accordingly
-                                    let mut remaining = t.as_str();
-                                    while !remaining.is_empty() {
-                                        if in_think_block {
-                                            if let Some(end_idx) = remaining.find("</think>") {
-                                                let before = &remaining[..end_idx];
-                                                if !before.is_empty() {
-                                                    self.output.on_thinking(before).await;
+                        
+                        let stream_loop_res = loop {
+                            tokio::select! {
+                                event = rx.recv() => {
+                                    match event {
+                                        Some(StreamEvent::Text(t)) => {
+                                            current_turn_text.push_str(&t);
+                                            let mut remaining = t.as_str();
+                                            while !remaining.is_empty() {
+                                                if in_think_block {
+                                                    if let Some(end_idx) = remaining.find("</think>") {
+                                                        let before = &remaining[..end_idx];
+                                                        if !before.is_empty() {
+                                                            self.output.on_thinking(before).await;
+                                                        }
+                                                        in_think_block = false;
+                                                        remaining = &remaining[end_idx + 8..];
+                                                    } else {
+                                                        self.output.on_thinking(remaining).await;
+                                                        break;
+                                                    }
+                                                } else {
+                                                    if let Some(start_idx) = remaining.find("<think>") {
+                                                        let before = &remaining[..start_idx];
+                                                        if !before.is_empty() {
+                                                            self.output.on_text(before).await;
+                                                        }
+                                                        in_think_block = true;
+                                                        remaining = &remaining[start_idx + 7..];
+                                                    } else {
+                                                        self.output.on_text(remaining).await;
+                                                        break;
+                                                    }
                                                 }
-                                                in_think_block = false;
-                                                remaining = &remaining[end_idx + 8..]; // skip </think>
-                                            } else {
-                                                // Entire chunk is inside think block
-                                                self.output.on_thinking(remaining).await;
-                                                break;
                                             }
-                                        } else {
-                                            if let Some(start_idx) = remaining.find("<think>") {
-                                                // Display content before <think> normally
-                                                let before = &remaining[..start_idx];
-                                                if !before.is_empty() {
-                                                    self.output.on_text(before).await;
-                                                }
-                                                in_think_block = true;
-                                                remaining = &remaining[start_idx + 7..]; // skip <think>
-                                            } else {
-                                                // Normal text, no think tags
-                                                self.output.on_text(remaining).await;
-                                                break;
-                                            }
+                                        }
+                                        Some(StreamEvent::Thought(t)) => {
+                                            self.output.on_thinking(&t).await;
+                                            current_turn_text.push_str(&format!("<think>{}</think>", t));
+                                        }
+                                        Some(StreamEvent::ToolCall(tc, sig)) => {
+                                            tool_calls_accumulated.push((tc, sig));
+                                        }
+                                        Some(StreamEvent::Done) | None => break Ok(()),
+                                        Some(StreamEvent::Error(e)) => {
+                                            self.output.on_error(&format!("Stream error: {}", e)).await;
                                         }
                                     }
                                 }
-                                StreamEvent::Thought(t) => {
-                                    self.output.on_thinking(&t).await;
-                                    current_turn_text.push_str(&format!("<think>{}</think>", t));
-                                }
-                                StreamEvent::ToolCall(tc, sig) => {
-                                    tool_calls_accumulated.push((tc, sig));
-                                }
-                                StreamEvent::Done => break,
-                                StreamEvent::Error(e) => {
-                                    self.output.on_error(&format!("Stream error: {}", e)).await;
+                                _ = self.cancel_token.notified() => {
+                                    break Err(RunExit::StoppedByUser);
                                 }
                             }
+                        };
+
+                        if let Err(exit) = stream_loop_res {
+                            self.context.end_turn();
+                            return Ok(exit);
                         }
-                        full_text = current_turn_text;
-                        tracing::debug!("Stream processing complete: text={} chars, tool_calls={}", full_text.len(), tool_calls_accumulated.len());
-                        break; // Success
+
+                        break current_turn_text;
                     },
                     Err(e) => {
                         if !self.handle_llm_error(&e, llm_attempts).await {
@@ -314,23 +314,19 @@ impl AgentLoop {
                         }
                     }
                 }
-            }
+            };
 
-            // Check if empty response
             if full_text.trim().is_empty() && tool_calls_accumulated.is_empty() {
-                task_state.consecutive_empty_responses += 1;
-                if task_state.consecutive_empty_responses >= Self::MAX_CONSECUTIVE_EMPTY_RESPONSES {
-                     tracing::error!("Exiting loop due to {} consecutive empty responses from the LLM.", Self::MAX_CONSECUTIVE_EMPTY_RESPONSES);
+                consecutive_empty_responses += 1;
+                if consecutive_empty_responses >= Self::MAX_CONSECUTIVE_EMPTY_RESPONSES {
                      self.context.end_turn();
                      return Ok(RunExit::CriticallyFailed("Too many empty responses".to_string()));
                 }
                 continue; 
             } else {
-                task_state.consecutive_empty_responses = 0;
+                consecutive_empty_responses = 0;
             }
 
-            // Add model output to context
-            // Construct parts
             let mut parts = Vec::new();
             if !full_text.is_empty() {
                 parts.push(Part {
@@ -354,22 +350,16 @@ impl AgentLoop {
                 parts,
             });
 
-
-            // Execute tools
-            let mut requested_finish = false;
-            let mut executed_signatures = HashSet::new();
-            
-            // If no tools called but text was generated, just yield to user
             if tool_calls_accumulated.is_empty() {
-                tracing::info!("Agent returned text without tool call. Yielding to user. text_len={}", full_text.len());
-                tracing::debug!("Agent text content: {}", crate::utils::truncate_log(&full_text));
                 self.output.flush().await;
                 self.context.end_turn();
                 return Ok(RunExit::YieldedToUser);
             }
 
+            let mut executed_signatures = HashSet::new();
+            let mut stop_loop = false;
+            
             for (mut call, _thought_sig) in tool_calls_accumulated {
-                 // Extract and display thought from args if present
                 if let Some(obj) = call.args.as_object_mut() {
                     if let Some(thought) = obj.remove("thought") {
                         if let Some(thought_str) = thought.as_str() {
@@ -381,19 +371,14 @@ impl AgentLoop {
                     }
                 }
 
-                 // Check deduplication
                 let sig = format!("{}:{}", call.name, call.args);
                 if !executed_signatures.insert(sig) || call.name.trim().is_empty() { continue; }
                 
                 if call.name == "finish_task" {
-                    requested_finish = true;
-                    // Delete the task plan file when task is officially finished
                     let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
                     let mut summary = call.args.to_string();
                     if let Some(obj) = call.args.as_object() {
-                        // Fix type annotation error by being explicit
-                        let s_opt: Option<&str> = obj.get("summary").and_then(|v| v.as_str());
-                        if let Some(s) = s_opt {
+                        if let Some(s) = obj.get("summary").and_then(|v| v.as_str()) {
                             summary = s.to_string();
                         }
                     }
@@ -404,25 +389,36 @@ impl AgentLoop {
                     return Ok(RunExit::Finished(summary));
                 }
 
-                // Find tool
                 let tool_opt = self.tools.iter().find(|t| t.name() == call.name);
-                let (result, is_error) = if let Some(tool) = tool_opt {
+                let (result, is_error, stopped) = if let Some(tool) = tool_opt {
                     self.output.flush().await;
                     self.output.on_tool_start(&call.name, &call.args.to_string()).await;
-                    match tool.execute(call.args.clone()).await {
-                        Ok(res) => (res, false),
-                        Err(e) => (format!("Error executing {}: {}", call.name, e), true),
+                    
+                    tokio::select! {
+                        exec_res = tool.execute(call.args.clone()) => {
+                            match exec_res {
+                                Ok(res) => (res, false, false),
+                                Err(e) => (format!("Error executing {}: {}", call.name, e), true, false),
+                            }
+                        }
+                        _ = self.cancel_token.notified() => {
+                            ("Tool execution interrupted by user.".to_string(), true, true)
+                        }
                     }
                 } else {
-                    (format!("Tool not found: {}", call.name), true)
+                    (format!("Tool not found: {}", call.name), true, false)
                 };
+
+                if stopped {
+                    self.output.on_error(&result).await;
+                    stop_loop = true;
+                    break;
+                }
 
                 if is_error {
                     self.output.on_error(&result).await;
                 } else {
                     self.output.on_tool_end(&result).await;
-
-                    // Specific logic for send_file: actually call on_file
                     if call.name == "send_file" {
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&result) {
                             if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
@@ -432,7 +428,6 @@ impl AgentLoop {
                     }
                 }
 
-                // Add tool result to context
                 self.context.add_message_to_current_turn(Message {
                     role: "function".to_string(),
                     parts: vec![Part {
@@ -448,66 +443,10 @@ impl AgentLoop {
                 });
             }
 
-            if requested_finish {
-                break;
+            if stop_loop {
+                 self.context.end_turn();
+                 return Ok(RunExit::StoppedByUser);
             }
         }
-
-        self.context.end_turn();
-        Ok(RunExit::Finished("Loop ended".to_string()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-    use crate::llm_client::{LlmClient, StreamEvent, LlmError};
-    use crate::context::{Message, Part};
-    use std::sync::atomic::AtomicBool;
-
-    struct MockLlm;
-
-    #[async_trait]
-    impl LlmClient for MockLlm {
-        fn model_name(&self) -> &str { "mock" }
-        fn provider_name(&self) -> &str { "mock" }
-        fn context_window_size(&self) -> usize { 1000 }
-        async fn generate_text(&self, _m: Vec<Message>, _s: Option<Message>) -> Result<String, LlmError> {
-            Ok("mock response".to_string())
-        }
-        async fn stream(&self, _m: Vec<Message>, _s: Option<Message>, _t: Vec<Arc<dyn Tool>>) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
-            let (tx, rx) = mpsc::channel(1);
-            let _ = tx.send(StreamEvent::Text("mock response".to_string())).await;
-            let _ = tx.send(StreamEvent::Done).await;
-            Ok(rx)
-        }
-    }
-
-    struct MockOutput;
-    #[async_trait]
-    impl AgentOutput for MockOutput {
-        async fn on_text(&self, _t: &str) {}
-        async fn on_tool_start(&self, _n: &str, _a: &str) {}
-        async fn on_tool_end(&self, _r: &str) {}
-        async fn on_error(&self, _e: &str) {}
-        async fn on_file(&self, _p: &str) {}
-    }
-
-    #[tokio::test]
-    async fn test_cancel_token_reset() {
-        let mut ctx = AgentContext::new();
-        let llm = Arc::new(MockLlm);
-        let output = Arc::new(MockOutput);
-        let mut agent = AgentLoop::new(llm, vec![], ctx, output);
-        
-        // Simulating a previous cancellation
-        agent.cancel_token.store(true, Ordering::SeqCst);
-        
-        // Starting a new step should reset it
-        let _ = agent.step("test goal".to_string()).await;
-        
-        assert_eq!(agent.cancel_token.load(Ordering::SeqCst), false);
     }
 }

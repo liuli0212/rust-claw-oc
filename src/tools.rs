@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::time::timeout;
 
-use crate::utils::truncate_log;
 
 // Helper to clean up JSON schema for strict LLM APIs like Gemini
 pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {

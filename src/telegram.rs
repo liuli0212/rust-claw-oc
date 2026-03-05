@@ -3,7 +3,7 @@ use crate::session_manager::SessionManager;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use teloxide::{prelude::*, utils::command::BotCommands};
+use teloxide::{prelude::*, utils::command::BotCommands, types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode}};
 
 struct TelegramOutput {
     bot: Bot,
@@ -91,7 +91,7 @@ impl TelegramOutput {
         }
     }
 
-    async fn send_long_message(&self, text: &str, parse_mode: Option<teloxide::types::ParseMode>) {
+    async fn send_long_message(&self, text: &str, parse_mode: Option<ParseMode>) {
         if text.is_empty() {
             return;
         }
@@ -157,12 +157,22 @@ impl AgentOutput for TelegramOutput {
             Self::escape_markdown_v2(name),
             Self::escape_markdown_v2(&summary)
         );
-        self.send_long_message(&msg, Some(teloxide::types::ParseMode::MarkdownV2)).await;
+
+        // Create an Inline Button for cancellation
+        let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback("🛑 停止任务", "cancel_task")]]);
+
+        if let Err(e) = self.bot.send_message(self.chat_id, msg)
+            .parse_mode(ParseMode::MarkdownV2)
+            .reply_markup(keyboard)
+            .await {
+                tracing::error!("Failed to send Telegram tool start message: {}", e);
+            }
     }
 
     async fn on_tool_end(&self, result: &str) {
         let mut ok = true;
         let mut display_name = "Result".to_string();
+        let mut output_text = String::new();
         
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(result) {
             if let Some(b) = val.get("ok").and_then(|v| v.as_bool()) {
@@ -171,21 +181,26 @@ impl AgentOutput for TelegramOutput {
             if let Some(n) = val.get("tool_name").and_then(|v| v.as_str()) {
                 display_name = n.to_string();
             }
+            // Extract clean output text from envelope
+            if let Some(o) = val.get("output").and_then(|v| v.as_str()) {
+                output_text = o.to_string();
+            }
         }
 
         let status_emoji = if ok { "✅" } else { "❌" };
         let mut msg = format!("{} *{}* completed", status_emoji, Self::escape_markdown_v2(&display_name));
 
-        // If failure or very short, show a snippet
-        if !ok || result.len() < 100 {
-            let lines: Vec<&str> = result.lines().collect();
-            let preview = lines.iter().take(2).cloned().collect::<Vec<_>>().join("\n");
-            if !preview.is_empty() {
-                msg.push_str(&format!("\n```\n{}\n```", Self::escape_pre_code(&preview)));
+        // Show a brief snippet for failures or very short results
+        if !ok {
+            // Truncate error output to keep telegram message manageable
+            let snippet: String = output_text.chars().take(200).collect();
+            let snippet = snippet.lines().take(3).collect::<Vec<_>>().join("\n");
+            if !snippet.is_empty() {
+                msg.push_str(&format!("\n```\n{}\n```", Self::escape_pre_code(&snippet)));
             }
         }
 
-        self.send_long_message(&msg, Some(teloxide::types::ParseMode::MarkdownV2)).await;
+        self.send_long_message(&msg, Some(ParseMode::MarkdownV2)).await;
     }
 
     async fn on_file(&self, path: &str) {
@@ -197,7 +212,7 @@ impl AgentOutput for TelegramOutput {
         }
 
         let input_file = teloxide::types::InputFile::file(path_buf.clone());
-        let ext = path_buf.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        let ext = path_buf.extension().and_then(|s| s.to_str()).unwrap_or("" ).to_lowercase();
 
         let res = match ext.as_str() {
             "png" | "jpg" | "jpeg" | "gif" | "webp" => {
@@ -216,7 +231,7 @@ impl AgentOutput for TelegramOutput {
     async fn on_error(&self, error: &str) {
         self.flush().await;
         let msg = format!("❌ *Error*: {}", Self::escape_markdown_v2(error));
-        self.send_long_message(&msg, Some(teloxide::types::ParseMode::MarkdownV2)).await;
+        self.send_long_message(&msg, Some(ParseMode::MarkdownV2)).await;
     }
 
     async fn flush(&self) {
@@ -253,13 +268,17 @@ pub async fn run_telegram_bot(token: String, session_manager: Arc<SessionManager
     tracing::info!("Starting Telegram bot");
     let bot = Bot::new(token);
 
-    let handler = Update::filter_message().branch(
-        dptree::entry()
-            .filter_command::<Command>()
-            .endpoint(handle_command),
-    ).branch(
-        dptree::endpoint(handle_message)
-    );
+    let handler = dptree::entry()
+        .branch(Update::filter_callback_query().endpoint(handle_callback_query))
+        .branch(
+            Update::filter_message()
+                .branch(
+                    dptree::entry()
+                        .filter_command::<Command>()
+                        .endpoint(handle_command),
+                )
+                .branch(dptree::endpoint(handle_message)),
+        );
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![session_manager])
@@ -267,6 +286,25 @@ pub async fn run_telegram_bot(token: String, session_manager: Arc<SessionManager
         .build()
         .dispatch()
         .await;
+}
+
+async fn handle_callback_query(
+    bot: Bot,
+    q: CallbackQuery,
+    session_manager: Arc<SessionManager>,
+) -> ResponseResult<()> {
+    if let Some(data) = q.data {
+        if data == "cancel_task" {
+            let chat_id = q.message.map(|m| m.chat().id);
+            if let Some(cid) = chat_id {
+                let session_id = format!("telegram:{}", cid);
+                session_manager.cancel_session(&session_id).await;
+                let _ = bot.answer_callback_query(q.id).text("🛑 正在请求停止任务...").await;
+                let _ = bot.send_message(cid, "🛑 正在尝试中止当前任务进程...").await;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn handle_command(
@@ -314,7 +352,7 @@ async fn handle_command(
                 max_tokens
             );
             bot.send_message(chat_id, status)
-                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                .parse_mode(ParseMode::MarkdownV2)
                 .await?;
         }
         Command::Model(args) => {
@@ -347,6 +385,13 @@ async fn handle_message(
     if let Some(text) = msg.text() {
         let chat_id = msg.chat.id;
         let session_id = format!("telegram:{}", chat_id);
+
+        // Support emoji based stop
+        if text == "🛑" || text == "🆘" || text.to_lowercase() == "stop" {
+             session_manager.cancel_session(&session_id).await;
+             bot.send_message(chat_id, "🛑 接收到紧急停止指令。").await?;
+             return Ok(());
+        }
 
         let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
 
@@ -389,6 +434,9 @@ async fn handle_message(
                     }
                     RunExit::RecoverableFailed(ref msg) | RunExit::CriticallyFailed(ref msg) => {
                         bot.send_message(chat_id, format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), msg)).await?;
+                    }
+                    RunExit::StoppedByUser => {
+                        bot.send_message(chat_id, "✅ 任务已手动中止并清理。底层的运行资源已释放，随时可以开始新任务。 ").await?;
                     }
                     _ => {}
                 }
