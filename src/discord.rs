@@ -83,26 +83,37 @@ impl EventHandler for Handler {
                     return;
                 }
             };
-        let mut agent = agent.lock().await;
-        match agent.step(msg.content).await {
-            Ok(exit) => {
-                match exit {
-                    crate::core::RunExit::AgentTurnLimitReached => {
-                        let _ = msg.channel_id.say(&ctx.http, "⚠️ [Turn Limit Reached] The agent reached the maximum allowed consecutive actions. Please type 'continue' if you want it to proceed.").await;
+
+        let content = msg.content.clone();
+        let channel_id = msg.channel_id;
+        let http = ctx.http.clone();
+
+        // Spawn agent execution in background so EventHandler returns immediately
+        tokio::spawn(async move {
+            let mut agent_guard = agent.lock().await;
+            let result = agent_guard.step(content).await;
+            drop(agent_guard);
+
+            match result {
+                Ok(exit) => {
+                    match exit {
+                        crate::core::RunExit::AgentTurnLimitReached => {
+                            let _ = channel_id.say(&http, "⚠️ [Turn Limit Reached]").await;
+                        }
+                        crate::core::RunExit::RecoverableFailed(ref e) | crate::core::RunExit::CriticallyFailed(ref e) => {
+                            let _ = channel_id.say(&http, format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), e)).await;
+                        }
+                        crate::core::RunExit::StoppedByUser => {
+                            let _ = channel_id.say(&http, "✅ Task stopped by user.").await;
+                        }
+                        _ => {}
                     }
-                    crate::core::RunExit::RecoverableFailed(ref e) | crate::core::RunExit::CriticallyFailed(ref e) => {
-                        let _ = msg
-                            .channel_id
-                            .say(&ctx.http, format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), e))
-                            .await;
-                    }
-                    _ => {}
+                }
+                Err(e) => {
+                    let _ = channel_id.say(&http, format!("Error: {}", e)).await;
                 }
             }
-            Err(e) => {
-                let _ = msg.channel_id.say(&ctx.http, format!("Error: {}", e)).await;
-            }
-        }
+        });
     }
 
     async fn ready(&self, _: Context, ready: Ready) {

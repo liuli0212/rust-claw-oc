@@ -386,7 +386,7 @@ async fn handle_message(
         let chat_id = msg.chat.id;
         let session_id = format!("telegram:{}", chat_id);
 
-        // Support emoji based stop
+        // Support emoji based stop — processed inline (no agent lock needed)
         if text == "🛑" || text == "🆘" || text.to_lowercase() == "stop" {
              session_manager.cancel_session(&session_id).await;
              bot.send_message(chat_id, "🛑 接收到紧急停止指令。").await?;
@@ -406,45 +406,54 @@ async fn handle_message(
             }
         };
 
-        // Send typing indicator in background
+        let text = text.to_string();
         let bot_clone = bot.clone();
-        let typing_done = Arc::new(tokio::sync::Notify::new());
-        let typing_done_clone = typing_done.clone();
-        
+
+        // Spawn agent execution in background so this handler returns immediately.
+        // This allows teloxide's dispatcher to process subsequent updates
+        // (stop button clicks, /cancel commands, stop text) while the agent runs.
         tokio::spawn(async move {
-            loop {
-                let _ = bot_clone.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await;
-                tokio::select! {
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
-                    _ = typing_done_clone.notified() => break,
+            // Send typing indicator in background
+            let bot_typing = bot_clone.clone();
+            let typing_done = Arc::new(tokio::sync::Notify::new());
+            let typing_done_clone = typing_done.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    let _ = bot_typing.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
+                        _ = typing_done_clone.notified() => break,
+                    }
+                }
+            });
+
+            let mut agent_guard = agent.lock().await;
+            let result = agent_guard.step(text).await;
+            drop(agent_guard); // Release lock before sending messages
+
+            typing_done.notify_one();
+
+            match result {
+                Ok(exit) => {
+                    match exit {
+                        RunExit::AgentTurnLimitReached => {
+                            let _ = bot_clone.send_message(chat_id, "⚠️ [Turn Limit Reached] The agent reached the maximum allowed consecutive actions. Please type 'continue' if you want it to proceed.").await;
+                        }
+                        RunExit::RecoverableFailed(ref msg) | RunExit::CriticallyFailed(ref msg) => {
+                            let _ = bot_clone.send_message(chat_id, format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), msg)).await;
+                        }
+                        RunExit::StoppedByUser => {
+                            let _ = bot_clone.send_message(chat_id, "✅ 任务已手动中止。随时可以开始新任务。").await;
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => {
+                    let _ = bot_clone.send_message(chat_id, format!("❌ Error: {}", e)).await;
                 }
             }
         });
-
-        let mut agent_guard = agent.lock().await;
-        let result = agent_guard.step(text.to_string()).await;
-        
-        typing_done.notify_one();
-
-        match result {
-            Ok(exit) => {
-                match exit {
-                    RunExit::AgentTurnLimitReached => {
-                        bot.send_message(chat_id, "⚠️ [Turn Limit Reached] The agent reached the maximum allowed consecutive actions. Please type 'continue' if you want it to proceed.").await?;
-                    }
-                    RunExit::RecoverableFailed(ref msg) | RunExit::CriticallyFailed(ref msg) => {
-                        bot.send_message(chat_id, format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), msg)).await?;
-                    }
-                    RunExit::StoppedByUser => {
-                        bot.send_message(chat_id, "✅ 任务已手动中止并清理。底层的运行资源已释放，随时可以开始新任务。 ").await?;
-                    }
-                    _ => {}
-                }
-            }
-            Err(e) => {
-                bot.send_message(chat_id, format!("❌ Error: {}", e)).await?;
-            }
-        }
     }
     Ok(())
 }
