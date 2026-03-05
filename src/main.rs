@@ -15,7 +15,6 @@ mod tools;
 mod utils;
 
 use crate::core::{AgentOutput, RunExit};
-use crate::llm_client::LlmClient;
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::session_manager::SessionManager;

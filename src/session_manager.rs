@@ -24,8 +24,8 @@ struct SessionEntry {
 pub struct SessionManager {
     llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     tools: Vec<Arc<dyn Tool>>,
-    // Active agent sessions (In-Memory) + their cancel tokens
-    sessions: AsyncMutex<HashMap<String, (Arc<AsyncMutex<AgentLoop>>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>,
+    // Active agent sessions (In-Memory) + their cancel mechanisms
+    sessions: AsyncMutex<HashMap<String, (Arc<AsyncMutex<AgentLoop>>, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>,
     transcript_dir: PathBuf,
     registry_path: PathBuf,
     // In-Memory Registry Cache (Fast Read/Write)
@@ -80,8 +80,10 @@ impl SessionManager {
 
     pub async fn cancel_session(&self, session_id: &str) {
         let sessions = self.sessions.lock().await;
-        if let Some((_, token)) = sessions.get(session_id) {
-            token.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some((_, notify, cancelled)) = sessions.get(session_id) {
+            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+            notify.notify_waiters();
+            tracing::info!("Cancel requested for session: {}", session_id);
         }
     }
 
@@ -91,7 +93,7 @@ impl SessionManager {
         output: Arc<dyn AgentOutput>,
     ) -> Result<Arc<AsyncMutex<AgentLoop>>, String> {
         let mut sessions = self.sessions.lock().await;
-        if let Some((agent, _)) = sessions.get(session_id) {
+        if let Some((agent, _, _)) = sessions.get(session_id) {
             // Update timestamp in memory only (fast)
             self.update_registry_entry(session_id, None, None);
             self.persist_registry_async();
@@ -111,8 +113,9 @@ impl SessionManager {
 
         let agent_loop = AgentLoop::new(llm.clone(), self.tools.clone(), context, output);
         let token = agent_loop.cancel_token.clone();
+        let cancelled = agent_loop.cancelled.clone();
         let agent = Arc::new(AsyncMutex::new(agent_loop));
-        sessions.insert(session_id.to_string(), (agent.clone(), token));
+        sessions.insert(session_id.to_string(), (agent.clone(), token, cancelled));
         Ok(agent)
     }
 
@@ -171,7 +174,7 @@ impl SessionManager {
                 }
 
                 let sessions = self.sessions.lock().await;
-                if let Some((agent_mutex, _)) = sessions.get(session_id) {
+                if let Some((agent_mutex, _, _)) = sessions.get(session_id) {
                     let mut agent = agent_mutex.lock().await;
                     agent.update_llm(new_llm);
                     Ok(format!("Updated session '{}' and global default to provider '{}' model '{:?}'", session_id, provider, model))
