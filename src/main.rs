@@ -238,11 +238,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tools.push(Arc::new(RagInsertTool::new(store.clone())));
     }
 
-    let loaded_skills = load_skills("skills");
-    let loaded_count = loaded_skills.len();
-    for skill in loaded_skills {
-        tools.push(Arc::new(skill));
-    }
+    // Skills are now dynamically loaded per-turn in the AgentLoop, 
+    // so we don't load them statically here anymore.
 
     let session_manager = Arc::new(SessionManager::new(llm_opt, tools.clone()));
 
@@ -263,7 +260,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut rl = DefaultEditor::new()?;
     println!("Welcome to Rusty-Claw! (type '/exit' to quit)");
-    if loaded_count > 0 { println!("Loaded {} dynamic skills from 'skills/' directory.", loaded_count); }
     if std::path::Path::new(".rusty_claw_task_plan.json").exists() {
         println!("\x1b[33m[System] Detected an existing task plan. If you no longer need it, use /cancel_task to clear it.\x1b[0m");
     }
