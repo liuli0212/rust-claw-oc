@@ -571,98 +571,118 @@ impl AgentContext {
     }
 
     fn strip_response_payload(fr: &mut FunctionResponse) {
-        if let Some(obj) = fr.response.as_object_mut() {
-            match fr.name.as_str() {
-                "read_file" => {
-                    let content_val = if let Some(v) = obj.get_mut("content") {
-                        Some(v)
-                    } else {
-                        obj.get_mut("result")
-                    };
+        // All tool results from core.rs are wrapped as: { "result": "{...serialized ToolExecutionEnvelope...}" }
+        // We unwrap the envelope, strip per-tool, remove noise fields, and re-serialize.
+        let obj = match fr.response.as_object_mut() {
+            Some(o) => o,
+            None => return,
+        };
+        let result_val = match obj.get_mut("result") {
+            Some(v) => v,
+            None => return,
+        };
+        let result_str = match result_val.as_str() {
+            Some(s) => s.to_string(),
+            None => return,
+        };
 
-                    if let Some(content_val) = content_val {
-                        if let Some(s) = content_val.as_str() {
-                            let line_count = s.lines().count();
-                            if line_count > 10 {
-                                let head: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
-                                let tail: String = s.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-                                *content_val = serde_json::Value::String(format!(
-                                    "{}\n... [History: Content stripped - {} lines total] ...\n{}",
-                                    head, line_count, tail
-                                ));
-                            }
-                        }
-                    }
-                },
-                "execute_bash" => {
-                    for field in ["stdout", "stderr", "result"] {
-                        if let Some(val) = obj.get_mut(field) {
-                            if let Some(s) = val.as_str() {
-                                let char_count = s.chars().count();
-                                if char_count > 500 {
-                                    let head: String = s.chars().take(200).collect();
-                                    let tail: String = s.chars().skip(char_count - 200).collect();
-                                    *val = serde_json::Value::String(format!(
-                                        "{}\n... [History: Output stripped - {} chars total] ...\n{}",
-                                        head, char_count, tail
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                },
-                "ls" | "find" | "grep" => {
-                     if let Some(files) = obj.get_mut("files").and_then(|v| v.as_array_mut()) {
-                         if files.len() > 10 {
-                             let total = files.len();
-                             files.truncate(10);
-                             files.push(serde_json::Value::String(format!("... and {} more files", total - 10)));
-                         }
-                     }
-                },
-                "web_fetch" | "web_search_tavily" => {
-                    if let Some(content) = obj.get_mut("result") {
-                        if let Some(s) = content.as_str() {
-                             *content = serde_json::Value::String(format!(
-                                "[History: Web content stripped - {} chars]", s.len()
+        // Try to parse the inner envelope JSON
+        let mut envelope: serde_json::Value = match serde_json::from_str(&result_str) {
+            Ok(v) => v,
+            Err(_) => {
+                // Not valid JSON — just truncate the raw string
+                if result_str.len() > 500 {
+                    let head: String = result_str.chars().take(200).collect();
+                    *result_val = serde_json::Value::String(format!(
+                        "{}\n... [stripped {} chars]", head, result_str.len()
+                    ));
+                }
+                return;
+            }
+        };
+
+        let env_obj = match envelope.as_object_mut() {
+            Some(o) => o,
+            None => return,
+        };
+
+        match fr.name.as_str() {
+            "task_plan" => {
+                // Plan is always in system prompt; replace entire result
+                *result_val = serde_json::Value::String("[plan updated]".to_string());
+                return;
+            },
+            "read_file" => {
+                if let Some(output) = env_obj.get_mut("output") {
+                    if let Some(s) = output.as_str() {
+                        let line_count = s.lines().count();
+                        if line_count > 10 {
+                            let head: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
+                            let tail: String = s.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                            *output = serde_json::Value::String(format!(
+                                "{}\n... [stripped {} lines] ...\n{}", head, line_count, tail
                             ));
                         }
                     }
-                },
-                "skill" | "use_skill" => {
-                    let msg_val = if let Some(v) = obj.get_mut("message") {
-                        Some(v)
-                    } else {
-                        obj.get_mut("result")
-                    };
-
-                    if let Some(msg) = msg_val {
-                         *msg = serde_json::Value::String("Skill loaded and active.".to_string());
+                }
+            },
+            "execute_bash" => {
+                if let Some(output) = env_obj.get_mut("output") {
+                    if let Some(s) = output.as_str() {
+                        let char_count = s.chars().count();
+                        if char_count > 500 {
+                            let head: String = s.chars().take(200).collect();
+                            let tail: String = s.chars().skip(char_count - 200).collect();
+                            *output = serde_json::Value::String(format!(
+                                "{}\n... [stripped {} chars] ...\n{}", head, char_count, tail
+                            ));
+                        }
                     }
-                },
-                "task_plan" => {
-                    // Task plan is always injected in the system prompt, so historical responses
-                    // are redundant. Replace with minimal marker to save tokens.
-                    // Note: fr.response structure is { "result": "{...serialized envelope...}" }
-                    if let Some(result_val) = obj.get_mut("result") {
-                        *result_val = serde_json::Value::String("[plan updated]".to_string());
+                }
+            },
+            "web_fetch" | "web_search_tavily" => {
+                if let Some(output) = env_obj.get_mut("output") {
+                    if let Some(s) = output.as_str() {
+                        *output = serde_json::Value::String(format!(
+                            "[web content stripped - {} chars]", s.len()
+                        ));
                     }
-                },
-                _ => {
-                    for (_k, v) in obj.iter_mut() {
-                        if let Some(s) = v.as_str() {
-                            if s.len() > 1000 {
-                                let head: String = s.chars().take(500).collect();
-                                let tail: String = s.chars().skip(s.chars().count() - 200).collect();
-                                *v = serde_json::Value::String(format!(
-                                    "{}\n... [History: Value stripped - {} chars] ...\n{}",
-                                    head, s.len(), tail
-                                ));
-                            }
+                }
+            },
+            "skill" | "use_skill" => {
+                if let Some(output) = env_obj.get_mut("output") {
+                    *output = serde_json::Value::String("Skill loaded.".to_string());
+                }
+            },
+            "write_file" | "patch_file" => {
+                // Already small, keep as-is
+            },
+            _ => {
+                // Generic: truncate output if large
+                if let Some(output) = env_obj.get_mut("output") {
+                    if let Some(s) = output.as_str() {
+                        if s.len() > 500 {
+                            let head: String = s.chars().take(200).collect();
+                            let tail: String = s.chars().skip(s.chars().count() - 100).collect();
+                            *output = serde_json::Value::String(format!(
+                                "{}\n... [stripped {} chars] ...\n{}", head, s.len(), tail
+                            ));
                         }
                     }
                 }
             }
+        }
+
+        // Strip noise fields from envelope to save tokens
+        env_obj.remove("duration_ms");
+        env_obj.remove("truncated");
+        env_obj.remove("recovery_attempted");
+        env_obj.remove("recovery_output");
+        env_obj.remove("recovery_rule");
+
+        // Re-serialize the stripped envelope back
+        if let Ok(stripped_str) = serde_json::to_string(env_obj) {
+            *result_val = serde_json::Value::String(stripped_str);
         }
     }
 
