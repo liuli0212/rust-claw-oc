@@ -227,6 +227,12 @@ impl AgentLoop {
             }
 
             let (messages, system, _) = self.context.build_llm_payload();
+            
+            // Dynamically load skills on every turn so we don't need to restart
+            let mut current_tools = self.tools.clone();
+            for skill in crate::skills::load_skills("skills") {
+                current_tools.push(Arc::new(skill));
+            }
 
             let mut llm_attempts = 0;
             let mut tool_calls_accumulated: Vec<(crate::context::FunctionCall, Option<String>)> = Vec::new();
@@ -235,7 +241,7 @@ impl AgentLoop {
                 llm_attempts += 1;
                 
                 let stream_res = tokio::select! {
-                    res = self.llm.stream(messages.clone(), system.clone(), self.tools.clone()) => res,
+                    res = self.llm.stream(messages.clone(), system.clone(), current_tools.clone()) => res,
                     _ = self.cancel_token.notified() => {
                         self.context.end_turn();
                         return Ok(RunExit::StoppedByUser);
