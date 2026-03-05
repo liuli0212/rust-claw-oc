@@ -640,6 +640,13 @@ impl AgentContext {
                          *msg = serde_json::Value::String("Skill loaded and active.".to_string());
                     }
                 },
+                "task_plan" => {
+                    // Task plan is always injected in the system prompt, so historical responses
+                    // are redundant. Replace with minimal marker to save tokens.
+                    if let Some(output) = obj.get_mut("output") {
+                        *output = serde_json::Value::String("[History: plan state updated]".to_string());
+                    }
+                },
                 _ => {
                     for (_k, v) in obj.iter_mut() {
                         if let Some(s) = v.as_str() {

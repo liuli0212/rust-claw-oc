@@ -26,6 +26,10 @@ pub trait AgentOutput: Send + Sync {
     async fn flush(&self) {
         // Default: no-op (CLI doesn't need buffering)
     }
+    async fn on_file(&self, path: &str) {
+        // Default: just notify that a file was created
+        self.on_text(&format!("[File] Created: {}\\n", path)).await;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -417,6 +421,15 @@ impl AgentLoop {
                     self.output.on_error(&result).await;
                 } else {
                     self.output.on_tool_end(&result).await;
+
+                    // Specific logic for send_file: actually call on_file
+                    if call.name == "send_file" {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&result) {
+                            if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
+                                self.output.on_file(path).await;
+                            }
+                        }
+                    }
                 }
 
                 // Add tool result to context
@@ -479,6 +492,7 @@ mod tests {
         async fn on_tool_start(&self, _n: &str, _a: &str) {}
         async fn on_tool_end(&self, _r: &str) {}
         async fn on_error(&self, _e: &str) {}
+        async fn on_file(&self, _p: &str) {}
     }
 
     #[tokio::test]

@@ -188,6 +188,31 @@ impl AgentOutput for TelegramOutput {
         self.send_long_message(&msg, Some(teloxide::types::ParseMode::MarkdownV2)).await;
     }
 
+    async fn on_file(&self, path: &str) {
+        self.flush().await;
+        let path_buf = std::path::PathBuf::from(path);
+        if !path_buf.exists() {
+            tracing::error!("File not found for Telegram sending: {}", path);
+            return;
+        }
+
+        let input_file = teloxide::types::InputFile::file(path_buf.clone());
+        let ext = path_buf.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+
+        let res = match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "gif" | "webp" => {
+                self.bot.send_photo(self.chat_id, input_file).await
+            }
+            _ => {
+                self.bot.send_document(self.chat_id, input_file).await
+            }
+        };
+
+        if let Err(e) = res {
+            tracing::error!("Failed to send file to Telegram: {}", e);
+        }
+    }
+
     async fn on_error(&self, error: &str) {
         self.flush().await;
         let msg = format!("❌ *Error*: {}", Self::escape_markdown_v2(error));
