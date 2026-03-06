@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::time::timeout;
 
+use crate::telemetry;
 
 // Helper to clean up JSON schema for strict LLM APIs like Gemini
 pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
@@ -70,6 +71,8 @@ pub struct ToolExecutionEnvelope {
     pub ok: bool,
     pub tool_name: String,
     pub output: String,
+    #[serde(default)]
+    pub data: Option<Value>,
     pub exit_code: Option<i32>,
     pub duration_ms: Option<u128>,
     pub truncated: bool,
@@ -89,10 +92,31 @@ fn serialize_tool_envelope(
     duration_ms: Option<u128>,
     truncated: bool,
 ) -> Result<String, ToolError> {
+    serialize_tool_envelope_with_data(
+        tool_name,
+        ok,
+        output,
+        None,
+        exit_code,
+        duration_ms,
+        truncated,
+    )
+}
+
+fn serialize_tool_envelope_with_data(
+    tool_name: &str,
+    ok: bool,
+    output: String,
+    data: Option<Value>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u128>,
+    truncated: bool,
+) -> Result<String, ToolError> {
     let envelope = ToolExecutionEnvelope {
         ok,
         tool_name: tool_name.to_string(),
         output,
+        data,
         exit_code,
         duration_ms,
         truncated,
@@ -172,13 +196,14 @@ impl Tool for BashTool {
         cmd.arg("-c");
         cmd.arg(&cmd_str);
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| {
-                tracing::error!("BashTool Error: Failed to spawn command '{}' - {}", cmd_str, e);
-                ToolError::ExecutionFailed(e.to_string())
-            })?;
+        let child = pair.slave.spawn_command(cmd).map_err(|e| {
+            tracing::error!(
+                "BashTool Error: Failed to spawn command '{}' - {}",
+                cmd_str,
+                e
+            );
+            ToolError::ExecutionFailed(e.to_string())
+        })?;
         let child = std::sync::Arc::new(std::sync::Mutex::new(child));
         drop(pair.slave); // Crucial: close slave so master gets EOF
 
@@ -289,7 +314,8 @@ impl Tool for PatchFileTool {
     }
 
     fn description(&self) -> String {
-        "Applies a unified diff patch to a file. This is the preferred way to edit existing files.".to_string()
+        "Applies a unified diff patch to a file. This is the preferred way to edit existing files."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -324,7 +350,11 @@ impl Tool for PatchFileTool {
         serialize_tool_envelope(
             "patch_file",
             ok,
-            if ok { stdout } else { format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr) },
+            if ok {
+                stdout
+            } else {
+                format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr)
+            },
             output.status.code(),
             Some(start.elapsed().as_millis()),
             false,
@@ -475,28 +505,49 @@ impl Tool for RagSearchTool {
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let parsed: RagSearchArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        let search_span = telemetry::retrieval_search_span(&parsed.query);
+        let _search_guard = search_span.enter();
 
         let limit = parsed.limit.unwrap_or(3);
 
         let results = self
             .store
-            .search(&parsed.query, limit)
+            .search_hits(&parsed.query, limit)
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         if results.is_empty() {
-            return Ok("No relevant information found in the knowledge base.".to_string());
+            return serialize_tool_envelope_with_data(
+                "search_knowledge_base",
+                true,
+                "No relevant information found in the knowledge base.".to_string(),
+                Some(serde_json::json!([])),
+                None,
+                None,
+                false,
+            );
         }
 
         let mut res = String::new();
         res.push_str("Found the following relevant snippets:\n\n");
-        for (content, source, distance) in results {
+        for hit in &results {
             res.push_str(&format!(
                 "--- Source: {} (Relevance: {:.2}) ---\n{}\n\n",
-                source, distance, content
+                hit.source, hit.relevance, hit.content
             ));
         }
 
-        Ok(res)
+        serialize_tool_envelope_with_data(
+            "search_knowledge_base",
+            true,
+            res,
+            Some(
+                serde_json::to_value(&results)
+                    .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
+            ),
+            None,
+            None,
+            false,
+        )
     }
 }
 
@@ -540,6 +591,8 @@ impl Tool for RagInsertTool {
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
         let parsed: RagInsertArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        let memory_span = telemetry::memory_promote_span(&parsed.source);
+        let _memory_guard = memory_span.enter();
 
         self.store
             .insert_chunk(parsed.content, parsed.source)
@@ -726,9 +779,7 @@ impl Tool for WebFetchTool {
                 false,
                 format!(
                     "Failed to fetch URL. HTTP: {} | URL: {} | Body: {}",
-                    status,
-                    url,
-                    raw_body
+                    status, url, raw_body
                 ),
                 Some(1),
                 Some(start.elapsed().as_millis()),
@@ -987,7 +1038,10 @@ impl Tool for TaskPlanTool {
                     ToolError::InvalidArguments("update_status requires 'index'".to_string())
                 })?;
                 if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!("index {} out of bounds", index)));
+                    return Err(ToolError::InvalidArguments(format!(
+                        "index {} out of bounds",
+                        index
+                    )));
                 }
                 let status = parsed.status.ok_or_else(|| {
                     ToolError::InvalidArguments("update_status requires 'status'".to_string())
@@ -1003,7 +1057,10 @@ impl Tool for TaskPlanTool {
                     ToolError::InvalidArguments("update_text requires 'index'".to_string())
                 })?;
                 if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!("index {} out of bounds", index)));
+                    return Err(ToolError::InvalidArguments(format!(
+                        "index {} out of bounds",
+                        index
+                    )));
                 }
                 if let Some(step) = parsed.step {
                     state.items[index].step = step;
@@ -1018,13 +1075,19 @@ impl Tool for TaskPlanTool {
                     ToolError::InvalidArguments("remove requires 'index'".to_string())
                 })?;
                 if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!("index {} out of bounds", index)));
+                    return Err(ToolError::InvalidArguments(format!(
+                        "index {} out of bounds",
+                        index
+                    )));
                 }
                 state.items.remove(index);
                 self.save_state(&state)?;
             }
             _ => {
-                return Err(ToolError::InvalidArguments(format!("unsupported action '{}'", parsed.action)));
+                return Err(ToolError::InvalidArguments(format!(
+                    "unsupported action '{}'",
+                    parsed.action
+                )));
             }
         }
 
@@ -1041,14 +1104,12 @@ impl Tool for TaskPlanTool {
     }
 }
 
-
 // --- Finish Task Tool ---
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct FinishTaskArgs {
     /// A summary of what was accomplished and the final answer to the user
     pub summary: String,
 }
-
 
 pub struct FinishTaskTool;
 
@@ -1064,17 +1125,24 @@ pub struct SendFileArgs {
 pub struct SendFileTool;
 #[async_trait]
 impl Tool for SendFileTool {
-    fn name(&self) -> String { "send_file".to_string() }
-    fn description(&self) -> String { "Sends a file (image, document, audio, etc.) to the user's chat.".to_string() }
+    fn name(&self) -> String {
+        "send_file".to_string()
+    }
+    fn description(&self) -> String {
+        "Sends a file (image, document, audio, etc.) to the user's chat.".to_string()
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         clean_schema(serde_json::to_value(schemars::schema_for!(SendFileArgs)).unwrap())
     }
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
-        let parsed: SendFileArgs = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        
+        let parsed: SendFileArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
         if !std::path::Path::new(&parsed.path).exists() {
-             return Err(ToolError::ExecutionFailed(format!("File not found: {}", parsed.path)));
+            return Err(ToolError::ExecutionFailed(format!(
+                "File not found: {}",
+                parsed.path
+            )));
         }
 
         Ok(serde_json::json!({
@@ -1082,20 +1150,28 @@ impl Tool for SendFileTool {
             "tool_name": "send_file",
             "path": parsed.path,
             "output": format!("File {} sent to user.", parsed.path)
-        }).to_string())
+        })
+        .to_string())
     }
 }
 #[async_trait]
 impl Tool for FinishTaskTool {
-    fn name(&self) -> String { "finish_task".to_string() }
-    fn description(&self) -> String { "Call this tool ONLY when you have fully completed the user's request and have nothing else to do. This will end your execution loop.".to_string() }
+    fn name(&self) -> String {
+        "finish_task".to_string()
+    }
+    fn description(&self) -> String {
+        "Call this tool ONLY when you have fully completed the user's request and have nothing else to do. This will end your execution loop.".to_string()
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         clean_schema(serde_json::to_value(schemars::schema_for!(FinishTaskArgs)).unwrap())
     }
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
-        let parsed: FinishTaskArgs = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        Ok(format!("Task marked as finished. Summary: {}", parsed.summary))
+        let parsed: FinishTaskArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        Ok(format!(
+            "Task marked as finished. Summary: {}",
+            parsed.summary
+        ))
     }
 }
 
