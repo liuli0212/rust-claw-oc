@@ -70,6 +70,13 @@ Per-session append-only file:
 
 This is the authoritative record of task progression.
 
+The writer model for v1 must be serialized. Event appends must go through one of these approved mechanisms:
+
+- a per-session MPSC append queue drained by a single writer task
+- a per-session async mutex guarding file append operations
+
+Concurrent direct writes to the same JSONL file are not allowed.
+
 ### D2. Materialized Task State
 
 Per-session derived snapshot:
@@ -85,6 +92,13 @@ Per-session artifact directory:
 - `rusty_claw/artifacts/<session_id>/<run_id>/...`
 
 Large tool outputs are stored here with typed metadata.
+
+The artifact store must also enforce a basic retention policy in v1:
+
+- age-based cleanup for stale artifacts
+- size-based protection to cap total artifact growth
+
+The exact policy is defined later in this document and must be implemented before artifactization is enabled by default.
 
 ### D4. Evidence Model
 
@@ -276,6 +290,7 @@ Suggested structure:
   "semantic_type": "command-output",
   "path": "rusty_claw/artifacts/cli/run_001/output.log",
   "summary": "cargo test output",
+  "is_truncated": false,
   "created_at": 1735689605
 }
 ```
@@ -343,6 +358,9 @@ To make eviction replayable:
 - scores must be explicit
 - tiebreakers must be stable
 - ordering cannot depend on hash-map iteration
+- if two items have the same `priority_score`, the first tiebreaker is newest `retrieved_at`
+- if `retrieved_at` is identical or unavailable, the second tiebreaker is lexical `id`
+- randomness, insertion-order accidents, and memory-address ordering are forbidden
 
 ### Tombstones
 
@@ -391,6 +409,8 @@ Initial spans:
 - `artifact.write`
 - `memory.promote`
 
+Telemetry export must be asynchronous. Exporters must use a background batch processor or equivalent buffering so span emission never blocks the inference loop or foreground tool execution.
+
 ### Metrics
 
 Initial metrics:
@@ -414,6 +434,16 @@ Each turn should have:
 
 This makes logs, telemetry, and persisted state easy to correlate.
 
+### Artifact retention
+
+V1 retention policy should be simple and deterministic:
+
+- delete artifact runs older than 7 days when a cleanup pass runs
+- cap total artifact store size per workspace at 500 MB
+- when over cap, delete the oldest fully expired runs first
+- if the store is still over cap, continue deleting oldest runs by `created_at`
+- never delete artifacts referenced by the active turn while that turn is in progress
+
 ## Coding Task Checklist
 
 This checklist is the intended coding breakdown after the implementation plan is approved.
@@ -430,6 +460,7 @@ This checklist is the intended coding breakdown after the implementation plan is
 - create `src/event_log.rs`
 - define `AgentEvent` enum and event payload structs
 - implement append-only JSONL writer
+- implement a serialized append path using either per-session MPSC or async mutex
 - implement event reader and replay iterator
 - add event emission for:
 - `TaskStarted`
@@ -454,6 +485,8 @@ This checklist is the intended coding breakdown after the implementation plan is
 - define artifact metadata model
 - implement artifact ID generation
 - implement file layout under `rusty_claw/artifacts/...`
+- add `is_truncated` to artifact metadata and set it explicitly on partial saves
+- implement retention policy enforcement and garbage-collection entry points
 - integrate artifact creation into tool execution flow for large outputs
 - add tests for artifact pathing, metadata generation, and large-output routing
 
@@ -545,6 +578,9 @@ We should explicitly test:
 - over-budget prompt assembly
 - session restore with missing derived state but intact event log
 - cancellation during tool execution
+- concurrent event append attempts preserving valid JSONL boundaries
+- telemetry exporter slowdown not blocking the foreground execution path
+- artifact retention deleting only expired or over-budget artifacts
 
 ### Backward-compatibility checks
 
@@ -626,6 +662,7 @@ Outputs:
 
 - easier debugging of cases where tool output was summarized incorrectly
 - traceability from prompt evidence back to raw artifact
+- visibility into retention cleanup and deleted-byte volume
 
 ### Stage 4: Replay and offline analysis
 
@@ -700,11 +737,13 @@ Changes:
 - emit `TaskStarted`
 - emit plan and tool execution events
 - create `events.jsonl` per session
+- enforce serialized event append semantics before writing production events
 
 Acceptance:
 
 - every turn produces replayable events
 - no task state yet depends on overwrite-only mutation
+- concurrent append stress tests preserve valid JSONL output
 
 ### Phase 2: Materialized Task State
 
@@ -733,11 +772,14 @@ Changes:
 - add artifact writer
 - store metadata next to artifacts
 - update tool execution flow in `src/core.rs`
+- add retention policy and cleanup trigger points
+- mark partial artifact writes with `is_truncated`
 
 Acceptance:
 
 - large tool outputs generate artifacts
 - transcript and task state only keep summaries and references
+- artifact cleanup remains deterministic and does not remove active-turn artifacts
 
 ### Phase 4: Evidence Objects And Freshness
 
@@ -783,10 +825,12 @@ Changes:
 - add OTel spans
 - add counters and histograms
 - add correlation IDs
+- use asynchronous batch export so telemetry does not block execution
 
 Acceptance:
 
 - execution lifecycle is visible in trace data
+- telemetry can be disabled or slowed without stalling the foreground loop
 
 ## File-Level Work Plan
 
@@ -836,6 +880,8 @@ These are the key questions reviewers should answer before coding begins:
 4. Is the proposed cache-aware prompt ordering acceptable across all supported providers?
 5. Is the deterministic eviction model acceptable, or do reviewers want a stricter algorithm now?
 6. Are artifact storage paths and metadata fields sufficient for downstream tooling?
+7. Is the proposed serialized event-writer model acceptable for v1, or do reviewers require queue-based append from day one?
+8. Is the proposed artifact retention policy acceptable for local workspaces?
 
 ## Definition Of Done
 
