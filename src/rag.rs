@@ -1,3 +1,4 @@
+use crate::schema::memory_db_path;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,13 @@ pub struct RagChunk {
     pub content: String,
     pub source: String,
     pub embedding: Vec<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct RagSearchHit {
+    pub content: String,
+    pub source: String,
+    pub relevance: f32,
 }
 
 pub struct VectorStore {
@@ -32,7 +40,7 @@ impl VectorStore {
         let model = TextEmbedding::try_new(opts)?;
 
         // Open a SQLite connection for hybrid search
-        let conn = Connection::open(".rusty_claw_memory.db")?;
+        let conn = Connection::open(memory_db_path(&std::env::current_dir()?))?;
 
         // Initialize the tables
         // 1. chunks: The source of truth
@@ -147,6 +155,18 @@ impl VectorStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(String, String, f32)>, Box<dyn std::error::Error>> {
+        Ok(self
+            .search_hits(query, limit)?
+            .into_iter()
+            .map(|hit| (hit.content, hit.source, hit.relevance))
+            .collect())
+    }
+
+    pub fn search_hits(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<RagSearchHit>, Box<dyn std::error::Error>> {
         let _start = Instant::now();
 
         // 1. Generate query embedding
@@ -221,11 +241,19 @@ impl VectorStore {
 
             let final_score =
                 (normalized_v * vector_weight) + (normalized_k as f32 * keyword_weight);
-            results.push((chunk.content.clone(), chunk.source.clone(), final_score));
+            results.push(RagSearchHit {
+                content: chunk.content.clone(),
+                source: chunk.source.clone(),
+                relevance: final_score,
+            });
         }
 
         // Sort by final score
-        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
 
         // if results.len() > 0 {
@@ -261,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_rag_hybrid_search() {
-        let _ = std::fs::remove_file(".rusty_claw_memory.db");
+        let _ = std::fs::remove_file(memory_db_path(&std::env::current_dir().unwrap()));
         let store = VectorStore::new().expect("Failed to init");
 
         store
