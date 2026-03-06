@@ -25,7 +25,16 @@ pub struct SessionManager {
     llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     tools: Vec<Arc<dyn Tool>>,
     // Active agent sessions (In-Memory) + their cancel mechanisms
-    sessions: AsyncMutex<HashMap<String, (Arc<AsyncMutex<AgentLoop>>, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>,
+    sessions: AsyncMutex<
+        HashMap<
+            String,
+            (
+                Arc<AsyncMutex<AgentLoop>>,
+                std::sync::Arc<tokio::sync::Notify>,
+                std::sync::Arc<std::sync::atomic::AtomicBool>,
+            ),
+        >,
+    >,
     transcript_dir: PathBuf,
     registry_path: PathBuf,
     // In-Memory Registry Cache (Fast Read/Write)
@@ -61,16 +70,16 @@ impl SessionManager {
 
     pub async fn reset_session(&self, session_id: &str) {
         let mut sessions = self.sessions.lock().await;
-        
+
         // Remove from memory
         sessions.remove(session_id);
-        
+
         // Delete transcript file if it exists
         let transcript_path = transcript_path_for_session(&self.transcript_dir, session_id);
         if transcript_path.exists() {
             let _ = std::fs::remove_file(&transcript_path);
         }
-        
+
         // Remove from registry
         if let Ok(mut registry) = self.registry_cache.write() {
             registry.sessions.remove(session_id);
@@ -109,9 +118,26 @@ impl SessionManager {
         self.persist_registry_async();
 
         let llm_guard = self.llm.read().unwrap();
-        let llm = llm_guard.as_ref().ok_or_else(|| "No LLM provider configured. Use /model <provider> to set one.".to_string())?;
+        let llm = llm_guard.as_ref().ok_or_else(|| {
+            "No LLM provider configured. Use /model <provider> to set one.".to_string()
+        })?;
 
-        let agent_loop = AgentLoop::new(llm.clone(), self.tools.clone(), context, output);
+        // Initialize Context Management Subsystems
+        let (telemetry, _telemetry_handle) = crate::telemetry::TelemetryExporter::new();
+        let telemetry = Arc::new(telemetry);
+        let event_log = Arc::new(crate::event_log::EventLog::new(session_id));
+        let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(session_id));
+
+        let agent_loop = AgentLoop::new(
+            session_id.to_string(),
+            llm.clone(),
+            self.tools.clone(),
+            context,
+            output,
+            telemetry,
+            event_log,
+            task_state_store,
+        );
         let token = agent_loop.cancel_token.clone();
         let cancelled = agent_loop.cancelled.clone();
         let agent = Arc::new(AsyncMutex::new(agent_loop));
@@ -162,7 +188,12 @@ impl SessionManager {
             let _ = fs::write(&registry_path, serialized);
         });
     }
-    pub async fn update_session_llm(&self, session_id: &str, provider: &str, model: Option<String>) -> Result<String, String> {
+    pub async fn update_session_llm(
+        &self,
+        session_id: &str,
+        provider: &str,
+        model: Option<String>,
+    ) -> Result<String, String> {
         let config = crate::config::AppConfig::load();
         // We use the factory function from llm_client
         match crate::llm_client::create_llm_client(provider, model.clone(), &config) {
@@ -177,17 +208,19 @@ impl SessionManager {
                 if let Some((agent_mutex, _, _)) = sessions.get(session_id) {
                     let mut agent = agent_mutex.lock().await;
                     agent.update_llm(new_llm);
-                    Ok(format!("Updated session '{}' and global default to provider '{}' model '{:?}'", session_id, provider, model))
+                    Ok(format!(
+                        "Updated session '{}' and global default to provider '{}' model '{:?}'",
+                        session_id, provider, model
+                    ))
                 } else {
                     // Even if session doesn't exist, we updated the global default.
                     Ok(format!("Updated global default to provider '{}' model '{:?}'. (Session '{}' not yet active)", provider, model, session_id))
                 }
             }
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 }
-
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()

@@ -146,7 +146,7 @@ impl VectorStore {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<(String, String, f32)>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<crate::evidence::Evidence>, Box<dyn std::error::Error>> {
         let _start = Instant::now();
 
         // 1. Generate query embedding
@@ -221,18 +221,28 @@ impl VectorStore {
 
             let final_score =
                 (normalized_v * vector_weight) + (normalized_k as f32 * keyword_weight);
-            results.push((chunk.content.clone(), chunk.source.clone(), final_score));
+            results.push((chunk.clone(), final_score));
         }
 
         // Sort by final score
-        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
 
-        // if results.len() > 0 {
-        //     println!("[RAG] Search finished in {}ms. Top score: {}", start.elapsed().as_millis(), results[0].2);
-        // }
+        let mut structured_evidence = Vec::new();
+        for (chunk, score) in results {
+             let evidence_id = format!("rag_{}", chunk.id);
+             let ev = crate::evidence::Evidence::new(
+                 evidence_id,
+                 "memory".to_string(),
+                 chunk.source.clone(),
+                 score,
+                 format!("RAG chunk from {}", chunk.source),
+                 chunk.content.clone(),
+             );
+             structured_evidence.push(ev);
+        }
 
-        Ok(results)
+        Ok(structured_evidence)
     }
 }
 

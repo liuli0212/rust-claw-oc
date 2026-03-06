@@ -1,11 +1,8 @@
-use crate::context::{
-    AgentContext, FunctionResponse, Message, Part, ContextDiff
-};
+use crate::context::{AgentContext, ContextDiff, FunctionResponse, Message, Part};
 use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -60,10 +57,14 @@ struct TaskState {
 }
 
 pub struct AgentLoop {
+    session_id: String,
     llm: Arc<dyn LlmClient>,
     tools: Vec<Arc<dyn Tool>>,
     context: AgentContext,
     output: Arc<dyn AgentOutput>,
+    telemetry: Arc<crate::telemetry::TelemetryExporter>,
+    event_log: Arc<crate::event_log::EventLog>,
+    task_state_store: Arc<crate::task_state::TaskStateStore>,
     pub cancel_token: Arc<Notify>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -75,23 +76,32 @@ impl AgentLoop {
     const INITIAL_ENERGY: usize = 100;
 
     pub fn new(
+        session_id: String,
         llm: Arc<dyn LlmClient>,
         tools: Vec<Arc<dyn Tool>>,
         context: AgentContext,
         output: Arc<dyn AgentOutput>,
+        telemetry: Arc<crate::telemetry::TelemetryExporter>,
+        event_log: Arc<crate::event_log::EventLog>,
+        task_state_store: Arc<crate::task_state::TaskStateStore>,
     ) -> Self {
         Self {
+            session_id,
             llm,
             tools,
             context,
             output,
+            telemetry,
+            event_log,
+            task_state_store,
             cancel_token: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     pub fn request_cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.cancel_token.notify_waiters();
     }
 
@@ -123,7 +133,10 @@ impl AgentLoop {
     }
 
     pub fn diff_snapshot(&self) -> Option<ContextDiff> {
-        self.context.last_snapshot.as_ref().map(|old| self.context.diff_snapshot(old))
+        self.context
+            .last_snapshot
+            .as_ref()
+            .map(|old| self.context.diff_snapshot(old))
     }
 
     pub fn format_diff(&self, diff: &ContextDiff) -> String {
@@ -133,17 +146,27 @@ impl AgentLoop {
     pub fn inspect_context(&self, section: &str, arg: Option<&str>) -> String {
         self.context.inspect_context(section, arg)
     }
-    
-    pub fn build_llm_payload(&self) -> (Vec<Message>, Option<Message>, crate::context::PromptReport) {
-        self.context.build_llm_payload()
+
+    pub fn build_llm_payload(
+        &self,
+    ) -> (Vec<Message>, Option<Message>, crate::context::PromptReport) {
+        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        let max_tokens = self.context.max_history_tokens; 
+        let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
+        self.context.build_llm_payload(&state, &assembler)
     }
 
-    pub async fn force_compact(&mut self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn force_compact(
+        &mut self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         self.maybe_compact_history(true).await?;
         Ok("Compaction triggered.".to_string())
     }
 
-    async fn maybe_compact_history(&mut self, force: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn maybe_compact_history(
+        &mut self,
+        force: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (current_usage, max_tokens, _, _, _) = self.context.get_context_status();
         let threshold = (max_tokens as f64 * 0.85) as usize;
 
@@ -154,13 +177,20 @@ impl AgentLoop {
         // Target: free up ~30% of max tokens worth of history
         let target_tokens = max_tokens.saturating_mul(30) / 100;
         let min_turns = 2;
-        let num_to_compact = self.context.oldest_turns_for_compaction(target_tokens, min_turns);
+        let num_to_compact = self
+            .context
+            .oldest_turns_for_compaction(target_tokens, min_turns);
 
         if num_to_compact == 0 {
             return Ok(());
         }
 
-        tracing::info!("Compacting {} oldest turns (usage={}, threshold={})", num_to_compact, current_usage, threshold);
+        tracing::info!(
+            "Compacting {} oldest turns (usage={}, threshold={})",
+            num_to_compact,
+            current_usage,
+            threshold
+        );
 
         if let Some(reason) = self.context.rule_based_compact(num_to_compact) {
             self.output.on_text(&format!("[System] {}\n", reason)).await;
@@ -171,23 +201,58 @@ impl AgentLoop {
 
     fn is_transient_llm_error(err: &crate::llm_client::LlmError) -> bool {
         let msg = format!("{}", err).to_lowercase();
-        msg.contains("timeout") || msg.contains("500") || msg.contains("502") || msg.contains("503") || msg.contains("rate limit")
+        msg.contains("timeout")
+            || msg.contains("500")
+            || msg.contains("502")
+            || msg.contains("503")
+            || msg.contains("rate limit")
     }
 
     async fn handle_llm_error(&self, err: &crate::llm_client::LlmError, attempt: usize) -> bool {
         if Self::is_transient_llm_error(err) && attempt < Self::MAX_LLM_RECOVERY_ATTEMPTS {
             let exponent = (attempt as u32).min(6);
             let backoff_ms = 500u64.saturating_mul(2u64.pow(exponent));
-            self.output.on_text(&format!("[System] Transient error. Retrying in {} ms... (Attempt {}/{})\n", backoff_ms, attempt, Self::MAX_LLM_RECOVERY_ATTEMPTS)).await;
+            self.output
+                .on_text(&format!(
+                    "[System] Transient error. Retrying in {} ms... (Attempt {}/{})\n",
+                    backoff_ms,
+                    attempt,
+                    Self::MAX_LLM_RECOVERY_ATTEMPTS
+                ))
+                .await;
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             return true;
         }
         false
     }
 
-    pub async fn step(&mut self, goal: String) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
+    async fn emit_agent_event(
+        &self,
+        event_type: &str,
+        task_id: Option<String>,
+        payload: serde_json::Value,
+    ) {
+        let event = crate::event_log::AgentEvent::new(
+            event_type,
+            &self.session_id,
+            task_id,
+            self.context.current_turn.as_ref().map(|t| t.turn_id.clone()),
+            payload,
+        );
+        let _ = self.event_log.append(event.clone()).await;
+        if let Ok(mut state) = self.task_state_store.load() {
+            state.apply_event(&event);
+            let _ = self.task_state_store.save(&state);
+        }
+    }
+
+    pub async fn step(
+        &mut self,
+        goal: String,
+    ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
         // Reset cancel flag at start of each step
-        self.cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.context.take_snapshot();
 
         let mut task_state = TaskState {
@@ -198,16 +263,45 @@ impl AgentLoop {
         let mut compaction_checked = false;
         let mut consecutive_empty_responses = 0;
 
-        self.context.start_turn(goal);
+        self.context.start_turn(goal.clone());
+
+        // Emit TaskStarted if no task ID exists yet
+        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        let current_task_id = state.task_id.unwrap_or_else(|| format!("tsk_{}", uuid::Uuid::new_v4().simple()));
+        
+        // Emitting Task Started if new (this is a simple proxy for new task for now)
+        if state.status == "initialized" {
+            self.emit_agent_event(
+                "TaskStarted",
+                Some(current_task_id.clone()),
+                serde_json::json!({ "goal": goal }),
+            ).await;
+        }
+
+        let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
+        let artifact_store = crate::artifact_store::ArtifactStore::new(&self.session_id, &run_id);
+
+        let c_ids = crate::schema::CorrelationIds {
+            session_id: self.session_id.clone(),
+            task_id: Some(current_task_id.clone()),
+            turn_id: self.context.current_turn.as_ref().map(|t| t.turn_id.clone()),
+            event_id: None,
+        };
+        self.telemetry.start_span("agent_step", c_ids.clone());
 
         loop {
             // Check persistent cancel flag at top of each iteration
             if self.is_cancelled() {
                 self.context.end_turn();
+                self.telemetry.end_span("agent_step");
                 return Ok(RunExit::StoppedByUser);
+
             }
             if task_state.iterations >= Self::MAX_ITERATIONS {
-                tracing::warn!("Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.", Self::MAX_ITERATIONS);
+                tracing::warn!(
+                    "Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.",
+                    Self::MAX_ITERATIONS
+                );
                 self.context.end_turn();
                 return Ok(RunExit::AgentTurnLimitReached);
             }
@@ -215,10 +309,12 @@ impl AgentLoop {
             task_state.energy_points = task_state.energy_points.saturating_sub(1);
 
             if task_state.energy_points == 0 {
-                 tracing::error!("Energy points depleted.");
-                 self.output.on_text("[System] Energy depleted. Stopping to prevent infinite loops.").await;
-                 self.context.end_turn();
-                 return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
+                tracing::error!("Energy points depleted.");
+                self.output
+                    .on_text("[System] Energy depleted. Stopping to prevent infinite loops.")
+                    .await;
+                self.context.end_turn();
+                return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
             }
 
             if !compaction_checked {
@@ -226,8 +322,13 @@ impl AgentLoop {
                 compaction_checked = true;
             }
 
-            let (messages, system, _) = self.context.build_llm_payload();
-            
+            // Build cache-aware prompt using ContextAssembler
+            // In a real advanced setup, ContextAssembler budget would be dynamic based on LLM size
+            let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+            let max_tokens = self.context.max_history_tokens; 
+            let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
+            let (messages, system, _) = self.context.build_llm_payload(&state, &assembler);
+
             // Dynamically load skills on every turn so we don't need to restart
             let mut current_tools = self.tools.clone();
             for skill in crate::skills::load_skills("skills") {
@@ -235,11 +336,12 @@ impl AgentLoop {
             }
 
             let mut llm_attempts = 0;
-            let mut tool_calls_accumulated: Vec<(crate::context::FunctionCall, Option<String>)> = Vec::new();
+            let mut tool_calls_accumulated: Vec<(crate::context::FunctionCall, Option<String>)> =
+                Vec::new();
 
             let full_text = loop {
                 llm_attempts += 1;
-                
+
                 let stream_res = tokio::select! {
                     res = self.llm.stream(messages.clone(), system.clone(), current_tools.clone()) => res,
                     _ = self.cancel_token.notified() => {
@@ -247,12 +349,12 @@ impl AgentLoop {
                         return Ok(RunExit::StoppedByUser);
                     }
                 };
-                
+
                 match stream_res {
                     Ok(mut rx) => {
                         let mut current_turn_text = String::new();
                         let mut in_think_block = false;
-                        
+
                         let stream_loop_res = loop {
                             tokio::select! {
                                 event = rx.recv() => {
@@ -313,10 +415,10 @@ impl AgentLoop {
                         }
 
                         break current_turn_text;
-                    },
+                    }
                     Err(e) => {
                         if !self.handle_llm_error(&e, llm_attempts).await {
-                             return Err(Box::new(e));
+                            return Err(Box::new(e));
                         }
                     }
                 }
@@ -325,10 +427,12 @@ impl AgentLoop {
             if full_text.trim().is_empty() && tool_calls_accumulated.is_empty() {
                 consecutive_empty_responses += 1;
                 if consecutive_empty_responses >= Self::MAX_CONSECUTIVE_EMPTY_RESPONSES {
-                     self.context.end_turn();
-                     return Ok(RunExit::CriticallyFailed("Too many empty responses".to_string()));
+                    self.context.end_turn();
+                    return Ok(RunExit::CriticallyFailed(
+                        "Too many empty responses".to_string(),
+                    ));
                 }
-                continue; 
+                continue;
             } else {
                 consecutive_empty_responses = 0;
             }
@@ -343,14 +447,14 @@ impl AgentLoop {
                 });
             }
             for (tc, sig) in &tool_calls_accumulated {
-                 parts.push(Part {
+                parts.push(Part {
                     text: None,
                     function_call: Some(tc.clone()),
                     function_response: None,
                     thought_signature: sig.clone(),
                 });
             }
-            
+
             self.context.add_message_to_current_turn(Message {
                 role: "model".to_string(),
                 parts,
@@ -359,12 +463,13 @@ impl AgentLoop {
             if tool_calls_accumulated.is_empty() {
                 self.output.flush().await;
                 self.context.end_turn();
+                self.telemetry.end_span("agent_step");
                 return Ok(RunExit::YieldedToUser);
             }
 
             let mut executed_signatures = HashSet::new();
             let mut stop_loop = false;
-            
+
             for (mut call, _thought_sig) in tool_calls_accumulated {
                 if let Some(obj) = call.args.as_object_mut() {
                     if let Some(thought) = obj.remove("thought") {
@@ -378,8 +483,10 @@ impl AgentLoop {
                 }
 
                 let sig = format!("{}:{}", call.name, call.args);
-                if !executed_signatures.insert(sig) || call.name.trim().is_empty() { continue; }
-                
+                if !executed_signatures.insert(sig) || call.name.trim().is_empty() {
+                    continue;
+                }
+
                 if call.name == "finish_task" {
                     let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
                     let mut summary = call.args.to_string();
@@ -391,15 +498,17 @@ impl AgentLoop {
                     self.output.flush().await;
                     self.output.on_text(&format!("\n{}\n", summary)).await;
                     self.output.flush().await;
-                    self.context.end_turn();
+                    self.telemetry.end_span("agent_step");
                     return Ok(RunExit::Finished(summary));
                 }
 
                 let tool_opt = self.tools.iter().find(|t| t.name() == call.name);
                 let (result, is_error, stopped) = if let Some(tool) = tool_opt {
                     self.output.flush().await;
-                    self.output.on_tool_start(&call.name, &call.args.to_string()).await;
-                    
+                    self.output
+                        .on_tool_start(&call.name, &call.args.to_string())
+                        .await;
+
                     tokio::select! {
                         exec_res = tool.execute(call.args.clone()) => {
                             match exec_res {
@@ -434,6 +543,47 @@ impl AgentLoop {
                     }
                 }
 
+                let mut final_result = result.clone();
+                let output_bytes = result.as_bytes();
+                if output_bytes.len() > 8000 {
+                    let artifact_id = crate::artifact_store::ArtifactStore::generate_id();
+                    let content_type = if call.name == "execute_bash" { "text/plain" } else { "text/plain" };
+                    if let Ok(metadata) = artifact_store.write_artifact(
+                        &artifact_id,
+                        Some(current_task_id.clone()),
+                        &call.name,
+                        content_type,
+                        "tool-output",
+                        output_bytes,
+                        &format!("Output of {}", call.name),
+                        false,
+                    ).await {
+                        // Truncate for the context window, leaving a reference to the artifact
+                        let head: String = result.chars().take(2000).collect();
+                        final_result = format!("{}\n\n... [Output truncated. Full output saved to artifact: {} - path: {}]", head, metadata.artifact_id, metadata.path);
+                        
+                        self.emit_agent_event(
+                            "ArtifactCreated",
+                            Some(current_task_id.clone()),
+                            serde_json::json!({
+                                "artifact_id": artifact_id,
+                                "path": metadata.path,
+                            }),
+                        ).await;
+                    }
+                }
+
+                self.emit_agent_event(
+                    "ToolExecutionFinished",
+                    Some(current_task_id.clone()),
+                    serde_json::json!({
+                        "tool": call.name,
+                        "args": call.args,
+                        "is_error": is_error,
+                        "result_brief": final_result.chars().take(500).collect::<String>(),
+                    }),
+                ).await;
+
                 self.context.add_message_to_current_turn(Message {
                     role: "function".to_string(),
                     parts: vec![Part {
@@ -441,7 +591,7 @@ impl AgentLoop {
                         function_call: None,
                         function_response: Some(FunctionResponse {
                             name: call.name.clone(),
-                            response: serde_json::json!({ "result": result }),
+                            response: serde_json::json!({ "result": final_result }),
                             tool_call_id: call.id.clone(),
                         }),
                         thought_signature: None,
@@ -450,8 +600,8 @@ impl AgentLoop {
             }
 
             if stop_loop {
-                 self.context.end_turn();
-                 return Ok(RunExit::StoppedByUser);
+                self.context.end_turn();
+                return Ok(RunExit::StoppedByUser);
             }
         }
     }
