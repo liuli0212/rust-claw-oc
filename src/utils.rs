@@ -49,7 +49,7 @@ fn truncate_impl(log: &str, max_lines: usize, max_chars: usize) -> String {
         let chars: Vec<char> = truncated_by_lines.chars().collect();
         let keep = max_chars / 2;
         if chars.len() <= max_chars {
-             truncated_by_lines
+            truncated_by_lines
         } else {
             let head: String = chars.iter().take(keep).collect();
             let tail: String = chars.iter().skip(chars.len() - keep).collect();

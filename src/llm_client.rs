@@ -17,6 +17,7 @@ pub enum LlmError {
     NetworkError(#[from] reqwest::Error),
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
+    #[allow(dead_code)]
     #[error("API error: {0}")]
     ApiError(String),
 }
@@ -30,109 +31,152 @@ pub enum StreamEvent {
     Done,
 }
 
-    fn estimate_context_window(model: &str) -> usize {
-        let m = model.to_lowercase();
-        if m.contains("gemini-2") || m.contains("gemini-3") {
-            1_000_000
-        } else if m.contains("1.5-pro") || m.contains("1.5-flash") {
-            1_000_000
-        } else if m.contains("gpt-4o") || m.contains("gpt-4-turbo") || m.contains("o1") || m.contains("o3") {
-            128_000
-        } else if m.contains("claude-3-5") || m.contains("claude-3-opus") {
-            200_000
-        } else if m.contains("deepseek") {
-            64_000
-        } else if m.contains("qwen") {
-            128_000
-        } else {
-            128_000
+fn estimate_context_window(model: &str) -> usize {
+    let m = model.to_lowercase();
+    if m.contains("gemini-2") || m.contains("gemini-3") {
+        1_000_000
+    } else if m.contains("1.5-pro") || m.contains("1.5-flash") {
+        1_000_000
+    } else if m.contains("gpt-4o")
+        || m.contains("gpt-4-turbo")
+        || m.contains("o1")
+        || m.contains("o3")
+    {
+        128_000
+    } else if m.contains("claude-3-5") || m.contains("claude-3-opus") {
+        200_000
+    } else if m.contains("deepseek") {
+        64_000
+    } else if m.contains("qwen") {
+        128_000
+    } else {
+        128_000
+    }
+}
+
+pub fn create_llm_client(
+    provider: &str,
+    model: Option<String>,
+    config: &crate::config::AppConfig,
+) -> Result<Arc<dyn LlmClient>, String> {
+    if let Some(prov_config) = config.get_provider(provider) {
+        tracing::info!("Initializing provider '{}' from config", provider);
+        match prov_config.type_name.as_str() {
+            "openai_compat" | "aliyun" => {
+                let raw_api_key = if let Some(env_var) = &prov_config.api_key_env {
+                    std::env::var(env_var).or_else(|_| {
+                        prov_config.api_key.clone().ok_or_else(|| {
+                            format!("API key not found in env var '{}' or config", env_var)
+                        })
+                    })?
+                } else {
+                    prov_config
+                        .api_key
+                        .clone()
+                        .ok_or_else(|| "API key must be provided in config".to_string())?
+                };
+                let api_key = raw_api_key.trim().to_string();
+
+                let base_url = prov_config
+                    .base_url
+                    .clone()
+                    .ok_or_else(|| "base_url required for openai_compat".to_string())?;
+                let model_final = model
+                    .or(prov_config.model.clone())
+                    .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+
+                let context_window = prov_config
+                    .context_window
+                    .unwrap_or_else(|| estimate_context_window(&model_final));
+
+                Ok(Arc::new(OpenAiCompatClient::new_with_window(
+                    api_key,
+                    base_url,
+                    model_final,
+                    provider.to_string(),
+                    context_window,
+                )))
+            }
+            "gemini" => {
+                let raw_api_key = if let Some(env_var) = &prov_config.api_key_env {
+                    std::env::var(env_var).or_else(|_| {
+                        prov_config.api_key.clone().ok_or_else(|| {
+                            format!("API key not found in env var '{}' or config", env_var)
+                        })
+                    })?
+                } else {
+                    prov_config
+                        .api_key
+                        .clone()
+                        .ok_or_else(|| "API key must be provided in config".to_string())?
+                };
+                let api_key = raw_api_key.trim().to_string();
+                let model_final = model.or(prov_config.model.clone());
+                let model_str = model_final
+                    .clone()
+                    .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+                let context_window = prov_config
+                    .context_window
+                    .unwrap_or_else(|| estimate_context_window(&model_str));
+
+                Ok(Arc::new(GeminiClient::new_with_window(
+                    api_key,
+                    model_final,
+                    context_window,
+                    provider.to_string(),
+                )))
+            }
+            _ => Err(format!("Unknown provider type '{}'", prov_config.type_name)),
+        }
+    } else {
+        // Fallback defaults if not in config
+        match provider {
+            "aliyun" => {
+                let api_key = std::env::var("DASHSCOPE_API_KEY")
+                    .map(|s| s.trim().to_string())
+                    .map_err(|_| "DASHSCOPE_API_KEY must be set for aliyun provider")?;
+                let model_final = model.unwrap_or_else(|| "qwen-plus".to_string());
+                tracing::info!("Using Aliyun provider with model: {}", model_final);
+                let context_window = estimate_context_window(&model_final);
+                Ok(Arc::new(OpenAiCompatClient::new_with_window(
+                    api_key,
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+                        .to_string(),
+                    model_final,
+                    "aliyun".to_string(),
+                    context_window,
+                )))
+            }
+            "gemini" | _ => {
+                let api_key = std::env::var("GEMINI_API_KEY")
+                    .map(|s| s.trim().to_string())
+                    .map_err(|_| "GEMINI_API_KEY must be set for gemini provider")?;
+                tracing::info!(
+                    "Using Gemini provider with model: {:?}",
+                    model.as_deref().unwrap_or("default")
+                );
+                let model_str = model
+                    .clone()
+                    .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+                let context_window = estimate_context_window(&model_str);
+                Ok(Arc::new(GeminiClient::new_with_window(
+                    api_key,
+                    model,
+                    context_window,
+                    provider.to_string(),
+                )))
+            }
         }
     }
-
-    pub fn create_llm_client(
-        provider: &str,
-        model: Option<String>,
-        config: &crate::config::AppConfig,
-    ) -> Result<Arc<dyn LlmClient>, String> {
-        if let Some(prov_config) = config.get_provider(provider) {
-            tracing::info!("Initializing provider '{}' from config", provider);
-            match prov_config.type_name.as_str() {
-                "openai_compat" | "aliyun" => {
-                                        let raw_api_key = if let Some(env_var) = &prov_config.api_key_env {
-                        std::env::var(env_var).or_else(|_| {
-                            prov_config.api_key.clone().ok_or_else(|| format!("API key not found in env var '{}' or config", env_var))
-                        })?
-                    } else {
-                        prov_config.api_key.clone().ok_or_else(|| "API key must be provided in config".to_string())?
-                    };
-                    let api_key = raw_api_key.trim().to_string();
-                    
-                    let base_url = prov_config.base_url.clone()
-                        .ok_or_else(|| "base_url required for openai_compat".to_string())?;
-                    let model_final = model
-                        .or(prov_config.model.clone())
-                        .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
-
-                    let context_window = prov_config.context_window
-                        .unwrap_or_else(|| estimate_context_window(&model_final));
-
-                    Ok(Arc::new(OpenAiCompatClient::new_with_window(api_key, base_url, model_final, provider.to_string(), context_window)))
-                }
-                "gemini" => {
-                                        let raw_api_key = if let Some(env_var) = &prov_config.api_key_env {
-                        std::env::var(env_var).or_else(|_| {
-                            prov_config.api_key.clone().ok_or_else(|| format!("API key not found in env var '{}' or config", env_var))
-                        })?
-                    } else {
-                        prov_config.api_key.clone().ok_or_else(|| "API key must be provided in config".to_string())?
-                    };
-                    let api_key = raw_api_key.trim().to_string();
-                    let model_final = model.or(prov_config.model.clone());
-                    let model_str = model_final.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
-                    let context_window = prov_config.context_window
-                        .unwrap_or_else(|| estimate_context_window(&model_str));
-
-                    Ok(Arc::new(GeminiClient::new_with_window(api_key, model_final, context_window, provider.to_string())))
-                }
-                _ => Err(format!("Unknown provider type '{}'", prov_config.type_name)),
-            }
-        } else {
-            // Fallback defaults if not in config
-            match provider {
-                "aliyun" => {
-                    let api_key = std::env::var("DASHSCOPE_API_KEY").map(|s| s.trim().to_string())
-                        .map_err(|_| "DASHSCOPE_API_KEY must be set for aliyun provider")?;
-                    let model_final = model.unwrap_or_else(|| "qwen-plus".to_string());
-                    tracing::info!("Using Aliyun provider with model: {}", model_final);
-                    let context_window = estimate_context_window(&model_final);
-                    Ok(Arc::new(OpenAiCompatClient::new_with_window(
-                        api_key,
-                        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string(),
-                        model_final,
-                        "aliyun".to_string(),
-                        context_window
-                    )))
-                }
-                "gemini" | _ => {
-                    let api_key = std::env::var("GEMINI_API_KEY").map(|s| s.trim().to_string())
-                        .map_err(|_| "GEMINI_API_KEY must be set for gemini provider")?;
-                    tracing::info!(
-                        "Using Gemini provider with model: {:?}",
-                        model.as_deref().unwrap_or("default")
-                    );
-                    let model_str = model.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
-                    let context_window = estimate_context_window(&model_str);
-                    Ok(Arc::new(GeminiClient::new_with_window(api_key, model, context_window, provider.to_string())))
-                }
-            }
-        }
-    }
+}
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
+    #[allow(dead_code)]
     fn context_window_size(&self) -> usize;
+    #[allow(dead_code)]
     async fn generate_text(
         &self,
         messages: Vec<Message>,
@@ -156,6 +200,7 @@ pub struct GeminiClient {
     provider_name: String,
     #[allow(dead_code)]
     function_declarations_cache: Mutex<Option<CachedFunctionDeclarations>>,
+    #[allow(dead_code)]
     context_window: usize,
 }
 
@@ -192,6 +237,7 @@ pub struct FunctionDeclaration {
 }
 
 impl GeminiClient {
+    #[allow(dead_code)]
     pub fn new(api_key: String, model_name: Option<String>, provider_name: String) -> Self {
         Self {
             api_key,
@@ -203,7 +249,12 @@ impl GeminiClient {
         }
     }
 
-    pub fn new_with_window(api_key: String, model_name: Option<String>, context_window: usize, provider_name: String) -> Self {
+    pub fn new_with_window(
+        api_key: String,
+        model_name: Option<String>,
+        context_window: usize,
+        provider_name: String,
+    ) -> Self {
         Self {
             api_key,
             client: Client::new(),
@@ -262,7 +313,10 @@ impl LlmClient for GeminiClient {
         );
 
         tracing::info!("Gemini generate_text request: url={}", url);
-        tracing::debug!("Gemini generate_text body: {}", truncate_log(&serde_json::to_string(&req_body).unwrap_or_default()));
+        tracing::debug!(
+            "Gemini generate_text body: {}",
+            truncate_log(&serde_json::to_string(&req_body).unwrap_or_default())
+        );
 
         let response = self
             .client
@@ -274,10 +328,20 @@ impl LlmClient for GeminiClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_else(|_| "Could not read error body".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Could not read error body".to_string());
             let truncated_error = truncate_log_error(&error_text);
-            tracing::error!("Gemini API Error: status={}, body={}", status, truncated_error);
-            return Err(LlmError::ApiError(format!("Gemini API status={}: {}", status, truncated_error)));
+            tracing::error!(
+                "Gemini API Error: status={}, body={}",
+                status,
+                truncated_error
+            );
+            return Err(LlmError::ApiError(format!(
+                "Gemini API status={}: {}",
+                status, truncated_error
+            )));
         }
 
         let resp_json: Value = response.json().await?;
@@ -323,13 +387,16 @@ impl LlmClient for GeminiClient {
 
             let mut attempts = 0;
             let max_attempts = 5;
-            let mut last_error = String::from("initialization");
 
             let resp = loop {
                 attempts += 1;
                 let body_json_string = serde_json::to_string(&req_body).unwrap_or_default();
-                
-                tracing::info!("Sending Gemini stream request (Attempt {}/{})", attempts, max_attempts);
+
+                tracing::info!(
+                    "Sending Gemini stream request (Attempt {}/{})",
+                    attempts,
+                    max_attempts
+                );
                 tracing::debug!("Gemini stream body: {}", truncate_log(&body_json_string));
 
                 let req_result = client
@@ -345,8 +412,9 @@ impl LlmClient for GeminiClient {
                         let status = r.status();
                         let is_transient = status.is_server_error() || status.as_u16() == 429;
                         let body = r.text().await.unwrap_or_default();
-                        last_error = format!("status={} body={}", status, truncate_log_error(&body));
-                        
+                        let last_error =
+                            format!("status={} body={}", status, truncate_log_error(&body));
+
                         tracing::warn!(
                             "Gemini Stream API Error (Attempt {}/{}): {}",
                             attempts,
@@ -355,15 +423,17 @@ impl LlmClient for GeminiClient {
                         );
 
                         if !is_transient || attempts >= max_attempts {
-                            let _ = tx.send(StreamEvent::Error(format!(
-                                "Gemini API error after {} attempts: {}",
-                                attempts, last_error
-                            ))).await;
+                            let _ = tx
+                                .send(StreamEvent::Error(format!(
+                                    "Gemini API error after {} attempts: {}",
+                                    attempts, last_error
+                                )))
+                                .await;
                             return;
                         }
                     }
                     Err(e) => {
-                        last_error = e.to_string();
+                        let last_error = e.to_string();
                         tracing::warn!(
                             "Gemini Network Error (Attempt {}/{}): {}",
                             attempts,
@@ -372,10 +442,12 @@ impl LlmClient for GeminiClient {
                         );
 
                         if attempts >= max_attempts {
-                            let _ = tx.send(StreamEvent::Error(format!(
-                                "Gemini network error after {} attempts: {}",
-                                attempts, last_error
-                            ))).await;
+                            let _ = tx
+                                .send(StreamEvent::Error(format!(
+                                    "Gemini network error after {} attempts: {}",
+                                    attempts, last_error
+                                )))
+                                .await;
                             return;
                         }
                     }
@@ -416,21 +488,36 @@ impl LlmClient for GeminiClient {
                             match serde_json::from_str::<Value>(data) {
                                 Ok(json) => {
                                     chunk_count += 1;
-                                    tracing::debug!("Gemini SSE chunk #{}: keys={:?}\nRaw: {}", chunk_count,
+                                    tracing::debug!(
+                                        "Gemini SSE chunk #{}: keys={:?}\nRaw: {}",
+                                        chunk_count,
                                         json.as_object().map(|m| m.keys().collect::<Vec<_>>()),
-                                        crate::utils::truncate_log(data));
+                                        crate::utils::truncate_log(data)
+                                    );
 
                                     // 1. Check for thinking at candidate level (some models/versions)
-                                    if let Some(candidate) = json["candidates"].as_array().and_then(|a| a.first()) {
-                                        if let Some(thought) = candidate.get("thought").and_then(|v| v.as_str()) {
+                                    if let Some(candidate) =
+                                        json["candidates"].as_array().and_then(|a| a.first())
+                                    {
+                                        if let Some(thought) =
+                                            candidate.get("thought").and_then(|v| v.as_str())
+                                        {
                                             if !thought.is_empty() {
-                                                let _ = tx.send(StreamEvent::Thought(thought.to_string())).await;
+                                                let _ = tx
+                                                    .send(StreamEvent::Thought(thought.to_string()))
+                                                    .await;
                                             }
                                         }
                                         // Also check for 'thinking' field
-                                        if let Some(thinking) = candidate.get("thinking").and_then(|v| v.as_str()) {
+                                        if let Some(thinking) =
+                                            candidate.get("thinking").and_then(|v| v.as_str())
+                                        {
                                             if !thinking.is_empty() {
-                                                let _ = tx.send(StreamEvent::Thought(thinking.to_string())).await;
+                                                let _ = tx
+                                                    .send(StreamEvent::Thought(
+                                                        thinking.to_string(),
+                                                    ))
+                                                    .await;
                                             }
                                         }
                                     }
@@ -441,52 +528,95 @@ impl LlmClient for GeminiClient {
                                         // Capture thought_signature from candidate level if not found in part
                                         let candidate_signature = json["candidates"][0]
                                             .get("thoughtSignature")
-                                            .or_else(|| json["candidates"][0].get("thought_signature"))
+                                            .or_else(|| {
+                                                json["candidates"][0].get("thought_signature")
+                                            })
                                             .and_then(|ts| ts.as_str())
                                             .map(|s| s.to_string());
 
                                         for part in parts {
                                             tracing::trace!("Gemini part: {}", part);
                                             // Check if this is a thought part (Gemini sends thought: true boolean)
-                                            let is_thought = part["thought"].as_bool().unwrap_or(false);
+                                            let is_thought =
+                                                part["thought"].as_bool().unwrap_or(false);
 
                                             // [Fix] Also check if 'thought' is a string itself (common in some API versions)
                                             if let Some(thought_text) = part["thought"].as_str() {
-                                                let _ = tx.send(StreamEvent::Thought(thought_text.to_string())).await;
+                                                let _ = tx
+                                                    .send(StreamEvent::Thought(
+                                                        thought_text.to_string(),
+                                                    ))
+                                                    .await;
                                             }
 
                                             if is_thought {
                                                 // thought: true means the text field contains thinking content
                                                 if let Some(text) = part["text"].as_str() {
-                                                    let _ = tx.send(StreamEvent::Thought(text.to_string())).await;
-                                                    tracing::debug!("Gemini thought: {} chars, content={}", text.len(), crate::utils::truncate_log(text));
+                                                    let _ = tx
+                                                        .send(StreamEvent::Thought(
+                                                            text.to_string(),
+                                                        ))
+                                                        .await;
+                                                    tracing::debug!(
+                                                        "Gemini thought: {} chars, content={}",
+                                                        text.len(),
+                                                        crate::utils::truncate_log(text)
+                                                    );
                                                 }
                                             } else if let Some(text) = part["text"].as_str() {
                                                 total_text_len += text.len();
-                                                tracing::debug!("Gemini text: {} chars (total: {}), content={}", text.len(), total_text_len, crate::utils::truncate_log(text));
-                                                let _ =
-                                                    tx.send(StreamEvent::Text(text.to_string())).await;
+                                                tracing::debug!(
+                                                    "Gemini text: {} chars (total: {}), content={}",
+                                                    text.len(),
+                                                    total_text_len,
+                                                    crate::utils::truncate_log(text)
+                                                );
+                                                let _ = tx
+                                                    .send(StreamEvent::Text(text.to_string()))
+                                                    .await;
                                             }
-                                            if let Some(func_call) = parse_function_call_basic(part) {
+                                            if let Some(func_call) = parse_function_call_basic(part)
+                                            {
                                                 total_tool_calls += 1;
-                                                tracing::debug!("Gemini tool_call: name={}", func_call.name);
-                                                let signature = capture_thought_signature(part).or_else(|| candidate_signature.clone());
-                                                let _ = tx.send(StreamEvent::ToolCall(func_call, signature)).await;
+                                                tracing::debug!(
+                                                    "Gemini tool_call: name={}",
+                                                    func_call.name
+                                                );
+                                                let signature = capture_thought_signature(part)
+                                                    .or_else(|| candidate_signature.clone());
+                                                let _ = tx
+                                                    .send(StreamEvent::ToolCall(
+                                                        func_call, signature,
+                                                    ))
+                                                    .await;
                                             }
                                         }
                                     } else {
-                                        tracing::debug!("Gemini SSE chunk #{} has no candidates/parts. Raw: {}", chunk_count, truncate_log(data));
+                                        tracing::debug!(
+                                            "Gemini SSE chunk #{} has no candidates/parts. Raw: {}",
+                                            chunk_count,
+                                            truncate_log(data)
+                                        );
                                     }
                                 }
                                 Err(parse_err) => {
-                                    tracing::warn!("Gemini SSE JSON parse error: {}. Raw data: {}", parse_err, truncate_log(data));
+                                    tracing::warn!(
+                                        "Gemini SSE JSON parse error: {}. Raw data: {}",
+                                        parse_err,
+                                        truncate_log(data)
+                                    );
                                 }
                             }
                         }
                     }
                 }
             }
-            tracing::debug!("Gemini stream ended. chunks={}, total_text={} chars, tool_calls={}", chunk_count, total_text_len, total_tool_calls);
+            tracing::debug!(
+                "Gemini stream ended. chunks={}, total_text={} chars, tool_calls={}",
+                chunk_count,
+                total_text_len,
+                total_tool_calls
+            );
             let _ = tx.send(StreamEvent::Done).await;
         });
 
@@ -506,8 +636,7 @@ fn parse_function_call_basic(part: &Value) -> Option<FunctionCall> {
 }
 
 fn capture_thought_signature(part: &Value) -> Option<String> {
-    part
-        .get("thoughtSignature")
+    part.get("thoughtSignature")
         .or_else(|| part.get("thought_signature"))
         .and_then(|ts| ts.as_str())
         .map(|s| s.to_string())
@@ -574,11 +703,18 @@ pub struct OpenAiCompatClient {
     model_name: String,
     provider_name: String,
     client: Client,
+    #[allow(dead_code)]
     context_window: usize,
 }
 
 impl OpenAiCompatClient {
-    pub fn new(api_key: String, base_url: String, model_name: String, provider_name: String) -> Self {
+    #[allow(dead_code)]
+    pub fn new(
+        api_key: String,
+        base_url: String,
+        model_name: String,
+        provider_name: String,
+    ) -> Self {
         Self {
             api_key,
             base_url,
@@ -589,7 +725,13 @@ impl OpenAiCompatClient {
         }
     }
 
-    pub fn new_with_window(api_key: String, base_url: String, model_name: String, provider_name: String, context_window: usize) -> Self {
+    pub fn new_with_window(
+        api_key: String,
+        base_url: String,
+        model_name: String,
+        provider_name: String,
+        context_window: usize,
+    ) -> Self {
         Self {
             api_key,
             base_url,
@@ -631,11 +773,18 @@ impl LlmClient for OpenAiCompatClient {
                     "content": msg.parts[0].text.as_deref().unwrap_or("")
                 }));
             } else if msg.role == "model" {
-                let text = msg.parts.iter().find_map(|p| p.text.as_deref()).unwrap_or("");
+                let text = msg
+                    .parts
+                    .iter()
+                    .find_map(|p| p.text.as_deref())
+                    .unwrap_or("");
                 let mut tool_calls = Vec::new();
                 for part in &msg.parts {
                     if let Some(fc) = &part.function_call {
-                        let call_id = fc.id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+                        let call_id = fc
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
                         tool_calls.push(serde_json::json!({
                             "id": call_id,
                             "type": "function",
@@ -646,26 +795,26 @@ impl LlmClient for OpenAiCompatClient {
                         }));
                     }
                 }
-                
+
                 let mut message_json = serde_json::json!({
                     "role": "assistant",
                     "content": if text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(text.to_string()) }
                 });
-                
+
                 if !tool_calls.is_empty() {
                     message_json["tool_calls"] = serde_json::Value::Array(tool_calls);
                 }
                 openai_messages.push(message_json);
             } else if msg.role == "function" {
-                 for part in &msg.parts {
-                     if let Some(fr) = &part.function_response {
-                         openai_messages.push(serde_json::json!({
+                for part in &msg.parts {
+                    if let Some(fr) = &part.function_response {
+                        openai_messages.push(serde_json::json!({
                              "role": "tool",
                              "tool_call_id": fr.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string()),
                              "content": fr.response.to_string()
                          }));
-                     }
-                 }
+                    }
+                }
             }
         }
 
@@ -688,7 +837,10 @@ impl LlmClient for OpenAiCompatClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_else(|_| "Could not read error body".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Could not read error body".to_string());
             let truncated_error = truncate_log_error(&error_text);
             tracing::error!(
                 "OpenAI API Error: status={}, url={}, body={}",
@@ -696,7 +848,10 @@ impl LlmClient for OpenAiCompatClient {
                 self.base_url,
                 truncated_error
             );
-            return Err(LlmError::ApiError(format!("OpenAI API status={}: {}", status, truncated_error)));
+            return Err(LlmError::ApiError(format!(
+                "OpenAI API status={}: {}",
+                status, truncated_error
+            )));
         }
 
         let resp_json: Value = response.json().await?;
@@ -730,11 +885,18 @@ impl LlmClient for OpenAiCompatClient {
                     "content": msg.parts[0].text.as_deref().unwrap_or("")
                 }));
             } else if msg.role == "model" {
-                let text = msg.parts.iter().find_map(|p| p.text.as_deref()).unwrap_or("");
+                let text = msg
+                    .parts
+                    .iter()
+                    .find_map(|p| p.text.as_deref())
+                    .unwrap_or("");
                 let mut tool_calls = Vec::new();
                 for part in &msg.parts {
                     if let Some(fc) = &part.function_call {
-                        let call_id = fc.id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+                        let call_id = fc
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
                         tool_calls.push(serde_json::json!({
                             "id": call_id,
                             "type": "function",
@@ -745,26 +907,26 @@ impl LlmClient for OpenAiCompatClient {
                         }));
                     }
                 }
-                
+
                 let mut message_json = serde_json::json!({
                     "role": "assistant",
                     "content": if text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(text.to_string()) }
                 });
-                
+
                 if !tool_calls.is_empty() {
                     message_json["tool_calls"] = serde_json::Value::Array(tool_calls);
                 }
                 openai_messages.push(message_json);
             } else if msg.role == "function" {
-                 for part in &msg.parts {
-                     if let Some(fr) = &part.function_response {
-                         openai_messages.push(serde_json::json!({
+                for part in &msg.parts {
+                    if let Some(fr) = &part.function_response {
+                        openai_messages.push(serde_json::json!({
                              "role": "tool",
                              "tool_call_id": fr.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string()),
                              "content": fr.response.to_string()
                          }));
-                     }
-                 }
+                    }
+                }
             }
         }
 
@@ -797,13 +959,17 @@ impl LlmClient for OpenAiCompatClient {
         tokio::spawn(async move {
             let mut attempts = 0;
             let max_attempts = 5;
-            let mut last_error = String::from("initialization");
 
             let resp = loop {
                 attempts += 1;
                 let body_json_string = serde_json::to_string(&body_map).unwrap_or_default();
-                
-                tracing::info!("Sending stream request to {} (Attempt {}/{})", base_url, attempts, max_attempts);
+
+                tracing::info!(
+                    "Sending stream request to {} (Attempt {}/{})",
+                    base_url,
+                    attempts,
+                    max_attempts
+                );
                 tracing::debug!("OpenAI stream body: {}", truncate_log(&body_json_string));
 
                 let req_result = client
@@ -820,8 +986,9 @@ impl LlmClient for OpenAiCompatClient {
                         let status = r.status();
                         let is_transient = status.is_server_error() || status.as_u16() == 429;
                         let body = r.text().await.unwrap_or_default();
-                        last_error = format!("status={} body={}", status, truncate_log_error(&body));
-                        
+                        let last_error =
+                            format!("status={} body={}", status, truncate_log_error(&body));
+
                         tracing::warn!(
                             "OpenAI Stream API Error (Attempt {}/{}): {}",
                             attempts,
@@ -830,15 +997,17 @@ impl LlmClient for OpenAiCompatClient {
                         );
 
                         if !is_transient || attempts >= max_attempts {
-                            let _ = tx.send(StreamEvent::Error(format!(
-                                "OpenAI API error after {} attempts: {}",
-                                attempts, last_error
-                            ))).await;
+                            let _ = tx
+                                .send(StreamEvent::Error(format!(
+                                    "OpenAI API error after {} attempts: {}",
+                                    attempts, last_error
+                                )))
+                                .await;
                             return;
                         }
                     }
                     Err(e) => {
-                        last_error = e.to_string();
+                        let last_error = e.to_string();
                         tracing::warn!(
                             "OpenAI Network Error (Attempt {}/{}): {}",
                             attempts,
@@ -847,10 +1016,12 @@ impl LlmClient for OpenAiCompatClient {
                         );
 
                         if attempts >= max_attempts {
-                            let _ = tx.send(StreamEvent::Error(format!(
-                                "OpenAI network error after {} attempts: {}",
-                                attempts, last_error
-                            ))).await;
+                            let _ = tx
+                                .send(StreamEvent::Error(format!(
+                                    "OpenAI network error after {} attempts: {}",
+                                    attempts, last_error
+                                )))
+                                .await;
                             return;
                         }
                     }
@@ -866,7 +1037,8 @@ impl LlmClient for OpenAiCompatClient {
             let mut buffer = String::new();
 
             // To properly parse OpenAI chunked tool calls (they can come with `index`)
-            let mut active_tools: std::collections::HashMap<usize, (String, String)> = std::collections::HashMap::new();
+            let mut active_tools: std::collections::HashMap<usize, (String, String)> =
+                std::collections::HashMap::new();
 
             while let Some(chunk_res) = stream.next().await {
                 if let Ok(chunk) = chunk_res {
@@ -887,34 +1059,70 @@ impl LlmClient for OpenAiCompatClient {
                                 continue;
                             }
                             if let Ok(json) = serde_json::from_str::<Value>(data) {
-                                tracing::trace!("OpenAI SSE chunk: {}", crate::utils::truncate_log(data));
-                                if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
+                                tracing::trace!(
+                                    "OpenAI SSE chunk: {}",
+                                    crate::utils::truncate_log(data)
+                                );
+                                if let Some(choices) =
+                                    json.get("choices").and_then(|v| v.as_array())
+                                {
                                     for choice in choices {
                                         if let Some(delta) = choice.get("delta") {
                                             // 1. Text content
-                                            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                                            if let Some(content) =
+                                                delta.get("content").and_then(|v| v.as_str())
+                                            {
                                                 if !content.is_empty() {
-                                                    let _ = tx.send(StreamEvent::Text(content.to_string())).await;
+                                                    let _ = tx
+                                                        .send(StreamEvent::Text(
+                                                            content.to_string(),
+                                                        ))
+                                                        .await;
                                                 }
                                             }
                                             // 2. Reasoning/Thinking content (DeepSeek/DashScope format)
-                                            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                                            if let Some(reasoning) = delta
+                                                .get("reasoning_content")
+                                                .and_then(|v| v.as_str())
+                                            {
                                                 if !reasoning.is_empty() {
-                                                    tracing::debug!("OpenAI reasoning chunk: {} chars", reasoning.len());
-                                                    let _ = tx.send(StreamEvent::Thought(reasoning.to_string())).await;
+                                                    tracing::debug!(
+                                                        "OpenAI reasoning chunk: {} chars",
+                                                        reasoning.len()
+                                                    );
+                                                    let _ = tx
+                                                        .send(StreamEvent::Thought(
+                                                            reasoning.to_string(),
+                                                        ))
+                                                        .await;
                                                 }
                                             }
                                             // 3. Tool calls
-                                            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                                            if let Some(tool_calls) =
+                                                delta.get("tool_calls").and_then(|v| v.as_array())
+                                            {
                                                 for tc in tool_calls {
-                                                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                                                    let entry = active_tools.entry(idx).or_insert_with(|| (String::new(), String::new()));
+                                                    let idx = tc
+                                                        .get("index")
+                                                        .and_then(|v| v.as_u64())
+                                                        .unwrap_or(0)
+                                                        as usize;
+                                                    let entry =
+                                                        active_tools.entry(idx).or_insert_with(
+                                                            || (String::new(), String::new()),
+                                                        );
 
                                                     if let Some(func) = tc.get("function") {
-                                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                                        if let Some(name) = func
+                                                            .get("name")
+                                                            .and_then(|v| v.as_str())
+                                                        {
                                                             entry.0.push_str(name);
                                                         }
-                                                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                                        if let Some(args) = func
+                                                            .get("arguments")
+                                                            .and_then(|v| v.as_str())
+                                                        {
                                                             entry.1.push_str(args);
                                                         }
                                                     }
@@ -935,37 +1143,57 @@ impl LlmClient for OpenAiCompatClient {
                 let data = &final_line[6..];
                 if data != "[DONE]" {
                     if let Ok(json) = serde_json::from_str::<Value>(data) {
-                         if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
-                                    for choice in choices {
-                                        if let Some(delta) = choice.get("delta") {
-                                            if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
-                                                if !content.is_empty() {
-                                                    let _ = tx.send(StreamEvent::Text(content.to_string())).await;
-                                                }
-                                            }
-                                            if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
-                                                if !reasoning.is_empty() {
-                                                    let _ = tx.send(StreamEvent::Thought(reasoning.to_string())).await;
-                                                }
-                                            }
-                                            if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                                                for tc in tool_calls {
-                                                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                                                    let entry = active_tools.entry(idx).or_insert_with(|| (String::new(), String::new()));
+                        if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
+                            for choice in choices {
+                                if let Some(delta) = choice.get("delta") {
+                                    if let Some(content) =
+                                        delta.get("content").and_then(|v| v.as_str())
+                                    {
+                                        if !content.is_empty() {
+                                            let _ = tx
+                                                .send(StreamEvent::Text(content.to_string()))
+                                                .await;
+                                        }
+                                    }
+                                    if let Some(reasoning) =
+                                        delta.get("reasoning_content").and_then(|v| v.as_str())
+                                    {
+                                        if !reasoning.is_empty() {
+                                            let _ = tx
+                                                .send(StreamEvent::Thought(reasoning.to_string()))
+                                                .await;
+                                        }
+                                    }
+                                    if let Some(tool_calls) =
+                                        delta.get("tool_calls").and_then(|v| v.as_array())
+                                    {
+                                        for tc in tool_calls {
+                                            let idx = tc
+                                                .get("index")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0)
+                                                as usize;
+                                            let entry = active_tools
+                                                .entry(idx)
+                                                .or_insert_with(|| (String::new(), String::new()));
 
-                                                    if let Some(func) = tc.get("function") {
-                                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                                            entry.0.push_str(name);
-                                                        }
-                                                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                                                            entry.1.push_str(args);
-                                                        }
-                                                    }
+                                            if let Some(func) = tc.get("function") {
+                                                if let Some(name) =
+                                                    func.get("name").and_then(|v| v.as_str())
+                                                {
+                                                    entry.0.push_str(name);
+                                                }
+                                                if let Some(args) =
+                                                    func.get("arguments").and_then(|v| v.as_str())
+                                                {
+                                                    entry.1.push_str(args);
                                                 }
                                             }
                                         }
                                     }
                                 }
+                            }
+                        }
                     }
                 }
             }
@@ -981,11 +1209,16 @@ impl LlmClient for OpenAiCompatClient {
                         } else {
                             serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
                         };
-                        let _ = tx.send(StreamEvent::ToolCall(FunctionCall {
-                            name,
-                            args,
-                            id: None,
-                        }, None)).await;
+                        let _ = tx
+                            .send(StreamEvent::ToolCall(
+                                FunctionCall {
+                                    name,
+                                    args,
+                                    id: None,
+                                },
+                                None,
+                            ))
+                            .await;
                     }
                 }
             }
@@ -998,21 +1231,20 @@ impl LlmClient for OpenAiCompatClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use crate::context::Part;
+    use std::env;
 
     #[tokio::test]
     #[ignore]
     async fn test_aliyun_qwen_generate() {
         let _ = dotenvy::dotenv();
         let api_key = env::var("DASHSCOPE_API_KEY");
-        let api_key = env::var("DASHSCOPE_API_KEY");
         if api_key.is_err() {
             println!("Skipping test: DASHSCOPE_API_KEY not set");
             return;
         }
         let api_key = api_key.unwrap();
-        
+
         let client = OpenAiCompatClient::new(
             api_key,
             "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".to_string(),
@@ -1049,4 +1281,3 @@ mod tests {
         assert_eq!(estimate_context_window("unknown-model"), 128_000);
     }
 }
-

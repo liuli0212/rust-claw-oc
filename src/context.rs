@@ -1,10 +1,17 @@
+use crate::context_assembler::{
+    assemble_prompt_sections, AssemblyInputs, AssemblyReport, PromptCandidate,
+};
+use crate::evidence::{reconcile_evidence, Evidence, EvidenceFreshness};
+use crate::schema::{new_turn_id, task_plan_path};
+use crate::task_state::{read_task_state, summarize_task_state};
+use crate::telemetry;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use tiktoken_rs::CoreBPE;
 use std::collections::hash_map::DefaultHasher;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use tiktoken_rs::CoreBPE;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Part {
@@ -55,7 +62,7 @@ pub struct Turn {
 pub struct DetailedContextStats {
     pub system_static: usize,
     pub system_runtime: usize,
-    pub system_custom: usize, // .claw_prompt.md
+    pub system_custom: usize,  // .claw_prompt.md
     pub system_project: usize, // AGENTS.md, etc.
     pub system_task_plan: usize,
     pub memory: usize,
@@ -96,9 +103,14 @@ pub struct PromptReport {
     pub history_turns_included: usize,
     pub current_turn_tokens: usize,
     pub system_prompt_tokens: usize,
+    pub cache_stable_tokens: usize,
+    pub volatile_tokens: usize,
     pub total_prompt_tokens: usize,
     pub retrieved_memory_snippets: usize,
     pub retrieved_memory_sources: Vec<String>,
+    pub evicted_item_labels: Vec<String>,
+    pub evicted_item_count: usize,
+    pub stale_evidence_refreshes: usize,
     pub detailed_stats: DetailedContextStats,
 }
 
@@ -108,7 +120,9 @@ pub struct AgentContext {
     pub current_turn: Option<Turn>,
     pub max_history_tokens: usize,
     transcript_path: Option<PathBuf>,
+    task_state_path: Option<PathBuf>,
     retrieved_memory: Option<String>,
+    retrieved_evidence: Vec<Evidence>,
     retrieved_memory_sources: Vec<String>,
     pub last_snapshot: Option<ContextSnapshot>,
 }
@@ -129,7 +143,9 @@ impl AgentContext {
             current_turn: None,
             max_history_tokens: 1_000_000,
             transcript_path: None,
+            task_state_path: None,
             retrieved_memory: None,
+            retrieved_evidence: Vec::new(),
             retrieved_memory_sources: Vec::new(),
             last_snapshot: None,
         }
@@ -144,105 +160,64 @@ impl AgentContext {
         self
     }
 
+    pub fn with_task_state_path(mut self, task_state_path: PathBuf) -> Self {
+        self.task_state_path = Some(task_state_path);
+        self
+    }
+
     /// Single source of truth for system prompt sections.
     /// Returns (assembled_prompt, per_section_token_counts).
     fn build_prompt_sections(&self) -> (String, DetailedContextStats) {
         let bpe = Self::get_bpe();
-        let mut stats = DetailedContextStats::default();
-        let mut sections = Vec::new();
+        let task_state_summary = self.load_task_state_summary();
+        let legacy_task_plan = self.load_legacy_task_plan();
+        let (retrieved_memory, _) = self.load_retrieved_memory_section();
+        let evidence_candidates = self.build_evidence_candidates();
+        let retrieved_memory = if evidence_candidates.is_empty() {
+            retrieved_memory
+        } else {
+            None
+        };
+        let (prompt, stats, _) = assemble_prompt_sections(
+            &bpe,
+            AssemblyInputs {
+                system_prompts: &self.system_prompts,
+                transcript_path: self.transcript_path.as_deref(),
+                task_state_summary: task_state_summary.as_deref(),
+                legacy_task_plan: legacy_task_plan.as_deref(),
+                retrieved_memory: retrieved_memory.as_deref(),
+                evidence_candidates,
+                max_history_tokens: self.max_history_tokens,
+            },
+        );
+        (prompt, stats)
+    }
 
-        // 1. Identity
-        let identity = self.system_prompts.join("\n\n");
-        if let Some(section) = Self::build_prompt_section("Identity", identity.clone(), 4_000) {
-            stats.system_static = bpe.encode_with_special_tokens(&section).len();
-            sections.push(section);
-        }
-
-        // 2. Runtime
-        let mut runtime = String::new();
-        runtime.push_str(&format!("OS: {}\n", std::env::consts::OS));
-        runtime.push_str(&format!("Architecture: {}\n", std::env::consts::ARCH));
-        if let Ok(dir) = std::env::current_dir() {
-            runtime.push_str(&format!("Current Directory: {}\n", dir.display()));
-        }
-        if let Some(path) = &self.transcript_path {
-            runtime.push_str(&format!("Session Transcript: {}\n", path.display()));
-        }
-        if let Some(section) = Self::build_prompt_section("Runtime Environment", runtime, 1_000) {
-            stats.system_runtime = bpe.encode_with_special_tokens(&section).len();
-            sections.push(section);
-        }
-
-        // 3. Custom Instructions
-        if let Ok(custom_prompt) = fs::read_to_string(".claw_prompt.md") {
-            if let Some(section) = Self::build_prompt_section("User Custom Instructions", custom_prompt, 4_000) {
-                stats.system_custom = bpe.encode_with_special_tokens(&section).len();
-                sections.push(section);
-            }
-        }
-
-        // 4. Task Plan
-        if let Ok(plan_content) = fs::read_to_string(".rusty_claw_task_plan.json") {
-            if let Ok(plan) = serde_json::from_str::<crate::tools::TaskPlanState>(&plan_content) {
-                if plan.items.iter().any(|i| i.status != "completed") {
-                    let mut plan_str = String::new();
-                    plan_str.push_str("You MUST follow this plan strictly. Do not skip steps without approval.\n\n");
-                    for (i, item) in plan.items.iter().enumerate() {
-                        let status_icon = match item.status.as_str() {
-                            "completed" => "[x]",
-                            "in_progress" => "[IN PROGRESS]",
-                            _ => "[ ]",
-                        };
-                        plan_str.push_str(&format!("{} {}. {}\n", status_icon, i + 1, item.step));
-                        if let Some(note) = &item.note {
-                            plan_str.push_str(&format!("   Note: {}\n", note));
-                        }
-                    }
-                    if let Some(section) = Self::build_prompt_section("Current Task Plan (STRICT)", plan_str, 4_000) {
-                        stats.system_task_plan = bpe.encode_with_special_tokens(&section).len();
-                        sections.push(section);
-                    }
-                }
-            }
-        }
-
-        // 5. Project Context
-        // [P1-1.4 Fix] Task Planning instruction only injected when NO active plan exists
-        let mut project_context = String::new();
-        if stats.system_task_plan == 0 {
-            project_context.push_str("### Task Planning\n");
-            project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("AGENTS.md") {
-            project_context.push_str("### AGENTS.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 3_000));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("README.md") {
-            project_context.push_str("### README.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 2_500));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("MEMORY.md") {
-            project_context.push_str("### MEMORY.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 1_500));
-            project_context.push_str("\n\n");
-        }
-        if let Some(section) = Self::build_prompt_section("Project Context", project_context, 7_000) {
-            stats.system_project = bpe.encode_with_special_tokens(&section).len();
-            sections.push(section);
-        }
-
-        // 6. Retrieved Memory (RAG)
-        if let Some(memory) = &self.retrieved_memory {
-            if let Some(section) = Self::build_prompt_section("Retrieved Memory", memory.clone(), 3_000) {
-                stats.memory = bpe.encode_with_special_tokens(&section).len();
-                sections.push(section);
-            }
-        }
-
-        stats.max = self.max_history_tokens;
-        (sections.join("\n"), stats)
+    fn build_prompt_sections_with_report(&self) -> (String, DetailedContextStats, AssemblyReport) {
+        let bpe = Self::get_bpe();
+        let task_state_summary = self.load_task_state_summary();
+        let legacy_task_plan = self.load_legacy_task_plan();
+        let (retrieved_memory, stale_evidence_refreshes) = self.load_retrieved_memory_section();
+        let evidence_candidates = self.build_evidence_candidates();
+        let retrieved_memory = if evidence_candidates.is_empty() {
+            retrieved_memory
+        } else {
+            None
+        };
+        let (prompt, stats, mut report) = assemble_prompt_sections(
+            &bpe,
+            AssemblyInputs {
+                system_prompts: &self.system_prompts,
+                transcript_path: self.transcript_path.as_deref(),
+                task_state_summary: task_state_summary.as_deref(),
+                legacy_task_plan: legacy_task_plan.as_deref(),
+                retrieved_memory: retrieved_memory.as_deref(),
+                evidence_candidates,
+                max_history_tokens: self.max_history_tokens,
+            },
+        );
+        report.stale_evidence_refreshes = stale_evidence_refreshes;
+        (prompt, stats, report)
     }
 
     pub fn get_detailed_stats(&self, pending_user_input: Option<&str>) -> DetailedContextStats {
@@ -256,23 +231,26 @@ impl AgentContext {
 
         // Current Turn
         if let Some(turn) = &self.current_turn {
-             for msg in &turn.messages {
-                 for part in &msg.parts {
-                     if let Some(text) = &part.text {
-                         stats.current_turn += bpe.encode_with_special_tokens(text).len();
-                     }
-                     if let Some(fc) = &part.function_call {
-                         stats.current_turn += bpe.encode_with_special_tokens(&fc.name).len();
-                         stats.current_turn += bpe.encode_with_special_tokens(&fc.args.to_string()).len();
-                     }
-                     if let Some(fr) = &part.function_response {
-                         stats.current_turn += bpe.encode_with_special_tokens(&fr.name).len();
-                         stats.current_turn += bpe.encode_with_special_tokens(&fr.response.to_string()).len();
-                     }
-                 }
-             }
+            for msg in &turn.messages {
+                for part in &msg.parts {
+                    if let Some(text) = &part.text {
+                        stats.current_turn += bpe.encode_with_special_tokens(text).len();
+                    }
+                    if let Some(fc) = &part.function_call {
+                        stats.current_turn += bpe.encode_with_special_tokens(&fc.name).len();
+                        stats.current_turn +=
+                            bpe.encode_with_special_tokens(&fc.args.to_string()).len();
+                    }
+                    if let Some(fr) = &part.function_response {
+                        stats.current_turn += bpe.encode_with_special_tokens(&fr.name).len();
+                        stats.current_turn += bpe
+                            .encode_with_special_tokens(&fr.response.to_string())
+                            .len();
+                    }
+                }
+            }
         } else if let Some(input) = pending_user_input {
-             stats.current_turn = bpe.encode_with_special_tokens(input).len();
+            stats.current_turn = bpe.encode_with_special_tokens(input).len();
         }
 
         // Last Turn
@@ -281,9 +259,14 @@ impl AgentContext {
         }
 
         // Total
-        stats.total = stats.system_static + stats.system_runtime + stats.system_custom
-            + stats.system_project + stats.system_task_plan + stats.memory
-            + stats.history + stats.current_turn;
+        stats.total = stats.system_static
+            + stats.system_runtime
+            + stats.system_custom
+            + stats.system_project
+            + stats.system_task_plan
+            + stats.memory
+            + stats.history
+            + stats.current_turn;
 
         stats
     }
@@ -300,9 +283,22 @@ impl AgentContext {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            turn_id: self.current_turn.as_ref().map(|t| t.turn_id.clone()).unwrap_or_default(),
+            turn_id: self
+                .current_turn
+                .as_ref()
+                .map(|t| t.turn_id.clone())
+                .unwrap_or_default(),
             stats,
-            messages_count: self.dialogue_history.iter().map(|t| t.messages.len()).sum::<usize>() + self.current_turn.as_ref().map(|t| t.messages.len()).unwrap_or(0),
+            messages_count: self
+                .dialogue_history
+                .iter()
+                .map(|t| t.messages.len())
+                .sum::<usize>()
+                + self
+                    .current_turn
+                    .as_ref()
+                    .map(|t| t.messages.len())
+                    .unwrap_or(0),
             system_prompt_hash: hash,
             retrieved_memory_sources: self.retrieved_memory_sources.clone(),
             history_turns_count: self.dialogue_history.len(),
@@ -318,20 +314,34 @@ impl AgentContext {
         system_prompt.hash(&mut hasher);
         let current_hash = hasher.finish();
 
-        let old_sources: std::collections::HashSet<_> = old.retrieved_memory_sources.iter().cloned().collect();
-        let new_sources_set: std::collections::HashSet<_> = self.retrieved_memory_sources.iter().cloned().collect();
+        let old_sources: std::collections::HashSet<_> =
+            old.retrieved_memory_sources.iter().cloned().collect();
+        let new_sources_set: std::collections::HashSet<_> =
+            self.retrieved_memory_sources.iter().cloned().collect();
 
-        let new_sources = self.retrieved_memory_sources.iter().filter(|s| !old_sources.contains(*s)).cloned().collect();
-        let removed_sources = old.retrieved_memory_sources.iter().filter(|s| !new_sources_set.contains(*s)).cloned().collect();
+        let new_sources = self
+            .retrieved_memory_sources
+            .iter()
+            .filter(|s| !old_sources.contains(*s))
+            .cloned()
+            .collect();
+        let removed_sources = old
+            .retrieved_memory_sources
+            .iter()
+            .filter(|s| !new_sources_set.contains(*s))
+            .cloned()
+            .collect();
 
         ContextDiff {
             token_delta: current_stats.total as i64 - old.stats.total as i64,
-            history_turns_delta: self.dialogue_history.len() as i32 - old.history_turns_count as i32,
+            history_turns_delta: self.dialogue_history.len() as i32
+                - old.history_turns_count as i32,
             system_prompt_changed: current_hash != old.system_prompt_hash,
             new_sources,
             removed_sources,
             memory_changed: self.retrieved_memory_sources != old.retrieved_memory_sources,
-            truncated_delta: current_stats.truncated_chars as i64 - old.stats.truncated_chars as i64,
+            truncated_delta: current_stats.truncated_chars as i64
+                - old.stats.truncated_chars as i64,
         }
     }
 
@@ -401,15 +411,6 @@ impl AgentContext {
         input.chars().take(max_chars).collect()
     }
 
-    fn build_prompt_section(title: &str, content: String, max_chars: usize) -> Option<String> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let truncated = Self::truncate_chars(trimmed, max_chars);
-        Some(format!("## {title}\n{truncated}\n"))
-    }
-
     fn build_system_prompt(&self) -> String {
         let (prompt, _) = self.build_prompt_sections();
         prompt
@@ -424,7 +425,6 @@ impl AgentContext {
         let mut cleaned_parts = Vec::new();
         for part in &msg.parts {
             let mut cleaned = part.clone();
-
 
             if role == "function" {
                 cleaned.text = None;
@@ -479,7 +479,7 @@ impl AgentContext {
                 if let Some(fr) = &mut part.function_response {
                     // Smart truncation: Try to truncate the "result" field inside the JSON first
                     let mut truncated_in_place = false;
-                    
+
                     // We need to work with the value as a mutable object if possible
                     if let Some(obj) = fr.response.as_object_mut() {
                         if let Some(val) = obj.get_mut("result") {
@@ -493,8 +493,9 @@ impl AgentContext {
                                     if char_count > 12_000 {
                                         let keep = 6_000;
                                         let head: String = s.chars().take(keep).collect();
-                                        let tail: String = s.chars().skip(char_count - keep).collect();
-                                        
+                                        let tail: String =
+                                            s.chars().skip(char_count - keep).collect();
+
                                         *val = serde_json::Value::String(format!(
                                             "{}\n... [History Compressed: {} chars hidden] ...\n{}",
                                             head,
@@ -504,7 +505,7 @@ impl AgentContext {
                                         truncated_in_place = true;
                                     }
                                 }
-                            } 
+                            }
                             // Case 2: result is a large object
                             else if val.to_string().len() > 12_000 {
                                 let s = val.to_string();
@@ -525,8 +526,8 @@ impl AgentContext {
                     if !truncated_in_place {
                         let response_str = fr.response.to_string();
                         if response_str.len() > 20_000 {
-                             let head: String = response_str.chars().take(2_000).collect();
-                             fr.response = serde_json::json!({
+                            let head: String = response_str.chars().take(2_000).collect();
+                            fr.response = serde_json::json!({
                                 "result": format!("{}\n... [Truncated massive object] ...", head),
                                 "original_chars": response_str.len()
                             });
@@ -542,19 +543,33 @@ impl AgentContext {
         let lower = msg.to_lowercase();
         let keywords = [
             // English
-            "previous command", "last command", "previous output", "last output",
-            "what did it say", "fix the error", "look above", "check the error",
-            "what was the error", "show me the output", "full output",
+            "previous command",
+            "last command",
+            "previous output",
+            "last output",
+            "what did it say",
+            "fix the error",
+            "look above",
+            "check the error",
+            "what was the error",
+            "show me the output",
+            "full output",
             // Chinese (P1-1.5 fix)
-            "上次", "之前", "刚才", "前面", "上面",
-            "修复错误", "看看输出", "检查错误", "什么错误",
-            "历史", "回顾", "重新看",
+            "上次",
+            "之前",
+            "刚才",
+            "前面",
+            "上面",
+            "修复错误",
+            "看看输出",
+            "检查错误",
+            "什么错误",
+            "历史",
+            "回顾",
+            "重新看",
         ];
         keywords.iter().any(|k| lower.contains(k))
     }
-
-
-
 
     fn strip_thinking_tags(text: &str) -> String {
         let mut result = text.to_string();
@@ -594,7 +609,9 @@ impl AgentContext {
                 if result_str.len() > 500 {
                     let head: String = result_str.chars().take(200).collect();
                     *result_val = serde_json::Value::String(format!(
-                        "{}\n... [stripped {} chars]", head, result_str.len()
+                        "{}\n... [stripped {} chars]",
+                        head,
+                        result_str.len()
                     ));
                 }
                 return;
@@ -611,21 +628,30 @@ impl AgentContext {
                 // Plan is always in system prompt; replace entire result
                 *result_val = serde_json::Value::String("[plan updated]".to_string());
                 return;
-            },
+            }
             "read_file" => {
                 if let Some(output) = env_obj.get_mut("output") {
                     if let Some(s) = output.as_str() {
                         let line_count = s.lines().count();
                         if line_count > 10 {
                             let head: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
-                            let tail: String = s.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                            let tail: String = s
+                                .lines()
+                                .rev()
+                                .take(5)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                                .join("\n");
                             *output = serde_json::Value::String(format!(
-                                "{}\n... [stripped {} lines] ...\n{}", head, line_count, tail
+                                "{}\n... [stripped {} lines] ...\n{}",
+                                head, line_count, tail
                             ));
                         }
                     }
                 }
-            },
+            }
             "execute_bash" => {
                 if let Some(output) = env_obj.get_mut("output") {
                     if let Some(s) = output.as_str() {
@@ -634,29 +660,31 @@ impl AgentContext {
                             let head: String = s.chars().take(200).collect();
                             let tail: String = s.chars().skip(char_count - 200).collect();
                             *output = serde_json::Value::String(format!(
-                                "{}\n... [stripped {} chars] ...\n{}", head, char_count, tail
+                                "{}\n... [stripped {} chars] ...\n{}",
+                                head, char_count, tail
                             ));
                         }
                     }
                 }
-            },
+            }
             "web_fetch" | "web_search_tavily" => {
                 if let Some(output) = env_obj.get_mut("output") {
                     if let Some(s) = output.as_str() {
                         *output = serde_json::Value::String(format!(
-                            "[web content stripped - {} chars]", s.len()
+                            "[web content stripped - {} chars]",
+                            s.len()
                         ));
                     }
                 }
-            },
+            }
             "skill" | "use_skill" => {
                 if let Some(output) = env_obj.get_mut("output") {
                     *output = serde_json::Value::String("Skill loaded.".to_string());
                 }
-            },
+            }
             "write_file" | "patch_file" => {
                 // Already small, keep as-is
-            },
+            }
             _ => {
                 // Generic: truncate output if large
                 if let Some(output) = env_obj.get_mut("output") {
@@ -665,7 +693,10 @@ impl AgentContext {
                             let head: String = s.chars().take(200).collect();
                             let tail: String = s.chars().skip(s.chars().count() - 100).collect();
                             *output = serde_json::Value::String(format!(
-                                "{}\n... [stripped {} chars] ...\n{}", head, s.len(), tail
+                                "{}\n... [stripped {} chars] ...\n{}",
+                                head,
+                                s.len(),
+                                tail
                             ));
                         }
                     }
@@ -704,7 +735,9 @@ impl AgentContext {
                 if let Some(fc) = &part.function_call {
                     if fc.name == "task_plan" {
                         // For task_plan, only keep the action to save tokens
-                        let action = fc.args.get("action")
+                        let action = fc
+                            .args
+                            .get("action")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown");
                         let mut stripped_fc = fc.clone();
@@ -738,7 +771,6 @@ impl AgentContext {
                             }
                         }
                         new_part.text = Some(cleaned_text);
-
                     } else if msg.role == "model" {
                         // Model text: Only keep if NO function call, and strip <think>
                         if new_part.function_call.is_none() {
@@ -749,23 +781,32 @@ impl AgentContext {
                         }
                     }
                 }
-                
+
                 // Only add part if it has content
-                if new_part.text.is_some() || new_part.function_call.is_some() || new_part.function_response.is_some() {
+                if new_part.text.is_some()
+                    || new_part.function_call.is_some()
+                    || new_part.function_response.is_some()
+                {
                     new_parts.push(new_part);
                 }
             }
 
             if !new_parts.is_empty() {
-                 new_messages.push(Message { role: msg.role.clone(), parts: new_parts });
+                new_messages.push(Message {
+                    role: msg.role.clone(),
+                    parts: new_parts,
+                });
             }
         }
-        
-        (Turn {
-            turn_id: turn.turn_id.clone(),
-            user_message: turn.user_message.clone(),
-            messages: new_messages,
-        }, 0)
+
+        (
+            Turn {
+                turn_id: turn.turn_id.clone(),
+                user_message: turn.user_message.clone(),
+                messages: new_messages,
+            },
+            0,
+        )
     }
 
     fn build_history_with_budget(&self) -> (Vec<Message>, usize, usize, usize) {
@@ -783,7 +824,7 @@ impl AgentContext {
                 Some(v) => v,
                 None => continue,
             };
-            
+
             // Heuristic: If this turn asks about history, protect the *next* turn we process (which is the older one)
             let user_asks_for_context = Self::is_user_referencing_history(&turn.user_message);
 
@@ -799,7 +840,7 @@ impl AgentContext {
                 Self::truncate_old_tool_results(&sanitized)
             };
             total_truncated_chars += truncated;
-            
+
             protect_next_turn = user_asks_for_context;
 
             let turn_tokens: usize = turn
@@ -821,7 +862,12 @@ impl AgentContext {
         for block in history_messages {
             flattened.extend(block);
         }
-        (flattened, current_tokens, turns_included, total_truncated_chars)
+        (
+            flattened,
+            current_tokens,
+            turns_included,
+            total_truncated_chars,
+        )
     }
 
     fn turn_token_estimate(turn: &Turn, bpe: &CoreBPE) -> usize {
@@ -842,7 +888,7 @@ impl AgentContext {
     // Refactored to return accurate NET tokens (using compression)
     pub fn get_context_status(&self) -> (usize, usize, usize, usize, usize) {
         let bpe = tiktoken_rs::cl100k_base().unwrap();
-        
+
         // 1. Calculate History (Net - Compressed)
         let (_, history_tokens, _, _) = self.build_history_with_budget();
 
@@ -857,11 +903,12 @@ impl AgentContext {
         };
 
         // 3. System Prompt (Net - Truncated)
+        let (system_prompt, _, _assembly_report) = self.build_prompt_sections_with_report();
         let system_msg = Message {
             role: "system".to_string(),
             parts: vec![Part {
                 thought_signature: None,
-                text: Some(self.build_system_prompt()),
+                text: Some(system_prompt),
                 function_call: None,
                 function_response: None,
             }],
@@ -870,33 +917,57 @@ impl AgentContext {
 
         // 4. Accurate Total
         let total_tokens = history_tokens + current_turn_tokens + system_tokens;
-        
-        (total_tokens, self.max_history_tokens, history_tokens, current_turn_tokens, system_tokens)
+
+        (
+            total_tokens,
+            self.max_history_tokens,
+            history_tokens,
+            current_turn_tokens,
+            system_tokens,
+        )
     }
 
     pub fn get_context_details(&self) -> String {
-        let bpe = Self::get_bpe();
         let stats = self.get_detailed_stats(None);
-        
+
         let mut details = String::new();
         details.push_str("\n\x1b[1;36m=== Context Audit Report ===\x1b[0m\n");
-        
-        details.push_str(&format!("\x1b[1;33m[Token Budget]\x1b[0m  {}/{} tokens ({:.1}% used)\n", 
-            stats.total, stats.max, (stats.total as f64 / stats.max as f64) * 100.0));
+
+        details.push_str(&format!(
+            "\x1b[1;33m[Token Budget]\x1b[0m  {}/{} tokens ({:.1}% used)\n",
+            stats.total,
+            stats.max,
+            (stats.total as f64 / stats.max as f64) * 100.0
+        ));
 
         details.push_str("\n\x1b[1;33m[System Components]\x1b[0m\n");
-        details.push_str(&format!("  - Identity (Static):   {} tokens\n", stats.system_static));
-        details.push_str(&format!("  - Runtime Env:        {} tokens\n", stats.system_runtime));
-        
+        details.push_str(&format!(
+            "  - Identity (Static):   {} tokens\n",
+            stats.system_static
+        ));
+        details.push_str(&format!(
+            "  - Runtime Env:        {} tokens\n",
+            stats.system_runtime
+        ));
+
         if stats.system_custom > 0 {
-            details.push_str(&format!("  - Custom Prompt:      {} tokens (.claw_prompt.md)\n", stats.system_custom));
-        }
-        
-        if stats.system_task_plan > 0 {
-            details.push_str(&format!("  - Task Plan:          {} tokens\n", stats.system_task_plan));
+            details.push_str(&format!(
+                "  - Custom Prompt:      {} tokens (.claw_prompt.md)\n",
+                stats.system_custom
+            ));
         }
 
-        details.push_str(&format!("  - Project Context:    {} tokens\n", stats.system_project));
+        if stats.system_task_plan > 0 {
+            details.push_str(&format!(
+                "  - Task Plan:          {} tokens\n",
+                stats.system_task_plan
+            ));
+        }
+
+        details.push_str(&format!(
+            "  - Project Context:    {} tokens\n",
+            stats.system_project
+        ));
         let project_files = ["AGENTS.md", "README.md", "MEMORY.md"];
         for file in project_files {
             if let Ok(meta) = fs::metadata(file) {
@@ -906,12 +977,22 @@ impl AgentContext {
 
         details.push_str("\n\x1b[1;33m[Conversation History]\x1b[0m\n");
         let (_, _, turns_included, _) = self.build_history_with_budget();
-        details.push_str(&format!("  - History Load:       {} tokens ({} turns included)\n", stats.history, turns_included));
-        details.push_str(&format!("  - Total History:      {} tokens ({} turns total)\n", self.dialogue_history_token_estimate(), self.dialogue_history.len()));
+        details.push_str(&format!(
+            "  - History Load:       {} tokens ({} turns included)\n",
+            stats.history, turns_included
+        ));
+        details.push_str(&format!(
+            "  - Total History:      {} tokens ({} turns total)\n",
+            self.dialogue_history_token_estimate(),
+            self.dialogue_history.len()
+        ));
 
         if stats.memory > 0 {
             details.push_str("\n\x1b[1;33m[RAG Memory]\x1b[0m\n");
-            details.push_str(&format!("  - Retrieved:          {} tokens\n", stats.memory));
+            details.push_str(&format!(
+                "  - Retrieved:          {} tokens\n",
+                stats.memory
+            ));
             for src in &self.retrieved_memory_sources {
                 details.push_str(&format!("    * {}\n", src));
             }
@@ -919,8 +1000,14 @@ impl AgentContext {
 
         if let Some(turn) = &self.current_turn {
             details.push_str("\n\x1b[1;33m[Current Turn]\x1b[0m\n");
-            details.push_str(&format!("  - Active Payload:     {} tokens\n", stats.current_turn));
-            details.push_str(&format!("  - User Message:       {}\n", Self::truncate_chars(&turn.user_message, 80)));
+            details.push_str(&format!(
+                "  - Active Payload:     {} tokens\n",
+                stats.current_turn
+            ));
+            details.push_str(&format!(
+                "  - User Message:       {}\n",
+                Self::truncate_chars(&turn.user_message, 80)
+            ));
         }
 
         details
@@ -975,7 +1062,11 @@ impl AgentContext {
 
         for (i, turn) in compacted_turns.iter().enumerate() {
             if budget_exhausted {
-                summary_lines.push(format!("\n[Turns {}-{}] (omitted due to summary size limit)", i + 1, to_compact));
+                summary_lines.push(format!(
+                    "\n[Turns {}-{}] (omitted due to summary size limit)",
+                    i + 1,
+                    to_compact
+                ));
                 break;
             }
 
@@ -992,8 +1083,11 @@ impl AgentContext {
                 continue;
             }
 
-            let header = format!("\n[Turn {}] User: {}", i + 1,
-                Self::truncate_chars(&turn.user_message, 120));
+            let header = format!(
+                "\n[Turn {}] User: {}",
+                i + 1,
+                Self::truncate_chars(&turn.user_message, 120)
+            );
             total_chars += header.len();
             summary_lines.push(header);
 
@@ -1054,7 +1148,7 @@ impl AgentContext {
 
         // Create a single compacted Turn
         let compacted_turn = Turn {
-            turn_id: format!("compacted-{}", uuid::Uuid::new_v4()),
+            turn_id: format!("compacted-{}", new_turn_id()),
             user_message: "[SYSTEM] History Compacted".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
@@ -1091,8 +1185,12 @@ impl AgentContext {
             }
             if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
                 let s = status.to_lowercase();
-                if s == "error" || s == "failed" { return true; }
-                if s == "ok" || s == "success" { return false; }
+                if s == "error" || s == "failed" {
+                    return true;
+                }
+                if s == "ok" || s == "success" {
+                    return false;
+                }
             }
         }
 
@@ -1100,7 +1198,9 @@ impl AgentContext {
         let result_str = response.to_string().to_lowercase();
 
         // Short-circuit: if the response is small and contains no signal, it's likely OK
-        if result_str.len() < 20 { return false; }
+        if result_str.len() < 20 {
+            return false;
+        }
 
         let has_error_keyword = result_str.contains("error:")
             || result_str.contains("failed:")
@@ -1123,35 +1223,30 @@ impl AgentContext {
     fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
         if let Some(obj) = args.as_object() {
             match tool_name {
-                "read_file" | "write_file" | "patch_file" => {
-                    obj.get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string()
-                }
+                "read_file" | "write_file" | "patch_file" => obj
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
                 "execute_bash" => {
-                    let cmd = obj.get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?");
+                    let cmd = obj.get("command").and_then(|v| v.as_str()).unwrap_or("?");
                     Self::truncate_chars(cmd, 80)
                 }
-                "web_fetch" => {
-                    obj.get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string()
-                }
+                "web_fetch" => obj
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
                 "browser" => {
                     let action = obj.get("action").and_then(|v| v.as_str()).unwrap_or("?");
                     let url = obj.get("url").and_then(|v| v.as_str()).unwrap_or("");
                     format!("{} {}", action, Self::truncate_chars(url, 60))
                 }
-                "task_plan" => {
-                    obj.get("action")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string()
-                }
+                "task_plan" => obj
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
                 _ => {
                     let s = args.to_string();
                     Self::truncate_chars(&s, 60)
@@ -1162,14 +1257,18 @@ impl AgentContext {
         }
     }
 
-    pub fn set_retrieved_memory(&mut self, retrieved_memory: Option<String>, sources: Vec<String>) {
-        self.retrieved_memory = retrieved_memory;
-        self.retrieved_memory_sources = sources;
+    pub fn set_retrieved_evidence(&mut self, evidence: Vec<Evidence>) {
+        self.retrieved_memory = None;
+        self.retrieved_memory_sources = evidence
+            .iter()
+            .map(|item| item.source_path.clone())
+            .collect();
+        self.retrieved_evidence = evidence;
     }
 
     pub fn start_turn(&mut self, text: String) {
         self.current_turn = Some(Turn {
-            turn_id: uuid::Uuid::new_v4().to_string(),
+            turn_id: new_turn_id(),
             user_message: text.clone(),
             messages: vec![Message {
                 role: "user".to_string(),
@@ -1183,51 +1282,153 @@ impl AgentContext {
         });
     }
 
+    pub fn current_turn_id(&self) -> Option<String> {
+        self.current_turn.as_ref().map(|turn| turn.turn_id.clone())
+    }
+
+    pub fn current_user_message(&self) -> Option<String> {
+        self.current_turn
+            .as_ref()
+            .map(|turn| turn.user_message.clone())
+    }
+
+    fn load_task_state_summary(&self) -> Option<String> {
+        let path = self.task_state_path.as_ref()?;
+        let snapshot = read_task_state(path).ok()?;
+        if snapshot.status == "pending" && snapshot.goal.is_empty() {
+            return None;
+        }
+        Some(summarize_task_state(&snapshot))
+    }
+
+    fn load_legacy_task_plan(&self) -> Option<String> {
+        let current_dir = std::env::current_dir().ok()?;
+        let plan_content = fs::read_to_string(task_plan_path(&current_dir)).ok()?;
+        let plan = serde_json::from_str::<crate::tools::TaskPlanState>(&plan_content).ok()?;
+        if !plan.items.iter().any(|item| item.status != "completed") {
+            return None;
+        }
+
+        let mut plan_str = String::new();
+        plan_str.push_str(
+            "You MUST follow this plan strictly. Do not skip steps without approval.\n\n",
+        );
+        for (i, item) in plan.items.iter().enumerate() {
+            let status_icon = match item.status.as_str() {
+                "completed" => "[x]",
+                "in_progress" => "[IN PROGRESS]",
+                _ => "[ ]",
+            };
+            plan_str.push_str(&format!("{} {}. {}\n", status_icon, i + 1, item.step));
+            if let Some(note) = &item.note {
+                plan_str.push_str(&format!("   Note: {}\n", note));
+            }
+        }
+        Some(plan_str)
+    }
+
+    fn load_retrieved_memory_section(&self) -> (Option<String>, usize) {
+        if self.retrieved_evidence.is_empty() {
+            return (self.retrieved_memory.clone(), 0);
+        }
+
+        let reconcile_span =
+            telemetry::context_reconcile_evidence_span(self.retrieved_evidence.len());
+        let _reconcile_guard = reconcile_span.enter();
+        let mut lines = Vec::new();
+        let mut refresh_count = 0usize;
+        for evidence in &self.retrieved_evidence {
+            let (freshness, reconciled) = reconcile_evidence(evidence);
+            match (freshness, reconciled) {
+                (EvidenceFreshness::Fresh, Some(current)) => {
+                    lines.push(format!(
+                        "--- Source: {} ---\n{}",
+                        current.source_path, current.content
+                    ));
+                }
+                (EvidenceFreshness::RefreshRequired, Some(current)) => {
+                    refresh_count += 1;
+                    lines.push(format!(
+                        "[Retrieved evidence refreshed after source changed: {}]\n--- Source: {} ---\n{}",
+                        current.source_path, current.source_path, current.content
+                    ));
+                }
+                (EvidenceFreshness::Invalidated, _) => {
+                    lines.push(format!(
+                        "[Retrieved evidence invalidated and omitted: {}]",
+                        evidence.source_path
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        if lines.is_empty() {
+            (None, refresh_count)
+        } else {
+            (Some(lines.join("\n\n")), refresh_count)
+        }
+    }
+
+    fn build_evidence_candidates(&self) -> Vec<PromptCandidate> {
+        let bpe = Self::get_bpe();
+        let mut candidates = Vec::new();
+        for evidence in &self.retrieved_evidence {
+            let (freshness, reconciled) = reconcile_evidence(evidence);
+            match freshness {
+                EvidenceFreshness::Fresh | EvidenceFreshness::RefreshRequired => {
+                    let Some(current) = reconciled else {
+                        continue;
+                    };
+                    let prefix = match freshness {
+                        EvidenceFreshness::Fresh => {
+                            format!("--- Source: {} ---\n", current.source_path)
+                        }
+                        EvidenceFreshness::RefreshRequired => format!(
+                            "[Retrieved evidence refreshed after source changed: {}]\n--- Source: {} ---\n",
+                            current.source_path, current.source_path
+                        ),
+                        EvidenceFreshness::Invalidated => unreachable!(),
+                    };
+                    let text = format!("## Evidence\n{}{}\n", prefix, current.content);
+                    let token_cost = bpe.encode_with_special_tokens(&text).len();
+                    candidates.push(PromptCandidate {
+                        id: current.evidence_id.clone(),
+                        kind: current.source_kind.clone(),
+                        layer: "evidence".to_string(),
+                        text,
+                        priority_score: 80,
+                        token_cost,
+                        required: false,
+                        retrieved_at: Some(current.retrieved_at),
+                    });
+                }
+                EvidenceFreshness::Invalidated => {
+                    let text = format!(
+                        "## Evidence\n[Retrieved evidence invalidated and omitted: {}]\n",
+                        evidence.source_path
+                    );
+                    let token_cost = bpe.encode_with_special_tokens(&text).len();
+                    candidates.push(PromptCandidate {
+                        id: format!("{}_invalidated", evidence.evidence_id),
+                        kind: evidence.source_kind.clone(),
+                        layer: "evidence".to_string(),
+                        text,
+                        priority_score: 85,
+                        token_cost,
+                        required: false,
+                        retrieved_at: Some(evidence.retrieved_at),
+                    });
+                }
+            }
+        }
+        candidates
+    }
+
     pub fn add_message_to_current_turn(&mut self, msg: Message) {
         if let Some(turn) = &mut self.current_turn {
             turn.messages.push(msg);
         }
-    }
-
-    pub fn truncate_current_turn_tool_results(&mut self, max_chars: usize) -> usize {
-        let mut truncated_parts = 0usize;
-        let Some(turn) = &mut self.current_turn else {
-            return 0;
-        };
-
-        for msg in &mut turn.messages {
-            if msg.role != "function" {
-                continue;
-            }
-            for part in &mut msg.parts {
-                let Some(fr) = &mut part.function_response else {
-                    continue;
-                };
-                let response_str = fr.response.to_string();
-                let char_count = response_str.chars().count();
-                
-                if char_count <= max_chars {
-                    continue;
-                }
-                
-                let keep_half = max_chars / 2;
-                let head: String = response_str.chars().take(keep_half).collect();
-                let tail: String = response_str.chars().skip(char_count - keep_half).collect();
-
-                fr.response = serde_json::json!({
-                    "result": format!(
-                        "{}\n... [Truncated by context recovery: {} chars hidden] ...\n{}",
-                        head,
-                        char_count - max_chars,
-                        tail
-                    ),
-                    "original_chars": char_count
-                });
-                truncated_parts += 1;
-            }
-        }
-
-        truncated_parts
     }
 
     pub fn end_turn(&mut self) {
@@ -1240,6 +1441,14 @@ impl AgentContext {
     }
 
     pub fn build_llm_payload(&self) -> (Vec<Message>, Option<Message>, PromptReport) {
+        let assemble_span = telemetry::context_assemble_span(
+            self.transcript_path
+                .as_ref()
+                .and_then(|path| path.file_stem())
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("unknown"),
+        );
+        let _assemble_guard = assemble_span.enter();
         let bpe = tiktoken_rs::cl100k_base().unwrap();
         let (mut messages, history_tokens_used, history_turns_included, _) =
             self.build_history_with_budget();
@@ -1256,7 +1465,11 @@ impl AgentContext {
                         "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]"
                     };
 
-                    if let Some(user_msg) = sanitized_turn.messages.iter_mut().find(|m| m.role == "user") {
+                    if let Some(user_msg) = sanitized_turn
+                        .messages
+                        .iter_mut()
+                        .find(|m| m.role == "user")
+                    {
                         if let Some(part) = user_msg.parts.first_mut() {
                             if let Some(text) = &mut part.text {
                                 *text = format!("{}\n\n{}", booster_msg, text);
@@ -1274,11 +1487,12 @@ impl AgentContext {
             }
         }
 
+        let (system_prompt, _, assembly_report) = self.build_prompt_sections_with_report();
         let system_msg = Message {
             role: "system".to_string(),
             parts: vec![Part {
-                    thought_signature: None,
-                text: Some(self.build_system_prompt()),
+                thought_signature: None,
+                text: Some(system_prompt),
                 function_call: None,
                 function_response: None,
             }],
@@ -1286,17 +1500,39 @@ impl AgentContext {
 
         let system_prompt_tokens = Self::estimate_tokens(&bpe, &system_msg);
         let retrieved_memory_snippets = self.retrieved_memory_sources.len();
+        let detailed_stats = self.get_detailed_stats(None);
+        let cache_stable_tokens = detailed_stats.system_static
+            + detailed_stats.system_custom
+            + detailed_stats.system_project
+            + detailed_stats.system_task_plan
+            + detailed_stats.memory;
+        let volatile_tokens =
+            detailed_stats.system_runtime + history_tokens_used + current_turn_tokens;
         let report = PromptReport {
             max_history_tokens: self.max_history_tokens,
             history_tokens_used,
             history_turns_included,
             current_turn_tokens,
             system_prompt_tokens,
+            cache_stable_tokens,
+            volatile_tokens,
             total_prompt_tokens: history_tokens_used + current_turn_tokens + system_prompt_tokens,
             retrieved_memory_snippets,
             retrieved_memory_sources: self.retrieved_memory_sources.clone(),
-            detailed_stats: self.get_detailed_stats(None),
+            evicted_item_count: assembly_report.evicted_item_labels.len(),
+            evicted_item_labels: assembly_report.evicted_item_labels,
+            stale_evidence_refreshes: assembly_report.stale_evidence_refreshes,
+            detailed_stats,
         };
+
+        telemetry::record_prompt_report(
+            self.transcript_path
+                .as_ref()
+                .and_then(|path| path.file_stem())
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("unknown"),
+            &report,
+        );
 
         (messages, Some(system_msg), report)
     }
@@ -1304,20 +1540,45 @@ impl AgentContext {
     pub fn format_diff(&self, diff: &ContextDiff) -> String {
         let mut output = String::new();
         output.push_str("\n\x1b[1;36m=== Context Diff ===\x1b[0m\n");
-        
+
         // Token Delta
         let token_sign = if diff.token_delta >= 0 { "+" } else { "" };
-        let token_color = if diff.token_delta > 0 { "\x1b[31m" } else if diff.token_delta < 0 { "\x1b[32m" } else { "\x1b[0m" };
-        output.push_str(&format!("  Tokens:       {}{}{}\x1b[0m\n", token_color, token_sign, diff.token_delta));
+        let token_color = if diff.token_delta > 0 {
+            "\x1b[31m"
+        } else if diff.token_delta < 0 {
+            "\x1b[32m"
+        } else {
+            "\x1b[0m"
+        };
+        output.push_str(&format!(
+            "  Tokens:       {}{}{}\x1b[0m\n",
+            token_color, token_sign, diff.token_delta
+        ));
 
         // Truncated Delta
         let trunc_sign = if diff.truncated_delta >= 0 { "+" } else { "" };
-        let trunc_color = if diff.truncated_delta > 0 { "\x1b[31m" } else if diff.truncated_delta < 0 { "\x1b[32m" } else { "\x1b[0m" };
-        output.push_str(&format!("  Truncated:    {}{}{}\x1b[0m chars\n", trunc_color, trunc_sign, diff.truncated_delta));
+        let trunc_color = if diff.truncated_delta > 0 {
+            "\x1b[31m"
+        } else if diff.truncated_delta < 0 {
+            "\x1b[32m"
+        } else {
+            "\x1b[0m"
+        };
+        output.push_str(&format!(
+            "  Truncated:    {}{}{}\x1b[0m chars\n",
+            trunc_color, trunc_sign, diff.truncated_delta
+        ));
 
         // History Turns
-        let turn_sign = if diff.history_turns_delta >= 0 { "+" } else { "" };
-        output.push_str(&format!("  History:      {}{}\x1b[0m turns\n", turn_sign, diff.history_turns_delta));
+        let turn_sign = if diff.history_turns_delta >= 0 {
+            "+"
+        } else {
+            ""
+        };
+        output.push_str(&format!(
+            "  History:      {}{}\x1b[0m turns\n",
+            turn_sign, diff.history_turns_delta
+        ));
 
         // System Prompt
         if diff.system_prompt_changed {
@@ -1350,49 +1611,48 @@ impl AgentContext {
                 let start = self.dialogue_history.len().saturating_sub(count);
                 let mut output = String::new();
                 for (i, turn) in self.dialogue_history.iter().enumerate().skip(start) {
-                    output.push_str(&format!("\n\x1b[1;33m[Turn {} - {}]\x1b[0m\n", i + 1, turn.turn_id));
+                    output.push_str(&format!(
+                        "\n\x1b[1;33m[Turn {} - {}]\x1b[0m\n",
+                        i + 1,
+                        turn.turn_id
+                    ));
                     output.push_str(&format!("User: {}\n", turn.user_message));
                     output.push_str(&format!("Messages: {}\n", turn.messages.len()));
                 }
                 if let Some(current) = &self.current_turn {
-                    output.push_str(&format!("\n\x1b[1;32m[Current Turn - {}]\x1b[0m\n", current.turn_id));
+                    output.push_str(&format!(
+                        "\n\x1b[1;32m[Current Turn - {}]\x1b[0m\n",
+                        current.turn_id
+                    ));
                     output.push_str(&format!("User: {}\n", current.user_message));
                     output.push_str(&format!("Messages: {}\n", current.messages.len()));
                 }
                 output
-            },
+            }
             "memory" => {
-                if let Some(mem) = &self.retrieved_memory {
+                if let (Some(mem), _) = self.load_retrieved_memory_section() {
                     format!("Sources: {:?}\n\n{}", self.retrieved_memory_sources, mem)
                 } else {
                     "No memory retrieved.".to_string()
                 }
-            },
+            }
             "plan" => {
-                 if let Ok(plan_content) = std::fs::read_to_string(".rusty_claw_task_plan.json") {
-                     plan_content
-                 } else {
-                     "No active plan.".to_string()
-                 }
-            },
-            _ => format!("Unknown section: {}", section)
+                if let Some(summary) = self.load_task_state_summary() {
+                    summary
+                } else if let Ok(current_dir) = std::env::current_dir() {
+                    if let Ok(plan_content) = std::fs::read_to_string(task_plan_path(&current_dir))
+                    {
+                        plan_content
+                    } else {
+                        "No active plan.".to_string()
+                    }
+                } else {
+                    "No active plan.".to_string()
+                }
+            }
+            _ => format!("Unknown section: {}", section),
         }
     }
-
-}
-
-pub fn transcript_path_for_session(base_dir: &Path, session_id: &str) -> PathBuf {
-    let sanitized = session_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    base_dir.join(format!("{sanitized}.jsonl"))
 }
 
 #[cfg(test)]
@@ -1424,6 +1684,35 @@ mod tests {
     }
 
     #[test]
+    fn test_task_state_summary_is_injected_into_system_prompt() {
+        let dir = tempdir().unwrap();
+        let task_state_path = dir.path().join("task_state.json");
+        std::fs::write(
+            &task_state_path,
+            serde_json::json!({
+                "schema_version": 1,
+                "task_id": "task_1",
+                "derived_from_event_id": "evt_1",
+                "derived_at": 1,
+                "status": "in_progress",
+                "goal": "Fix context management",
+                "current_step": "Running tool: read_file",
+                "plan_steps": [],
+                "artifact_ids": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ctx = AgentContext::new().with_task_state_path(task_state_path);
+        let (prompt, stats) = ctx.build_prompt_sections();
+
+        assert!(prompt.contains("Current Task State (Derived)"));
+        assert!(prompt.contains("Goal: Fix context management"));
+        assert!(stats.system_task_plan > 0);
+    }
+
+    #[test]
     fn test_token_budget_truncation() {
         let mut ctx = AgentContext::new();
         ctx.max_history_tokens = 10;
@@ -1439,5 +1728,49 @@ mod tests {
             payload.last().unwrap().parts[0].text.as_ref().unwrap(),
             "Short message"
         );
+    }
+
+    #[test]
+    fn test_retrieved_evidence_refreshes_memory_section() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snippet.txt");
+        std::fs::write(&path, "old content").unwrap();
+
+        let evidence = crate::evidence::file_evidence(
+            "ev_1".to_string(),
+            &path,
+            1,
+            "sample".to_string(),
+            "old content".to_string(),
+        )
+        .unwrap();
+
+        let mut ctx = AgentContext::new();
+        ctx.set_retrieved_evidence(vec![evidence]);
+        std::fs::write(&path, "new content").unwrap();
+
+        let (memory, refreshes) = ctx.load_retrieved_memory_section();
+        let memory = memory.unwrap();
+        assert_eq!(refreshes, 1);
+        assert!(memory.contains("refreshed after source changed"));
+        assert!(memory.contains("new content"));
+    }
+
+    #[test]
+    fn test_evidence_candidates_include_invalidated_tombstone() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing.txt");
+        std::fs::write(&path, "stale").unwrap();
+        let evidence =
+            crate::evidence::file_evidence("ev_missing".to_string(), &path, 1, "missing".to_string(), "stale".to_string())
+                .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut ctx = AgentContext::new();
+        ctx.set_retrieved_evidence(vec![evidence]);
+
+        let candidates = ctx.build_evidence_candidates();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].text.contains("invalidated and omitted"));
     }
 }
