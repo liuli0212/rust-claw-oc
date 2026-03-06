@@ -883,6 +883,25 @@ These are the key questions reviewers should answer before coding begins:
 7. Is the proposed serialized event-writer model acceptable for v1, or do reviewers require queue-based append from day one?
 8. Is the proposed artifact retention policy acceptable for local workspaces?
 
+## Review Outcomes
+
+The implementation plan is approved with these explicit decisions:
+
+1. `events.jsonl` is the approved source of truth for task progression.
+2. JSON Schema is sufficient for v1. Protobuf is deferred.
+3. Evidence freshness in v1 uses file hash plus file `mtime`.
+4. The cache-aware prompt ordering is approved as written.
+5. Deterministic eviction is approved with fixed tiebreakers:
+- first by `priority_score`
+- then by newest `retrieved_at`
+- then by lexical `id`
+6. Artifact metadata is approved with `is_truncated: bool`.
+7. The serialized event writer for v1 should use `per-session tokio::sync::Mutex<tokio::fs::File>`.
+8. The artifact retention policy is approved:
+- delete runs older than 7 days
+- cap total artifact storage per workspace at 500 MB
+- delete fully expired runs first, then oldest runs by `created_at`
+
 ## Definition Of Done
 
 The implementation is complete when:
