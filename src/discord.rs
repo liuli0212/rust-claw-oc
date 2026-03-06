@@ -76,13 +76,17 @@ impl EventHandler for Handler {
         let agent = match self
             .session_manager
             .get_or_create_session(&session_id, output)
-            .await {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = msg.channel_id.say(&ctx.http, format!("❌ Error: {}", e)).await;
-                    return;
-                }
-            };
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, format!("❌ Error: {}", e))
+                    .await;
+                return;
+            }
+        };
 
         let content = msg.content.clone();
         let channel_id = msg.channel_id;
@@ -95,20 +99,24 @@ impl EventHandler for Handler {
             drop(agent_guard);
 
             match result {
-                Ok(exit) => {
-                    match exit {
-                        crate::core::RunExit::AgentTurnLimitReached => {
-                            let _ = channel_id.say(&http, "⚠️ [Turn Limit Reached]").await;
-                        }
-                        crate::core::RunExit::RecoverableFailed(ref e) | crate::core::RunExit::CriticallyFailed(ref e) => {
-                            let _ = channel_id.say(&http, format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), e)).await;
-                        }
-                        crate::core::RunExit::StoppedByUser => {
-                            let _ = channel_id.say(&http, "✅ Task stopped by user.").await;
-                        }
-                        _ => {}
+                Ok(exit) => match exit {
+                    crate::core::RunExit::AgentTurnLimitReached => {
+                        let _ = channel_id.say(&http, "⚠️ [Turn Limit Reached]").await;
                     }
-                }
+                    crate::core::RunExit::RecoverableFailed(ref e)
+                    | crate::core::RunExit::CriticallyFailed(ref e) => {
+                        let _ = channel_id
+                            .say(
+                                &http,
+                                format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), e),
+                            )
+                            .await;
+                    }
+                    crate::core::RunExit::StoppedByUser => {
+                        let _ = channel_id.say(&http, "✅ Task stopped by user.").await;
+                    }
+                    _ => {}
+                },
                 Err(e) => {
                     let _ = channel_id.say(&http, format!("Error: {}", e)).await;
                 }
