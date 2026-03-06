@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct AppConfig {
@@ -26,24 +26,26 @@ impl AppConfig {
     pub fn load() -> Self {
         let paths = vec![
             PathBuf::from("config.toml"),
-            dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("rusty-claw/config.toml"),
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".rusty-claw/config.toml"),
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("rusty-claw/config.toml"),
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".rusty-claw/config.toml"),
         ];
 
         for path in paths {
             if path.exists() {
                 match fs::read_to_string(&path) {
-                    Ok(content) => {
-                        match toml::from_str(&content) {
-                            Ok(config) => {
-                                tracing::info!("Loaded config from {}", path.display());
-                                return config;
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to parse config at {}: {}", path.display(), e);
-                            }
+                    Ok(content) => match toml::from_str(&content) {
+                        Ok(config) => {
+                            tracing::info!("Loaded config from {}", path.display());
+                            return config;
                         }
-                    }
+                        Err(e) => {
+                            tracing::warn!("Failed to parse config at {}: {}", path.display(), e);
+                        }
+                    },
                     Err(e) => {
                         tracing::warn!("Failed to read config at {}: {}", path.display(), e);
                     }

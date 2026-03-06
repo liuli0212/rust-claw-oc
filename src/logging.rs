@@ -2,9 +2,7 @@ use crate::config::AppConfig;
 use std::fs;
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{
-    fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
-};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 pub fn init_logging(
     _config: &AppConfig,
@@ -22,10 +20,9 @@ pub fn init_logging(
         .unwrap_or_else(|| EnvFilter::new("info"))
         .add_directive("rustyline=off".parse().unwrap());
 
-
     let enable_file = std::env::var("CLAW_FILE_LOG")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        .map(|v| v != "0")
+        .unwrap_or(true);
 
     let log_dir = std::env::var("CLAW_LOG_DIR")
         .ok()
