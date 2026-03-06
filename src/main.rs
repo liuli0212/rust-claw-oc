@@ -7,20 +7,31 @@ pub mod evidence;
 pub mod context_assembler;
 pub mod telemetry;
 
+<<<<<<< HEAD
+=======
+pub mod artifact_store;
+mod context;
+pub mod context_assembler;
+>>>>>>> b337582 (feat: Context Management Integration)
 mod config;
 mod context;
 mod core;
 mod discord;
+pub mod event_log;
+pub mod evidence;
 mod llm_client;
 mod logging;
 mod memory;
 pub mod rag;
+pub mod schema;
 mod session_manager;
 mod skills;
+pub mod task_state;
 mod telegram;
+pub mod telemetry;
 mod tools;
+mod ui;
 mod utils;
-mod ui; // Add the UI module
 
 use crate::core::{AgentOutput, RunExit};
 use crate::memory::WorkspaceMemory;
@@ -175,21 +186,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-<<<<<<< HEAD
-    let output = Arc::new(CliOutput);
-    if let Err(e) = session_manager
-        .get_or_create_session("cli", output.clone())
-        .await
-    {
-        eprintln!(
-            "\x1b[33m[Warning] Failed to pre-initialize CLI session: {}\x1b[0m",
-            e
-        );
-=======
     let output = Arc::new(TuiOutput::new());
     if let Err(e) = session_manager.get_or_create_session("cli", output.clone()).await {
         eprintln!("{} Failed to pre-initialize CLI session: {}", style("⚠").yellow(), e);
->>>>>>> 399502f (feat: enhance CLI UI with Markdown rendering, spinners, and icons)
     }
 
     let mut rl = DefaultEditor::new()?;

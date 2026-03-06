@@ -286,10 +286,10 @@ mod tests {
 
         // 1. Vector match (semantic)
         let res = store.search("speed performance", 1).unwrap();
-        assert_eq!(res[0].1, "doc1");
+        assert_eq!(res[0].source_path, "doc1");
 
         // 2. Keyword match (exact)
         let res2 = store.search("rusty claw", 1).unwrap();
-        assert_eq!(res2[0].1, "doc3");
+        assert_eq!(res2[0].source_path, "doc3");
     }
 }
