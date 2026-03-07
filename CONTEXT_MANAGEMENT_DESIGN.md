@@ -232,6 +232,17 @@ If the underlying source has changed, the assembler should either:
 - invalidate it and remove it from active state
 - replace it with a tombstone indicating that the old evidence is stale
 
+### L3.2 Advanced Evidence Applications
+
+The Evidence mechanism should not be limited to semantic memory (RAG). Its primary value lies in active environment monitoring and preventing hallucinations.
+
+High-value applications include:
+
+- **Tool Action Binding**: When reading files (e.g., `read_file`), the tool should emit an Evidence object. If the file is modified later by the user or another tool, the Evidence invalidates, placing a tombstone in the prompt to force the agent to re-read the file.
+- **Diagnostic State Binding**: Compilers or linters output (like `cargo check` errors) can be wrapped as Evidence and bound to the source files. If the source files change, the old diagnostic Evidence is invalidated, ensuring the agent doesn't act on outdated error messages.
+- **Directory Snapshots**: Outputs of tree or list directory commands can be wrapped as Evidence. The freshness check will use the directory's mtime to track if files were added or removed, invalidating the old directory structure snapshot if changes occurred.
+- **User-Level Context Pinning**: A feature to explicitly pin a file to the context. The file is loaded as Evidence, and the freshness tracker keeps it highly synced with the user's out-of-band edits.
+
 ### L4: Artifact Store
 
 This layer stores large outputs that should not remain in prompt or transcript.
