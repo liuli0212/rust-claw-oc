@@ -88,21 +88,14 @@ impl AgentOutput for TuiOutput {
         if text.trim().is_empty() {
             return;
         }
-        // Instead of printing raw text, we update the spinner or print dimmed lines
-        // For short thoughts, update spinner
-        if text.len() < 60 && !text.contains('\n') {
-            self.update_spinner(text);
-        } else {
-            // For longer thoughts, print dimmed
-            // self.stop_spinner(); // Optionally stop spinner to print long thoughts
-            // println!("{}", style(text.trim()).dim());
-            // actually, let's keep it minimal like Claude Code - just show we are thinking
-            // unless it's a long block.
-            let lines = text.lines();
-            for line in lines {
-                if !line.trim().is_empty() {
-                     println!("{}", style(format!("  {} {}", Emoji("🧠", "*"), line.trim())).dim());
-                }
+        
+        // Stop the spinner so thoughts are clearly printed above tools
+        self.stop_spinner();
+
+        let lines = text.lines();
+        for line in lines {
+            if !line.trim().is_empty() {
+                 println!("  {} {}", style(Emoji("🧠", "*")).cyan(), style(line.trim()).cyan());
             }
         }
     }
