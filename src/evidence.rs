@@ -49,7 +49,7 @@ impl Evidence {
             .unwrap_or_default()
             .as_secs();
 
-        if source_kind == "file" {
+        if source_kind == "file" || source_kind == "directory" {
             let path = PathBuf::from(source_path);
             if path.exists() {
                 if let Ok(metadata) = fs::metadata(&path) {
@@ -58,8 +58,6 @@ impl Evidence {
                             .duration_since(SystemTime::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        // For v1 we can use size + mtime as a pseudo-hash to save heavy file reading,
-                        // or we could hash the content. Let's start with a mtime + size based string.
                         let size = metadata.len();
                         let version = format!("v1-{}-{}", mtime_secs, size);
                         return (Some(version), retrieved_at);
@@ -73,12 +71,13 @@ impl Evidence {
     /// Check if this evidence is still fresh.
     /// Returns (is_fresh, replacement_tombstone)
     pub fn is_fresh(&self) -> (bool, Option<String>) {
-        if self.source_kind == "file" {
+        if self.source_kind == "file" || self.source_kind == "directory" {
             let (current_version, _) = Self::generate_freshness(&self.source_kind, &self.source_path);
             if current_version != self.source_version {
+                let kind_label = if self.source_kind == "directory" { "directory" } else { "file" };
                 let tombstone = format!(
-                    "[Evidence '{}' automatically invalidated because the underlying file was modified since retrieval]",
-                    self.source_path
+                    "[Evidence '{}' automatically invalidated because the underlying {} was modified since retrieval]",
+                    self.source_path, kind_label
                 );
                 return (false, Some(tombstone));
             }

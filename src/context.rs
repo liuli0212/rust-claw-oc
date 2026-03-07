@@ -186,31 +186,9 @@ impl AgentContext {
         }
 
         // 4. Task Plan
-        if let Ok(plan_content) = fs::read_to_string(".rusty_claw_task_plan.json") {
-            if let Ok(plan) = serde_json::from_str::<crate::tools::TaskPlanState>(&plan_content) {
-                if plan.items.iter().any(|i| i.status != "completed") {
-                    let mut plan_str = String::new();
-                    plan_str.push_str("You MUST follow this plan strictly. Do not skip steps without approval.\n\n");
-                    for (i, item) in plan.items.iter().enumerate() {
-                        let status_icon = match item.status.as_str() {
-                            "completed" => "[x]",
-                            "in_progress" => "[IN PROGRESS]",
-                            _ => "[ ]",
-                        };
-                        plan_str.push_str(&format!("{} {}. {}\n", status_icon, i + 1, item.step));
-                        if let Some(note) = &item.note {
-                            plan_str.push_str(&format!("   Note: {}\n", note));
-                        }
-                    }
-                    if let Some(section) =
-                        Self::build_prompt_section("Current Task Plan (STRICT)", plan_str, 4_000)
-                    {
-                        stats.system_task_plan = bpe.encode_with_special_tokens(&section).len();
-                        sections.push(section);
-                    }
-                }
-            }
-        }
+        // Deprecated: the task plan is now loaded via context assembler dynamically from events. 
+        // We leave the block stubbed here for structural layout compat in build_prompt_sections if any other code relied on length.
+        let plan_str = ""; 
 
         // 5. Project Context
         // [P1-1.4 Fix] Task Planning instruction only injected when NO active plan exists

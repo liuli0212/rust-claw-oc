@@ -873,19 +873,9 @@ impl Tool for TavilySearchTool {
 
 // --- Task Plan Tool ---
 pub struct TaskPlanTool {
-    pub path: PathBuf,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Clone)]
-pub struct TaskPlanItem {
-    pub step: String,
-    pub status: String, // pending, in_progress, completed
-    pub note: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Default)]
-pub struct TaskPlanState {
-    pub items: Vec<TaskPlanItem>,
+    pub session_id: String,
+    pub event_log: std::sync::Arc<crate::event_log::EventLog>,
+    pub task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -903,27 +893,41 @@ pub struct TaskPlanArgs {
 }
 
 impl TaskPlanTool {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub fn new(
+        session_id: String,
+        event_log: std::sync::Arc<crate::event_log::EventLog>,
+        task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
+    ) -> Self {
+        Self {
+            session_id,
+            event_log,
+            task_state_store,
+        }
     }
 
-    fn load_state(&self) -> Result<TaskPlanState, ToolError> {
-        if !self.path.exists() {
-            return Ok(TaskPlanState::default());
-        }
-        let raw = std::fs::read_to_string(&self.path).map_err(ToolError::IoError)?;
-        serde_json::from_str::<TaskPlanState>(&raw).map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to parse task plan state: {}", e))
-        })
-    }
+    async fn emit_event(&self, event_type: &str, payload: serde_json::Value) -> Result<(), ToolError> {
+        // We need a stable task ID to bind these events.
+        // For now, retrieve the current one from store, or generate a temporary one if uninitialized.
+        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        let task_id = state.task_id.or_else(|| Some(format!("tsk_{}", uuid::Uuid::new_v4().simple())));
 
-    fn save_state(&self, state: &TaskPlanState) -> Result<(), ToolError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(ToolError::IoError)?;
+        let event = crate::event_log::AgentEvent::new(
+            event_type,
+            &self.session_id,
+            task_id,
+            None, // turn_id not easily accessible here without plumbing context, acceptable for now
+            payload,
+        );
+
+        self.event_log.append(event.clone()).await.map_err(|e| ToolError::ExecutionFailed(format!("Failed to append event: {}", e)))?;
+        
+        // Update materialized view
+        if let Ok(mut state) = self.task_state_store.load() {
+            state.apply_event(&event);
+            let _ = self.task_state_store.save(&state);
         }
-        let raw = serde_json::to_string_pretty(state)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-        std::fs::write(&self.path, raw).map_err(ToolError::IoError)
+
+        Ok(())
     }
 
     fn normalize_status(status: &str) -> Result<String, ToolError> {
@@ -958,75 +962,54 @@ impl Tool for TaskPlanTool {
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
         let action = parsed.action.trim().to_lowercase();
-        let mut state = self.load_state()?;
 
         match action.as_str() {
             "get" => {}
             "clear" => {
-                state.items.clear();
-                self.save_state(&state)?;
+                self.emit_event("PlanCleared", serde_json::json!({})).await?;
             }
             "add" => {
                 let step = parsed.step.ok_or_else(|| {
                     ToolError::InvalidArguments("add requires 'step'".to_string())
                 })?;
-                let item = TaskPlanItem {
-                    step,
-                    status: "pending".to_string(),
-                    note: parsed.note,
-                };
-                state.items.push(item);
-                self.save_state(&state)?;
+                self.emit_event("PlanStepAdded", serde_json::json!({ "step": step })).await?;
             }
             "update_status" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("update_status requires 'index'".to_string())
                 })?;
-                if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!(
-                        "index {} out of bounds",
-                        index
-                    )));
-                }
                 let status = parsed.status.ok_or_else(|| {
                     ToolError::InvalidArguments("update_status requires 'status'".to_string())
                 })?;
-                state.items[index].status = Self::normalize_status(&status)?;
+                let normalized_status = Self::normalize_status(&status)?;
+
+                let mut payload = serde_json::json!({
+                    "index": index,
+                    "status": normalized_status
+                });
                 if let Some(note) = parsed.note {
-                    state.items[index].note = Some(note);
+                    payload["note"] = serde_json::Value::String(note);
                 }
-                self.save_state(&state)?;
+                self.emit_event("PlanStepUpdated", payload).await?;
             }
             "update_text" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("update_text requires 'index'".to_string())
                 })?;
-                if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!(
-                        "index {} out of bounds",
-                        index
-                    )));
-                }
+                let mut payload = serde_json::json!({ "index": index });
                 if let Some(step) = parsed.step {
-                    state.items[index].step = step;
+                    payload["step"] = serde_json::Value::String(step);
                 }
                 if let Some(note) = parsed.note {
-                    state.items[index].note = Some(note);
+                    payload["note"] = serde_json::Value::String(note);
                 }
-                self.save_state(&state)?;
+                self.emit_event("PlanStepUpdated", payload).await?;
             }
             "remove" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("remove requires 'index'".to_string())
                 })?;
-                if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!(
-                        "index {} out of bounds",
-                        index
-                    )));
-                }
-                state.items.remove(index);
-                self.save_state(&state)?;
+                self.emit_event("PlanStepRemoved", serde_json::json!({ "index": index })).await?;
             }
             _ => {
                 return Err(ToolError::InvalidArguments(format!(
@@ -1036,8 +1019,12 @@ impl Tool for TaskPlanTool {
             }
         }
 
-        let output = serde_json::to_string_pretty(&state)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let output = if let Ok(state) = self.task_state_store.load() {
+            state.summary()
+        } else {
+            "Plan updated.".to_string()
+        };
+
         serialize_tool_envelope(
             "task_plan",
             true,

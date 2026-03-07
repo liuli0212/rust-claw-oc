@@ -502,6 +502,8 @@ impl AgentLoop {
                     return Ok(RunExit::Finished(summary));
                 }
 
+
+
                 let tool_opt = self.tools.iter().find(|t| t.name() == call.name);
                 let (result, is_error, stopped) = if let Some(tool) = tool_opt {
                     self.output.flush().await;
@@ -596,6 +598,57 @@ impl AgentLoop {
                                 "path": metadata.path,
                             }),
                         ).await;
+                    }
+                }
+
+                if !is_error {
+                    if call.name == "execute_bash" {
+                        if let Some(obj) = call.args.as_object() {
+                            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                                let cmd_trim = cmd.trim();
+                                let is_diagnostic = cmd_trim.contains("cargo ") || cmd_trim.contains("npm run") || cmd_trim.contains("pytest") || cmd_trim.contains("tsc") || cmd_trim.contains("make");
+                                let is_dir_list = cmd_trim.starts_with("ls ") || cmd_trim == "ls" || cmd_trim.starts_with("tree ") || cmd_trim == "tree" || cmd_trim.starts_with("find ");
+
+                                if is_diagnostic || is_dir_list {
+                                    let kind = if is_diagnostic { "diagnostic" } else { "directory" };
+                                    let source_path = if is_diagnostic { "workspace_state" } else { cmd_trim };
+                                    let evidence_id = format!("{}_{}", kind, uuid::Uuid::new_v4().simple());
+                                    
+                                    let evidence = crate::evidence::Evidence::new(
+                                        evidence_id.clone(),
+                                        kind.to_string(),
+                                        source_path.to_string(),
+                                        1.0,
+                                        format!("Bash snapshot: {}", cmd_trim).chars().take(200).collect(),
+                                        final_result.clone(),
+                                    );
+                                    
+                                    if is_dir_list {
+                                        self.context.active_evidence.retain(|e| e.source_kind != kind || e.source_path != source_path);
+                                    } else {
+                                        self.context.active_evidence.retain(|e| e.source_kind != kind);
+                                    }
+                                    
+                                    self.context.active_evidence.push(evidence);
+                                    
+                                    self.emit_agent_event(
+                                        "EvidenceAdded",
+                                        Some(current_task_id.clone()),
+                                        serde_json::json!({
+                                            "evidence_id": evidence_id,
+                                            "source": source_path,
+                                        }),
+                                    ).await;
+                                }
+                            }
+                        }
+                    } else if call.name == "write_file" || call.name == "patch_file" {
+                        // Invalidate diagnostic evidence because source code changed
+                        for ev in self.context.active_evidence.iter_mut() {
+                            if ev.source_kind == "diagnostic" {
+                                ev.source_version = Some("invalidated_by_write".to_string());
+                            }
+                        }
                     }
                 }
 
