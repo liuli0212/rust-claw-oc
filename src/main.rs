@@ -1,34 +1,23 @@
+pub mod artifact_store;
 pub mod browser;
+pub mod context_assembler;
 pub mod event_log;
+pub mod evidence;
+pub mod rag;
 pub mod schema;
 pub mod task_state;
-pub mod artifact_store;
-pub mod evidence;
-pub mod context_assembler;
 pub mod telemetry;
 
-<<<<<<< HEAD
-=======
-pub mod artifact_store;
-mod context;
-pub mod context_assembler;
->>>>>>> b337582 (feat: Context Management Integration)
 mod config;
 mod context;
 mod core;
 mod discord;
-pub mod event_log;
-pub mod evidence;
 mod llm_client;
 mod logging;
 mod memory;
-pub mod rag;
-pub mod schema;
 mod session_manager;
 mod skills;
-pub mod task_state;
 mod telegram;
-pub mod telemetry;
 mod tools;
 mod ui;
 mod utils;
@@ -321,20 +310,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-<<<<<<< HEAD
-                        "compact" => match agent_guard.force_compact().await {
-                            Ok(r) => println!("\x1b[32m[System] Context compacted: {}\x1b[0m", r),
-                            Err(e) => println!("\x1b[31m[System] Compaction skipped: {}\x1b[0m", e),
-                        },
-                        _ => {
-                            let stats = agent_guard.get_detailed_stats();
-                            println!(
-                                "\x1b[36m[Context Usage]\x1b[0m {}/{} tokens ({:.1}%)",
-                                stats.total,
-                                stats.max,
-                                (stats.total as f64 / stats.max as f64) * 100.0
-                            );
-=======
                         "compact" => {
                              match agent_guard.force_compact().await {
                                  Ok(r) => println!("  {} Context compacted: {}", style("✔").green(), r),
@@ -345,7 +320,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let stats = agent_guard.get_detailed_stats();
                             let pct = (stats.total as f64 / stats.max as f64) * 100.0;
                             println!("  {} {}/{} tokens ({:.1}%)", style("Context Usage").bold().cyan(), stats.total, stats.max, pct);
->>>>>>> 399502f (feat: enhance CLI UI with Markdown rendering, spinners, and icons)
                             println!("  Identity: {} | Runtime: {} | Custom: {} | Plan: {} | Project: {} | Memory: {} | History: {} | Current: {}", 
                                 stats.system_static, stats.system_runtime, stats.system_custom, stats.system_task_plan, stats.system_project, stats.memory, stats.history, stats.current_turn);
                             println!("  Use {} for deep dive or {} to see changes.", style("/context audit").bold(), style("/context diff").bold());
@@ -368,18 +342,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         continue;
                     }
-<<<<<<< HEAD
-                    match session_manager
-                        .update_session_llm("cli", parts[1], parts.get(2).map(|s| s.to_string()))
-                        .await
-                    {
-                        Ok(msg) => println!("\x1b[32m[System] {}\x1b[0m", msg),
-                        Err(e) => println!("\x1b[31m[System] Failed: {}\x1b[0m", e),
-=======
                     match session_manager.update_session_llm("cli", parts[1], parts.get(2).map(|s| s.to_string())).await {
                         Ok(msg) => println!("  {} {}", style("✔").green(), msg),
                         Err(e) => println!("  {} Failed: {}", style("✖").red(), e),
->>>>>>> 399502f (feat: enhance CLI UI with Markdown rendering, spinners, and icons)
                     }
                     continue;
                 }
@@ -420,15 +385,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("\n  {} Recoverable Failure: {}", style("⚠").yellow(), msg);
                         }
                         RunExit::CriticallyFailed(ref msg) => {
-<<<<<<< HEAD
-                            println!("\n\x1b[31m[Run Exit] critical_failure\x1b[0m: {}", msg);
-                            println!(
-                                "The system encountered an unrecoverable error during execution."
-                            );
-=======
                             println!("\n  {} Critical Failure: {}", style("✖").red(), msg);
                             println!("  The system encountered an unrecoverable error.");
->>>>>>> 399502f (feat: enhance CLI UI with Markdown rendering, spinners, and icons)
                         }
                     },
                     Err(e) => eprintln!("  {} Agent error: {}", style("✖").red(), e),
@@ -444,13 +402,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Exiting.");
                     break;
                 } else {
-<<<<<<< HEAD
-                    println!(
-                        "\n\x1b[33m[System] Press Ctrl-C again to exit (or type '/exit').\x1b[0m"
-                    );
-=======
                     println!("\n  {}", style("Press Ctrl-C again to exit.").yellow());
->>>>>>> 399502f (feat: enhance CLI UI with Markdown rendering, spinners, and icons)
                 }
             }
             Err(ReadlineError::Eof) => {
