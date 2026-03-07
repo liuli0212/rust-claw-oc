@@ -590,12 +590,6 @@ impl AgentLoop {
                                     }
                                     
                                     self.context.active_evidence.push(evidence);
-                                    
-                                    let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
-                                    if !state.evidence_ids.iter().any(|x| x == &evidence_id) {
-                                        state.evidence_ids.push(evidence_id.clone());
-                                        let _ = self.task_state_store.save(&state);
-                                    }
                                 }
                             }
                         }
