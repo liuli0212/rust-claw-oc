@@ -29,7 +29,43 @@ impl VectorStore {
 
         let mut opts = InitOptions::new(EmbeddingModel::AllMiniLML6V2);
         opts.show_download_progress = false;
-        let model = TextEmbedding::try_new(opts)?;
+
+        // WORKAROUND: hf-mirror.com and similar mirrors often strip the `Content-Range` header on 200 OK 
+        // responses, which crashes the rust `hf-hub` crate used by `fastembed`.
+        // If the user has a proxy configured, we can temporarily unset HF_ENDPOINT to download locally.
+        let hf_endpoint = std::env::var("HF_ENDPOINT").unwrap_or_default();
+        let has_proxy = std::env::var("https_proxy").is_ok() || std::env::var("all_proxy").is_ok() || std::env::var("HTTP_PROXY").is_ok();
+        
+        if hf_endpoint.contains("hf-mirror") && has_proxy {
+            tracing::warn!("[RAG] Temporarily unsetting HF_ENDPOINT to bypass download bug, relying on system proxy...");
+            std::env::remove_var("HF_ENDPOINT");
+        }
+
+        let model_res = TextEmbedding::try_new(opts);
+
+        // Restore HF_ENDPOINT
+        if !hf_endpoint.is_empty() {
+            std::env::set_var("HF_ENDPOINT", hf_endpoint);
+        }
+
+        let model = match model_res {
+            Ok(m) => m,
+            Err(e) => {
+                if e.to_string().contains("Content-Range") {
+                    eprintln!("======================================================");
+                    eprintln!("❌ RAG Initialization Error: Failed to download embedding model.");
+                    eprintln!("This is caused by your HF_ENDPOINT stripping the 'Content-Range'");
+                    eprintln!("header which is strictly required by the underlying hf-hub crate.");
+                    eprintln!("Workarounds:");
+                    eprintln!(" 1. Run with a proxy and bypass the mirror:");
+                    eprintln!("    env HF_ENDPOINT= cargo run");
+                    eprintln!(" 2. Download 'Qdrant/all-MiniLM-L6-v2-onnx' manually into:");
+                    eprintln!("    ~/.cache/huggingface/hub/");
+                    eprintln!("======================================================");
+                }
+                return Err(e.into());
+            }
+        };
 
         // Open a SQLite connection for hybrid search
         let conn = Connection::open(".rusty_claw_memory.db")?;
