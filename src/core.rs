@@ -576,6 +576,27 @@ impl AgentLoop {
                 if output_bytes.len() > 8000 {
                     let artifact_id = crate::artifact_store::ArtifactStore::generate_id();
                     let content_type = if call.name == "execute_bash" { "text/plain" } else { "text/plain" };
+                    let mut summary_details = String::new();
+                    if let Some(obj) = call.args.as_object() {
+                        if call.name == "execute_bash" {
+                            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                                summary_details = cmd.chars().take(60).collect::<String>().replace('\n', " ");
+                            }
+                        } else if call.name == "read_file" || call.name == "write_file" || call.name == "patch_file" {
+                            if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+                                summary_details = path.to_string();
+                            }
+                        } else if call.name == "web_fetch" || call.name == "browser" || call.name == "search" {
+                            if let Some(url) = obj.get("url").or_else(|| obj.get("target_url")).or_else(|| obj.get("query")).and_then(|v| v.as_str()) {
+                                summary_details = url.to_string();
+                            }
+                        }
+                    }
+                    if summary_details.is_empty() {
+                        summary_details = call.args.to_string().chars().take(50).collect::<String>().replace('\n', " ");
+                    }
+                    let artifact_summary = format!("Output of {} ({})", call.name, summary_details);
+
                     if let Ok(metadata) = artifact_store.write_artifact(
                         &artifact_id,
                         Some(current_task_id.clone()),
@@ -583,7 +604,7 @@ impl AgentLoop {
                         content_type,
                         "tool-output",
                         output_bytes,
-                        &format!("Output of {}", call.name),
+                        &artifact_summary,
                         false,
                     ).await {
                         // Truncate for the context window, leaving a reference to the artifact
