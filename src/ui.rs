@@ -101,7 +101,7 @@ impl AgentOutput for TuiOutput {
             let lines = text.lines();
             for line in lines {
                 if !line.trim().is_empty() {
-                     println!("{}", style(format!("  {} {}", Emoji("💭", "*"), line.trim())).dim());
+                     println!("{}", style(format!("  {} {}", Emoji("🧠", "*"), line.trim())).dim());
                 }
             }
         }

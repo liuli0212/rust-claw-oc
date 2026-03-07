@@ -101,12 +101,18 @@ impl SessionManager {
         session_id: &str,
         output: Arc<dyn AgentOutput>,
     ) -> Result<Arc<AsyncMutex<AgentLoop>>, String> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some((agent, _, _)) = sessions.get(session_id) {
+        let existing = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session_id).map(|(a, _, _)| a.clone())
+        };
+
+        if let Some(agent_mutex) = existing {
+            let mut agent = agent_mutex.lock().await;
+            agent.update_output(output);
             // Update timestamp in memory only (fast)
             self.update_registry_entry(session_id, None, None);
             self.persist_registry_async();
-            return Ok(agent.clone());
+            return Ok(agent_mutex.clone());
         }
 
         let transcript_path = transcript_path_for_session(&self.transcript_dir, session_id);
@@ -117,10 +123,12 @@ impl SessionManager {
         self.update_registry_entry(session_id, Some(transcript_path), Some(loaded_turns));
         self.persist_registry_async();
 
-        let llm_guard = self.llm.read().unwrap();
-        let llm = llm_guard.as_ref().ok_or_else(|| {
-            "No LLM provider configured. Use /model <provider> to set one.".to_string()
-        })?;
+        let llm = {
+            let llm_guard = self.llm.read().unwrap();
+            llm_guard.as_ref().ok_or_else(|| {
+                "No LLM provider configured. Use /model <provider> to set one.".to_string()
+            })?.clone()
+        };
 
         let (telemetry, _telemetry_handle) = crate::telemetry::TelemetryExporter::new();
         let telemetry = Arc::new(telemetry);
@@ -136,7 +144,7 @@ impl SessionManager {
 
         let agent_loop = AgentLoop::new(
             session_id.to_string(),
-            llm.clone(),
+            llm,
             session_tools,
             context,
             output,
@@ -147,6 +155,8 @@ impl SessionManager {
         let token = agent_loop.cancel_token.clone();
         let cancelled = agent_loop.cancelled.clone();
         let agent = Arc::new(AsyncMutex::new(agent_loop));
+        
+        let mut sessions = self.sessions.lock().await;
         sessions.insert(session_id.to_string(), (agent.clone(), token, cancelled));
         Ok(agent)
     }
@@ -194,6 +204,7 @@ impl SessionManager {
             let _ = fs::write(&registry_path, serialized);
         });
     }
+
     pub async fn update_session_llm(
         &self,
         session_id: &str,
@@ -210,8 +221,11 @@ impl SessionManager {
                     *llm_guard = Some(new_llm.clone());
                 }
 
-                let sessions = self.sessions.lock().await;
-                if let Some((agent_mutex, _, _)) = sessions.get(session_id) {
+                let agent_mutex = {
+                    let sessions = self.sessions.lock().await;
+                    sessions.get(session_id).map(|(a, _, _)| a.clone())
+                };
+                if let Some(agent_mutex) = agent_mutex {
                     let mut agent = agent_mutex.lock().await;
                     agent.update_llm(new_llm);
                     Ok(format!(
@@ -225,6 +239,19 @@ impl SessionManager {
             }
             Err(e) => Err(e),
         }
+    }
+
+    pub fn list_sessions(&self) -> Vec<(String, u64, usize)> {
+        let cache = self.registry_cache.read().unwrap();
+        let mut list: Vec<_> = cache
+            .sessions
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.updated_at_unix, entry.loaded_turns))
+            .collect();
+
+        // Sort by last updated (descending)
+        list.sort_by(|a, b| b.1.cmp(&a.1));
+        list
     }
 }
 

@@ -112,6 +112,29 @@ impl AgentLoop {
     pub fn update_llm(&mut self, new_llm: Arc<dyn LlmClient>) {
         self.llm = new_llm;
     }
+    pub fn update_output(&mut self, output: Arc<dyn AgentOutput>) {
+        self.output = output;
+    }
+
+    pub fn get_session_details(&self) -> serde_json::Value {
+        let (tokens, max_tokens, turns, system_tokens, evidence_count) = self.context.get_context_status();
+        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        serde_json::json!({
+            "session_id": self.session_id,
+            "provider": self.llm.provider_name(),
+            "model": self.llm.model_name(),
+            "context": {
+                "tokens": tokens,
+                "max_tokens": max_tokens,
+                "turns": turns,
+                "system_tokens": system_tokens,
+                "active_evidence": evidence_count,
+            },
+            "task_id": state.task_id,
+            "task_status": state.status,
+            "cancelled": self.is_cancelled(),
+        })
+    }
 
     pub fn get_status(&self) -> (String, String, usize, usize) {
         let (total_tokens, max_tokens, _, _, _) = self.context.get_context_status();
@@ -163,7 +186,7 @@ impl AgentLoop {
         Ok("Compaction triggered.".to_string())
     }
 
-    async fn maybe_compact_history(
+    pub async fn maybe_compact_history(
         &mut self,
         force: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -488,7 +511,7 @@ impl AgentLoop {
                 }
 
                 if call.name == "finish_task" {
-                    let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
+                    self.emit_agent_event("PlanCleared", Some(current_task_id.clone()), serde_json::json!({})).await;
                     let mut summary = call.args.to_string();
                     if let Some(obj) = call.args.as_object() {
                         if let Some(s) = obj.get("summary").and_then(|v| v.as_str()) {
