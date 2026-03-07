@@ -496,8 +496,6 @@ impl AgentLoop {
                         }
                     }
                     self.output.flush().await;
-                    self.output.on_text(&format!("\n{}\n", summary)).await;
-                    self.output.flush().await;
                     self.telemetry.end_span("agent_step");
                     return Ok(RunExit::Finished(summary));
                 }
