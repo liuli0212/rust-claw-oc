@@ -874,7 +874,6 @@ impl Tool for TavilySearchTool {
 // --- Task Plan Tool ---
 pub struct TaskPlanTool {
     pub session_id: String,
-    pub event_log: std::sync::Arc<crate::event_log::EventLog>,
     pub task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
 }
 
@@ -895,39 +894,12 @@ pub struct TaskPlanArgs {
 impl TaskPlanTool {
     pub fn new(
         session_id: String,
-        event_log: std::sync::Arc<crate::event_log::EventLog>,
         task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
     ) -> Self {
         Self {
             session_id,
-            event_log,
             task_state_store,
         }
-    }
-
-    async fn emit_event(&self, event_type: &str, payload: serde_json::Value) -> Result<(), ToolError> {
-        // We need a stable task ID to bind these events.
-        // For now, retrieve the current one from store, or generate a temporary one if uninitialized.
-        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
-        let task_id = state.task_id.or_else(|| Some(format!("tsk_{}", uuid::Uuid::new_v4().simple())));
-
-        let event = crate::event_log::AgentEvent::new(
-            event_type,
-            &self.session_id,
-            task_id,
-            None, // turn_id not easily accessible here without plumbing context, acceptable for now
-            payload,
-        );
-
-        self.event_log.append(event.clone()).await.map_err(|e| ToolError::ExecutionFailed(format!("Failed to append event: {}", e)))?;
-        
-        // Update materialized view
-        if let Ok(mut state) = self.task_state_store.load() {
-            state.apply_event(&event);
-            let _ = self.task_state_store.save(&state);
-        }
-
-        Ok(())
     }
 
     fn normalize_status(status: &str) -> Result<String, ToolError> {
@@ -962,17 +934,29 @@ impl Tool for TaskPlanTool {
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
         let action = parsed.action.trim().to_lowercase();
+        
+        let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        
+        // Ensure task has a defined ID and in_progress status
+        if state.task_id.is_none() {
+            state.task_id = Some(format!("tsk_{}", uuid::Uuid::new_v4().simple()));
+            state.status = "in_progress".to_string();
+        }
 
         match action.as_str() {
             "get" => {}
             "clear" => {
-                self.emit_event("PlanCleared", serde_json::json!({})).await?;
+                state.plan_steps.clear();
             }
             "add" => {
                 let step = parsed.step.ok_or_else(|| {
                     ToolError::InvalidArguments("add requires 'step'".to_string())
                 })?;
-                self.emit_event("PlanStepAdded", serde_json::json!({ "step": step })).await?;
+                state.plan_steps.push(crate::task_state::PlanStep {
+                    step,
+                    status: "pending".to_string(),
+                    note: None,
+                });
             }
             "update_status" => {
                 let index = parsed.index.ok_or_else(|| {
@@ -983,33 +967,40 @@ impl Tool for TaskPlanTool {
                 })?;
                 let normalized_status = Self::normalize_status(&status)?;
 
-                let mut payload = serde_json::json!({
-                    "index": index,
-                    "status": normalized_status
-                });
-                if let Some(note) = parsed.note {
-                    payload["note"] = serde_json::Value::String(note);
+                if index < state.plan_steps.len() {
+                    state.plan_steps[index].status = normalized_status;
+                    if let Some(note) = parsed.note {
+                        state.plan_steps[index].note = Some(note);
+                    }
+                } else {
+                    return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
                 }
-                self.emit_event("PlanStepUpdated", payload).await?;
             }
             "update_text" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("update_text requires 'index'".to_string())
                 })?;
-                let mut payload = serde_json::json!({ "index": index });
-                if let Some(step) = parsed.step {
-                    payload["step"] = serde_json::Value::String(step);
+                
+                if index < state.plan_steps.len() {
+                    if let Some(step) = parsed.step {
+                        state.plan_steps[index].step = step;
+                    }
+                    if let Some(note) = parsed.note {
+                        state.plan_steps[index].note = Some(note);
+                    }
+                } else {
+                    return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
                 }
-                if let Some(note) = parsed.note {
-                    payload["note"] = serde_json::Value::String(note);
-                }
-                self.emit_event("PlanStepUpdated", payload).await?;
             }
             "remove" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("remove requires 'index'".to_string())
                 })?;
-                self.emit_event("PlanStepRemoved", serde_json::json!({ "index": index })).await?;
+                if index < state.plan_steps.len() {
+                    state.plan_steps.remove(index);
+                } else {
+                    return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
+                }
             }
             _ => {
                 return Err(ToolError::InvalidArguments(format!(
@@ -1018,6 +1009,8 @@ impl Tool for TaskPlanTool {
                 )));
             }
         }
+        
+        let _ = self.task_state_store.save(&state);
 
         let output = if let Ok(state) = self.task_state_store.load() {
             state.summary()

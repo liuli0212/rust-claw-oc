@@ -249,26 +249,6 @@ impl AgentLoop {
         false
     }
 
-    async fn emit_agent_event(
-        &self,
-        event_type: &str,
-        task_id: Option<String>,
-        payload: serde_json::Value,
-    ) {
-        let event = crate::event_log::AgentEvent::new(
-            event_type,
-            &self.session_id,
-            task_id,
-            self.context.current_turn.as_ref().map(|t| t.turn_id.clone()),
-            payload,
-        );
-        let _ = self.event_log.append(event.clone()).await;
-        if let Ok(mut state) = self.task_state_store.load() {
-            state.apply_event(&event);
-            let _ = self.task_state_store.save(&state);
-        }
-    }
-
     pub async fn step(
         &mut self,
         goal: String,
@@ -288,17 +268,15 @@ impl AgentLoop {
 
         self.context.start_turn(goal.clone());
 
-        // Emit TaskStarted if no task ID exists yet
-        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
-        let current_task_id = state.task_id.unwrap_or_else(|| format!("tsk_{}", uuid::Uuid::new_v4().simple()));
+        // Init Task state if new
+        let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        let current_task_id = state.task_id.clone().unwrap_or_else(|| format!("tsk_{}", uuid::Uuid::new_v4().simple()));
         
-        // Emitting Task Started if new (this is a simple proxy for new task for now)
         if state.status == "initialized" {
-            self.emit_agent_event(
-                "TaskStarted",
-                Some(current_task_id.clone()),
-                serde_json::json!({ "goal": goal }),
-            ).await;
+            state.task_id = Some(current_task_id.clone());
+            state.status = "in_progress".to_string();
+            state.goal = Some(goal.clone());
+            let _ = self.task_state_store.save(&state);
         }
 
         let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
@@ -510,7 +488,6 @@ impl AgentLoop {
                 }
 
                 if call.name == "finish_task" {
-                    self.emit_agent_event("PlanCleared", Some(current_task_id.clone()), serde_json::json!({})).await;
                     let mut summary = call.args.to_string();
                     if let Some(obj) = call.args.as_object() {
                         if let Some(s) = obj.get("summary").and_then(|v| v.as_str()) {
@@ -577,15 +554,6 @@ impl AgentLoop {
                                 // Maintain a clean state: remove older versions of the same file
                                 self.context.active_evidence.retain(|e| e.source_kind != "file" || e.source_path != path_val);
                                 self.context.active_evidence.push(evidence);
-                                
-                                self.emit_agent_event(
-                                    "EvidenceAdded",
-                                    Some(current_task_id.clone()),
-                                    serde_json::json!({
-                                        "evidence_id": evidence_id,
-                                        "source": path_val,
-                                    }),
-                                ).await;
                             }
                         }
                     }
@@ -623,14 +591,11 @@ impl AgentLoop {
                                     
                                     self.context.active_evidence.push(evidence);
                                     
-                                    self.emit_agent_event(
-                                        "EvidenceAdded",
-                                        Some(current_task_id.clone()),
-                                        serde_json::json!({
-                                            "evidence_id": evidence_id,
-                                            "source": source_path,
-                                        }),
-                                    ).await;
+                                    let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+                                    if !state.evidence_ids.iter().any(|x| x == &evidence_id) {
+                                        state.evidence_ids.push(evidence_id.clone());
+                                        let _ = self.task_state_store.save(&state);
+                                    }
                                 }
                             }
                         }
@@ -643,17 +608,6 @@ impl AgentLoop {
                         }
                     }
                 }
-
-                self.emit_agent_event(
-                    "ToolExecutionFinished",
-                    Some(current_task_id.clone()),
-                    serde_json::json!({
-                        "tool": call.name,
-                        "args": call.args,
-                        "is_error": is_error,
-                        "result_brief": final_result.chars().take(500).collect::<String>(),
-                    }),
-                ).await;
 
                 self.context.add_message_to_current_turn(Message {
                     role: "function".to_string(),
