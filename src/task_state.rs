@@ -21,7 +21,6 @@ pub struct TaskStateSnapshot {
     pub goal: Option<String>,
     pub current_step: Option<String>,
     pub plan_steps: Vec<PlanStep>,
-    pub evidence_ids: Vec<String>,
 }
 
 impl TaskStateSnapshot {
