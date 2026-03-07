@@ -124,7 +124,11 @@ impl ContextAssembler {
         }
 
         // Layer 3: Task State
-        let state_summary = task_state.summary();
+        let mut state_summary = task_state.summary();
+        if !task_state.plan_steps.is_empty() && task_state.status == "in_progress" {
+            state_summary.push_str("\n\nIMPORTANT INSTRUCTION: You have an active task plan in progress. If the user's latest input is simply a greeting (like 'hi', 'hello', etc.), DO NOT automatically execute the next step. Instead, politely reply to the greeting, remind them of the active task, and ask if they would like to resume it. Only execute steps if the user explicitly asks to continue or gives a task-related command.");
+        }
+
         candidates.push(PromptCandidate {
             id: "task_state".to_string(),
             kind: CandidateKind::TaskStateSummary,

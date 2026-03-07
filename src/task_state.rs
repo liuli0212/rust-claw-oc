@@ -22,8 +22,6 @@ pub struct TaskStateSnapshot {
     pub goal: Option<String>,
     pub current_step: Option<String>,
     pub plan_steps: Vec<PlanStep>,
-    pub open_questions: Vec<String>,
-    pub active_files: Vec<String>,
     pub evidence_ids: Vec<String>,
     pub artifact_ids: Vec<String>,
 }
@@ -88,6 +86,9 @@ impl TaskStateSnapshot {
                         if let Some(note) = event.payload.get("note").and_then(|v| v.as_str()) {
                             self.plan_steps[idx].note = Some(note.to_string());
                         }
+                        if let Some(step_text) = event.payload.get("step").and_then(|v| v.as_str()) {
+                            self.plan_steps[idx].step = step_text.to_string();
+                        }
                     }
                 }
             }
@@ -145,12 +146,6 @@ impl TaskStateSnapshot {
             }
         }
 
-        if !self.active_files.is_empty() {
-            let _ = writeln!(s, "- Active files: {:?}", self.active_files);
-        }
-        if !self.open_questions.is_empty() {
-            let _ = writeln!(s, "- Open questions: {:?}", self.open_questions);
-        }
         if !self.plan_steps.is_empty() {
             let _ = writeln!(s, "\nPlan steps:");
             for (i, p) in self.plan_steps.iter().enumerate() {
@@ -179,6 +174,13 @@ impl TaskStateStore {
         }
     }
 
+    pub fn clear(&self) -> Result<(), std::io::Error> {
+        if self.file_path.exists() {
+            std::fs::remove_file(&self.file_path)?;
+        }
+        Ok(())
+    }
+
     pub fn load(&self) -> Result<TaskStateSnapshot, std::io::Error> {
         if !self.file_path.exists() {
             return Ok(TaskStateSnapshot::empty());
@@ -195,6 +197,14 @@ impl TaskStateStore {
         let content = serde_json::to_string_pretty(state)?;
         fs::write(&self.file_path, content)?;
         Ok(())
+    }
+
+    pub fn has_active_plan(&self) -> bool {
+        if let Ok(state) = self.load() {
+            !state.plan_steps.is_empty() && state.status == "in_progress"
+        } else {
+            false
+        }
     }
 
     pub fn materialize_from_events(&self, events: &[AgentEvent]) -> TaskStateSnapshot {

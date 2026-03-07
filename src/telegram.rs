@@ -280,10 +280,14 @@ enum Command {
     Help,
     #[command(description = "reset the current session.")]
     Reset,
+    #[command(description = "check if bot is alive.")]
+    Ping,
     #[command(description = "cancel the current running task.")]
     Cancel,
     #[command(description = "show session status.")]
     Status,
+    #[command(description = "show detailed session diagnostics.")]
+    Session,
     #[command(description = "switch LLM model: /model <provider> [model_name]")]
     Model(String),
 }
@@ -354,6 +358,9 @@ async fn handle_command(
             session_manager.reset_session(&session_id).await;
             bot.send_message(chat_id, "♻️ Session reset.").await?;
         }
+        Command::Ping => {
+            bot.send_message(chat_id, "🏓 Pong!").await?;
+        }
         Command::Cancel => {
             session_manager.cancel_session(&session_id).await;
             bot.send_message(chat_id, "🛑 Task cancellation requested.")
@@ -385,30 +392,75 @@ async fn handle_command(
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
         }
-        Command::Model(args) => {
-            let mut parts = args.split_whitespace();
-            let provider = parts.next();
-            let model = parts.next().map(|s| s.to_string());
-
-            if let Some(p) = provider {
-                match session_manager
-                    .update_session_llm(&session_id, p, model)
-                    .await
-                {
-                    Ok(msg) => {
-                        bot.send_message(chat_id, format!("✅ {}", msg)).await?;
-                    }
-                    Err(e) => {
-                        bot.send_message(chat_id, format!("❌ Error: {}", e))
-                            .await?;
-                    }
+        Command::Session => {
+            let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
+            let agent = match session_manager
+                .get_or_create_session(&session_id, output)
+                .await
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    bot.send_message(chat_id, format!("❌ Error: {}", e))
+                        .await?;
+                    return Ok(());
                 }
-            } else {
-                bot.send_message(chat_id, "❌ Usage: /model <provider> [model_name]")
+            };
+            let agent_guard = agent.lock().await;
+            let details = agent_guard.get_session_details();
+            
+            let formatted = format!(
+                "📝 *Detailed Session Diagnostics*\n\
+                ━━━━━━━━━━━━━━━━━━━━━\n\
+                *ID*: `{}`\n\
+                *LLM*: `{}` / `{}`\n\
+                *Task*: `{}` ({})\n\
+                *Context*: {} / {} tokens\n\
+                *Turns*: `{}`\n\
+                *System Prompts*: `{}`\n\
+                *Active Evidence*: `{}`\n\
+                *Cancelled*: `{}`",
+                TelegramOutput::escape_markdown_v2(details["session_id"].as_str().unwrap_or("")),
+                TelegramOutput::escape_markdown_v2(details["provider"].as_str().unwrap_or("")),
+                TelegramOutput::escape_markdown_v2(details["model"].as_str().unwrap_or("unknown")),
+                TelegramOutput::escape_markdown_v2(details["task_id"].as_str().unwrap_or("none")),
+                details["task_status"].as_str().unwrap_or("idle"),
+                details["context"]["tokens"],
+                details["context"]["max_tokens"],
+                details["context"]["turns"],
+                details["context"]["system_tokens"],
+                details["context"]["active_evidence"],
+                details["cancelled"]
+            );
+            bot.send_message(chat_id, formatted)
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+        }
+        Command::Model(args) => {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            if parts.is_empty() {
+                bot.send_message(chat_id, "Usage: /model <provider> [model_name]")
                     .await?;
+                return Ok(());
+            }
+
+            let provider = parts[0];
+            let model = parts.get(1).map(|s| s.to_string());
+
+            match session_manager
+                .update_session_llm(&session_id, provider, model)
+                .await
+            {
+                Ok(msg) => {
+                    bot.send_message(chat_id, format!("✅ {}", msg)).await?;
+                }
+                Err(e) => {
+                    bot.send_message(chat_id, format!("❌ Error: {}", e))
+                        .await?;
+                }
             }
         }
     }
+
     Ok(())
 }
 
@@ -417,6 +469,7 @@ async fn handle_message(
     msg: Message,
     session_manager: Arc<SessionManager>,
 ) -> ResponseResult<()> {
+    tracing::info!("Telegram: Received message from {}", msg.chat.id);
     let mut final_text = String::new();
 
     if let Some(text) = msg.text() {
