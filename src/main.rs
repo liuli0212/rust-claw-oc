@@ -1,4 +1,3 @@
-pub mod artifact_store;
 pub mod browser;
 pub mod context_assembler;
 pub mod event_log;

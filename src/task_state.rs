@@ -23,7 +23,6 @@ pub struct TaskStateSnapshot {
     pub current_step: Option<String>,
     pub plan_steps: Vec<PlanStep>,
     pub evidence_ids: Vec<String>,
-    pub artifact_ids: Vec<String>,
 }
 
 impl TaskStateSnapshot {
@@ -105,13 +104,6 @@ impl TaskStateSnapshot {
             }
             "TaskFinished" => {
                 self.status = "completed".to_string();
-            }
-            "ArtifactCreated" => {
-                if let Some(aid) = event.payload.get("artifact_id").and_then(|v| v.as_str()) {
-                    if !self.artifact_ids.iter().any(|x| x == aid) {
-                        self.artifact_ids.push(aid.to_string());
-                    }
-                }
             }
             "EvidenceAdded" => {
                 if let Some(eid) = event.payload.get("evidence_id").and_then(|v| v.as_str()) {
