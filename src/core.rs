@@ -540,6 +540,32 @@ impl AgentLoop {
                                 self.output.on_file(path).await;
                             }
                         }
+                    } else if call.name == "read_file" {
+                        if let Some(obj) = call.args.as_object() {
+                            if let Some(path_val) = obj.get("path").and_then(|v| v.as_str()) {
+                                let evidence_id = format!("file_{}", path_val);
+                                let evidence = crate::evidence::Evidence::new(
+                                    evidence_id.clone(),
+                                    "file".to_string(),
+                                    path_val.to_string(),
+                                    1.0,
+                                    format!("Direct read of {}", path_val),
+                                    result.clone(),
+                                );
+                                // Maintain a clean state: remove older versions of the same file
+                                self.context.active_evidence.retain(|e| e.source_kind != "file" || e.source_path != path_val);
+                                self.context.active_evidence.push(evidence);
+                                
+                                self.emit_agent_event(
+                                    "EvidenceAdded",
+                                    Some(current_task_id.clone()),
+                                    serde_json::json!({
+                                        "evidence_id": evidence_id,
+                                        "source": path_val,
+                                    }),
+                                ).await;
+                            }
+                        }
                     }
                 }
 

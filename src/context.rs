@@ -111,6 +111,7 @@ pub struct AgentContext {
     retrieved_memory: Option<String>,
     retrieved_memory_sources: Vec<String>,
     pub last_snapshot: Option<ContextSnapshot>,
+    pub active_evidence: Vec<crate::evidence::Evidence>,
 }
 
 impl AgentContext {
@@ -132,6 +133,7 @@ impl AgentContext {
             retrieved_memory: None,
             retrieved_memory_sources: Vec::new(),
             last_snapshot: None,
+            active_evidence: Vec::new(),
         }
     }
 
@@ -1446,7 +1448,7 @@ impl AgentContext {
         
         let durable_memory = fs::read_to_string("MEMORY.md").ok();
 
-        let mut active_evidence = Vec::new();
+        let mut active_evidence = self.active_evidence.clone();
         if let Some(mem) = &self.retrieved_memory {
             active_evidence.push(crate::evidence::Evidence::new(
                 "legacy_rag".into(),
