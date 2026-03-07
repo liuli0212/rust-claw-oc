@@ -257,6 +257,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("  {} No changes since last snapshot.", style("ℹ").blue());
                             }
                         }
+                        "inspect" => {
+                            let section = parts.get(2).map(|s| *s).unwrap_or("");
+                            let arg = parts.get(3).map(|s| *s);
+                            if section.is_empty() {
+                                println!("  {} Usage: /context inspect <system|history|memory|plan> [arg]", style("ℹ").blue());
+                            } else {
+                                println!("{}", agent_guard.inspect_context(section, arg));
+                            }
+                        }
+                        "dump" => {
+                            let (payload, sys, report) = agent_guard.build_llm_payload();
+                            let dump_data = serde_json::json!({
+                                "system_prompt": sys,
+                                "messages": payload,
+                                "report": {
+                                    "max_history_tokens": report.max_history_tokens,
+                                    "history_tokens_used": report.history_tokens_used,
+                                    "history_turns_included": report.history_turns_included,
+                                    "current_turn_tokens": report.current_turn_tokens,
+                                    "system_prompt_tokens": report.system_prompt_tokens,
+                                    "total_prompt_tokens": report.total_prompt_tokens,
+                                    "retrieved_memory_snippets": report.retrieved_memory_snippets,
+                                    "retrieved_memory_sources": report.retrieved_memory_sources,
+                                },
+                                "detailed_stats": {
+                                    "system_static": report.detailed_stats.system_static,
+                                    "system_runtime": report.detailed_stats.system_runtime,
+                                    "system_custom": report.detailed_stats.system_custom,
+                                    "system_project": report.detailed_stats.system_project,
+                                    "system_task_plan": report.detailed_stats.system_task_plan,
+                                    "memory": report.detailed_stats.memory,
+                                    "history": report.detailed_stats.history,
+                                    "current_turn": report.detailed_stats.current_turn,
+                                    "total": report.detailed_stats.total,
+                                    "max": report.detailed_stats.max,
+                                    "truncated_chars": report.detailed_stats.truncated_chars,
+                                }
+                            });
+                            if let Ok(json_str) = serde_json::to_string_pretty(&dump_data) {
+                                if let Ok(_) = std::fs::write("debug_context.json", json_str) {
+                                    println!("  {} Context dumped to debug_context.json", style("✔").green());
+                                } else {
+                                    println!("  {} Failed to write debug_context.json", style("✖").red());
+                                }
+                            }
+                        }
                         "compact" => {
                             println!("  {} Attempting manual compaction...", style("⚙").yellow());
                             match agent_guard.maybe_compact_history(true).await {
@@ -265,7 +311,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         _ => {
-                            println!("  {} Usage: /context <audit|diff|compact>", style("ℹ").blue());
+                            let stats = agent_guard.get_detailed_stats();
+                            let pct = (stats.total as f64 / stats.max as f64) * 100.0;
+                            println!("  {} {}/{} tokens ({:.1}%)", style("Context Usage").bold().cyan(), stats.total, stats.max, pct);
+                            println!("  Identity: {} | Runtime: {} | Custom: {} | Plan: {} | Project: {} | Memory: {} | History: {} | Current: {}", 
+                                stats.system_static, stats.system_runtime, stats.system_custom, stats.system_task_plan, stats.system_project, stats.memory, stats.history, stats.current_turn);
+                            println!("  Use {} for deep dive or {} to see changes.", style("/context audit").bold(), style("/context diff").bold());
                         }
                     }
                     continue;
