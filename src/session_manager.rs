@@ -138,7 +138,6 @@ impl SessionManager {
         let mut session_tools = self.tools.clone();
         session_tools.push(Arc::new(crate::tools::TaskPlanTool::new(
             session_id.to_string(),
-            event_log.clone(),
             task_state_store.clone(),
         )));
 

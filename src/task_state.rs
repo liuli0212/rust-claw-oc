@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::event_log::AgentEvent;
 use crate::schema::StoragePaths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,93 +30,6 @@ impl TaskStateSnapshot {
             schema_version: crate::schema::CURRENT_SCHEMA_VERSION,
             status: "initialized".to_string(),
             ..Default::default()
-        }
-    }
-
-    pub fn apply_event(&mut self, event: &AgentEvent) {
-        self.derived_from_event_id = Some(event.event_id.clone());
-        self.derived_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        if self.task_id.is_none() && event.task_id.is_some() {
-            self.task_id = event.task_id.clone();
-        }
-
-        match event.event_type.as_str() {
-            "TaskStarted" => {
-                self.status = "in_progress".to_string();
-                if let Some(goal) = event.payload.get("goal").and_then(|v| v.as_str()) {
-                    self.goal = Some(goal.to_string());
-                }
-            }
-            "PlanInitialized" => {
-                if let Some(steps) = event.payload.get("steps").and_then(|v| v.as_array()) {
-                    self.plan_steps.clear();
-                    for s in steps {
-                        if let Some(step_text) = s.as_str() {
-                            self.plan_steps.push(PlanStep {
-                                step: step_text.to_string(),
-                                status: "pending".to_string(),
-                                note: None,
-                            });
-                        }
-                    }
-                }
-            }
-            "PlanStepAdded" => {
-                if let Some(step) = event.payload.get("step").and_then(|v| v.as_str()) {
-                    self.plan_steps.push(PlanStep {
-                        step: step.to_string(),
-                        status: "pending".to_string(),
-                        note: None,
-                    });
-                }
-            }
-            "PlanStepUpdated" => {
-                if let Some(idx) = event.payload.get("index").and_then(|v| v.as_u64()) {
-                    let idx = idx as usize;
-                    if idx < self.plan_steps.len() {
-                        if let Some(status) = event.payload.get("status").and_then(|v| v.as_str()) {
-                            self.plan_steps[idx].status = status.to_string();
-                        }
-                        if let Some(note) = event.payload.get("note").and_then(|v| v.as_str()) {
-                            self.plan_steps[idx].note = Some(note.to_string());
-                        }
-                        if let Some(step_text) = event.payload.get("step").and_then(|v| v.as_str()) {
-                            self.plan_steps[idx].step = step_text.to_string();
-                        }
-                    }
-                }
-            }
-            "PlanStepRemoved" => {
-                if let Some(idx) = event.payload.get("index").and_then(|v| v.as_u64()) {
-                    let idx = idx as usize;
-                    if idx < self.plan_steps.len() {
-                        self.plan_steps.remove(idx);
-                    }
-                }
-            }
-            "PlanCleared" => {
-                self.plan_steps.clear();
-            }
-            "TaskFinished" => {
-                self.status = "completed".to_string();
-            }
-            "EvidenceAdded" => {
-                if let Some(eid) = event.payload.get("evidence_id").and_then(|v| v.as_str()) {
-                    if !self.evidence_ids.iter().any(|x| x == eid) {
-                        self.evidence_ids.push(eid.to_string());
-                    }
-                }
-            }
-            "EvidenceInvalidated" => {
-                if let Some(eid) = event.payload.get("evidence_id").and_then(|v| v.as_str()) {
-                    self.evidence_ids.retain(|x| x != eid);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -199,53 +111,4 @@ impl TaskStateStore {
         }
     }
 
-    pub fn materialize_from_events(&self, events: &[AgentEvent]) -> TaskStateSnapshot {
-        let mut state = TaskStateSnapshot::empty();
-        for event in events {
-            state.apply_event(event);
-        }
-        state
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_materialize_state() {
-        let e1 = AgentEvent::new(
-            "TaskStarted",
-            "sess",
-            None,
-            None,
-            serde_json::json!({"goal": "build house"}),
-        );
-        let e2 = AgentEvent::new(
-            "PlanInitialized",
-            "sess",
-            None,
-            None,
-            serde_json::json!({"steps": ["buy wood", "build"]}),
-        );
-        let e3 = AgentEvent::new(
-            "PlanStepUpdated",
-            "sess",
-            None,
-            None,
-            serde_json::json!({"index": 0, "status": "completed"}),
-        );
-
-        let store = TaskStateStore::new("sess");
-        let state = store.materialize_from_events(&[e1, e2, e3]);
-        assert_eq!(state.status, "in_progress");
-        assert_eq!(state.goal.as_deref().unwrap(), "build house");
-        assert_eq!(state.plan_steps.len(), 2);
-        assert_eq!(state.plan_steps[0].status, "completed");
-        assert_eq!(state.plan_steps[1].status, "pending");
-
-        let summary = state.summary();
-        assert!(summary.contains("[0] buy wood (completed)"));
-        assert!(summary.contains("[1] build (pending)"));
-    }
 }
