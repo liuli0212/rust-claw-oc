@@ -13,6 +13,7 @@ mod skills;
 mod telegram;
 mod tools;
 mod utils;
+mod ui; // Add the UI module
 
 use crate::core::{AgentOutput, RunExit};
 use crate::memory::WorkspaceMemory;
@@ -24,8 +25,10 @@ use crate::tools::{
     TaskPlanTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool, FinishTaskTool,
     PatchFileTool, SendFileTool,
 };
+use crate::ui::TuiOutput; // Use the new UI output
 use async_trait::async_trait;
 use clap::Parser;
+use console::style; // For colored text
 use dotenvy::dotenv;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -61,104 +64,6 @@ struct CliArgs {
     /// Enable prompt report output
     #[arg(long)]
     prompt_report: bool,
-}
-
-struct CliOutput;
-
-impl CliOutput {
-    fn truncate_to_one_line(input: &str) -> String {
-        let first_line = input.lines().next().unwrap_or("");
-        if first_line.len() > 60 {
-            format!("{}...", &first_line.chars().take(57).collect::<String>())
-        } else {
-            first_line.to_string()
-        }
-    }
-
-    fn is_prefixed_status(text: &str) -> bool {
-        let t = text.trim_start();
-        t.starts_with("[Progress]")
-            || t.starts_with("[System]")
-            || t.starts_with("[Perf]")
-            || t.starts_with("[Prompt Report]")
-            || t.starts_with("[Recovery Stats]")
-    }
-
-    fn style_status(text: &str) -> String {
-        let t = text.trim_start();
-        if t.starts_with("[Progress]") {
-            format!("\x1b[38;5;245m{}\x1b[0m", text)
-        } else if t.starts_with("[System]") {
-            format!("\x1b[36m{}\x1b[0m", text)
-        } else if t.starts_with("[Perf]") || t.starts_with("[Prompt Report]") {
-            format!("\x1b[35m{}\x1b[0m", text)
-        } else {
-            format!("\x1b[38;5;244m{}\x1b[0m", text)
-        }
-    }
-}
-
-#[async_trait]
-impl AgentOutput for CliOutput {
-    async fn on_text(&self, text: &str) {
-        let text = text.replace("<final>", "").replace("</final>", "");
-        let text = text.as_str();
-        if text.is_empty() {
-            return;
-        }
-        if Self::is_prefixed_status(text) {
-            print!("{}", Self::style_status(text));
-        } else {
-            print!("\x1b[1;97m{}\x1b[0m", text);
-        }
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-    }
-
-    async fn on_thinking(&self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        print!("\x1b[38;5;244m{}\x1b[0m", text);
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-    }
-
-    async fn on_tool_start(&self, name: &str, args: &str) {
-        let args_val: serde_json::Value = serde_json::from_str(args).unwrap_or(serde_json::json!({}));
-        let summary = match name {
-            "read_file" | "write_file" | "patch_file" => {
-                args_val.get("path").and_then(|v| v.as_str()).unwrap_or("unknown").to_string()
-            }
-            "execute_bash" => {
-                let cmd = args_val.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                Self::truncate_to_one_line(cmd)
-            }
-            "web_fetch" | "browser" => {
-                args_val.get("url").or_else(|| args_val.get("target_url")).and_then(|v| v.as_str()).unwrap_or("").to_string()
-            }
-            _ => Self::truncate_to_one_line(args),
-        };
-
-        if summary.is_empty() {
-            println!("\x1b[33m> [Tool]: {}\x1b[0m", name);
-        } else {
-            println!("\x1b[33m> [Tool]: {} ({})\x1b[0m", name, summary);
-        }
-    }
-
-    async fn on_tool_end(&self, result: &str) {
-        let display_result = if result.len() > 100 {
-            format!("{}... (total {} chars)", &result.chars().take(80).collect::<String>(), result.len())
-        } else {
-            result.replace('\n', " ").to_string()
-        };
-        println!("\x1b[32m> [Result]: {}\x1b[0m", display_result);
-    }
-
-    async fn on_error(&self, error: &str) {
-        tracing::error!("{}", error);
-    }
 }
 
 #[tokio::main]
@@ -253,15 +158,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(async move { discord::run_discord_bot(token, sm).await; });
     }
 
-    let output = Arc::new(CliOutput);
+    let output = Arc::new(TuiOutput::new());
     if let Err(e) = session_manager.get_or_create_session("cli", output.clone()).await {
-        eprintln!("\x1b[33m[Warning] Failed to pre-initialize CLI session: {}\x1b[0m", e);
+        eprintln!("{} Failed to pre-initialize CLI session: {}", style("⚠").yellow(), e);
     }
 
     let mut rl = DefaultEditor::new()?;
-    println!("Welcome to Rusty-Claw! (type '/exit' to quit)");
+    
+    println!();
+    println!("  {}", style("Rust Claw OC").bold().magenta());
+    println!("  Type {} to exit, {} for help.", style("/exit").bold(), style("/help").bold());
+    println!();
+
     if std::path::Path::new(".rusty_claw_task_plan.json").exists() {
-        println!("\x1b[33m[System] Detected an existing task plan. If you no longer need it, use /cancel_task to clear it.\x1b[0m");
+        println!("  {} Detected an existing task plan. Use {} to clear it.", style("ℹ").blue(), style("/cancel_task").bold());
     }
 
     let sm_clone = session_manager.clone();
@@ -272,7 +182,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut ctrl_c_count = 0;
     loop {
-        let readline = rl.readline(">> ");
+        let prompt = format!("{} ", style("❯").cyan().bold());
+        let readline = rl.readline(&prompt);
         match readline {
             Ok(line) => {
                 ctrl_c_count = 0;
@@ -280,22 +191,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line == "/exit" {
                     break;
                 }
+                if line == "/help" {
+                    println!();
+                    println!("  {}", style("Available Commands:").bold());
+                    println!("  {}  - Start a fresh session", style("/new").green());
+                    println!("  {} - Cancel current task", style("/cancel").yellow());
+                    println!("  {} - Show model usage", style("/status").cyan());
+                    println!("  {} - Switch models", style("/model").magenta());
+                    println!("  {} - Inspect context", style("/context").blue());
+                    println!();
+                    continue;
+                }
                 if line == "/new" {
                     session_manager.reset_session("cli").await;
                     let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
-                    println!("\x1b[32m[System] Session cleared. Starting fresh.\x1b[0m");
+                    println!("  {} Session cleared. Starting fresh.", style("✔").green());
                     continue;
                 }
                 if line == "/cancel" || line == "/cancel_task" {
                     session_manager.cancel_session("cli").await;
                     let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
-                    println!("\x1b[33m[System] Task and plan cancelled.\x1b[0m");
-                    continue;
-                }
-                if line == "/new" {
-                    session_manager.reset_session("cli").await;
-                    let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
-                    println!("\x1b[32m[System] Session cleared. Starting fresh.\x1b[0m");
+                    println!("  {} Task and plan cancelled.", style("✔").yellow());
                     continue;
                 }
                 if line == "/status" {
@@ -303,7 +219,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let agent_guard = agent.lock().await;
                     let (provider, model, tokens, max_tokens) = agent_guard.get_status();
                     let percentage = (tokens as f64 / max_tokens as f64) * 100.0;
-                    println!("\x1b[36m[Status]\x1b[0m Provider: {}, Model: {}, Context: {}/{} tokens ({:.1}%)", provider, model, tokens, max_tokens, percentage);
+                    println!("  {} Provider: {}, Model: {}, Context: {}/{} tokens ({:.1}%)", 
+                        style("📊").cyan(), provider, model, tokens, max_tokens, percentage);
                     continue;
                 }
                 if line.starts_with("/context") {
@@ -318,14 +235,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(diff) = agent_guard.diff_snapshot() {
                                 println!("{}", agent_guard.format_diff(&diff));
                             } else {
-                                println!("\x1b[33m[System] No snapshot available for diff. Run a command first.\x1b[0m");
+                                println!("  {} No snapshot available for diff. Run a command first.", style("⚠").yellow());
                             }
                         }
                         "inspect" => {
                             let section = parts.get(2).map(|s| *s).unwrap_or("");
                             let arg = parts.get(3).map(|s| *s);
                             if section.is_empty() {
-                                println!("\x1b[33m[System] Usage: /context inspect <system|history|memory|plan> [arg]\x1b[0m");
+                                println!("  {} Usage: /context inspect <system|history|memory|plan> [arg]", style("ℹ").blue());
                             } else {
                                 println!("{}", agent_guard.inspect_context(section, arg));
                             }
@@ -361,24 +278,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
                             if let Ok(json_str) = serde_json::to_string_pretty(&dump_data) {
                                 if let Ok(_) = std::fs::write("debug_context.json", json_str) {
-                                    println!("\x1b[32m[System] Context dumped to debug_context.json\x1b[0m");
+                                    println!("  {} Context dumped to debug_context.json", style("✔").green());
                                 } else {
-                                    println!("\x1b[31m[System] Failed to write debug_context.json\x1b[0m");
+                                    println!("  {} Failed to write debug_context.json", style("✖").red());
                                 }
                             }
                         }
                         "compact" => {
                              match agent_guard.force_compact().await {
-                                 Ok(r) => println!("\x1b[32m[System] Context compacted: {}\x1b[0m", r),
-                                 Err(e) => println!("\x1b[31m[System] Compaction skipped: {}\x1b[0m", e)
+                                 Ok(r) => println!("  {} Context compacted: {}", style("✔").green(), r),
+                                 Err(e) => println!("  {} Compaction skipped: {}", style("⚠").yellow(), e)
                             }
                         }
                         _ => {
                             let stats = agent_guard.get_detailed_stats();
-                            println!("\x1b[36m[Context Usage]\x1b[0m {}/{} tokens ({:.1}%)", stats.total, stats.max, (stats.total as f64 / stats.max as f64) * 100.0);
+                            let pct = (stats.total as f64 / stats.max as f64) * 100.0;
+                            println!("  {} {}/{} tokens ({:.1}%)", style("Context Usage").bold().cyan(), stats.total, stats.max, pct);
                             println!("  Identity: {} | Runtime: {} | Custom: {} | Plan: {} | Project: {} | Memory: {} | History: {} | Current: {}", 
                                 stats.system_static, stats.system_runtime, stats.system_custom, stats.system_task_plan, stats.system_project, stats.memory, stats.history, stats.current_turn);
-                            println!("  Use '/context audit' for deep dive or '/context diff' to see changes.");
+                            println!("  Use {} for deep dive or {} to see changes.", style("/context audit").bold(), style("/context diff").bold());
                         }
                     }
                     continue;
@@ -391,8 +309,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                     match session_manager.update_session_llm("cli", parts[1], parts.get(2).map(|s| s.to_string())).await {
-                        Ok(msg) => println!("\x1b[32m[System] {}\x1b[0m", msg),
-                        Err(e) => println!("\x1b[31m[System] Failed: {}\x1b[0m", e),
+                        Ok(msg) => println!("  {} {}", style("✔").green(), msg),
+                        Err(e) => println!("  {} Failed: {}", style("✖").red(), e),
                     }
                     continue;
                 }
@@ -405,36 +323,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(exit) => match exit {
                         RunExit::YieldedToUser => { println!(); }
                         RunExit::Finished(ref summary) => {
-                            println!("\n\x1b[1;32m{}\x1b[0m", summary);
-                            println!("\x1b[32m[Run Exit] finished\x1b[0m");
+                            println!("\n{}", style(summary).green().bold());
+                            println!("  {}", style("Task Finished").green());
                         }
                         RunExit::StoppedByUser => {
-                            println!("\n\x1b[33m[Run Exit] execution_stopped_by_user\x1b[0m");
-                            println!("The current operation was manually cancelled.");
+                            println!("\n  {}", style("Execution Stopped by User").yellow());
+                            println!("  The current operation was manually cancelled.");
                         }
                         RunExit::AgentTurnLimitReached => {
-                            println!("\n\x1b[33m[Run Exit] turn_limit_reached\x1b[0m");
-                            println!("The agent reached the maximum allowed consecutive actions (to prevent infinite loops).");
-                            println!("👉 \x1b[1;36mAction required:\x1b[0m Review the recent actions. If the agent is on the right track, just type \x1b[32m'continue'\x1b[0m to let it proceed.");
+                            println!("\n  {}", style("Turn Limit Reached").yellow());
+                            println!("  The agent reached the maximum allowed consecutive actions.");
+                            println!("  👉 Action required: Review recent actions. If on track, type {} to proceed.", style("continue").green());
                         }
                         RunExit::ContextLimitReached => {
-                            println!("\n\x1b[31m[Run Exit] context_limit_reached\x1b[0m");
-                            println!("The context window size is exceeding the model's limit.");
-                            println!("👉 \x1b[1;36mAction required:\x1b[0m Wait for auto-compaction, or use \x1b[33m/clear\x1b[0m to start a fresh session.");
+                            println!("\n  {}", style("Context Limit Reached").red());
+                            println!("  The context window size is exceeding the model's limit.");
+                            println!("  👉 Action required: Wait for compaction or use {} to start fresh.", style("/new").green());
                         }
                         RunExit::RecoverableFailed(ref msg) => {
-                            println!("\n\x1b[33m[Run Exit] recoverable_failure\x1b[0m: {}", msg);
+                            println!("\n  {} Recoverable Failure: {}", style("⚠").yellow(), msg);
                         }
                         RunExit::CriticallyFailed(ref msg) => {
-                            println!("\n\x1b[31m[Run Exit] critical_failure\x1b[0m: {}", msg);
-                            println!("The system encountered an unrecoverable error during execution.");
+                            println!("\n  {} Critical Failure: {}", style("✖").red(), msg);
+                            println!("  The system encountered an unrecoverable error.");
                         }
                     },
-                    Err(e) => eprintln!("Agent error: {}", e),
+                    Err(e) => eprintln!("  {} Agent error: {}", style("✖").red(), e),
                 }
 
                 if std::path::Path::new(".rusty_claw_task_plan.json").exists() {
-                    println!("\x1b[33m[System] Current task plan is still active. Use /cancel_task if you want to abort it.\x1b[0m");
+                    println!("  {} Task plan active. Use {} to abort.", style("ℹ").blue(), style("/cancel_task").bold());
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -443,7 +361,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Exiting.");
                     break;
                 } else {
-                    println!("\n\x1b[33m[System] Press Ctrl-C again to exit (or type '/exit').\x1b[0m");
+                    println!("\n  {}", style("Press Ctrl-C again to exit.").yellow());
                 }
             }
             Err(ReadlineError::Eof) => { println!("CTRL-D"); break; }
