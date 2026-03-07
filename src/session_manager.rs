@@ -122,16 +122,22 @@ impl SessionManager {
             "No LLM provider configured. Use /model <provider> to set one.".to_string()
         })?;
 
-        // Initialize Context Management Subsystems
         let (telemetry, _telemetry_handle) = crate::telemetry::TelemetryExporter::new();
         let telemetry = Arc::new(telemetry);
         let event_log = Arc::new(crate::event_log::EventLog::new(session_id));
         let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(session_id));
 
+        let mut session_tools = self.tools.clone();
+        session_tools.push(Arc::new(crate::tools::TaskPlanTool::new(
+            session_id.to_string(),
+            event_log.clone(),
+            task_state_store.clone(),
+        )));
+
         let agent_loop = AgentLoop::new(
             session_id.to_string(),
             llm.clone(),
-            self.tools.clone(),
+            session_tools,
             context,
             output,
             telemetry,

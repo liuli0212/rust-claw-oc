@@ -152,9 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tools.push(Arc::new(WebFetchTool::new()));
     tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
     tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
-    tools.push(Arc::new(TaskPlanTool::new(
-        current_dir.join(".rusty_claw_task_plan.json"),
-    )));
+
 
     if let Ok(tavily_api_key) = std::env::var("TAVILY_API_KEY") {
         if !tavily_api_key.trim().is_empty() {
