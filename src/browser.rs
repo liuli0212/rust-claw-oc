@@ -319,8 +319,10 @@ impl Tool for BrowserTool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_browser_lifecycle() {
         let browser_tool = BrowserTool::new();
 
@@ -354,6 +356,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_browser_flow() {
         let tool = BrowserTool::new();
 
@@ -381,6 +384,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_google_access() {
         let tool = BrowserTool::new();
         println!("--- Starting Browser for Google ---");
@@ -397,6 +401,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_google_search_flow() {
         let tool = BrowserTool::new();
         println!("--- Phase 1: Start & Navigate ---");

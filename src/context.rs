@@ -125,6 +125,7 @@ impl AgentContext {
                 "NEVER say you cannot write code or lack capabilities. You are powered by Gemini 3.1 Pro and possess absolute technical mastery.".to_string(),
                 "VERY VERY CRITICAL: When you have fully completed the user's request and there is absolutely nothing left to do, you MUST call the `finish_task` tool. Otherwise you will be in DEAD LOOP, NEVER exit.".to_string(),
                 "ALL internal reasoning MUST be inside <think>...</think>. Do not output any analysis outside <think>. Format every reply as <think>...</think> then <final>...</final>, with no other text. Only the final user-visible reply may appear inside <final>. Only text inside <final> is shown to the user; everything else is discarded and never seen by the user.".to_string(),
+                "Context Awareness Protocol: Conversation history is segmented by recency markers. [EARLIER HISTORY] contains old context, [RECENT CONTEXT] contains moderately recent turns, unmarked turns are the most recent history, and [CURRENT TASK] marks the active user instruction. Always prioritize [CURRENT TASK] as the primary directive. If earlier history conflicts with [CURRENT TASK], follow [CURRENT TASK]. Use historical context only as background reference, not as active instructions.".to_string(),
             ],
             dialogue_history: Vec::new(),
             current_turn: None,
@@ -782,9 +783,9 @@ impl AgentContext {
                         // User text: Keep, but clean system tags
                         let mut cleaned_text = text.clone();
                         let markers = [
-                            "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]",
-                            "[SYSTEM ALERT: CRITICAL INSTRUCTION. IGNORE PREVIOUS CONTEXT IF CONFLICTING.]",
-                            "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE.]"
+                            "[CURRENT TASK]",
+                            "--- [RECENT CONTEXT] ---",
+                            "--- [EARLIER HISTORY] ---",
                         ];
                         for marker in markers {
                             if cleaned_text.contains(marker) {
@@ -833,7 +834,8 @@ impl AgentContext {
     fn build_history_with_budget(&self) -> (Vec<Message>, usize, usize, usize) {
         let bpe = tiktoken_rs::cl100k_base().unwrap();
         let history_budget = self.max_history_tokens.saturating_mul(85) / 100;
-        let mut history_messages = Vec::new();
+        // Each entry: (distance_index, messages)
+        let mut history_blocks: Vec<(usize, Vec<Message>)> = Vec::new();
         let mut current_tokens = 0;
         let mut turns_included = 0;
         let mut total_truncated_chars = 0;
@@ -874,15 +876,51 @@ impl AgentContext {
                 break;
             }
             current_tokens += turn_tokens;
-            history_messages.push(turn.messages);
+            history_blocks.push((i, turn.messages));
             turns_included += 1;
         }
 
-        history_messages.reverse();
+        history_blocks.reverse();
+
+        // Inject zone separator labels based on turn distance.
+        // Hot Zone (distance < 3): no label
+        // Warm Zone (3 <= distance < 10): "--- [RECENT CONTEXT] ---"
+        // Cold Zone (distance >= 10): "--- [EARLIER HISTORY] ---"
         let mut flattened = Vec::new();
-        for block in history_messages {
-            flattened.extend(block);
+        let mut prev_zone: Option<u8> = None; // 0=cold, 1=warm, 2=hot
+
+        for (distance, block) in &history_blocks {
+            let zone = if *distance >= 10 {
+                0u8 // cold
+            } else if *distance >= 3 {
+                1u8 // warm
+            } else {
+                2u8 // hot
+            };
+
+            // Insert a zone separator when transitioning between zones
+            if prev_zone.is_none() || prev_zone != Some(zone) {
+                let label = match zone {
+                    0 => Some("--- [EARLIER HISTORY] ---"),
+                    1 => Some("--- [RECENT CONTEXT] ---"),
+                    _ => None, // Hot zone: no label
+                };
+                if let Some(label_text) = label {
+                    flattened.push(Message {
+                        role: "user".to_string(),
+                        parts: vec![Part {
+                            text: Some(label_text.to_string()),
+                            function_call: None,
+                            function_response: None,
+                            thought_signature: None,
+                        }],
+                    });
+                }
+            }
+            prev_zone = Some(zone);
+            flattened.extend(block.clone());
         }
+
         (
             flattened,
             current_tokens,
@@ -1366,16 +1404,9 @@ impl AgentContext {
         let mut current_turn_tokens = 0;
         if let Some(turn) = &self.current_turn {
             if let Some(mut sanitized_turn) = Self::sanitize_turn(turn) {
-                // FOCUS BOOSTER: Reinforce the new instruction based on history length.
+                // Self-Adaptive Context (SAC): Mark current turn with [CURRENT TASK] label
+                // so the LLM can distinguish active instructions from historical context.
                 if history_turns_included >= 1 {
-                    let booster_msg = if history_turns_included > 20 {
-                        "[SYSTEM ALERT: CRITICAL INSTRUCTION. IGNORE PREVIOUS CONTEXT IF CONFLICTING.]"
-                    } else if history_turns_included > 10 {
-                        "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE.]"
-                    } else {
-                        "[SYSTEM NOTE: FOCUS ON THIS NEW USER MESSAGE. Context above is history.]"
-                    };
-
                     if let Some(user_msg) = sanitized_turn
                         .messages
                         .iter_mut()
@@ -1383,7 +1414,7 @@ impl AgentContext {
                     {
                         if let Some(part) = user_msg.parts.first_mut() {
                             if let Some(text) = &mut part.text {
-                                *text = format!("{}\n\n{}", booster_msg, text);
+                                *text = format!("[CURRENT TASK]\n\n{}", text);
                             }
                         }
                     }
