@@ -21,7 +21,7 @@ mod tools;
 mod ui;
 mod utils;
 
-use crate::core::RunExit;
+use crate::core::{RunExit, AgentOutput};
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::session_manager::SessionManager;
@@ -167,6 +167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(line) => {
                 ctrl_c_count = 0;
                 let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
                 if line == "/exit" {
                     break;
                 }
@@ -354,6 +358,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let line = line.to_string();
                 let mut agent_guard = agent.lock().await;
+
+                let _ = output.on_waiting("Processing...").await;
 
                 match agent_guard.step(line).await {
                     Ok(exit) => match exit {
