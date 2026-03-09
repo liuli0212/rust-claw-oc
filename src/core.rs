@@ -1,17 +1,15 @@
-use crate::context::{
-    AgentContext, FunctionResponse, Message, Part, ContextDiff
-};
+use crate::context::{AgentContext, ContextDiff, FunctionResponse, Message, Part};
 use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
 #[async_trait]
 pub trait AgentOutput: Send + Sync {
+    async fn on_waiting(&self, _message: &str) {}
     async fn on_text(&self, text: &str);
     async fn on_thinking(&self, text: &str) {
         // Default: treat thinking as regular text (backward compat)
@@ -60,10 +58,14 @@ struct TaskState {
 }
 
 pub struct AgentLoop {
+    session_id: String,
     llm: Arc<dyn LlmClient>,
     tools: Vec<Arc<dyn Tool>>,
     context: AgentContext,
     output: Arc<dyn AgentOutput>,
+    telemetry: Arc<crate::telemetry::TelemetryExporter>,
+    event_log: Arc<crate::event_log::EventLog>,
+    task_state_store: Arc<crate::task_state::TaskStateStore>,
     pub cancel_token: Arc<Notify>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -75,23 +77,32 @@ impl AgentLoop {
     const INITIAL_ENERGY: usize = 100;
 
     pub fn new(
+        session_id: String,
         llm: Arc<dyn LlmClient>,
         tools: Vec<Arc<dyn Tool>>,
         context: AgentContext,
         output: Arc<dyn AgentOutput>,
+        telemetry: Arc<crate::telemetry::TelemetryExporter>,
+        event_log: Arc<crate::event_log::EventLog>,
+        task_state_store: Arc<crate::task_state::TaskStateStore>,
     ) -> Self {
         Self {
+            session_id,
             llm,
             tools,
             context,
             output,
+            telemetry,
+            event_log,
+            task_state_store,
             cancel_token: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     pub fn request_cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.cancel_token.notify_waiters();
     }
 
@@ -101,6 +112,29 @@ impl AgentLoop {
 
     pub fn update_llm(&mut self, new_llm: Arc<dyn LlmClient>) {
         self.llm = new_llm;
+    }
+    pub fn update_output(&mut self, output: Arc<dyn AgentOutput>) {
+        self.output = output;
+    }
+
+    pub fn get_session_details(&self) -> serde_json::Value {
+        let (tokens, max_tokens, turns, system_tokens, evidence_count) = self.context.get_context_status();
+        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        serde_json::json!({
+            "session_id": self.session_id,
+            "provider": self.llm.provider_name(),
+            "model": self.llm.model_name(),
+            "context": {
+                "tokens": tokens,
+                "max_tokens": max_tokens,
+                "turns": turns,
+                "system_tokens": system_tokens,
+                "active_evidence": evidence_count,
+            },
+            "task_id": state.task_id,
+            "task_status": state.status,
+            "cancelled": self.is_cancelled(),
+        })
     }
 
     pub fn get_status(&self) -> (String, String, usize, usize) {
@@ -123,7 +157,10 @@ impl AgentLoop {
     }
 
     pub fn diff_snapshot(&self) -> Option<ContextDiff> {
-        self.context.last_snapshot.as_ref().map(|old| self.context.diff_snapshot(old))
+        self.context
+            .last_snapshot
+            .as_ref()
+            .map(|old| self.context.diff_snapshot(old))
     }
 
     pub fn format_diff(&self, diff: &ContextDiff) -> String {
@@ -133,17 +170,27 @@ impl AgentLoop {
     pub fn inspect_context(&self, section: &str, arg: Option<&str>) -> String {
         self.context.inspect_context(section, arg)
     }
-    
-    pub fn build_llm_payload(&self) -> (Vec<Message>, Option<Message>, crate::context::PromptReport) {
-        self.context.build_llm_payload()
+
+    pub fn build_llm_payload(
+        &self,
+    ) -> (Vec<Message>, Option<Message>, crate::context::PromptReport) {
+        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        let max_tokens = self.context.max_history_tokens; 
+        let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
+        self.context.build_llm_payload(&state, &assembler)
     }
 
-    pub async fn force_compact(&mut self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn force_compact(
+        &mut self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         self.maybe_compact_history(true).await?;
         Ok("Compaction triggered.".to_string())
     }
 
-    async fn maybe_compact_history(&mut self, force: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn maybe_compact_history(
+        &mut self,
+        force: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (current_usage, max_tokens, _, _, _) = self.context.get_context_status();
         let threshold = (max_tokens as f64 * 0.85) as usize;
 
@@ -154,13 +201,20 @@ impl AgentLoop {
         // Target: free up ~30% of max tokens worth of history
         let target_tokens = max_tokens.saturating_mul(30) / 100;
         let min_turns = 2;
-        let num_to_compact = self.context.oldest_turns_for_compaction(target_tokens, min_turns);
+        let num_to_compact = self
+            .context
+            .oldest_turns_for_compaction(target_tokens, min_turns);
 
         if num_to_compact == 0 {
             return Ok(());
         }
 
-        tracing::info!("Compacting {} oldest turns (usage={}, threshold={})", num_to_compact, current_usage, threshold);
+        tracing::info!(
+            "Compacting {} oldest turns (usage={}, threshold={})",
+            num_to_compact,
+            current_usage,
+            threshold
+        );
 
         if let Some(reason) = self.context.rule_based_compact(num_to_compact) {
             self.output.on_text(&format!("[System] {}\n", reason)).await;
@@ -169,25 +223,107 @@ impl AgentLoop {
         Ok(())
     }
 
+    async fn process_streaming_text(
+        &self,
+        full_text: &str,
+        processed_idx: &mut usize,
+        in_think_block: &mut bool,
+    ) {
+        loop {
+            let remaining = &full_text[*processed_idx..];
+            if remaining.is_empty() {
+                break;
+            }
+
+            if *in_think_block {
+                if let Some(end_idx) = remaining.find("</think>") {
+                    let content = &remaining[..end_idx];
+                    if !content.is_empty() {
+                        self.output.on_thinking(content).await;
+                    }
+                    *processed_idx += end_idx + 8;
+                    *in_think_block = false;
+                } else {
+                    // Check if we have a partial tag at the end
+                    let potential_tag_start = remaining.rfind("</");
+                    let len_to_process = if let Some(pos) = potential_tag_start {
+                        pos
+                    } else {
+                        remaining.len()
+                    };
+
+                    if len_to_process > 0 {
+                        self.output.on_thinking(&remaining[..len_to_process]).await;
+                        *processed_idx += len_to_process;
+                    }
+                    break;
+                }
+            } else {
+                if let Some(start_idx) = remaining.find("<think>") {
+                    let content = &remaining[..start_idx];
+                    if !content.is_empty() {
+                        self.output.on_text(content).await;
+                    }
+                    *processed_idx += start_idx + 7;
+                    *in_think_block = true;
+                } else {
+                    // Check for partial <think> tag
+                    let potential_tag_start = remaining.rfind('<');
+                    let len_to_process = if let Some(pos) = potential_tag_start {
+                        pos
+                    } else {
+                        remaining.len()
+                    };
+
+                    if len_to_process > 0 {
+                        self.output.on_text(&remaining[..len_to_process]).await;
+                        *processed_idx += len_to_process;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     fn is_transient_llm_error(err: &crate::llm_client::LlmError) -> bool {
         let msg = format!("{}", err).to_lowercase();
-        msg.contains("timeout") || msg.contains("500") || msg.contains("502") || msg.contains("503") || msg.contains("rate limit")
+        msg.contains("timeout")
+            || msg.contains("500")
+            || msg.contains("502")
+            || msg.contains("503")
+            || msg.contains("rate limit")
     }
 
     async fn handle_llm_error(&self, err: &crate::llm_client::LlmError, attempt: usize) -> bool {
         if Self::is_transient_llm_error(err) && attempt < Self::MAX_LLM_RECOVERY_ATTEMPTS {
             let exponent = (attempt as u32).min(6);
             let backoff_ms = 500u64.saturating_mul(2u64.pow(exponent));
-            self.output.on_text(&format!("[System] Transient error. Retrying in {} ms... (Attempt {}/{})\n", backoff_ms, attempt, Self::MAX_LLM_RECOVERY_ATTEMPTS)).await;
+            self.output
+                .on_text(&format!(
+                    "[System] Transient error. Retrying in {} ms... (Attempt {}/{})\n",
+                    backoff_ms,
+                    attempt,
+                    Self::MAX_LLM_RECOVERY_ATTEMPTS
+                ))
+                .await;
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             return true;
         }
         false
     }
 
-    pub async fn step(&mut self, goal: String) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn step(
+        &mut self,
+        goal: String,
+    ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
+        let goal = goal.trim().to_string();
+        if goal.is_empty() {
+            return Ok(RunExit::YieldedToUser);
+        }
+
         // Reset cancel flag at start of each step
-        self.cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.context.take_snapshot();
 
         let mut task_state = TaskState {
@@ -198,16 +334,42 @@ impl AgentLoop {
         let mut compaction_checked = false;
         let mut consecutive_empty_responses = 0;
 
-        self.context.start_turn(goal);
+        self.context.start_turn(goal.clone());
+
+        // Init Task state if new
+        let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        let current_task_id = state.task_id.clone().unwrap_or_else(|| format!("tsk_{}", uuid::Uuid::new_v4().simple()));
+        
+        if state.status == "initialized" {
+            state.task_id = Some(current_task_id.clone());
+            state.status = "in_progress".to_string();
+            state.goal = Some(goal.clone());
+            let _ = self.task_state_store.save(&state);
+        }
+
+        let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
+
+        let c_ids = crate::schema::CorrelationIds {
+            session_id: self.session_id.clone(),
+            task_id: Some(current_task_id.clone()),
+            turn_id: self.context.current_turn.as_ref().map(|t| t.turn_id.clone()),
+            event_id: None,
+        };
+        self.telemetry.start_span("agent_step", c_ids.clone());
 
         loop {
             // Check persistent cancel flag at top of each iteration
             if self.is_cancelled() {
                 self.context.end_turn();
+                self.telemetry.end_span("agent_step");
                 return Ok(RunExit::StoppedByUser);
+
             }
             if task_state.iterations >= Self::MAX_ITERATIONS {
-                tracing::warn!("Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.", Self::MAX_ITERATIONS);
+                tracing::warn!(
+                    "Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.",
+                    Self::MAX_ITERATIONS
+                );
                 self.context.end_turn();
                 return Ok(RunExit::AgentTurnLimitReached);
             }
@@ -215,10 +377,12 @@ impl AgentLoop {
             task_state.energy_points = task_state.energy_points.saturating_sub(1);
 
             if task_state.energy_points == 0 {
-                 tracing::error!("Energy points depleted.");
-                 self.output.on_text("[System] Energy depleted. Stopping to prevent infinite loops.").await;
-                 self.context.end_turn();
-                 return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
+                tracing::error!("Energy points depleted.");
+                self.output
+                    .on_text("[System] Energy depleted. Stopping to prevent infinite loops.")
+                    .await;
+                self.context.end_turn();
+                return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
             }
 
             if !compaction_checked {
@@ -226,8 +390,13 @@ impl AgentLoop {
                 compaction_checked = true;
             }
 
-            let (messages, system, _) = self.context.build_llm_payload();
-            
+            // Build cache-aware prompt using ContextAssembler
+            // In a real advanced setup, ContextAssembler budget would be dynamic based on LLM size
+            let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+            let max_tokens = self.context.max_history_tokens; 
+            let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
+            let (messages, system, _) = self.context.build_llm_payload(&state, &assembler);
+
             // Dynamically load skills on every turn so we don't need to restart
             let mut current_tools = self.tools.clone();
             for skill in crate::skills::load_skills("skills") {
@@ -235,11 +404,12 @@ impl AgentLoop {
             }
 
             let mut llm_attempts = 0;
-            let mut tool_calls_accumulated: Vec<(crate::context::FunctionCall, Option<String>)> = Vec::new();
+            let mut tool_calls_accumulated: Vec<(crate::context::FunctionCall, Option<String>)> =
+                Vec::new();
 
             let full_text = loop {
                 llm_attempts += 1;
-                
+
                 let stream_res = tokio::select! {
                     res = self.llm.stream(messages.clone(), system.clone(), current_tools.clone()) => res,
                     _ = self.cancel_token.notified() => {
@@ -247,50 +417,25 @@ impl AgentLoop {
                         return Ok(RunExit::StoppedByUser);
                     }
                 };
-                
+
                 match stream_res {
                     Ok(mut rx) => {
                         let mut current_turn_text = String::new();
+                        let mut processed_idx = 0;
                         let mut in_think_block = false;
-                        
+
                         let stream_loop_res = loop {
                             tokio::select! {
                                 event = rx.recv() => {
                                     match event {
                                         Some(StreamEvent::Text(t)) => {
                                             current_turn_text.push_str(&t);
-                                            let mut remaining = t.as_str();
-                                            while !remaining.is_empty() {
-                                                if in_think_block {
-                                                    if let Some(end_idx) = remaining.find("</think>") {
-                                                        let before = &remaining[..end_idx];
-                                                        if !before.is_empty() {
-                                                            self.output.on_thinking(before).await;
-                                                        }
-                                                        in_think_block = false;
-                                                        remaining = &remaining[end_idx + 8..];
-                                                    } else {
-                                                        self.output.on_thinking(remaining).await;
-                                                        break;
-                                                    }
-                                                } else {
-                                                    if let Some(start_idx) = remaining.find("<think>") {
-                                                        let before = &remaining[..start_idx];
-                                                        if !before.is_empty() {
-                                                            self.output.on_text(before).await;
-                                                        }
-                                                        in_think_block = true;
-                                                        remaining = &remaining[start_idx + 7..];
-                                                    } else {
-                                                        self.output.on_text(remaining).await;
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                                            self.process_streaming_text(&current_turn_text, &mut processed_idx, &mut in_think_block).await;
                                         }
                                         Some(StreamEvent::Thought(t)) => {
                                             self.output.on_thinking(&t).await;
                                             current_turn_text.push_str(&format!("<think>{}</think>", t));
+                                            processed_idx = current_turn_text.len();
                                         }
                                         Some(StreamEvent::ToolCall(tc, sig)) => {
                                             tool_calls_accumulated.push((tc, sig));
@@ -313,10 +458,10 @@ impl AgentLoop {
                         }
 
                         break current_turn_text;
-                    },
+                    }
                     Err(e) => {
                         if !self.handle_llm_error(&e, llm_attempts).await {
-                             return Err(Box::new(e));
+                            return Err(Box::new(e));
                         }
                     }
                 }
@@ -325,10 +470,12 @@ impl AgentLoop {
             if full_text.trim().is_empty() && tool_calls_accumulated.is_empty() {
                 consecutive_empty_responses += 1;
                 if consecutive_empty_responses >= Self::MAX_CONSECUTIVE_EMPTY_RESPONSES {
-                     self.context.end_turn();
-                     return Ok(RunExit::CriticallyFailed("Too many empty responses".to_string()));
+                    self.context.end_turn();
+                    return Ok(RunExit::CriticallyFailed(
+                        "Too many empty responses".to_string(),
+                    ));
                 }
-                continue; 
+                continue;
             } else {
                 consecutive_empty_responses = 0;
             }
@@ -343,14 +490,14 @@ impl AgentLoop {
                 });
             }
             for (tc, sig) in &tool_calls_accumulated {
-                 parts.push(Part {
+                parts.push(Part {
                     text: None,
                     function_call: Some(tc.clone()),
                     function_response: None,
                     thought_signature: sig.clone(),
                 });
             }
-            
+
             self.context.add_message_to_current_turn(Message {
                 role: "model".to_string(),
                 parts,
@@ -359,12 +506,13 @@ impl AgentLoop {
             if tool_calls_accumulated.is_empty() {
                 self.output.flush().await;
                 self.context.end_turn();
+                self.telemetry.end_span("agent_step");
                 return Ok(RunExit::YieldedToUser);
             }
 
             let mut executed_signatures = HashSet::new();
             let mut stop_loop = false;
-            
+
             for (mut call, _thought_sig) in tool_calls_accumulated {
                 if let Some(obj) = call.args.as_object_mut() {
                     if let Some(thought) = obj.remove("thought") {
@@ -378,10 +526,11 @@ impl AgentLoop {
                 }
 
                 let sig = format!("{}:{}", call.name, call.args);
-                if !executed_signatures.insert(sig) || call.name.trim().is_empty() { continue; }
-                
+                if !executed_signatures.insert(sig) || call.name.trim().is_empty() {
+                    continue;
+                }
+
                 if call.name == "finish_task" {
-                    let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
                     let mut summary = call.args.to_string();
                     if let Some(obj) = call.args.as_object() {
                         if let Some(s) = obj.get("summary").and_then(|v| v.as_str()) {
@@ -389,17 +538,19 @@ impl AgentLoop {
                         }
                     }
                     self.output.flush().await;
-                    self.output.on_text(&format!("\n{}\n", summary)).await;
-                    self.output.flush().await;
-                    self.context.end_turn();
+                    self.telemetry.end_span("agent_step");
                     return Ok(RunExit::Finished(summary));
                 }
+
+
 
                 let tool_opt = self.tools.iter().find(|t| t.name() == call.name);
                 let (result, is_error, stopped) = if let Some(tool) = tool_opt {
                     self.output.flush().await;
-                    self.output.on_tool_start(&call.name, &call.args.to_string()).await;
-                    
+                    self.output
+                        .on_tool_start(&call.name, &call.args.to_string())
+                        .await;
+
                     tokio::select! {
                         exec_res = tool.execute(call.args.clone()) => {
                             match exec_res {
@@ -431,6 +582,67 @@ impl AgentLoop {
                                 self.output.on_file(path).await;
                             }
                         }
+                    } else if call.name == "read_file" {
+                        if let Some(obj) = call.args.as_object() {
+                            if let Some(path_val) = obj.get("path").and_then(|v| v.as_str()) {
+                                let evidence_id = format!("file_{}", path_val);
+                                let evidence = crate::evidence::Evidence::new(
+                                    evidence_id.clone(),
+                                    "file".to_string(),
+                                    path_val.to_string(),
+                                    1.0,
+                                    format!("Direct read of {}", path_val),
+                                    result.clone(),
+                                );
+                                // Maintain a clean state: remove older versions of the same file
+                                self.context.active_evidence.retain(|e| e.source_kind != "file" || e.source_path != path_val);
+                                self.context.active_evidence.push(evidence);
+                            }
+                        }
+                    }
+                }
+
+                let final_result = result.clone();
+
+                if !is_error {
+                    if call.name == "execute_bash" {
+                        if let Some(obj) = call.args.as_object() {
+                            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+                                let cmd_trim = cmd.trim();
+                                let is_diagnostic = cmd_trim.contains("cargo ") || cmd_trim.contains("npm run") || cmd_trim.contains("pytest") || cmd_trim.contains("tsc") || cmd_trim.contains("make");
+                                let is_dir_list = cmd_trim.starts_with("ls ") || cmd_trim == "ls" || cmd_trim.starts_with("tree ") || cmd_trim == "tree" || cmd_trim.starts_with("find ");
+
+                                if is_diagnostic || is_dir_list {
+                                    let kind = if is_diagnostic { "diagnostic" } else { "directory" };
+                                    let source_path = if is_diagnostic { "workspace_state" } else { cmd_trim };
+                                    let evidence_id = format!("{}_{}", kind, uuid::Uuid::new_v4().simple());
+                                    
+                                    let evidence = crate::evidence::Evidence::new(
+                                        evidence_id.clone(),
+                                        kind.to_string(),
+                                        source_path.to_string(),
+                                        1.0,
+                                        format!("Bash snapshot: {}", cmd_trim).chars().take(200).collect(),
+                                        final_result.clone(),
+                                    );
+                                    
+                                    if is_dir_list {
+                                        self.context.active_evidence.retain(|e| e.source_kind != kind || e.source_path != source_path);
+                                    } else {
+                                        self.context.active_evidence.retain(|e| e.source_kind != kind);
+                                    }
+                                    
+                                    self.context.active_evidence.push(evidence);
+                                }
+                            }
+                        }
+                    } else if call.name == "write_file" || call.name == "patch_file" {
+                        // Invalidate diagnostic evidence because source code changed
+                        for ev in self.context.active_evidence.iter_mut() {
+                            if ev.source_kind == "diagnostic" {
+                                ev.source_version = Some("invalidated_by_write".to_string());
+                            }
+                        }
                     }
                 }
 
@@ -441,7 +653,7 @@ impl AgentLoop {
                         function_call: None,
                         function_response: Some(FunctionResponse {
                             name: call.name.clone(),
-                            response: serde_json::json!({ "result": result }),
+                            response: serde_json::json!({ "result": final_result }),
                             tool_call_id: call.id.clone(),
                         }),
                         thought_signature: None,
@@ -449,9 +661,16 @@ impl AgentLoop {
                 });
             }
 
+            // Impose limits on extremely large tool results that might explode the context window
+            let truncated = self.context.truncate_current_turn_tool_results(30000);
+            if truncated > 0 {
+                let current_turn_id = self.context.current_turn.as_ref().map(|t| t.turn_id.as_str()).unwrap_or("unknown");
+                tracing::warn!("Turn {} tool results had {} oversized part(s) automatically truncated to save memory bounds.", current_turn_id, truncated);
+            }
+
             if stop_loop {
-                 self.context.end_turn();
-                 return Ok(RunExit::StoppedByUser);
+                self.context.end_turn();
+                return Ok(RunExit::StoppedByUser);
             }
         }
     }

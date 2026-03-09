@@ -1,34 +1,38 @@
 pub mod browser;
+pub mod context_assembler;
+pub mod event_log;
+pub mod evidence;
+pub mod rag;
+pub mod schema;
+pub mod task_state;
+pub mod telemetry;
 
-mod context;
 mod config;
+mod context;
 mod core;
 mod discord;
 mod llm_client;
 mod logging;
 mod memory;
-pub mod rag;
 mod session_manager;
 mod skills;
 mod telegram;
 mod tools;
+mod ui;
 mod utils;
-mod ui; // Add the UI module
 
-use crate::core::{AgentOutput, RunExit};
+use crate::core::{RunExit, AgentOutput};
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::session_manager::SessionManager;
-use crate::skills::load_skills;
 use crate::tools::{
-    BashTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool,
-    TaskPlanTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool, FinishTaskTool,
-    PatchFileTool, SendFileTool,
+    BashTool, FinishTaskTool, PatchFileTool, RagInsertTool, RagSearchTool, ReadFileTool,
+    ReadMemoryTool, SendFileTool, TavilySearchTool, WebFetchTool, WriteFileTool,
+    WriteMemoryTool,
 };
-use crate::ui::TuiOutput; // Use the new UI output
-use async_trait::async_trait;
+use crate::ui::TuiOutput;
 use clap::Parser;
-use console::style; // For colored text
+use console::style;
 use dotenvy::dotenv;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -61,112 +65,79 @@ struct CliArgs {
     /// Disable performance report output
     #[arg(long, conflicts_with = "timing_report")]
     no_timing_report: bool,
-    /// Enable prompt report output
+    /// Enable prompt caching (if supported by the provider)
     #[arg(long)]
-    prompt_report: bool,
+    cache: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = dotenv();
+    dotenv().ok();
     let args = CliArgs::parse();
 
-    if let Some(level) = &args.log_level {
-        std::env::set_var("RUST_LOG", level);
-    }
-    if args.timing_report {
-        std::env::set_var("CLAW_TIMING_REPORT", "1");
-    } else if args.no_timing_report {
-        std::env::set_var("CLAW_TIMING_REPORT", "0");
-    }
-    if args.prompt_report {
-        std::env::set_var("CLAW_PROMPT_REPORT", "1");
-    }
+    println!();
+    println!("  {}", style("Rusty-Claw AGENT-OS v0.1.0").bold().cyan());
+    println!("  {}", style("---------------------------").dim());
 
     let config = config::AppConfig::load();
-    let _log_guard = match logging::init_logging(&config) {
-        Ok(guard) => guard,
+    let _guards = logging::init_logging(&config);
+
+    let llm_opt = match llm_client::create_llm_client(&args.provider, args.model.clone(), &config) {
+        Ok(llm) => Some(llm),
         Err(e) => {
-            eprintln!("WARNING: failed to initialize logging: {}", e);
+            tracing::error!("Failed to initialize default LLM: {}", e);
+            println!(
+                "  {} Failed to initialize default LLM: {}",
+                style("⚠️").yellow(),
+                e
+            );
+            println!(
+                "  Starting without default LLM. Use {} to configure one.",
+                style("/model <provider> [model_name]").bold()
+            );
             None
         }
     };
 
-    let provider_name = if args.provider != "gemini" {
-        args.provider.clone()
-    } else {
-        config.default_provider.clone().unwrap_or(args.provider.clone())
-    };
+    let vector_store = Arc::new(VectorStore::new()?);
+    let workspace_memory = Arc::new(WorkspaceMemory::new("."));
 
-    let llm_init_result = llm_client::create_llm_client(&provider_name, args.model.clone(), &config);
-    let llm_opt = match llm_init_result {
-        Ok(client) => Some(client),
-        Err(e) => {
-            eprintln!("\x1b[33m[Warning] LLM initialization failed: {}. You can still use /model to switch later.\x1b[0m", e);
-            None
-        }
-    };
+    let tavily_key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
 
-    let current_dir = std::env::current_dir()?;
-    let current_dir_str = current_dir.to_str().unwrap_or(".");
-    let workspace = Arc::new(WorkspaceMemory::new(current_dir_str));
-
-    let rag_store = match VectorStore::new() {
-        Ok(store) => Some(Arc::new(store)),
-        Err(e) => {
-            tracing::warn!("Failed to initialize VectorStore: {}", e);
-            None
-        }
-    };
-
-    let mut tools: Vec<Arc<dyn tools::Tool>> = Vec::new();
-    tools.push(Arc::new(BashTool::new()));
-    tools.push(Arc::new(crate::browser::BrowserTool::new()));
-    tools.push(Arc::new(WriteFileTool));
-    tools.push(Arc::new(ReadFileTool));
-    tools.push(Arc::new(PatchFileTool));
-    tools.push(Arc::new(SendFileTool));
-    tools.push(Arc::new(FinishTaskTool));
-    tools.push(Arc::new(WebFetchTool::new()));
-    tools.push(Arc::new(ReadMemoryTool::new(workspace.clone())));
-    tools.push(Arc::new(WriteMemoryTool::new(workspace.clone())));
-    tools.push(Arc::new(TaskPlanTool::new(current_dir.join(".rusty_claw_task_plan.json"))));
-
-    if let Ok(tavily_api_key) = std::env::var("TAVILY_API_KEY") {
-        if !tavily_api_key.trim().is_empty() {
-            tools.push(Arc::new(TavilySearchTool::new(tavily_api_key)));
-        }
-    }
-
-    if let Some(store) = rag_store {
-        tools.push(Arc::new(RagSearchTool::new(store.clone())));
-        tools.push(Arc::new(RagInsertTool::new(store.clone())));
-    }
-
-    // Skills are now dynamically loaded per-turn in the AgentLoop, 
-    // so we don't load them statically here anymore.
+    let tools: Vec<Arc<dyn tools::Tool>> = vec![
+        Arc::new(BashTool::new()),
+        Arc::new(WriteFileTool),
+        Arc::new(ReadFileTool),
+        Arc::new(PatchFileTool),
+        Arc::new(TavilySearchTool::new(tavily_key)),
+        Arc::new(WebFetchTool::new()),
+        Arc::new(RagSearchTool::new(vector_store.clone())),
+        Arc::new(RagInsertTool::new(vector_store.clone())),
+        Arc::new(ReadMemoryTool::new(workspace_memory.clone())),
+        Arc::new(WriteMemoryTool::new(workspace_memory.clone())),
+        Arc::new(FinishTaskTool),
+        Arc::new(SendFileTool),
+    ];
 
     let session_manager = Arc::new(SessionManager::new(llm_opt, tools.clone()));
 
     if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
         let sm = session_manager.clone();
-        tokio::spawn(async move { telegram::run_telegram_bot(token, sm).await; });
+        tokio::spawn(async move {
+            telegram::run_telegram_bot(token, sm).await;
+        });
     }
 
     if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN") {
         let sm = session_manager.clone();
-        tokio::spawn(async move { discord::run_discord_bot(token, sm).await; });
-    }
-
-    let output = Arc::new(TuiOutput::new());
-    if let Err(e) = session_manager.get_or_create_session("cli", output.clone()).await {
-        eprintln!("{} Failed to pre-initialize CLI session: {}", style("⚠").yellow(), e);
+        tokio::spawn(async move {
+            discord::run_discord_bot(token, sm).await;
+        });
     }
 
     let mut rl = DefaultEditor::new()?;
-    
-    println!();
-    println!("  {}", style("Rust Claw OC").bold().magenta());
+    let output = Arc::new(TuiOutput::new());
+
     println!("  Type {} to exit, {} for help.", style("/exit").bold(), style("/help").bold());
     println!();
 
@@ -176,9 +147,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sm_clone = session_manager.clone();
     tokio::spawn(async move {
-        let mut sigs = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-        while let Some(_) = sigs.recv().await { sm_clone.cancel_session("cli").await; }
+        let mut sigs =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        while let Some(_) = sigs.recv().await {
+            sm_clone.cancel_session("cli").await;
+        }
     });
+
+    let task_store_check_cli = crate::task_state::TaskStateStore::new("cli");
+    if task_store_check_cli.has_active_plan() {
+        println!("  {} Task plan active. Use {} to abort.", style("ℹ").blue(), style("/cancel_task").bold());
+    }
 
     let mut ctrl_c_count = 0;
     loop {
@@ -188,6 +167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(line) => {
                 ctrl_c_count = 0;
                 let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
                 if line == "/exit" {
                     break;
                 }
@@ -195,27 +178,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                     println!("  {}", style("Available Commands:").bold());
                     println!("  {}  - Start a fresh session", style("/new").green());
-                    println!("  {} - Cancel current task", style("/cancel").yellow());
+                    println!("  {} - Cancel current API request", style("/cancel").yellow());
+                    println!("  {} - Abort active task plan", style("/cancel_task").red());
                     println!("  {} - Show model usage", style("/status").cyan());
                     println!("  {} - Switch models", style("/model").magenta());
+                    println!("  {} - List all sessions", style("/session").white());
                     println!("  {} - Inspect context", style("/context").blue());
                     println!();
                     continue;
                 }
                 if line == "/new" {
                     session_manager.reset_session("cli").await;
-                    let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
+                    let ts = crate::task_state::TaskStateStore::new("cli");
+                    let _ = ts.clear();
                     println!("  {} Session cleared. Starting fresh.", style("✔").green());
                     continue;
                 }
-                if line == "/cancel" || line == "/cancel_task" {
+                if line == "/cancel" {
                     session_manager.cancel_session("cli").await;
-                    let _ = std::fs::remove_file(".rusty_claw_task_plan.json");
-                    println!("  {} Task and plan cancelled.", style("✔").yellow());
+                    println!("  {} Request cancelled.", style("✔").yellow());
+                    continue;
+                }
+                if line == "/cancel_task" {
+                    session_manager.cancel_session("cli").await;
+                    let ts = crate::task_state::TaskStateStore::new("cli");
+                    let _ = ts.clear();
+                    println!("  {} Task cancelled and plan cleared.", style("✔").yellow());
                     continue;
                 }
                 if line == "/status" {
-                    let agent = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
+                    let agent = session_manager
+                        .get_or_create_session("cli", output.clone())
+                        .await
+                        .unwrap();
                     let agent_guard = agent.lock().await;
                     let (provider, model, tokens, max_tokens) = agent_guard.get_status();
                     let percentage = (tokens as f64 / max_tokens as f64) * 100.0;
@@ -223,19 +218,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         style("📊").cyan(), provider, model, tokens, max_tokens, percentage);
                     continue;
                 }
+                if line == "/session" {
+                    let sessions = session_manager.list_sessions();
+                    println!();
+                    println!("  {}", style("Active/Recent Sessions:").bold());
+                    if sessions.is_empty() {
+                        println!("    (No sessions found)");
+                    } else {
+                        for (id, updated, turns) in sessions {
+                            let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(updated);
+                            let datetime: chrono::DateTime<chrono::Local> = chrono::DateTime::from(time);
+                            println!(
+                                "    {} - {} (Turns: {}, Last Updated: {})",
+                                style("•").cyan(),
+                                style(id).bold(),
+                                turns,
+                                datetime.format("%Y-%m-%d %H:%M:%S")
+                            );
+                        }
+                    }
+                    println!();
+                    continue;
+                }
                 if line.starts_with("/context") {
-                    let agent = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
+                    let agent = session_manager
+                        .get_or_create_session("cli", output.clone())
+                        .await
+                        .unwrap();
                     let mut agent_guard = agent.lock().await;
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     let subcommand = parts.get(1).map(|s| *s).unwrap_or("");
 
                     match subcommand {
-                        "audit" => { println!("{}", agent_guard.get_context_details()); }
+                        "audit" => {
+                            println!("{}", agent_guard.get_context_details());
+                        }
                         "diff" => {
                             if let Some(diff) = agent_guard.diff_snapshot() {
                                 println!("{}", agent_guard.format_diff(&diff));
                             } else {
-                                println!("  {} No snapshot available for diff. Run a command first.", style("⚠").yellow());
+                                println!("  {} No changes since last snapshot.", style("ℹ").blue());
                             }
                         }
                         "inspect" => {
@@ -285,9 +307,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         "compact" => {
-                             match agent_guard.force_compact().await {
-                                 Ok(r) => println!("  {} Context compacted: {}", style("✔").green(), r),
-                                 Err(e) => println!("  {} Compaction skipped: {}", style("⚠").yellow(), e)
+                            println!("  {} Attempting manual compaction...", style("⚙").yellow());
+                            match agent_guard.maybe_compact_history(true).await {
+                                Ok(_) => println!("  {} Compaction attempt finished.", style("✔").green()),
+                                Err(e) => println!("  {} Compaction failed: {}", style("❌").red(), e.to_string()),
                             }
                         }
                         _ => {
@@ -301,27 +324,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     continue;
                 }
+
                 if line.starts_with("/model") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() < 2 {
-                        let config = crate::config::AppConfig::load();
-                        println!("Usage: /model <provider> [model]\nAvailable: {}", config.providers.keys().cloned().collect::<Vec<_>>().join(", "));
+                        println!("  {} Usage: /model <provider> [model_name]", style("ℹ").blue());
                         continue;
                     }
-                    match session_manager.update_session_llm("cli", parts[1], parts.get(2).map(|s| s.to_string())).await {
+                    let provider = parts[1];
+                    let model = parts.get(2).map(|s| s.to_string());
+                    match session_manager.update_session_llm("cli", provider, model).await {
                         Ok(msg) => println!("  {} {}", style("✔").green(), msg),
-                        Err(e) => println!("  {} Failed: {}", style("✖").red(), e),
+                        Err(e) => println!("  {} Error updating model: {}", style("❌").red(), e),
                     }
                     continue;
                 }
-                if line.is_empty() { continue; }
-                let _ = rl.add_history_entry(line);
-                let agent = session_manager.get_or_create_session("cli", output.clone()).await.unwrap();
+
+                if line.starts_with("/") {
+                    println!("  {} Unknown command: {}", style("❌").red(), line);
+                    continue;
+                }
+
+                let agent = match session_manager
+                    .get_or_create_session("cli", output.clone())
+                    .await
+                {
+                    Ok(a) => a,
+                    Err(e) => {
+                        println!("  {} Error: {}", style("❌").red(), e);
+                        continue;
+                    }
+                };
+
+                let line = line.to_string();
                 let mut agent_guard = agent.lock().await;
 
-                match agent_guard.step(line.to_string()).await {
+                let _ = output.on_waiting("Processing...").await;
+
+                match agent_guard.step(line).await {
                     Ok(exit) => match exit {
-                        RunExit::YieldedToUser => { println!(); }
+                        RunExit::YieldedToUser => {
+                            println!();
+                        }
                         RunExit::Finished(ref summary) => {
                             println!("\n{}", style(summary).green().bold());
                             println!("  {}", style("Task Finished").green());
@@ -350,23 +394,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     Err(e) => eprintln!("  {} Agent error: {}", style("✖").red(), e),
                 }
-
-                if std::path::Path::new(".rusty_claw_task_plan.json").exists() {
-                    println!("  {} Task plan active. Use {} to abort.", style("ℹ").blue(), style("/cancel_task").bold());
-                }
             }
             Err(ReadlineError::Interrupted) => {
                 ctrl_c_count += 1;
                 if ctrl_c_count >= 2 {
-                    println!("Exiting.");
+                    println!("\n  Exiting...");
                     break;
-                } else {
-                    println!("\n  {}", style("Press Ctrl-C again to exit.").yellow());
                 }
+                println!("\n  {}", style("Press Ctrl-C again to exit.").yellow());
+                session_manager.cancel_session("cli").await;
             }
-            Err(ReadlineError::Eof) => { println!("CTRL-D"); break; }
-            Err(err) => { println!("Error: {:?}", err); break; }
+            Err(ReadlineError::Eof) => {
+                break;
+            }
+            Err(err) => {
+                println!("  {} Error: {:?}", style("❌").red(), err);
+                break;
+            }
         }
     }
+
     Ok(())
 }

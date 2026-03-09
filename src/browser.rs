@@ -8,11 +8,10 @@ use tokio::task;
 
 // Import chromiumoxide for CDP automation
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::handler::Handler;
 use chromiumoxide::Page;
 use futures::StreamExt;
 
-use crate::tools::{Tool, ToolError, clean_schema};
+use crate::tools::{clean_schema, Tool, ToolError};
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct BrowserActionRequest {
@@ -28,13 +27,13 @@ pub struct BrowserActionRequest {
 pub struct BrowserToolParams {
     /// Action: status, start, stop, snapshot, act, navigate
     pub action: String,
-    
+
     /// Target URL (for navigate)
     pub target_url: Option<String>,
-    
+
     /// Action details (for act)
     pub request: Option<BrowserActionRequest>,
-    
+
     /// Profile type: 'chrome' (attach) or 'openclaw' (sandbox)
     pub profile: Option<String>,
 }
@@ -61,14 +60,19 @@ impl BrowserTool {
     async fn handle_start(&self) -> Result<String, ToolError> {
         let mut state = self.state.write().await;
         if state.browser.is_some() {
-            return Ok("Browser is already running. Use status to check, or stop to restart.".to_string());
+            return Ok(
+                "Browser is already running. Use status to check, or stop to restart.".to_string(),
+            );
         }
 
         // Configure sandbox browser
         let config = BrowserConfig::builder()
-            .with_head() // Using headed mode for debugging locally. In prod, we may use headless.
+            .no_sandbox()
+            .arg("--disable-dev-shm-usage")
             .build()
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to build browser config: {}", e)))?;
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to build browser config: {}", e))
+            })?;
 
         // Launch the browser process
         let (browser, mut handler) = Browser::launch(config)
@@ -86,9 +90,9 @@ impl BrowserTool {
         });
 
         // Create an initial page
-        let page = browser.new_page("about:blank")
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create initial page: {}", e)))?;
+        let page = browser.new_page("about:blank").await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to create initial page: {}", e))
+        })?;
 
         state.browser = Some(browser);
         state.active_page = Some(page);
@@ -102,7 +106,7 @@ impl BrowserTool {
             return Ok("Browser is already stopped.".to_string());
         }
 
-        // Dropping the page and browser handles will close the connection 
+        // Dropping the page and browser handles will close the connection
         // and chromiumoxide will kill the child process cleanly.
         state.active_page = None;
         state.browser = None;
@@ -113,20 +117,26 @@ impl BrowserTool {
     async fn handle_navigate(&self, url: &str) -> Result<String, ToolError> {
         let state = self.state.read().await;
         let page = state.active_page.as_ref().ok_or_else(|| {
-            ToolError::ExecutionFailed("Browser is not running or no active page. Please call 'start' first.".to_string())
+            ToolError::ExecutionFailed(
+                "Browser is not running or no active page. Please call 'start' first.".to_string(),
+            )
         })?;
 
         // Basic validation
-        let target = if url.starts_with("http") { url.to_string() } else { format!("https://{}", url) };
+        let target = if url.starts_with("http") {
+            url.to_string()
+        } else {
+            format!("https://{}", url)
+        };
 
         page.goto(&target)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Navigation failed: {}", e)))?;
 
         // Wait for page load
-        page.wait_for_navigation()
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Wait for navigation failed: {}", e)))?;
+        page.wait_for_navigation().await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Wait for navigation failed: {}", e))
+        })?;
 
         Ok(format!("Successfully navigated to {}", target))
     }
@@ -148,8 +158,8 @@ impl Tool for BrowserTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
-        let params: BrowserToolParams = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        let params: BrowserToolParams =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
         match params.action.as_str() {
             "status" => {
@@ -159,40 +169,50 @@ impl Tool for BrowserTool {
                 } else {
                     Ok("Browser is stopped. Call start to launch it.".to_string())
                 }
-            },
+            }
             "start" => self.handle_start().await,
             "stop" => self.handle_stop().await,
             "navigate" => {
                 let url = params.target_url.ok_or_else(|| {
-                    ToolError::InvalidArguments("target_url is required for navigate action".to_string())
+                    ToolError::InvalidArguments(
+                        "target_url is required for navigate action".to_string(),
+                    )
                 })?;
                 self.handle_navigate(&url).await
-            },
+            }
             "snapshot" => {
                 let state = self.state.read().await;
                 let page = state.active_page.as_ref().ok_or_else(|| {
-                    ToolError::ExecutionFailed("Browser is not running. Call start first.".to_string())
+                    ToolError::ExecutionFailed(
+                        "Browser is not running. Call start first.".to_string(),
+                    )
                 })?;
-                
+
                 let js_code = include_str!("browser/extractor.js");
-                let result = page.evaluate(js_code).await
+                let result = page
+                    .evaluate(js_code)
+                    .await
                     .map_err(|e| ToolError::ExecutionFailed(format!("Extract failed: {}", e)))?;
-                
+
                 if let Some(val) = result.value() {
                     if let Some(s) = val.as_str() {
                         return Ok(s.to_string());
                     }
                 }
                 Ok("[]".to_string())
-            },
+            }
             "act" => {
                 let state = self.state.read().await;
                 let page = state.active_page.as_ref().ok_or_else(|| {
-                    ToolError::ExecutionFailed("Browser is not running. Call start first.".to_string())
+                    ToolError::ExecutionFailed(
+                        "Browser is not running. Call start first.".to_string(),
+                    )
                 })?;
 
                 let req = params.request.ok_or_else(|| {
-                    ToolError::InvalidArguments("request field is missing for act action".to_string())
+                    ToolError::InvalidArguments(
+                        "request field is missing for act action".to_string(),
+                    )
                 })?;
 
                 let target_id = req.target_id.ok_or_else(|| {
@@ -201,19 +221,24 @@ impl Tool for BrowserTool {
 
                 // Fetch coordinates using evaluate
                 let get_coords_js = format!(
-                    "window.__OC_NODE_MAP__['{}'] ? JSON.stringify(window.__OC_NODE_MAP__['{}']) : null", 
+                    "window.__OC_NODE_MAP__['{}'] ? JSON.stringify(window.__OC_NODE_MAP__['{}']) : null",
                     target_id, target_id
                 );
-                
-                let coord_res = page.evaluate(get_coords_js).await
-                    .map_err(|e| ToolError::ExecutionFailed(format!("Failed to get node coordinates: {}", e)))?;
-                
+
+                let coord_res = page.evaluate(get_coords_js).await.map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Failed to get node coordinates: {}", e))
+                })?;
+
                 if let Some(val) = coord_res.value() {
                     if val.is_null() {
-                        return Err(ToolError::ExecutionFailed(format!("Target ID {} not found in snapshot", target_id)));
+                        return Err(ToolError::ExecutionFailed(format!(
+                            "Target ID {} not found in snapshot",
+                            target_id
+                        )));
                     }
                     if let Some(s) = val.as_str() {
-                        let parsed: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::json!({}));
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(s).unwrap_or(serde_json::json!({}));
                         if let (Some(x), Some(y)) = (parsed["x"].as_f64(), parsed["y"].as_f64()) {
                             match req.kind.as_str() {
                                 "click" => {
@@ -221,42 +246,71 @@ impl Tool for BrowserTool {
                                     // and requires chromiumoxide advanced mapping. For now, we inject a click payload.
                                     // Phase 4: Use pure CDP coordinates for interaction
                                     use chromiumoxide::layout::Point;
-                                    page.click(Point { x, y }).await
-                                        .map_err(|e| ToolError::ExecutionFailed(format!("CDP click failed: {}", e)))?;
-                                    
+                                    page.click(Point { x, y }).await.map_err(|e| {
+                                        ToolError::ExecutionFailed(format!(
+                                            "CDP click failed: {}",
+                                            e
+                                        ))
+                                    })?;
+
                                     // Wait a bit for potential navigation or DOM mutations
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-                                    
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(150))
+                                        .await;
+
                                     return Ok(format!("Successfully clicked on element [{}] at CDP coordinates ({}, {})", target_id, x, y));
-                                },
+                                }
                                 "type" => {
                                     // Phase 4: Focus via JS, type via CDP
                                     let focus_js = format!(
                                         "let el = document.querySelector('[data-oc-id=\"{}\"]'); if (el) {{ el.focus(); el.value = ''; true; }} else {{ false; }}",
                                         target_id
                                     );
-                                    page.evaluate(focus_js).await
-                                        .map_err(|e| ToolError::ExecutionFailed(format!("Focus execution failed: {}", e)))?;
-                                    
+                                    page.evaluate(focus_js).await.map_err(|e| {
+                                        ToolError::ExecutionFailed(format!(
+                                            "Focus execution failed: {}",
+                                            e
+                                        ))
+                                    })?;
+
                                     let text = req.text.unwrap_or_default();
                                     use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
-                                    let _res = page.execute(InsertTextParams::new(text)).await
-                                        .map_err(|e| ToolError::ExecutionFailed(format!("CDP insert text failed: {}", e)))?;
-                                    
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-                                    return Ok(format!("Successfully typed text into element [{}] via CDP", target_id));
-                                },
+                                    let _res = page
+                                        .execute(InsertTextParams::new(text))
+                                        .await
+                                        .map_err(|e| {
+                                            ToolError::ExecutionFailed(format!(
+                                                "CDP insert text failed: {}",
+                                                e
+                                            ))
+                                        })?;
+
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(150))
+                                        .await;
+                                    return Ok(format!(
+                                        "Successfully typed text into element [{}] via CDP",
+                                        target_id
+                                    ));
+                                }
                                 _ => {
-                                    return Err(ToolError::InvalidArguments(format!("Unsupported act kind: {}", req.kind)));
+                                    return Err(ToolError::InvalidArguments(format!(
+                                        "Unsupported act kind: {}",
+                                        req.kind
+                                    )));
                                 }
                             }
                         }
                     }
                 }
-                
-                Err(ToolError::ExecutionFailed(format!("Failed to parse coordinates for ID {}", target_id)))
-            },
-            _ => Err(ToolError::InvalidArguments(format!("Unknown action: {}", params.action))),
+
+                Err(ToolError::ExecutionFailed(format!(
+                    "Failed to parse coordinates for ID {}",
+                    target_id
+                )))
+            }
+            _ => Err(ToolError::InvalidArguments(format!(
+                "Unknown action: {}",
+                params.action
+            ))),
         }
     }
 }
@@ -265,59 +319,80 @@ impl Tool for BrowserTool {
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_browser_lifecycle() {
         let browser_tool = BrowserTool::new();
 
         // 1. Status - Should be stopped
-        let status_res = browser_tool.execute(json!({"action": "status"})).await.unwrap();
+        let status_res = browser_tool
+            .execute(json!({"action": "status"}))
+            .await
+            .unwrap();
         assert!(status_res.contains("stopped"));
 
         // 2. Start
-        let start_res = browser_tool.execute(json!({"action": "start"})).await.unwrap();
+        let start_res = browser_tool
+            .execute(json!({"action": "start"}))
+            .await
+            .unwrap();
         assert!(start_res.contains("ready"));
 
         // 3. Status - Should be running
-        let status_res2 = browser_tool.execute(json!({"action": "status"})).await.unwrap();
+        let status_res2 = browser_tool
+            .execute(json!({"action": "status"}))
+            .await
+            .unwrap();
         assert!(status_res2.contains("running"));
 
         // 4. Stop
-        let stop_res = browser_tool.execute(json!({"action": "stop"})).await.unwrap();
+        let stop_res = browser_tool
+            .execute(json!({"action": "stop"}))
+            .await
+            .unwrap();
         assert!(stop_res.contains("stopped"));
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_browser_flow() {
         let tool = BrowserTool::new();
-        
+
         println!("--- Starting Browser ---");
         let res = tool.execute(json!({"action": "start"})).await.unwrap();
         println!("{}", res);
-        
+
         println!("--- Navigating ---");
-        let res = tool.execute(json!({"action": "navigate", "target_url": "https://example.com"})).await.unwrap();
+        let res = tool
+            .execute(json!({"action": "navigate", "target_url": "https://example.com"}))
+            .await
+            .unwrap();
         println!("{}", res);
-        
+
         println!("--- Waiting for render ---");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        
+
         println!("--- Taking Snapshot ---");
         let res = tool.execute(json!({"action": "snapshot"})).await.unwrap();
         println!("Snapshot Result:\n{}", res);
-        
+
         println!("--- Stopping Browser ---");
         let res = tool.execute(json!({"action": "stop"})).await.unwrap();
         println!("{}", res);
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_google_access() {
         let tool = BrowserTool::new();
         println!("--- Starting Browser for Google ---");
         tool.execute(json!({"action": "start"})).await.unwrap();
         println!("--- Navigating to Google ---");
-        tool.execute(json!({"action": "navigate", "target_url": "https://www.google.com"})).await.unwrap();
+        tool.execute(json!({"action": "navigate", "target_url": "https://www.google.com"}))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         println!("--- Taking Google Snapshot ---");
         let snapshot = tool.execute(json!({"action": "snapshot"})).await.unwrap();
@@ -326,11 +401,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_google_search_flow() {
         let tool = BrowserTool::new();
         println!("--- Phase 1: Start & Navigate ---");
         tool.execute(json!({"action": "start"})).await.unwrap();
-        tool.execute(json!({"action": "navigate", "target_url": "https://www.google.com"})).await.unwrap();
+        tool.execute(json!({"action": "navigate", "target_url": "https://www.google.com"}))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         println!("--- Phase 2: Identify Search Box ---");
@@ -340,28 +418,33 @@ mod tests {
         println!("Snapshot:\n{}", snapshot);
 
         // We'll search for 'input' in the snapshot to be dynamic
-        let search_id = snapshot.lines()
+        let search_id = snapshot
+            .lines()
             .find(|l| l.contains("input"))
             .and_then(|l| l.split(']').next())
             .map(|s| s.trim_start_matches('['))
             .unwrap_or("5"); // Fallback to 5 if parsing fails
 
         println!("--- Phase 3: Typing Search Query ---");
-        let res = tool.execute(json!({
-            "action": "act",
-            "request": {
-                "kind": "type",
-                "target_id": search_id,
-                "text": "OpenClaw github"
-            }
-        })).await.unwrap();
+        let res = tool
+            .execute(json!({
+                "action": "act",
+                "request": {
+                    "kind": "type",
+                    "target_id": search_id,
+                    "text": "OpenClaw github"
+                }
+            }))
+            .await
+            .unwrap();
         println!("{}", res);
 
         println!("--- Phase 4: Submit Search ---");
-        // We can either find the search button or just press Enter. 
-        // Our 'act' tool 'type' currently doesn't simulate Enter key easily in the simplified JS fallback 
+        // We can either find the search button or just press Enter.
+        // Our 'act' tool 'type' currently doesn't simulate Enter key easily in the simplified JS fallback
         // unless we add it, but we can just click the 'Google 搜索' button.
-        let button_id = snapshot.lines()
+        let button_id = snapshot
+            .lines()
             .find(|l| l.contains("Google 搜索"))
             .and_then(|l| l.split(']').next())
             .map(|s| s.trim_start_matches('['))
@@ -373,7 +456,9 @@ mod tests {
                 "kind": "click",
                 "target_id": button_id
             }
-        })).await.unwrap();
+        }))
+        .await
+        .unwrap();
 
         println!("--- Phase 5: Waiting for Results ---");
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;

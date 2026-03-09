@@ -25,7 +25,16 @@ pub struct SessionManager {
     llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     tools: Vec<Arc<dyn Tool>>,
     // Active agent sessions (In-Memory) + their cancel mechanisms
-    sessions: AsyncMutex<HashMap<String, (Arc<AsyncMutex<AgentLoop>>, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<std::sync::atomic::AtomicBool>)>>,
+    sessions: AsyncMutex<
+        HashMap<
+            String,
+            (
+                Arc<AsyncMutex<AgentLoop>>,
+                std::sync::Arc<tokio::sync::Notify>,
+                std::sync::Arc<std::sync::atomic::AtomicBool>,
+            ),
+        >,
+    >,
     transcript_dir: PathBuf,
     registry_path: PathBuf,
     // In-Memory Registry Cache (Fast Read/Write)
@@ -61,16 +70,16 @@ impl SessionManager {
 
     pub async fn reset_session(&self, session_id: &str) {
         let mut sessions = self.sessions.lock().await;
-        
+
         // Remove from memory
         sessions.remove(session_id);
-        
+
         // Delete transcript file if it exists
         let transcript_path = transcript_path_for_session(&self.transcript_dir, session_id);
         if transcript_path.exists() {
             let _ = std::fs::remove_file(&transcript_path);
         }
-        
+
         // Remove from registry
         if let Ok(mut registry) = self.registry_cache.write() {
             registry.sessions.remove(session_id);
@@ -92,12 +101,18 @@ impl SessionManager {
         session_id: &str,
         output: Arc<dyn AgentOutput>,
     ) -> Result<Arc<AsyncMutex<AgentLoop>>, String> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some((agent, _, _)) = sessions.get(session_id) {
+        let existing = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session_id).map(|(a, _, _)| a.clone())
+        };
+
+        if let Some(agent_mutex) = existing {
+            let mut agent = agent_mutex.lock().await;
+            agent.update_output(output);
             // Update timestamp in memory only (fast)
             self.update_registry_entry(session_id, None, None);
             self.persist_registry_async();
-            return Ok(agent.clone());
+            return Ok(agent_mutex.clone());
         }
 
         let transcript_path = transcript_path_for_session(&self.transcript_dir, session_id);
@@ -108,13 +123,39 @@ impl SessionManager {
         self.update_registry_entry(session_id, Some(transcript_path), Some(loaded_turns));
         self.persist_registry_async();
 
-        let llm_guard = self.llm.read().unwrap();
-        let llm = llm_guard.as_ref().ok_or_else(|| "No LLM provider configured. Use /model <provider> to set one.".to_string())?;
+        let llm = {
+            let llm_guard = self.llm.read().unwrap();
+            llm_guard.as_ref().ok_or_else(|| {
+                "No LLM provider configured. Use /model <provider> to set one.".to_string()
+            })?.clone()
+        };
 
-        let agent_loop = AgentLoop::new(llm.clone(), self.tools.clone(), context, output);
+        let (telemetry, _telemetry_handle) = crate::telemetry::TelemetryExporter::new();
+        let telemetry = Arc::new(telemetry);
+        let event_log = Arc::new(crate::event_log::EventLog::new(session_id));
+        let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(session_id));
+
+        let mut session_tools = self.tools.clone();
+        session_tools.push(Arc::new(crate::tools::TaskPlanTool::new(
+            session_id.to_string(),
+            task_state_store.clone(),
+        )));
+
+        let agent_loop = AgentLoop::new(
+            session_id.to_string(),
+            llm,
+            session_tools,
+            context,
+            output,
+            telemetry,
+            event_log,
+            task_state_store,
+        );
         let token = agent_loop.cancel_token.clone();
         let cancelled = agent_loop.cancelled.clone();
         let agent = Arc::new(AsyncMutex::new(agent_loop));
+        
+        let mut sessions = self.sessions.lock().await;
         sessions.insert(session_id.to_string(), (agent.clone(), token, cancelled));
         Ok(agent)
     }
@@ -162,7 +203,13 @@ impl SessionManager {
             let _ = fs::write(&registry_path, serialized);
         });
     }
-    pub async fn update_session_llm(&self, session_id: &str, provider: &str, model: Option<String>) -> Result<String, String> {
+
+    pub async fn update_session_llm(
+        &self,
+        session_id: &str,
+        provider: &str,
+        model: Option<String>,
+    ) -> Result<String, String> {
         let config = crate::config::AppConfig::load();
         // We use the factory function from llm_client
         match crate::llm_client::create_llm_client(provider, model.clone(), &config) {
@@ -173,21 +220,39 @@ impl SessionManager {
                     *llm_guard = Some(new_llm.clone());
                 }
 
-                let sessions = self.sessions.lock().await;
-                if let Some((agent_mutex, _, _)) = sessions.get(session_id) {
+                let agent_mutex = {
+                    let sessions = self.sessions.lock().await;
+                    sessions.get(session_id).map(|(a, _, _)| a.clone())
+                };
+                if let Some(agent_mutex) = agent_mutex {
                     let mut agent = agent_mutex.lock().await;
                     agent.update_llm(new_llm);
-                    Ok(format!("Updated session '{}' and global default to provider '{}' model '{:?}'", session_id, provider, model))
+                    Ok(format!(
+                        "Updated session '{}' and global default to provider '{}' model '{:?}'",
+                        session_id, provider, model
+                    ))
                 } else {
                     // Even if session doesn't exist, we updated the global default.
                     Ok(format!("Updated global default to provider '{}' model '{:?}'. (Session '{}' not yet active)", provider, model, session_id))
                 }
             }
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
-}
 
+    pub fn list_sessions(&self) -> Vec<(String, u64, usize)> {
+        let cache = self.registry_cache.read().unwrap();
+        let mut list: Vec<_> = cache
+            .sessions
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.updated_at_unix, entry.loaded_turns))
+            .collect();
+
+        // Sort by last updated (descending)
+        list.sort_by(|a, b| b.1.cmp(&a.1));
+        list
+    }
+}
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()

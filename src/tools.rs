@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::time::timeout;
 
-
 // Helper to clean up JSON schema for strict LLM APIs like Gemini
 pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = schema_val.as_object_mut() {
@@ -172,13 +171,14 @@ impl Tool for BashTool {
         cmd.arg("-c");
         cmd.arg(&cmd_str);
 
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| {
-                tracing::error!("BashTool Error: Failed to spawn command '{}' - {}", cmd_str, e);
-                ToolError::ExecutionFailed(e.to_string())
-            })?;
+        let child = pair.slave.spawn_command(cmd).map_err(|e| {
+            tracing::error!(
+                "BashTool Error: Failed to spawn command '{}' - {}",
+                cmd_str,
+                e
+            );
+            ToolError::ExecutionFailed(e.to_string())
+        })?;
         let child = std::sync::Arc::new(std::sync::Mutex::new(child));
         drop(pair.slave); // Crucial: close slave so master gets EOF
 
@@ -289,7 +289,8 @@ impl Tool for PatchFileTool {
     }
 
     fn description(&self) -> String {
-        "Applies a unified diff patch to a file. This is the preferred way to edit existing files.".to_string()
+        "Applies a unified diff patch to a file. This is the preferred way to edit existing files."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -324,7 +325,11 @@ impl Tool for PatchFileTool {
         serialize_tool_envelope(
             "patch_file",
             ok,
-            if ok { stdout } else { format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr) },
+            if ok {
+                stdout
+            } else {
+                format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr)
+            },
             output.status.code(),
             Some(start.elapsed().as_millis()),
             false,
@@ -481,22 +486,16 @@ impl Tool for RagSearchTool {
         let results = self
             .store
             .search(&parsed.query, limit)
+            .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         if results.is_empty() {
-            return Ok("No relevant information found in the knowledge base.".to_string());
+            return Ok(serde_json::json!({"status": "No relevant information found in the knowledge base."}).to_string());
         }
 
-        let mut res = String::new();
-        res.push_str("Found the following relevant snippets:\n\n");
-        for (content, source, distance) in results {
-            res.push_str(&format!(
-                "--- Source: {} (Relevance: {:.2}) ---\n{}\n\n",
-                source, distance, content
-            ));
-        }
-
-        Ok(res)
+        // Return structured evidence array, LLM understands JSON directly 
+        // and we fulfill the requirement: "return structured evidence objects instead of text-only tuples"
+        Ok(serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string()))
     }
 }
 
@@ -543,6 +542,7 @@ impl Tool for RagInsertTool {
 
         self.store
             .insert_chunk(parsed.content, parsed.source)
+            .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         Ok("Knowledge successfully embedded and saved into long-term vector memory.".to_string())
@@ -726,9 +726,7 @@ impl Tool for WebFetchTool {
                 false,
                 format!(
                     "Failed to fetch URL. HTTP: {} | URL: {} | Body: {}",
-                    status,
-                    url,
-                    raw_body
+                    status, url, raw_body
                 ),
                 Some(1),
                 Some(start.elapsed().as_millis()),
@@ -877,19 +875,8 @@ impl Tool for TavilySearchTool {
 
 // --- Task Plan Tool ---
 pub struct TaskPlanTool {
-    pub path: PathBuf,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Clone)]
-pub struct TaskPlanItem {
-    pub step: String,
-    pub status: String, // pending, in_progress, completed
-    pub note: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema, Default)]
-pub struct TaskPlanState {
-    pub items: Vec<TaskPlanItem>,
+    pub session_id: String,
+    pub task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -907,27 +894,14 @@ pub struct TaskPlanArgs {
 }
 
 impl TaskPlanTool {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn load_state(&self) -> Result<TaskPlanState, ToolError> {
-        if !self.path.exists() {
-            return Ok(TaskPlanState::default());
+    pub fn new(
+        session_id: String,
+        task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
+    ) -> Self {
+        Self {
+            session_id,
+            task_state_store,
         }
-        let raw = std::fs::read_to_string(&self.path).map_err(ToolError::IoError)?;
-        serde_json::from_str::<TaskPlanState>(&raw).map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to parse task plan state: {}", e))
-        })
-    }
-
-    fn save_state(&self, state: &TaskPlanState) -> Result<(), ToolError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(ToolError::IoError)?;
-        }
-        let raw = serde_json::to_string_pretty(state)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-        std::fs::write(&self.path, raw).map_err(ToolError::IoError)
     }
 
     fn normalize_status(status: &str) -> Result<String, ToolError> {
@@ -962,74 +936,90 @@ impl Tool for TaskPlanTool {
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
         let action = parsed.action.trim().to_lowercase();
-        let mut state = self.load_state()?;
+        
+        let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        
+        // Ensure task has a defined ID and in_progress status
+        if state.task_id.is_none() {
+            state.task_id = Some(format!("tsk_{}", uuid::Uuid::new_v4().simple()));
+            state.status = "in_progress".to_string();
+        }
 
         match action.as_str() {
             "get" => {}
             "clear" => {
-                state.items.clear();
-                self.save_state(&state)?;
+                state.plan_steps.clear();
             }
             "add" => {
                 let step = parsed.step.ok_or_else(|| {
                     ToolError::InvalidArguments("add requires 'step'".to_string())
                 })?;
-                let item = TaskPlanItem {
+                state.plan_steps.push(crate::task_state::PlanStep {
                     step,
                     status: "pending".to_string(),
-                    note: parsed.note,
-                };
-                state.items.push(item);
-                self.save_state(&state)?;
+                    note: None,
+                });
             }
             "update_status" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("update_status requires 'index'".to_string())
                 })?;
-                if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!("index {} out of bounds", index)));
-                }
                 let status = parsed.status.ok_or_else(|| {
                     ToolError::InvalidArguments("update_status requires 'status'".to_string())
                 })?;
-                state.items[index].status = Self::normalize_status(&status)?;
-                if let Some(note) = parsed.note {
-                    state.items[index].note = Some(note);
+                let normalized_status = Self::normalize_status(&status)?;
+
+                if index < state.plan_steps.len() {
+                    state.plan_steps[index].status = normalized_status;
+                    if let Some(note) = parsed.note {
+                        state.plan_steps[index].note = Some(note);
+                    }
+                } else {
+                    return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
                 }
-                self.save_state(&state)?;
             }
             "update_text" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("update_text requires 'index'".to_string())
                 })?;
-                if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!("index {} out of bounds", index)));
+                
+                if index < state.plan_steps.len() {
+                    if let Some(step) = parsed.step {
+                        state.plan_steps[index].step = step;
+                    }
+                    if let Some(note) = parsed.note {
+                        state.plan_steps[index].note = Some(note);
+                    }
+                } else {
+                    return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
                 }
-                if let Some(step) = parsed.step {
-                    state.items[index].step = step;
-                }
-                if let Some(note) = parsed.note {
-                    state.items[index].note = Some(note);
-                }
-                self.save_state(&state)?;
             }
             "remove" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("remove requires 'index'".to_string())
                 })?;
-                if index >= state.items.len() {
-                    return Err(ToolError::InvalidArguments(format!("index {} out of bounds", index)));
+                if index < state.plan_steps.len() {
+                    state.plan_steps.remove(index);
+                } else {
+                    return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
                 }
-                state.items.remove(index);
-                self.save_state(&state)?;
             }
             _ => {
-                return Err(ToolError::InvalidArguments(format!("unsupported action '{}'", parsed.action)));
+                return Err(ToolError::InvalidArguments(format!(
+                    "unsupported action '{}'",
+                    parsed.action
+                )));
             }
         }
+        
+        let _ = self.task_state_store.save(&state);
 
-        let output = serde_json::to_string_pretty(&state)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let output = if let Ok(state) = self.task_state_store.load() {
+            state.summary()
+        } else {
+            "Plan updated.".to_string()
+        };
+
         serialize_tool_envelope(
             "task_plan",
             true,
@@ -1041,14 +1031,12 @@ impl Tool for TaskPlanTool {
     }
 }
 
-
 // --- Finish Task Tool ---
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct FinishTaskArgs {
     /// A summary of what was accomplished and the final answer to the user
     pub summary: String,
 }
-
 
 pub struct FinishTaskTool;
 
@@ -1064,17 +1052,24 @@ pub struct SendFileArgs {
 pub struct SendFileTool;
 #[async_trait]
 impl Tool for SendFileTool {
-    fn name(&self) -> String { "send_file".to_string() }
-    fn description(&self) -> String { "Sends a file (image, document, audio, etc.) to the user's chat.".to_string() }
+    fn name(&self) -> String {
+        "send_file".to_string()
+    }
+    fn description(&self) -> String {
+        "Sends a file (image, document, audio, etc.) to the user's chat.".to_string()
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         clean_schema(serde_json::to_value(schemars::schema_for!(SendFileArgs)).unwrap())
     }
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
-        let parsed: SendFileArgs = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        
+        let parsed: SendFileArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
         if !std::path::Path::new(&parsed.path).exists() {
-             return Err(ToolError::ExecutionFailed(format!("File not found: {}", parsed.path)));
+            return Err(ToolError::ExecutionFailed(format!(
+                "File not found: {}",
+                parsed.path
+            )));
         }
 
         Ok(serde_json::json!({
@@ -1082,20 +1077,28 @@ impl Tool for SendFileTool {
             "tool_name": "send_file",
             "path": parsed.path,
             "output": format!("File {} sent to user.", parsed.path)
-        }).to_string())
+        })
+        .to_string())
     }
 }
 #[async_trait]
 impl Tool for FinishTaskTool {
-    fn name(&self) -> String { "finish_task".to_string() }
-    fn description(&self) -> String { "Call this tool ONLY when you have fully completed the user's request and have nothing else to do. This will end your execution loop.".to_string() }
+    fn name(&self) -> String {
+        "finish_task".to_string()
+    }
+    fn description(&self) -> String {
+        "Call this tool ONLY when you have fully completed the user's request and have nothing else to do. This will end your execution loop.".to_string()
+    }
     fn parameters_schema(&self) -> serde_json::Value {
         clean_schema(serde_json::to_value(schemars::schema_for!(FinishTaskArgs)).unwrap())
     }
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
-        let parsed: FinishTaskArgs = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        Ok(format!("Task marked as finished. Summary: {}", parsed.summary))
+        let parsed: FinishTaskArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        Ok(format!(
+            "Task marked as finished. Summary: {}",
+            parsed.summary
+        ))
     }
 }
 

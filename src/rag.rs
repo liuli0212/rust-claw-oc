@@ -1,7 +1,7 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -29,7 +29,43 @@ impl VectorStore {
 
         let mut opts = InitOptions::new(EmbeddingModel::AllMiniLML6V2);
         opts.show_download_progress = false;
-        let model = TextEmbedding::try_new(opts)?;
+
+        // WORKAROUND: hf-mirror.com and similar mirrors often strip the `Content-Range` header on 200 OK 
+        // responses, which crashes the rust `hf-hub` crate used by `fastembed`.
+        // If the user has a proxy configured, we can temporarily unset HF_ENDPOINT to download locally.
+        let hf_endpoint = std::env::var("HF_ENDPOINT").unwrap_or_default();
+        let has_proxy = std::env::var("https_proxy").is_ok() || std::env::var("all_proxy").is_ok() || std::env::var("HTTP_PROXY").is_ok();
+        
+        if hf_endpoint.contains("hf-mirror") && has_proxy {
+            tracing::warn!("[RAG] Temporarily unsetting HF_ENDPOINT to bypass download bug, relying on system proxy...");
+            std::env::remove_var("HF_ENDPOINT");
+        }
+
+        let model_res = TextEmbedding::try_new(opts);
+
+        // Restore HF_ENDPOINT
+        if !hf_endpoint.is_empty() {
+            std::env::set_var("HF_ENDPOINT", hf_endpoint);
+        }
+
+        let model = match model_res {
+            Ok(m) => m,
+            Err(e) => {
+                if e.to_string().contains("Content-Range") {
+                    eprintln!("======================================================");
+                    eprintln!("❌ RAG Initialization Error: Failed to download embedding model.");
+                    eprintln!("This is caused by your HF_ENDPOINT stripping the 'Content-Range'");
+                    eprintln!("header which is strictly required by the underlying hf-hub crate.");
+                    eprintln!("Workarounds:");
+                    eprintln!(" 1. Run with a proxy and bypass the mirror:");
+                    eprintln!("    env HF_ENDPOINT= cargo run");
+                    eprintln!(" 2. Download 'Qdrant/all-MiniLM-L6-v2-onnx' manually into:");
+                    eprintln!("    ~/.cache/huggingface/hub/");
+                    eprintln!("======================================================");
+                }
+                return Err(e.into());
+            }
+        };
 
         // Open a SQLite connection for hybrid search
         let conn = Connection::open(".rusty_claw_memory.db")?;
@@ -106,14 +142,28 @@ impl VectorStore {
         })
     }
 
-    pub fn insert_chunk(
+    /// Insert a chunk into the vector store.
+    /// Runs embedding computation and SQLite writes on a blocking thread
+    /// to avoid stalling the tokio runtime.
+    pub async fn insert_chunk(
+        self: &Arc<Self>,
+        content: String,
+        source: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.insert_chunk_blocking(content, source))
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+    }
+
+    fn insert_chunk_blocking(
         &self,
         content: String,
         source: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let documents = vec![content.clone()];
 
-        // Generate embedding
+        // Generate embedding (CPU-intensive)
         let embedding = {
             let mut model = self.model.lock().unwrap();
             let embeddings = model.embed(documents, None)?;
@@ -142,14 +192,29 @@ impl VectorStore {
         Ok(())
     }
 
-    pub fn search(
+    /// Search the vector store with hybrid BM25 + semantic scoring.
+    /// Runs embedding computation and SQLite queries on a blocking thread
+    /// to avoid stalling the tokio runtime.
+    pub async fn search(
+        self: &Arc<Self>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::evidence::Evidence>, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || store.search_blocking(&query, limit))
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+    }
+
+    fn search_blocking(
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<(String, String, f32)>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<crate::evidence::Evidence>, Box<dyn std::error::Error + Send + Sync>> {
         let _start = Instant::now();
 
-        // 1. Generate query embedding
+        // 1. Generate query embedding (CPU-intensive)
         let query_embedding = {
             let mut model = self.model.lock().unwrap();
             let embeddings = model.embed(vec![query.to_string()], None)?;
@@ -221,18 +286,28 @@ impl VectorStore {
 
             let final_score =
                 (normalized_v * vector_weight) + (normalized_k as f32 * keyword_weight);
-            results.push((chunk.content.clone(), chunk.source.clone(), final_score));
+            results.push((chunk.clone(), final_score));
         }
 
         // Sort by final score
-        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(limit);
 
-        // if results.len() > 0 {
-        //     println!("[RAG] Search finished in {}ms. Top score: {}", start.elapsed().as_millis(), results[0].2);
-        // }
+        let mut structured_evidence = Vec::new();
+        for (chunk, score) in results {
+             let evidence_id = format!("rag_{}", chunk.id);
+             let ev = crate::evidence::Evidence::new(
+                 evidence_id,
+                 "memory".to_string(),
+                 chunk.source.clone(),
+                 score,
+                 format!("RAG chunk from {}", chunk.source),
+                 chunk.content.clone(),
+             );
+             structured_evidence.push(ev);
+        }
 
-        Ok(results)
+        Ok(structured_evidence)
     }
 }
 
@@ -259,27 +334,30 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_rag_hybrid_search() {
+    #[tokio::test]
+    async fn test_rag_hybrid_search() {
         let _ = std::fs::remove_file(".rusty_claw_memory.db");
-        let store = VectorStore::new().expect("Failed to init");
+        let store = Arc::new(VectorStore::new().expect("Failed to init"));
 
         store
             .insert_chunk("Rust is fast.".to_string(), "doc1".to_string())
+            .await
             .unwrap();
         store
             .insert_chunk("Python is easy.".to_string(), "doc2".to_string())
+            .await
             .unwrap();
         store
             .insert_chunk("The rusty claw grabs.".to_string(), "doc3".to_string())
+            .await
             .unwrap();
 
         // 1. Vector match (semantic)
-        let res = store.search("speed performance", 1).unwrap();
-        assert_eq!(res[0].1, "doc1");
+        let res = store.search("speed performance", 1).await.unwrap();
+        assert_eq!(res[0].source_path, "doc1");
 
         // 2. Keyword match (exact)
-        let res2 = store.search("rusty claw", 1).unwrap();
-        assert_eq!(res2[0].1, "doc3");
+        let res2 = store.search("rusty claw", 1).await.unwrap();
+        assert_eq!(res2[0].source_path, "doc3");
     }
 }

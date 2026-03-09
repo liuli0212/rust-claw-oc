@@ -9,6 +9,7 @@ use termimad::{crossterm::style::Color::*, MadSkin};
 pub struct TuiOutput {
     skin: MadSkin,
     spinner: Arc<Mutex<Option<ProgressBar>>>,
+    in_thinking: Arc<Mutex<bool>>,
 }
 
 impl TuiOutput {
@@ -25,6 +26,7 @@ impl TuiOutput {
         Self {
             skin,
             spinner: Arc::new(Mutex::new(None)),
+            in_thinking: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -66,10 +68,24 @@ impl TuiOutput {
 
 #[async_trait]
 impl AgentOutput for TuiOutput {
+    async fn on_waiting(&self, message: &str) {
+        self.start_spinner(message);
+    }
+
     async fn on_text(&self, text: &str) {
         self.stop_spinner();
+        
+        // If we were thinking, print a newline to separate from the reply
+        {
+            let mut thinking_guard = self.in_thinking.lock().unwrap();
+            if *thinking_guard {
+                println!();
+                *thinking_guard = false;
+            }
+        }
+
         // Remove internal tags if any leak through
-        let clean_text = text.replace("<final>", "").replace("</final>", "");
+        let clean_text = text.replace("<final>", "").replace("</final>", "").replace("<think>", "").replace("</think>", "");
         if clean_text.trim().is_empty() {
             return;
         }
@@ -88,27 +104,37 @@ impl AgentOutput for TuiOutput {
         if text.trim().is_empty() {
             return;
         }
-        // Instead of printing raw text, we update the spinner or print dimmed lines
-        // For short thoughts, update spinner
-        if text.len() < 60 && !text.contains('\n') {
-            self.update_spinner(text);
-        } else {
-            // For longer thoughts, print dimmed
-            // self.stop_spinner(); // Optionally stop spinner to print long thoughts
-            // println!("{}", style(text.trim()).dim());
-            // actually, let's keep it minimal like Claude Code - just show we are thinking
-            // unless it's a long block.
-            let lines = text.lines();
-            for line in lines {
-                if !line.trim().is_empty() {
-                     println!("{}", style(format!("  {} {}", Emoji("💭", "*"), line.trim())).dim());
-                }
+        
+        self.stop_spinner();
+
+        {
+            let mut thinking_guard = self.in_thinking.lock().unwrap();
+            if !*thinking_guard {
+                println!("  {} {}", style(Emoji("🧠", "*")).cyan(), style("Thinking...").cyan().italic());
+                *thinking_guard = true;
+            }
+        }
+
+        let lines = text.lines();
+        for line in lines {
+            if !line.trim().is_empty() {
+                 println!("    {}", style(line.trim()).dim().italic());
             }
         }
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
         self.stop_spinner();
+        
+        // Close thinking block if active
+        {
+            let mut thinking_guard = self.in_thinking.lock().unwrap();
+            if *thinking_guard {
+                println!();
+                *thinking_guard = false;
+            }
+        }
+
         let tool_icon = match name {
             "read_file" => "📄",
             "write_file" => "📝",

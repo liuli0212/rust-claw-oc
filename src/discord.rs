@@ -27,6 +27,10 @@ impl DiscordOutput {
 
 #[async_trait]
 impl AgentOutput for DiscordOutput {
+    async fn on_waiting(&self, _message: &str) {
+        let _ = self.channel_id.broadcast_typing(&self.ctx.http).await;
+    }
+
     async fn on_text(&self, text: &str) {
         let _ = self.channel_id.say(&self.ctx.http, text).await;
     }
@@ -75,14 +79,18 @@ impl EventHandler for Handler {
 
         let agent = match self
             .session_manager
-            .get_or_create_session(&session_id, output)
-            .await {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = msg.channel_id.say(&ctx.http, format!("❌ Error: {}", e)).await;
-                    return;
-                }
-            };
+            .get_or_create_session(&session_id, output.clone())
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, format!("❌ Error: {}", e))
+                    .await;
+                return;
+            }
+        };
 
         let content = msg.content.clone();
         let channel_id = msg.channel_id;
@@ -90,25 +98,47 @@ impl EventHandler for Handler {
 
         // Spawn agent execution in background so EventHandler returns immediately
         tokio::spawn(async move {
-            let mut agent_guard = agent.lock().await;
+            // Try to acquire the agent lock without blocking indefinitely.
+            // If the previous task is still running, notify the user instead of silently queuing.
+            let mut agent_guard = match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                agent.lock(),
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = channel_id
+                        .say(&http, "⏳ Previous task is still running. Please wait or cancel it first.")
+                        .await;
+                    return;
+                }
+            };
+
+            let _ = output.on_waiting("Processing...").await;
+
             let result = agent_guard.step(content).await;
             drop(agent_guard);
 
             match result {
-                Ok(exit) => {
-                    match exit {
-                        crate::core::RunExit::AgentTurnLimitReached => {
-                            let _ = channel_id.say(&http, "⚠️ [Turn Limit Reached]").await;
-                        }
-                        crate::core::RunExit::RecoverableFailed(ref e) | crate::core::RunExit::CriticallyFailed(ref e) => {
-                            let _ = channel_id.say(&http, format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), e)).await;
-                        }
-                        crate::core::RunExit::StoppedByUser => {
-                            let _ = channel_id.say(&http, "✅ Task stopped by user.").await;
-                        }
-                        _ => {}
+                Ok(exit) => match exit {
+                    crate::core::RunExit::AgentTurnLimitReached => {
+                        let _ = channel_id.say(&http, "⚠️ [Turn Limit Reached]").await;
                     }
-                }
+                    crate::core::RunExit::RecoverableFailed(ref e)
+                    | crate::core::RunExit::CriticallyFailed(ref e) => {
+                        let _ = channel_id
+                            .say(
+                                &http,
+                                format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), e),
+                            )
+                            .await;
+                    }
+                    crate::core::RunExit::StoppedByUser => {
+                        let _ = channel_id.say(&http, "✅ Task stopped by user.").await;
+                    }
+                    _ => {}
+                },
                 Err(e) => {
                     let _ = channel_id.say(&http, format!("Error: {}", e)).await;
                 }
