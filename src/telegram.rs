@@ -136,6 +136,12 @@ impl TelegramOutput {
 
 #[async_trait]
 impl AgentOutput for TelegramOutput {
+    async fn on_waiting(&self, _message: &str) {
+        let _ = self.bot
+            .send_chat_action(self.chat_id, teloxide::types::ChatAction::Typing)
+            .await;
+    }
+
     async fn on_text(&self, text: &str) {
         let clean = Self::strip_ansi(text);
         let clean = clean.replace("<final>", "").replace("</final>", "");
@@ -369,7 +375,7 @@ async fn handle_command(
         Command::Status => {
             let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
             let agent = match session_manager
-                .get_or_create_session(&session_id, output)
+                .get_or_create_session(&session_id, output.clone())
                 .await
             {
                 Ok(a) => a,
@@ -395,7 +401,7 @@ async fn handle_command(
         Command::Session => {
             let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
             let agent = match session_manager
-                .get_or_create_session(&session_id, output)
+                .get_or_create_session(&session_id, output.clone())
                 .await
             {
                 Ok(a) => a,
@@ -515,7 +521,7 @@ async fn handle_message(
         let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
 
         let agent = match session_manager
-            .get_or_create_session(&session_id, output)
+            .get_or_create_session(&session_id, output.clone())
             .await
         {
             Ok(a) => a,
@@ -569,6 +575,8 @@ async fn handle_message(
                     }
                 }
             });
+
+            let _ = output.on_waiting("Processing...").await;
 
             let result = agent_guard.step(text).await;
             drop(agent_guard); // Release lock before sending messages

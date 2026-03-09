@@ -68,6 +68,10 @@ impl TuiOutput {
 
 #[async_trait]
 impl AgentOutput for TuiOutput {
+    async fn on_waiting(&self, message: &str) {
+        self.start_spinner(message);
+    }
+
     async fn on_text(&self, text: &str) {
         self.stop_spinner();
         

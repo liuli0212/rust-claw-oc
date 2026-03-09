@@ -9,6 +9,7 @@ use tokio::sync::Notify;
 
 #[async_trait]
 pub trait AgentOutput: Send + Sync {
+    async fn on_waiting(&self, _message: &str) {}
     async fn on_text(&self, text: &str);
     async fn on_thinking(&self, text: &str) {
         // Default: treat thinking as regular text (backward compat)
@@ -315,6 +316,11 @@ impl AgentLoop {
         &mut self,
         goal: String,
     ) -> Result<RunExit, Box<dyn std::error::Error + Send + Sync>> {
+        let goal = goal.trim().to_string();
+        if goal.is_empty() {
+            return Ok(RunExit::YieldedToUser);
+        }
+
         // Reset cancel flag at start of each step
         self.cancelled
             .store(false, std::sync::atomic::Ordering::SeqCst);

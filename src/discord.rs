@@ -27,6 +27,10 @@ impl DiscordOutput {
 
 #[async_trait]
 impl AgentOutput for DiscordOutput {
+    async fn on_waiting(&self, _message: &str) {
+        let _ = self.channel_id.broadcast_typing(&self.ctx.http).await;
+    }
+
     async fn on_text(&self, text: &str) {
         let _ = self.channel_id.say(&self.ctx.http, text).await;
     }
@@ -75,7 +79,7 @@ impl EventHandler for Handler {
 
         let agent = match self
             .session_manager
-            .get_or_create_session(&session_id, output)
+            .get_or_create_session(&session_id, output.clone())
             .await
         {
             Ok(a) => a,
@@ -110,6 +114,8 @@ impl EventHandler for Handler {
                     return;
                 }
             };
+
+            let _ = output.on_waiting("Processing...").await;
 
             let result = agent_guard.step(content).await;
             drop(agent_guard);
