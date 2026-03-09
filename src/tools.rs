@@ -5,8 +5,6 @@ use reqwest::Client;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::Read;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::time::timeout;
@@ -875,6 +873,7 @@ impl Tool for TavilySearchTool {
 
 // --- Task Plan Tool ---
 pub struct TaskPlanTool {
+    #[allow(dead_code)]
     pub session_id: String,
     pub task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
 }

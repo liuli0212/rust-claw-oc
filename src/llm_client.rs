@@ -18,6 +18,7 @@ pub enum LlmError {
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
     #[error("API error: {0}")]
+    #[allow(dead_code)]
     ApiError(String),
 }
 
@@ -173,7 +174,9 @@ pub fn create_llm_client(
 pub trait LlmClient: Send + Sync {
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
+    #[allow(dead_code)]
     fn context_window_size(&self) -> usize;
+    #[allow(dead_code)]
     async fn generate_text(
         &self,
         messages: Vec<Message>,
@@ -197,6 +200,7 @@ pub struct GeminiClient {
     provider_name: String,
     #[allow(dead_code)]
     function_declarations_cache: Mutex<Option<CachedFunctionDeclarations>>,
+    #[allow(dead_code)]
     context_window: usize,
 }
 
@@ -233,6 +237,7 @@ pub struct FunctionDeclaration {
 }
 
 impl GeminiClient {
+    #[allow(dead_code)]
     pub fn new(api_key: String, model_name: Option<String>, provider_name: String) -> Self {
         Self {
             api_key,
@@ -247,7 +252,8 @@ impl GeminiClient {
     pub fn new_with_window(
         api_key: String,
         model_name: Option<String>,
-        context_window: usize,
+        #[allow(dead_code)]
+    context_window: usize,
         provider_name: String,
     ) -> Self {
         Self {
@@ -699,10 +705,12 @@ pub struct OpenAiCompatClient {
     model_name: String,
     provider_name: String,
     client: Client,
+    #[allow(dead_code)]
     context_window: usize,
 }
 
 impl OpenAiCompatClient {
+    #[allow(dead_code)]
     pub fn new(
         api_key: String,
         base_url: String,
@@ -724,7 +732,8 @@ impl OpenAiCompatClient {
         base_url: String,
         model_name: String,
         provider_name: String,
-        context_window: usize,
+        #[allow(dead_code)]
+    context_window: usize,
     ) -> Self {
         Self {
             api_key,

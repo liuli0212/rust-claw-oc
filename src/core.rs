@@ -18,7 +18,7 @@ pub trait AgentOutput: Send + Sync {
     async fn on_tool_start(&self, name: &str, args: &str);
     async fn on_tool_end(&self, result: &str);
     async fn on_error(&self, error: &str);
-    async fn flush(&self) {
+    fn clear_waiting(async fn flush(&self) {self) {}
         // Default: no-op (CLI doesn't need buffering)
     }
     async fn on_file(&self, path: &str) {
@@ -335,6 +335,7 @@ impl AgentLoop {
         let mut consecutive_empty_responses = 0;
 
         self.context.start_turn(goal.clone());
+        let _spinner_guard = WaitingGuard::new(&*self.output);
 
         // Init Task state if new
         let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
@@ -504,7 +505,7 @@ impl AgentLoop {
             });
 
             if tool_calls_accumulated.is_empty() {
-                self.output.flush().await;
+                
                 self.context.end_turn();
                 self.telemetry.end_span("agent_step");
                 return Ok(RunExit::YieldedToUser);
@@ -537,7 +538,7 @@ impl AgentLoop {
                             summary = s.to_string();
                         }
                     }
-                    self.output.flush().await;
+                    
                     self.telemetry.end_span("agent_step");
                     return Ok(RunExit::Finished(summary));
                 }
@@ -546,7 +547,7 @@ impl AgentLoop {
 
                 let tool_opt = self.tools.iter().find(|t| t.name() == call.name);
                 let (result, is_error, stopped) = if let Some(tool) = tool_opt {
-                    self.output.flush().await;
+                    
                     self.output
                         .on_tool_start(&call.name, &call.args.to_string())
                         .await;
@@ -673,5 +674,21 @@ impl AgentLoop {
                 return Ok(RunExit::StoppedByUser);
             }
         }
+    }
+}
+
+pub struct WaitingGuard<'a> {
+    output: &'a dyn AgentOutput,
+}
+
+impl<'a> WaitingGuard<'a> {
+    pub fn new(output: &'a dyn AgentOutput) -> Self {
+        Self { output }
+    }
+}
+
+impl<'a> Drop for WaitingGuard<'a> {
+    fn drop(&mut self) {
+        self.output.clear_waiting();
     }
 }
