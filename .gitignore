@@ -1,8 +1,9 @@
 /target/
 .env
 Cargo.lock
-\n*.db\n.fastembed_cache/
-".fastembed_cache/"
-".rusty_claw_memory.db"
-"rusty_claw/"
-"logs/"
+*.db
+.fastembed_cache/
+.sisyphus/
+rusty_claw/
+logs/
+.DS_Store
