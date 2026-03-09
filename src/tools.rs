@@ -486,6 +486,7 @@ impl Tool for RagSearchTool {
         let results = self
             .store
             .search(&parsed.query, limit)
+            .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         if results.is_empty() {
@@ -541,6 +542,7 @@ impl Tool for RagInsertTool {
 
         self.store
             .insert_chunk(parsed.content, parsed.source)
+            .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         Ok("Knowledge successfully embedded and saved into long-term vector memory.".to_string())

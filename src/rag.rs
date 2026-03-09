@@ -1,7 +1,7 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -142,14 +142,28 @@ impl VectorStore {
         })
     }
 
-    pub fn insert_chunk(
+    /// Insert a chunk into the vector store.
+    /// Runs embedding computation and SQLite writes on a blocking thread
+    /// to avoid stalling the tokio runtime.
+    pub async fn insert_chunk(
+        self: &Arc<Self>,
+        content: String,
+        source: String,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.insert_chunk_blocking(content, source))
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+    }
+
+    fn insert_chunk_blocking(
         &self,
         content: String,
         source: String,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let documents = vec![content.clone()];
 
-        // Generate embedding
+        // Generate embedding (CPU-intensive)
         let embedding = {
             let mut model = self.model.lock().unwrap();
             let embeddings = model.embed(documents, None)?;
@@ -178,14 +192,29 @@ impl VectorStore {
         Ok(())
     }
 
-    pub fn search(
+    /// Search the vector store with hybrid BM25 + semantic scoring.
+    /// Runs embedding computation and SQLite queries on a blocking thread
+    /// to avoid stalling the tokio runtime.
+    pub async fn search(
+        self: &Arc<Self>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::evidence::Evidence>, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || store.search_blocking(&query, limit))
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+    }
+
+    fn search_blocking(
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<crate::evidence::Evidence>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<crate::evidence::Evidence>, Box<dyn std::error::Error + Send + Sync>> {
         let _start = Instant::now();
 
-        // 1. Generate query embedding
+        // 1. Generate query embedding (CPU-intensive)
         let query_embedding = {
             let mut model = self.model.lock().unwrap();
             let embeddings = model.embed(vec![query.to_string()], None)?;
@@ -305,27 +334,30 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_rag_hybrid_search() {
+    #[tokio::test]
+    async fn test_rag_hybrid_search() {
         let _ = std::fs::remove_file(".rusty_claw_memory.db");
-        let store = VectorStore::new().expect("Failed to init");
+        let store = Arc::new(VectorStore::new().expect("Failed to init"));
 
         store
             .insert_chunk("Rust is fast.".to_string(), "doc1".to_string())
+            .await
             .unwrap();
         store
             .insert_chunk("Python is easy.".to_string(), "doc2".to_string())
+            .await
             .unwrap();
         store
             .insert_chunk("The rusty claw grabs.".to_string(), "doc3".to_string())
+            .await
             .unwrap();
 
         // 1. Vector match (semantic)
-        let res = store.search("speed performance", 1).unwrap();
+        let res = store.search("speed performance", 1).await.unwrap();
         assert_eq!(res[0].source_path, "doc1");
 
         // 2. Keyword match (exact)
-        let res2 = store.search("rusty claw", 1).unwrap();
+        let res2 = store.search("rusty claw", 1).await.unwrap();
         assert_eq!(res2[0].source_path, "doc3");
     }
 }
