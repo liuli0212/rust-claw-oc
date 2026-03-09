@@ -222,6 +222,68 @@ impl AgentLoop {
         Ok(())
     }
 
+    async fn process_streaming_text(
+        &self,
+        full_text: &str,
+        processed_idx: &mut usize,
+        in_think_block: &mut bool,
+    ) {
+        loop {
+            let remaining = &full_text[*processed_idx..];
+            if remaining.is_empty() {
+                break;
+            }
+
+            if *in_think_block {
+                if let Some(end_idx) = remaining.find("</think>") {
+                    let content = &remaining[..end_idx];
+                    if !content.is_empty() {
+                        self.output.on_thinking(content).await;
+                    }
+                    *processed_idx += end_idx + 8;
+                    *in_think_block = false;
+                } else {
+                    // Check if we have a partial tag at the end
+                    let potential_tag_start = remaining.rfind("</");
+                    let len_to_process = if let Some(pos) = potential_tag_start {
+                        pos
+                    } else {
+                        remaining.len()
+                    };
+
+                    if len_to_process > 0 {
+                        self.output.on_thinking(&remaining[..len_to_process]).await;
+                        *processed_idx += len_to_process;
+                    }
+                    break;
+                }
+            } else {
+                if let Some(start_idx) = remaining.find("<think>") {
+                    let content = &remaining[..start_idx];
+                    if !content.is_empty() {
+                        self.output.on_text(content).await;
+                    }
+                    *processed_idx += start_idx + 7;
+                    *in_think_block = true;
+                } else {
+                    // Check for partial <think> tag
+                    let potential_tag_start = remaining.rfind('<');
+                    let len_to_process = if let Some(pos) = potential_tag_start {
+                        pos
+                    } else {
+                        remaining.len()
+                    };
+
+                    if len_to_process > 0 {
+                        self.output.on_text(&remaining[..len_to_process]).await;
+                        *processed_idx += len_to_process;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     fn is_transient_llm_error(err: &crate::llm_client::LlmError) -> bool {
         let msg = format!("{}", err).to_lowercase();
         msg.contains("timeout")
@@ -353,6 +415,7 @@ impl AgentLoop {
                 match stream_res {
                     Ok(mut rx) => {
                         let mut current_turn_text = String::new();
+                        let mut processed_idx = 0;
                         let mut in_think_block = false;
 
                         let stream_loop_res = loop {
@@ -361,38 +424,12 @@ impl AgentLoop {
                                     match event {
                                         Some(StreamEvent::Text(t)) => {
                                             current_turn_text.push_str(&t);
-                                            let mut remaining = t.as_str();
-                                            while !remaining.is_empty() {
-                                                if in_think_block {
-                                                    if let Some(end_idx) = remaining.find("</think>") {
-                                                        let before = &remaining[..end_idx];
-                                                        if !before.is_empty() {
-                                                            self.output.on_thinking(before).await;
-                                                        }
-                                                        in_think_block = false;
-                                                        remaining = &remaining[end_idx + 8..];
-                                                    } else {
-                                                        self.output.on_thinking(remaining).await;
-                                                        break;
-                                                    }
-                                                } else {
-                                                    if let Some(start_idx) = remaining.find("<think>") {
-                                                        let before = &remaining[..start_idx];
-                                                        if !before.is_empty() {
-                                                            self.output.on_text(before).await;
-                                                        }
-                                                        in_think_block = true;
-                                                        remaining = &remaining[start_idx + 7..];
-                                                    } else {
-                                                        self.output.on_text(remaining).await;
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                                            self.process_streaming_text(&current_turn_text, &mut processed_idx, &mut in_think_block).await;
                                         }
                                         Some(StreamEvent::Thought(t)) => {
                                             self.output.on_thinking(&t).await;
                                             current_turn_text.push_str(&format!("<think>{}</think>", t));
+                                            processed_idx = current_turn_text.len();
                                         }
                                         Some(StreamEvent::ToolCall(tc, sig)) => {
                                             tool_calls_accumulated.push((tc, sig));

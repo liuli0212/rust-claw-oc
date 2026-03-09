@@ -94,7 +94,23 @@ impl EventHandler for Handler {
 
         // Spawn agent execution in background so EventHandler returns immediately
         tokio::spawn(async move {
-            let mut agent_guard = agent.lock().await;
+            // Try to acquire the agent lock without blocking indefinitely.
+            // If the previous task is still running, notify the user instead of silently queuing.
+            let mut agent_guard = match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                agent.lock(),
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = channel_id
+                        .say(&http, "⏳ Previous task is still running. Please wait or cancel it first.")
+                        .await;
+                    return;
+                }
+            };
+
             let result = agent_guard.step(content).await;
             drop(agent_guard);
 

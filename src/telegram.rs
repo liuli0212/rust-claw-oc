@@ -533,6 +533,26 @@ async fn handle_message(
         // This allows teloxide's dispatcher to process subsequent updates
         // (stop button clicks, /cancel commands, stop text) while the agent runs.
         tokio::spawn(async move {
+            // Try to acquire the agent lock without blocking indefinitely.
+            // If the previous task is still running, notify the user instead of silently queuing.
+            let mut agent_guard = match tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                agent.lock(),
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = bot_clone
+                        .send_message(
+                            chat_id,
+                            "⏳ 上一个任务仍在执行中，请等待完成后再发送新消息，或使用 /cancel 取消当前任务。",
+                        )
+                        .await;
+                    return;
+                }
+            };
+
             // Send typing indicator in background
             let bot_typing = bot_clone.clone();
             let typing_done = Arc::new(tokio::sync::Notify::new());
@@ -550,7 +570,6 @@ async fn handle_message(
                 }
             });
 
-            let mut agent_guard = agent.lock().await;
             let result = agent_guard.step(text).await;
             drop(agent_guard); // Release lock before sending messages
 
