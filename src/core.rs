@@ -7,9 +7,28 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+pub struct ScopeGuard<F: FnOnce()> {
+    closure: Option<F>,
+}
+
+impl<F: FnOnce()> ScopeGuard<F> {
+    pub fn new(closure: F) -> Self {
+        Self { closure: Some(closure) }
+    }
+}
+
+impl<F: FnOnce()> Drop for ScopeGuard<F> {
+    fn drop(&mut self) {
+        if let Some(closure) = self.closure.take() {
+            closure();
+        }
+    }
+}
+
 #[async_trait]
 pub trait AgentOutput: Send + Sync {
     async fn on_waiting(&self, _message: &str) {}
+    fn clear_waiting(&self) {}
     async fn on_text(&self, text: &str);
     async fn on_thinking(&self, text: &str) {
         // Default: treat thinking as regular text (backward compat)
@@ -18,7 +37,7 @@ pub trait AgentOutput: Send + Sync {
     async fn on_tool_start(&self, name: &str, args: &str);
     async fn on_tool_end(&self, result: &str);
     async fn on_error(&self, error: &str);
-    fn clear_waiting(async fn flush(&self) {self) {}
+    async fn flush(&self) {
         // Default: no-op (CLI doesn't need buffering)
     }
     async fn on_file(&self, path: &str) {
@@ -118,7 +137,7 @@ impl AgentLoop {
     }
 
     pub fn get_session_details(&self) -> serde_json::Value {
-        let (tokens, max_tokens, turns, system_tokens, evidence_count) = self.context.get_context_status();
+        let (tokens, max_tokens, turns, system_tokens, _) = self.context.get_context_status();
         let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
         serde_json::json!({
             "session_id": self.session_id,
@@ -129,7 +148,6 @@ impl AgentLoop {
                 "max_tokens": max_tokens,
                 "turns": turns,
                 "system_tokens": system_tokens,
-                "active_evidence": evidence_count,
             },
             "task_id": state.task_id,
             "task_status": state.status,
@@ -335,7 +353,6 @@ impl AgentLoop {
         let mut consecutive_empty_responses = 0;
 
         self.context.start_turn(goal.clone());
-        let _spinner_guard = WaitingGuard::new(&*self.output);
 
         // Init Task state if new
         let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
@@ -348,7 +365,7 @@ impl AgentLoop {
             let _ = self.task_state_store.save(&state);
         }
 
-        let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
+        let _run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
 
         let c_ids = crate::schema::CorrelationIds {
             session_id: self.session_id.clone(),
@@ -358,9 +375,15 @@ impl AgentLoop {
         };
         self.telemetry.start_span("agent_step", c_ids.clone());
 
+        let output_clone = Arc::clone(&self.output);
+        let _spinner_guard = ScopeGuard::new(move || {
+            output_clone.clear_waiting();
+        });
+
         loop {
             // Check persistent cancel flag at top of each iteration
             if self.is_cancelled() {
+                
                 self.context.end_turn();
                 self.telemetry.end_span("agent_step");
                 return Ok(RunExit::StoppedByUser);
@@ -371,6 +394,7 @@ impl AgentLoop {
                     "Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.",
                     Self::MAX_ITERATIONS
                 );
+                
                 self.context.end_turn();
                 return Ok(RunExit::AgentTurnLimitReached);
             }
@@ -382,6 +406,7 @@ impl AgentLoop {
                 self.output
                     .on_text("[System] Energy depleted. Stopping to prevent infinite loops.")
                     .await;
+                
                 self.context.end_turn();
                 return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
             }
@@ -414,6 +439,7 @@ impl AgentLoop {
                 let stream_res = tokio::select! {
                     res = self.llm.stream(messages.clone(), system.clone(), current_tools.clone()) => res,
                     _ = self.cancel_token.notified() => {
+                        
                         self.context.end_turn();
                         return Ok(RunExit::StoppedByUser);
                     }
@@ -448,12 +474,14 @@ impl AgentLoop {
                                     }
                                 }
                                 _ = self.cancel_token.notified() => {
+                                    
                                     break Err(RunExit::StoppedByUser);
                                 }
                             }
                         };
 
                         if let Err(exit) = stream_loop_res {
+                            
                             self.context.end_turn();
                             return Ok(exit);
                         }
@@ -471,6 +499,7 @@ impl AgentLoop {
             if full_text.trim().is_empty() && tool_calls_accumulated.is_empty() {
                 consecutive_empty_responses += 1;
                 if consecutive_empty_responses >= Self::MAX_CONSECUTIVE_EMPTY_RESPONSES {
+                    
                     self.context.end_turn();
                     return Ok(RunExit::CriticallyFailed(
                         "Too many empty responses".to_string(),
@@ -538,16 +567,14 @@ impl AgentLoop {
                             summary = s.to_string();
                         }
                     }
+                    self.context.end_turn();
                     
                     self.telemetry.end_span("agent_step");
                     return Ok(RunExit::Finished(summary));
                 }
 
-
-
                 let tool_opt = self.tools.iter().find(|t| t.name() == call.name);
                 let (result, is_error, stopped) = if let Some(tool) = tool_opt {
-                    
                     self.output
                         .on_tool_start(&call.name, &call.args.to_string())
                         .await;
@@ -670,25 +697,10 @@ impl AgentLoop {
             }
 
             if stop_loop {
+                
                 self.context.end_turn();
                 return Ok(RunExit::StoppedByUser);
             }
         }
-    }
-}
-
-pub struct WaitingGuard<'a> {
-    output: &'a dyn AgentOutput,
-}
-
-impl<'a> WaitingGuard<'a> {
-    pub fn new(output: &'a dyn AgentOutput) -> Self {
-        Self { output }
-    }
-}
-
-impl<'a> Drop for WaitingGuard<'a> {
-    fn drop(&mut self) {
-        self.output.clear_waiting();
     }
 }

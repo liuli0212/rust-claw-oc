@@ -189,8 +189,6 @@ impl AgentContext {
         // 4. Task Plan
         // Deprecated: the task plan is now loaded via context assembler dynamically from events. 
         // We leave the block stubbed here for structural layout compat in build_prompt_sections if any other code relied on length.
-        let plan_str = ""; 
-
         // 5. Project Context
         // [P1-1.4 Fix] Task Planning instruction only injected when NO active plan exists
         let mut project_context = String::new();

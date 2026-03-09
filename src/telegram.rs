@@ -30,8 +30,8 @@ impl TelegramOutput {
         let mut result = String::with_capacity(text.len());
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                if chars.peek() == Some(&'[') {
+            if c == '\x1b'
+                && chars.peek() == Some(&'[') {
                     chars.next(); // skip '['
                     while let Some(&nc) = chars.peek() {
                         chars.next();
@@ -41,7 +41,6 @@ impl TelegramOutput {
                     }
                     continue;
                 }
-            }
             result.push(c);
         }
         result

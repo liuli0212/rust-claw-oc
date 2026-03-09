@@ -62,7 +62,7 @@ impl Tool for SkillTool {
         }
         if !stderr_str.is_empty() {
             if !res.is_empty() {
-                res.push_str("\n");
+                res.push('\n');
             }
             res.push_str("STDERR:\n");
             res.push_str(&stderr_str);
@@ -90,7 +90,7 @@ pub fn load_skills(dir: &str) -> Vec<SkillTool> {
 
     for entry in std::fs::read_dir(path).unwrap().flatten() {
         let file_path = entry.path();
-        if file_path.is_file() && file_path.extension().map_or(false, |e| e == "md") {
+        if file_path.is_file() && file_path.extension().is_some_and(|e| e == "md") {
             if let Ok(content) = std::fs::read_to_string(&file_path) {
                 if let Some(skill) = parse_skill_markdown(&content) {
                     skills.push(skill);
