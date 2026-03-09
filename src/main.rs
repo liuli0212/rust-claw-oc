@@ -26,7 +26,7 @@ use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::session_manager::SessionManager;
 use crate::tools::{
-    BashTool, FinishTaskTool, PatchFileTool, RagInsertTool, RagSearchTool, ReadFileTool,
+    BashTool, PatchFileTool, RagInsertTool, RagSearchTool, ReadFileTool,
     ReadMemoryTool, SendFileTool, TavilySearchTool, WebFetchTool, WriteFileTool,
     WriteMemoryTool,
 };
@@ -115,7 +115,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(RagInsertTool::new(vector_store.clone())),
         Arc::new(ReadMemoryTool::new(workspace_memory.clone())),
         Arc::new(WriteMemoryTool::new(workspace_memory.clone())),
-        Arc::new(FinishTaskTool),
         Arc::new(SendFileTool),
     ];
 
@@ -141,15 +140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Type {} to exit, {} for help.", style("/exit").bold(), style("/help").bold());
     println!();
 
-    if std::path::Path::new(".rusty_claw_task_plan.json").exists() {
-        println!("  {} Detected an existing task plan. Use {} to clear it.", style("ℹ").blue(), style("/cancel_task").bold());
-    }
-
     let sm_clone = session_manager.clone();
     tokio::spawn(async move {
         let mut sigs =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-        while let Some(_) = sigs.recv().await {
+        while sigs.recv().await.is_some() {
             sm_clone.cancel_session("cli").await;
         }
     });
@@ -247,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap();
                     let mut agent_guard = agent.lock().await;
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    let subcommand = parts.get(1).map(|s| *s).unwrap_or("");
+                    let subcommand = parts.get(1).copied().unwrap_or("");
 
                     match subcommand {
                         "audit" => {
@@ -261,8 +256,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         "inspect" => {
-                            let section = parts.get(2).map(|s| *s).unwrap_or("");
-                            let arg = parts.get(3).map(|s| *s);
+                            let section = parts.get(2).copied().unwrap_or("");
+                            let arg = parts.get(3).copied();
                             if section.is_empty() {
                                 println!("  {} Usage: /context inspect <system|history|memory|plan> [arg]", style("ℹ").blue());
                             } else {
@@ -299,7 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             });
                             if let Ok(json_str) = serde_json::to_string_pretty(&dump_data) {
-                                if let Ok(_) = std::fs::write("debug_context.json", json_str) {
+                                if std::fs::write("debug_context.json", json_str).is_ok() {
                                     println!("  {} Context dumped to debug_context.json", style("✔").green());
                                 } else {
                                     println!("  {} Failed to write debug_context.json", style("✖").red());
@@ -310,7 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("  {} Attempting manual compaction...", style("⚙").yellow());
                             match agent_guard.maybe_compact_history(true).await {
                                 Ok(_) => println!("  {} Compaction attempt finished.", style("✔").green()),
-                                Err(e) => println!("  {} Compaction failed: {}", style("❌").red(), e.to_string()),
+                                Err(e) => println!("  {} Compaction failed: {}", style("❌").red(), e),
                             }
                         }
                         _ => {

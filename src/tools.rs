@@ -880,10 +880,12 @@ pub struct TaskPlanTool {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct TaskPlanArgs {
-    /// Action: get, add, update_status, update_text, remove, clear.
+    /// Action: get, add, update_status, update_text, update_goal, remove, clear.
     pub action: String,
     /// For "add", "update_text": The step description.
     pub step: Option<String>,
+    /// For "update_goal": The new concise goal description.
+    pub goal: Option<String>,
     /// For "add", "update_status", "update_text": Optional note.
     pub note: Option<String>,
     /// For "update_status", "update_text", "remove": The 0-based index of the item.
@@ -922,7 +924,7 @@ impl Tool for TaskPlanTool {
     }
 
     fn description(&self) -> String {
-        "Manages the strict execution plan. You MUST update this plan as you progress. Actions: get, add, update_status (index, status), update_text (index, step), remove (index), clear.".to_string()
+        "Manages the strict execution plan. You MUST update this plan as you progress. Actions: get, add, update_status (index, status), update_text (index, step), update_goal (goal), remove (index), clear. If the task completely changes, use update_goal to set a new concise goal.".to_string()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -993,6 +995,12 @@ impl Tool for TaskPlanTool {
                     return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
                 }
             }
+            "update_goal" => {
+                let new_goal = parsed.goal.ok_or_else(|| {
+                    ToolError::InvalidArguments("update_goal requires 'goal'".to_string())
+                })?;
+                state.goal = Some(new_goal);
+            }
             "remove" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("remove requires 'index'".to_string())
@@ -1037,7 +1045,9 @@ pub struct FinishTaskArgs {
     pub summary: String,
 }
 
-pub struct FinishTaskTool;
+pub struct FinishTaskTool {
+    pub task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
+}
 
 // --- Send File Tool ---
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1094,6 +1104,15 @@ impl Tool for FinishTaskTool {
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
         let parsed: FinishTaskArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        
+        // Mark the global task state as completed
+        if let Ok(mut state) = self.task_state_store.load() {
+            if state.status == "in_progress" {
+                state.status = "completed".to_string();
+                let _ = self.task_state_store.save(&state);
+            }
+        }
+
         Ok(format!(
             "Task marked as finished. Summary: {}",
             parsed.summary

@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use crate::context::{FunctionCall, Message};
 use crate::tools::Tool;
 use async_trait::async_trait;

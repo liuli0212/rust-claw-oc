@@ -14,6 +14,7 @@ struct TelegramOutput {
     bot: Bot,
     chat_id: ChatId,
     text_buffer: Arc<Mutex<String>>,
+    active_plan_message_id: Arc<Mutex<Option<teloxide::types::MessageId>>>,
 }
 
 impl TelegramOutput {
@@ -22,6 +23,7 @@ impl TelegramOutput {
             bot,
             chat_id,
             text_buffer: Arc::new(Mutex::new(String::new())),
+            active_plan_message_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -273,6 +275,72 @@ impl AgentOutput for TelegramOutput {
             self.send_long_message(&text, None).await;
         }
     }
+
+    async fn on_plan_update(&self, state: &crate::task_state::TaskStateSnapshot) {
+        if state.plan_steps.is_empty() {
+            return;
+        }
+
+        let mut lines = Vec::new();
+        if let Some(goal) = &state.goal {
+            lines.push(format!("🎯 *Objective*: {}", Self::escape_markdown_v2(goal)));
+            lines.push(String::new());
+        }
+
+        lines.push(format!("*Plan Overview* \\({}\\):", Self::escape_markdown_v2(&state.status)));
+        
+        for (i, step) in state.plan_steps.iter().enumerate() {
+            let icon = match step.status.as_str() {
+                "completed" => "✅",
+                "in_progress" => "🔄",
+                _ => "⏳",
+            };
+            
+            let mut line = format!("{} {}\\. {}", icon, i + 1, Self::escape_markdown_v2(&step.step));
+            if let Some(note) = &step.note {
+                if !note.is_empty() {
+                    line.push_str(&format!(" \\- _{}_", Self::escape_markdown_v2(note)));
+                }
+            }
+            lines.push(line);
+        }
+
+        let text = lines.join("\n");
+
+        let mut active_msg_id = self.active_plan_message_id.lock().await;
+
+        if let Some(msg_id) = *active_msg_id {
+            let res = self.bot.edit_message_text(self.chat_id, msg_id, &text)
+                .parse_mode(ParseMode::MarkdownV2)
+                .await;
+            
+            if res.is_err() {
+                *active_msg_id = None;
+            } else {
+                return;
+            }
+        }
+
+        if let Ok(msg) = self.bot.send_message(self.chat_id, text).parse_mode(ParseMode::MarkdownV2).await {
+            *active_msg_id = Some(msg.id);
+        }
+    }
+
+    async fn on_task_finish(&self, summary: &str) {
+        self.flush().await;
+
+        let lines = [
+            "🎉 *Task Completed*".to_string(),
+            String::new(),
+            Self::escape_markdown_v2(summary),
+        ];
+
+        let text = lines.join("\n");
+        let _ = self.bot.send_message(self.chat_id, text).parse_mode(ParseMode::MarkdownV2).await;
+
+        let mut active_msg_id = self.active_plan_message_id.lock().await;
+        *active_msg_id = None;
+    }
 }
 
 #[derive(BotCommands, Clone)]
@@ -489,7 +557,7 @@ async fn handle_message(
                 let temp_dir = std::env::temp_dir();
                 let path = temp_dir.join(format!("{}.jpg", photo.file.id));
                 if let Ok(mut dest) = tokio::fs::File::create(&path).await {
-                    if let Ok(_) = bot.download_file(&file.path, &mut dest).await {
+                    if bot.download_file(&file.path, &mut dest).await.is_ok() {
                         let img_msg = format!(
                             "[User uploaded an image. Saved locally at: {}]",
                             path.display()

@@ -54,13 +54,6 @@ impl TuiOutput {
         }
     }
 
-    fn update_spinner(&self, message: &str) {
-        let guard = self.spinner.lock().unwrap();
-        if let Some(pb) = guard.as_ref() {
-            pb.set_message(message.to_string());
-        }
-    }
-
     fn print_markdown(&self, text: &str) {
         self.skin.print_text(text);
     }
@@ -201,5 +194,50 @@ impl AgentOutput for TuiOutput {
              style("VG").green(), 
              style(path).bold().underlined()
         );
+    }
+
+    async fn on_plan_update(&self, state: &crate::task_state::TaskStateSnapshot) {
+        if state.plan_steps.is_empty() {
+            return;
+        }
+        self.stop_spinner();
+        
+        println!("  ╭─ {} {}", style("Plan").bold().cyan(), style("─".repeat(45)).cyan());
+        if let Some(goal) = &state.goal {
+            println!("  │ {}: {}", style("Goal").bold(), style(goal).italic());
+            println!("  │");
+        }
+        
+        let mut completed = 0;
+        for (i, step) in state.plan_steps.iter().enumerate() {
+            let (icon, color_step) = match step.status.as_str() {
+                "completed" => {
+                    completed += 1;
+                    ("✅", style(&step.step).green().dim())
+                },
+                "in_progress" => ("🔄", style(&step.step).blue().bold()),
+                _ => ("⏳", style(&step.step).dim()),
+            };
+            
+            let mut line = format!("  │  {} {}. {}", icon, i + 1, color_step);
+            if let Some(note) = &step.note {
+                if !note.is_empty() {
+                    line.push_str(&format!(" - {}", style(note).dim().italic()));
+                }
+            }
+            println!("{}", line);
+        }
+        let total = state.plan_steps.len();
+        println!("  │");
+        println!("  │ {}: {}/{} completed", style("Progress").dim(), completed, total);
+        println!("  ╰{}", style("─".repeat(50)).cyan());
+        println!();
+    }
+
+    async fn on_task_finish(&self, summary: &str) {
+        self.stop_spinner();
+        println!("\n{} {}\n", Emoji("🎉", "*"), style("Task Completed!").green().bold());
+        self.print_markdown(summary);
+        println!();
     }
 }

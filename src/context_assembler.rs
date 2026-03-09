@@ -124,10 +124,7 @@ impl ContextAssembler {
         }
 
         // Layer 3: Task State
-        let mut state_summary = task_state.summary();
-        if !task_state.plan_steps.is_empty() && task_state.status == "in_progress" {
-            state_summary.push_str("\n\nIMPORTANT INSTRUCTION: You have an active task plan in progress. But DO NOT automatically execute the next step. Instead, politely reply to the user, remind them of the active task, and ask if they would like to resume it. Only execute steps if the user explicitly asks to continue or gives a task-related command.");
-        }
+        let state_summary = task_state.summary();
 
         candidates.push(PromptCandidate {
             id: "task_state".to_string(),

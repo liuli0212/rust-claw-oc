@@ -239,11 +239,9 @@ impl VectorStore {
             });
 
             if let Ok(iter) = fts_iter {
-                for item in iter {
-                    if let Ok((id, score)) = item {
-                        // SQLite BM25 is negative (more negative = better). We invert it.
-                        scores.insert(id, score.abs());
-                    }
+                for (id, score) in iter.flatten() {
+                    // SQLite BM25 is negative (more negative = better). We invert it.
+                    scores.insert(id, score.abs());
                 }
             }
             scores

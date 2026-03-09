@@ -4,14 +4,14 @@ use std::path::PathBuf;
 
 use crate::schema::StoragePaths;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlanStep {
     pub step: String,
     pub status: String, // pending, in_progress, completed
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TaskStateSnapshot {
     pub schema_version: u32,
     pub task_id: Option<String>,

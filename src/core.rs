@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use crate::context::{AgentContext, ContextDiff, FunctionResponse, Message, Part};
 use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;
@@ -43,6 +44,12 @@ pub trait AgentOutput: Send + Sync {
     async fn on_file(&self, path: &str) {
         // Default: just notify that a file was created
         self.on_text(&format!("[File] Created: {}\n", path)).await;
+    }
+    async fn on_plan_update(&self, _state: &crate::task_state::TaskStateSnapshot) {
+        // Default: no-op
+    }
+    async fn on_task_finish(&self, _summary: &str) {
+        // Default: no-op
     }
 }
 
@@ -186,6 +193,16 @@ impl AgentLoop {
     }
 
     pub fn inspect_context(&self, section: &str, arg: Option<&str>) -> String {
+        if section == "plan" {
+            if let Ok(state) = self.task_state_store.load() {
+                if state.plan_steps.is_empty() {
+                    return "No active plan.".to_string();
+                }
+                return state.summary();
+            } else {
+                return "No active plan.".to_string();
+            }
+        }
         self.context.inspect_context(section, arg)
     }
 
@@ -354,11 +371,18 @@ impl AgentLoop {
 
         self.context.start_turn(goal.clone());
 
-        // Init Task state if new
+        // Init Task state — new task always clears old incomplete plans
         let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        
+        if state.status == "in_progress" {
+            // New user command arrived while old task still in progress — auto-clear
+            tracing::info!("Auto-clearing previous in_progress task plan for new goal");
+            state = crate::task_state::TaskStateSnapshot::empty();
+        }
+
         let current_task_id = state.task_id.clone().unwrap_or_else(|| format!("tsk_{}", uuid::Uuid::new_v4().simple()));
         
-        if state.status == "initialized" {
+        if state.status == "initialized" || state.status == "empty" {
             state.task_id = Some(current_task_id.clone());
             state.status = "in_progress".to_string();
             state.goal = Some(goal.clone());
@@ -418,7 +442,6 @@ impl AgentLoop {
 
             // Build cache-aware prompt using ContextAssembler
             // In a real advanced setup, ContextAssembler budget would be dynamic based on LLM size
-            let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
             let max_tokens = self.context.max_history_tokens; 
             let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
             let (messages, system, _) = self.context.build_llm_payload(&state, &assembler);
@@ -540,6 +563,7 @@ impl AgentLoop {
                 return Ok(RunExit::YieldedToUser);
             }
 
+            let state_before_tools = state.clone();
             let mut executed_signatures = HashSet::new();
             let mut stop_loop = false;
 
@@ -568,6 +592,8 @@ impl AgentLoop {
                         }
                     }
                     self.context.end_turn();
+                    
+                    self.output.on_task_finish(&summary).await;
                     
                     self.telemetry.end_span("agent_step");
                     return Ok(RunExit::Finished(summary));
@@ -688,6 +714,12 @@ impl AgentLoop {
                     }],
                 });
             }
+
+            let state_after_tools = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+            if state_before_tools != state_after_tools {
+                self.output.on_plan_update(&state_after_tools).await;
+            }
+            state = state_after_tools;
 
             // Impose limits on extremely large tool results that might explode the context window
             let truncated = self.context.truncate_current_turn_tool_results(30000);

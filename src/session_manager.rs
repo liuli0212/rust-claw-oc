@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use crate::context::{transcript_path_for_session, AgentContext};
 use crate::core::{AgentLoop, AgentOutput};
 use crate::llm_client::LlmClient;
@@ -140,6 +141,9 @@ impl SessionManager {
             session_id.to_string(),
             task_state_store.clone(),
         )));
+        session_tools.push(Arc::new(crate::tools::FinishTaskTool {
+            task_state_store: task_state_store.clone(),
+        }));
 
         let agent_loop = AgentLoop::new(
             session_id.to_string(),

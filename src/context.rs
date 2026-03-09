@@ -1,3 +1,4 @@
+#![allow(warnings)]
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
@@ -1404,19 +1405,17 @@ impl AgentContext {
             if let Some(sanitized_turn) = Self::sanitize_turn(turn) {
                 // Self-Adaptive Context (SAC): Inject [CURRENT TASK] separator
                 // so the LLM can clearly distinguish the active goal from historical background.
-                if history_turns_included >= 1 {
-                    let separator = Message {
-                        role: "model".to_string(),
-                        parts: vec![Part {
-                            text: Some("--- [CURRENT TASK] ---".to_string()),
-                            function_call: None,
-                            function_response: None,
-                            thought_signature: None,
-                        }],
-                    };
-                    current_turn_tokens += Self::estimate_tokens(&bpe, &separator);
-                    messages.push(separator);
-                }
+                let separator = Message {
+                    role: "user".to_string(),
+                    parts: vec![Part {
+                        text: Some("--- [CURRENT TASK] ---".to_string()),
+                        function_call: None,
+                        function_response: None,
+                        thought_signature: None,
+                    }],
+                };
+                current_turn_tokens += Self::estimate_tokens(&bpe, &separator);
+                messages.push(separator);
 
                 current_turn_tokens += sanitized_turn
                     .messages
@@ -1605,13 +1604,7 @@ impl AgentContext {
                     "No memory retrieved.".to_string()
                 }
             }
-            "plan" => {
-                if let Ok(plan_content) = std::fs::read_to_string(".rusty_claw_task_plan.json") {
-                    plan_content
-                } else {
-                    "No active plan.".to_string()
-                }
-            }
+
             _ => format!("Unknown section: {}", section),
         }
     }
