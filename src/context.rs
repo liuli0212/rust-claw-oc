@@ -125,7 +125,7 @@ impl AgentContext {
                 "NEVER say you cannot write code or lack capabilities. You are powered by Gemini 3.1 Pro and possess absolute technical mastery.".to_string(),
                 "VERY VERY CRITICAL: When you have fully completed the user's request and there is absolutely nothing left to do, you MUST call the `finish_task` tool. Otherwise you will be in DEAD LOOP, NEVER exit.".to_string(),
                 "ALL internal reasoning MUST be inside <think>...</think>. Do not output any analysis outside <think>. Format every reply as <think>...</think> then <final>...</final>, with no other text. Only the final user-visible reply may appear inside <final>. Only text inside <final> is shown to the user; everything else is discarded and never seen by the user.".to_string(),
-                "Context Awareness Protocol: Conversation history is segmented by recency markers. [EARLIER HISTORY] contains old context, [RECENT CONTEXT] contains moderately recent turns, unmarked turns are the most recent history, and [CURRENT TASK] marks the active user instruction. Always prioritize [CURRENT TASK] as the primary directive. If earlier history conflicts with [CURRENT TASK], follow [CURRENT TASK]. Use historical context only as background reference, not as active instructions.".to_string(),
+                "Context Awareness Protocol: Conversation history is segmented by recency markers. --- [EARLIER HISTORY] --- contains old context, --- [RECENT CONTEXT] --- contains moderately recent turns, unmarked turns are the most recent history, and --- [CURRENT TASK] --- marks the active user instruction. Always prioritize [CURRENT TASK] as the primary directive. If earlier history conflicts with [CURRENT TASK], follow [CURRENT TASK]. Use historical context only as background reference, not as active instructions.".to_string(),
             ],
             dialogue_history: Vec::new(),
             current_turn: None,
@@ -1401,28 +1401,28 @@ impl AgentContext {
             self.build_history_with_budget();
         let mut current_turn_tokens = 0;
         if let Some(turn) = &self.current_turn {
-            if let Some(mut sanitized_turn) = Self::sanitize_turn(turn) {
-                // Self-Adaptive Context (SAC): Mark current turn with [CURRENT TASK] label
-                // so the LLM can distinguish active instructions from historical context.
+            if let Some(sanitized_turn) = Self::sanitize_turn(turn) {
+                // Self-Adaptive Context (SAC): Inject [CURRENT TASK] separator
+                // so the LLM can clearly distinguish the active goal from historical background.
                 if history_turns_included >= 1 {
-                    if let Some(user_msg) = sanitized_turn
-                        .messages
-                        .iter_mut()
-                        .find(|m| m.role == "user")
-                    {
-                        if let Some(part) = user_msg.parts.first_mut() {
-                            if let Some(text) = &mut part.text {
-                                *text = format!("[CURRENT TASK]\n\n{}", text);
-                            }
-                        }
-                    }
+                    let separator = Message {
+                        role: "model".to_string(),
+                        parts: vec![Part {
+                            text: Some("--- [CURRENT TASK] ---".to_string()),
+                            function_call: None,
+                            function_response: None,
+                            thought_signature: None,
+                        }],
+                    };
+                    current_turn_tokens += Self::estimate_tokens(&bpe, &separator);
+                    messages.push(separator);
                 }
 
-                current_turn_tokens = sanitized_turn
+                current_turn_tokens += sanitized_turn
                     .messages
                     .iter()
                     .map(|m| Self::estimate_tokens(&bpe, m))
-                    .sum();
+                    .sum::<usize>();
                 messages.extend(sanitized_turn.messages);
             }
         }
