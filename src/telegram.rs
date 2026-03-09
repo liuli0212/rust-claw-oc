@@ -49,7 +49,7 @@ impl TelegramOutput {
     }
 
     fn escape_markdown_v2(text: &str) -> String {
-        let to_escape = r"_*[]()~`>#+-=|{}.!";
+        let to_escape = "_*[]()~`>#+-=|{}.!\\";
         let mut escaped = String::with_capacity(text.len());
         for c in text.chars() {
             if to_escape.contains(c) {
@@ -183,12 +183,15 @@ impl AgentOutput for TelegramOutput {
 
         if let Err(e) = self
             .bot
-            .send_message(self.chat_id, msg)
+            .send_message(self.chat_id, &msg)
             .parse_mode(ParseMode::MarkdownV2)
-            .reply_markup(keyboard)
+            .reply_markup(keyboard.clone())
             .await
         {
             tracing::error!("Failed to send Telegram tool start message: {}", e);
+            // Fallback to plain text
+            let plain_msg = format!("🛠️ {}: {}", name, summary);
+            let _ = self.bot.send_message(self.chat_id, plain_msg).reply_markup(keyboard).await;
         }
     }
 
@@ -321,8 +324,14 @@ impl AgentOutput for TelegramOutput {
             }
         }
 
-        if let Ok(msg) = self.bot.send_message(self.chat_id, text).parse_mode(ParseMode::MarkdownV2).await {
+        if let Ok(msg) = self.bot.send_message(self.chat_id, &text).parse_mode(ParseMode::MarkdownV2).await {
             *active_msg_id = Some(msg.id);
+        } else {
+            // Fallback to plain text, stripping escape backslashes
+            let plain_text = text.replace('\\', "");
+            if let Ok(msg) = self.bot.send_message(self.chat_id, plain_text).await {
+                *active_msg_id = Some(msg.id);
+            }
         }
     }
 
@@ -336,7 +345,7 @@ impl AgentOutput for TelegramOutput {
         ];
 
         let text = lines.join("\n");
-        let _ = self.bot.send_message(self.chat_id, text).parse_mode(ParseMode::MarkdownV2).await;
+        self.send_long_message(&text, Some(ParseMode::MarkdownV2)).await;
 
         let mut active_msg_id = self.active_plan_message_id.lock().await;
         *active_msg_id = None;

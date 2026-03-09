@@ -109,6 +109,10 @@ impl SessionManager {
 
         if let Some(agent_mutex) = existing {
             let mut agent = agent_mutex.lock().await;
+            
+            // Flush any trapped text in the old buffer before dropping it
+            agent.flush_output().await;
+
             agent.update_output(output);
             // Update timestamp in memory only (fast)
             self.update_registry_entry(session_id, None, None);

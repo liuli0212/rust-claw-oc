@@ -143,6 +143,10 @@ impl AgentLoop {
         self.output = output;
     }
 
+    pub async fn flush_output(&self) {
+        self.output.flush().await;
+    }
+
     pub fn get_session_details(&self) -> serde_json::Value {
         let (tokens, max_tokens, turns, system_tokens, _) = self.context.get_context_status();
         let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
@@ -407,11 +411,10 @@ impl AgentLoop {
         loop {
             // Check persistent cancel flag at top of each iteration
             if self.is_cancelled() {
-                
+                self.output.flush().await;
                 self.context.end_turn();
                 self.telemetry.end_span("agent_step");
                 return Ok(RunExit::StoppedByUser);
-
             }
             if task_state.iterations >= Self::MAX_ITERATIONS {
                 tracing::warn!(
@@ -419,6 +422,7 @@ impl AgentLoop {
                     Self::MAX_ITERATIONS
                 );
                 
+                self.output.flush().await;
                 self.context.end_turn();
                 return Ok(RunExit::AgentTurnLimitReached);
             }
@@ -431,6 +435,7 @@ impl AgentLoop {
                     .on_text("[System] Energy depleted. Stopping to prevent infinite loops.")
                     .await;
                 
+                self.output.flush().await;
                 self.context.end_turn();
                 return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
             }
@@ -462,7 +467,7 @@ impl AgentLoop {
                 let stream_res = tokio::select! {
                     res = self.llm.stream(messages.clone(), system.clone(), current_tools.clone()) => res,
                     _ = self.cancel_token.notified() => {
-                        
+                        self.output.flush().await;
                         self.context.end_turn();
                         return Ok(RunExit::StoppedByUser);
                     }
@@ -504,16 +509,17 @@ impl AgentLoop {
                         };
 
                         if let Err(exit) = stream_loop_res {
-                            
-                            self.context.end_turn();
-                            return Ok(exit);
+                        self.output.flush().await;
+                        self.context.end_turn();
+                        return Ok(exit);
                         }
 
                         break current_turn_text;
                     }
                     Err(e) => {
                         if !self.handle_llm_error(&e, llm_attempts).await {
-                            return Err(Box::new(e));
+                        self.output.flush().await;
+                        return Err(Box::new(e));
                         }
                     }
                 }
@@ -522,7 +528,7 @@ impl AgentLoop {
             if full_text.trim().is_empty() && tool_calls_accumulated.is_empty() {
                 consecutive_empty_responses += 1;
                 if consecutive_empty_responses >= Self::MAX_CONSECUTIVE_EMPTY_RESPONSES {
-                    
+                    self.output.flush().await;
                     self.context.end_turn();
                     return Ok(RunExit::CriticallyFailed(
                         "Too many empty responses".to_string(),
@@ -557,7 +563,7 @@ impl AgentLoop {
             });
 
             if tool_calls_accumulated.is_empty() {
-                
+                self.output.flush().await;
                 self.context.end_turn();
                 self.telemetry.end_span("agent_step");
                 return Ok(RunExit::YieldedToUser);
@@ -729,7 +735,7 @@ impl AgentLoop {
             }
 
             if stop_loop {
-                
+                self.output.flush().await;
                 self.context.end_turn();
                 return Ok(RunExit::StoppedByUser);
             }
