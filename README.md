@@ -22,9 +22,10 @@ This project is a Rust-native implementation of an AI agent, closely following t
 - **⚡ Dual-Phase Task Execution:**
   - **Phase 1 (Lead Architect):** Analyzes request complexity and generates a multi-step execution plan using a lightweight, low-token prompt.
   - **Phase 2 (Execution Engineer):** Executes the plan turn-by-turn with full project context (AGENTS.md, README, Environment) and autonomous tool usage.
-- **🔌 Multi-Platform & Multi-Provider:**
+- **🔌 Multi-Platform & Session Management:**
+  - **Isolated Sessions:** Concurrent execution across CLI, Telegram, and Discord, with strict state and context isolation per user/chat.
+  - **Live Dashboards:** Real-time bordered TUI task checklists for CLI, and live-updating dashboard messages (via `edit_message_text`) for Telegram.
   - **Providers:** Supports Google Gemini, Aliyun Qwen, and any OpenAI-compatible API (DeepSeek, LocalAI, vLLM).
-  - **Platforms:** Supports CLI, Telegram, and Discord concurrently.
 - **🛡️ Active Context Curation:**
   - **Smart Stripping:** Automatically compresses historical tool outputs like `read_file` or `ls` to keep only essential summaries. This saves lots of tokens.
   - **Focus Booster:** Injects attention prompts like "Focus on this new message" when history gets long.
@@ -32,6 +33,9 @@ This project is a Rust-native implementation of an AI agent, closely following t
 - **🔄 Reliable & Self-Healing:**
   - **Exponential Backoff:** API calls automatically retry with exponential delays on failure (429, 5xx).
   - **Dynamic Context Window:** Detects model limits like 1M for Gemini or 128k for GPT-4o and adjusts buffers to prevent overflow.
+- **📊 Telemetry & Observability:**
+  - **Distributed Tracing:** Full `tracing`-based span tracking across all agent actions, linked by correlation IDs (Session, Task, Turn).
+  - **Structured Event Logs:** Append-only JSONL event logs for deterministic workflow auditing and playback.
 - **🌐 Full-Featured Browser Automation:**
   - **Persistent Session:** Keeps a browser instance across turns for complex workflows like login, navigation, and extraction.
   - **See-Act Loop:** Uses `snapshot` to parse DOM into JSON and `act` to interact with elements using stable IDs.
@@ -64,7 +68,7 @@ Rusty-Claw comes equipped with a comprehensive suite of engineering tools:
 | **Browser** | `browser` | Full browser automation: `start`, `stop`, `navigate`, `snapshot` (DOM extraction), `act` (click/type). |
 | **Web** | `web_search` | Real-time internet search via Tavily API. |
 | | `web_fetch` | Fetch webpages and convert HTML to Markdown. |
-| **Planning** | `task_plan` | Manage the structured `.rusty_claw_task_plan.json` (add/update/complete steps). |
+| **Planning** | `task_plan` | Manage session-specific structured task plans (update goals, add/complete steps). |
 | **Memory** | `rag_search` | Semantic search over the project's vector database. |
 | | `rag_insert` | Index new knowledge into long-term memory. |,
 ## 🛠️ Setup & Configuration
