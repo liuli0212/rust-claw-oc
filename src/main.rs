@@ -309,6 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let dump_data = serde_json::json!({
                                 "system_prompt": sys,
                                 "messages": payload,
+                                "tools": agent_guard.get_tools_metadata(),
                                 "report": {
                                     "max_history_tokens": report.max_history_tokens,
                                     "history_tokens_used": report.history_tokens_used,

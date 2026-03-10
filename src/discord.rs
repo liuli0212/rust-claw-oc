@@ -9,9 +9,22 @@ use std::sync::Arc;
 struct DiscordOutput {
     ctx: Context,
     channel_id: serenity::model::id::ChannelId,
+    text_buffer: Arc<Mutex<String>>,
+    streaming_message_id: Arc<Mutex<Option<serenity::model::id::MessageId>>>,
+    last_update: Arc<Mutex<std::time::Instant>>,
 }
 
 impl DiscordOutput {
+    fn new(ctx: Context, channel_id: serenity::model::id::ChannelId) -> Self {
+        Self {
+            ctx,
+            channel_id,
+            text_buffer: Arc::new(Mutex::new(String::new())),
+            streaming_message_id: Arc::new(Mutex::new(None)),
+            last_update: Arc::new(Mutex::new(std::time::Instant::now())),
+        }
+    }
+
     fn truncate_to_three_lines(input: &str) -> String {
         let lines: Vec<&str> = input.lines().collect();
         if lines.len() <= 3 {
@@ -22,6 +35,67 @@ impl DiscordOutput {
             lines[..3].join("\n"),
             lines.len() - 3
         )
+    }
+
+    async fn maybe_update_live_message(&self, force: bool) {
+        let (text, now, last) = {
+            let buf = self.text_buffer.lock().await;
+            let now = std::time::Instant::now();
+            let last = self.last_update.lock().await;
+            (buf.clone(), now, *last)
+        };
+
+        if text.is_empty() {
+            return;
+        }
+
+        // Throttle updates to every 2 seconds for Discord
+        if !force && now.duration_since(last) < std::time::Duration::from_secs(2) {
+            return;
+        }
+
+        let mut streaming_id_guard = self.streaming_message_id.lock().await;
+        if let Some(msg_id) = *streaming_id_guard {
+            // Edit the message
+            let builder = serenity::builder::EditMessage::new().content(text);
+            let _ = self
+                .channel_id
+                .edit_message(&self.ctx.http, msg_id, builder)
+                .await;
+        } else {
+            // Start a new message
+            if let Ok(msg) = self.channel_id.say(&self.ctx.http, &text).await {
+                *streaming_id_guard = Some(msg.id);
+            }
+        }
+
+        let mut last_guard = self.last_update.lock().await;
+        *last_guard = now;
+    }
+
+    async fn flush_internal(
+        &self,
+        streaming_id_guard: &mut tokio::sync::MutexGuard<'_, Option<serenity::model::id::MessageId>>,
+    ) {
+        let text = {
+            let mut buf = self.text_buffer.lock().await;
+            std::mem::take(&mut *buf)
+        };
+        if text.is_empty() {
+            **streaming_id_guard = None;
+            return;
+        }
+
+        if let Some(msg_id) = **streaming_id_guard {
+            let builder = serenity::builder::EditMessage::new().content(text);
+            let _ = self
+                .channel_id
+                .edit_message(&self.ctx.http, msg_id, builder)
+                .await;
+        } else {
+            let _ = self.channel_id.say(&self.ctx.http, &text).await;
+        }
+        **streaming_id_guard = None;
     }
 }
 
@@ -34,10 +108,27 @@ impl AgentOutput for DiscordOutput {
     }
 
     async fn on_text(&self, text: &str) {
-        let _ = self.channel_id.say(&self.ctx.http, text).await;
+        if !text.is_empty() {
+            self.text_buffer.lock().await.push_str(text);
+            self.maybe_update_live_message(false).await;
+        }
+    }
+
+    async fn on_thinking(&self, text: &str) {
+        if !text.is_empty() {
+            let mut buf = self.text_buffer.lock().await;
+            if buf.is_empty() || buf.ends_with('\n') {
+                buf.push_str("> 🧠 ");
+            }
+            let indented = text.replace('\n', "\n> ");
+            buf.push_str(&indented);
+            drop(buf);
+            self.maybe_update_live_message(false).await;
+        }
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
+        self.flush().await;
         let msg = format!(
             "🛠️ **Tool Call**: `{}`\nArgs:\n```{}\n```",
             name,
@@ -57,8 +148,14 @@ impl AgentOutput for DiscordOutput {
     }
 
     async fn on_error(&self, error: &str) {
+        self.flush().await;
         let msg = format!("❌ **Error**: {}", error);
         let _ = self.channel_id.say(&self.ctx.http, msg).await;
+    }
+
+    async fn flush(&self) {
+        let mut streaming_id_guard = self.streaming_message_id.lock().await;
+        self.flush_internal(&mut streaming_id_guard).await;
     }
 }
 
@@ -74,10 +171,7 @@ impl EventHandler for Handler {
         }
 
         let session_id = format!("discord:{}", msg.channel_id);
-        let output = Arc::new(DiscordOutput {
-            ctx: ctx.clone(),
-            channel_id: msg.channel_id,
-        });
+        let output = Arc::new(DiscordOutput::new(ctx.clone(), msg.channel_id));
 
         let agent = match self
             .session_manager

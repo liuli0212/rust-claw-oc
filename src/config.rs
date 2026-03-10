@@ -18,6 +18,7 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub context_window: Option<usize>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl AppConfig {

@@ -9,11 +9,15 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::time::timeout;
 
-// Helper to clean up JSON schema for strict LLM APIs like Gemini
+// Helper to clean up JSON schema for strict LLM APIs like OpenAI and Gemini
 pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = schema_val.as_object_mut() {
         obj.remove("$schema");
         obj.remove("title");
+        // Ensure "properties" exists for objects (required by OpenAI for strict schemas)
+        if obj.get("type").and_then(|t| t.as_str()) == Some("object") && !obj.contains_key("properties") {
+            obj.insert("properties".to_string(), serde_json::json!({}));
+        }
     }
     schema_val
 }
@@ -121,10 +125,7 @@ impl Tool for BashTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        let schema = schema_for!(ExecuteCmdArgs);
-        let mut val = serde_json::to_value(&schema).unwrap();
-        val.as_object_mut().unwrap().remove("$schema");
-        val.as_object_mut().unwrap().remove("title");
+        let mut val = clean_schema(serde_json::to_value(schema_for!(ExecuteCmdArgs)).unwrap());
         if let Some(properties) = val.get_mut("properties").and_then(|p| p.as_object_mut()) {
             if let Some(timeout) = properties
                 .get_mut("timeout")
@@ -360,11 +361,7 @@ impl Tool for ReadMemoryTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        let schema = schema_for!(EmptyArgs);
-        let mut val = serde_json::to_value(&schema).unwrap();
-        val.as_object_mut().unwrap().remove("$schema");
-        val.as_object_mut().unwrap().remove("title");
-        val
+        clean_schema(serde_json::to_value(schema_for!(EmptyArgs)).unwrap())
     }
 
     async fn execute(&self, _args: Value) -> Result<String, ToolError> {
@@ -414,11 +411,7 @@ impl Tool for WriteMemoryTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        let schema = schema_for!(WriteMemoryArgs);
-        let mut val = serde_json::to_value(&schema).unwrap();
-        val.as_object_mut().unwrap().remove("$schema");
-        val.as_object_mut().unwrap().remove("title");
-        val
+        clean_schema(serde_json::to_value(schema_for!(WriteMemoryArgs)).unwrap())
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
@@ -468,11 +461,7 @@ impl Tool for RagSearchTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        let schema = schema_for!(RagSearchArgs);
-        let mut val = serde_json::to_value(&schema).unwrap();
-        val.as_object_mut().unwrap().remove("$schema");
-        val.as_object_mut().unwrap().remove("title");
-        val
+        clean_schema(serde_json::to_value(schema_for!(RagSearchArgs)).unwrap())
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
@@ -527,11 +516,7 @@ impl Tool for RagInsertTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        let schema = schema_for!(RagInsertArgs);
-        let mut val = serde_json::to_value(&schema).unwrap();
-        val.as_object_mut().unwrap().remove("$schema");
-        val.as_object_mut().unwrap().remove("title");
-        val
+        clean_schema(serde_json::to_value(schema_for!(RagInsertArgs)).unwrap())
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
@@ -1156,6 +1141,32 @@ mod tests {
         assert_eq!(content, "Line 1\nLine 2 edited\nLine 3\n");
 
         std::fs::remove_file(test_file).unwrap();
+    }
+
+    #[test]
+    fn test_tool_schema_validation() {
+        let workspace = std::sync::Arc::new(crate::memory::WorkspaceMemory::new("test_memory.md"));
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(BashTool::new()),
+            Box::new(ReadMemoryTool::new(workspace.clone())),
+            Box::new(WriteMemoryTool::new(workspace.clone())),
+            Box::new(PatchFileTool),
+            Box::new(WriteFileTool),
+            Box::new(ReadFileTool),
+        ];
+
+        for tool in tools {
+            let schema = tool.parameters_schema();
+            let obj = schema.as_object().expect("Schema must be an object");
+            
+            // Critical checks for OpenAI/Gemini
+            assert!(!obj.contains_key("$schema"), "Schema for {} should not contain $schema", tool.name());
+            assert!(!obj.contains_key("title"), "Schema for {} should not contain title", tool.name());
+            
+            if obj.get("type").and_then(|t| t.as_str()) == Some("object") {
+                assert!(obj.contains_key("properties"), "Schema for {} must contain properties", tool.name());
+            }
+        }
     }
 }
 

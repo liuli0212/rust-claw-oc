@@ -26,3 +26,11 @@ api_key_env = "DEEPSEEK_API_KEY"
 base_url = "https://api.deepseek.com/chat/completions"
 model = "deepseek-chat"
 context_window = 32000
+
+[providers.mify]
+type = "openai_compat"
+api_key_env = "MIFY_API_KEY"
+base_url = "http://model.mify.ai.srv/v1/chat/completions"
+model = "azure_openai/gpt-5.3-codex-5"
+reasoning_effort = "high"
+context_window = 1000000

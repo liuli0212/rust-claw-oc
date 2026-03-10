@@ -10,6 +10,8 @@ pub struct TuiOutput {
     skin: MadSkin,
     spinner: Arc<Mutex<Option<ProgressBar>>>,
     in_thinking: Arc<Mutex<bool>>,
+    line_buffer: Arc<Mutex<String>>,
+    in_code_block: Arc<Mutex<bool>>,
 }
 
 impl TuiOutput {
@@ -27,6 +29,8 @@ impl TuiOutput {
             skin,
             spinner: Arc::new(Mutex::new(None)),
             in_thinking: Arc::new(Mutex::new(false)),
+            line_buffer: Arc::new(Mutex::new(String::new())),
+            in_code_block: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -57,6 +61,26 @@ impl TuiOutput {
     fn print_markdown(&self, text: &str) {
         self.skin.print_text(text);
     }
+
+    fn flush_line_buffer(&self) {
+        let mut buffer_guard = self.line_buffer.lock().unwrap();
+        if !buffer_guard.is_empty() {
+            let line = buffer_guard.clone();
+            buffer_guard.clear();
+            
+            let in_code_guard = self.in_code_block.lock().unwrap();
+            if line.starts_with("[System]") {
+                println!("{}", style(line.trim()).cyan());
+            } else if line.starts_with("[Error]") {
+                println!("{}", style(line.trim()).red());
+            } else if *in_code_guard {
+                println!("{}", style(line).color256(250));
+            } else {
+                self.skin.print_inline(&line);
+                println!();
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -71,6 +95,7 @@ impl AgentOutput for TuiOutput {
 
     async fn flush(&self) {
         self.stop_spinner();
+        self.flush_line_buffer();
     }
 
     async fn on_text(&self, text: &str) {
@@ -86,31 +111,48 @@ impl AgentOutput for TuiOutput {
         }
 
         // Remove internal tags if any leak through
-        let clean_text = text
+        let clean_chunk = text
             .replace("<final>", "")
             .replace("</final>", "")
             .replace("<think>", "")
             .replace("</think>", "");
-        if clean_text.trim().is_empty() {
+
+        if clean_chunk.is_empty() {
             return;
         }
 
-        // Check for special status prefixes and style them
-        if clean_text.trim_start().starts_with("[System]") {
-            println!("{}", style(clean_text.trim()).cyan());
-        } else if clean_text.trim_start().starts_with("[Error]") {
-            println!("{}", style(clean_text.trim()).red());
-        } else {
-            self.print_markdown(&clean_text);
+        let mut buffer_guard = self.line_buffer.lock().unwrap();
+        
+        buffer_guard.push_str(&clean_chunk);
+        
+        while let Some(pos) = buffer_guard.find('\n') {
+            let line = buffer_guard[..pos].to_string();
+            *buffer_guard = buffer_guard[pos + 1..].to_string();
+            
+            let mut in_code_guard = self.in_code_block.lock().unwrap();
+            if line.trim_start().starts_with("```") {
+                *in_code_guard = !*in_code_guard;
+                println!("{}", style(&line).dim());
+            } else if line.starts_with("[System]") {
+                println!("{}", style(line.trim()).cyan());
+            } else if line.starts_with("[Error]") {
+                println!("{}", style(line.trim()).red());
+            } else if *in_code_guard {
+                println!("{}", style(&line).color256(250));
+            } else {
+                self.skin.print_inline(&line);
+                println!();
+            }
         }
     }
 
     async fn on_thinking(&self, text: &str) {
-        if text.trim().is_empty() {
+        if text.is_empty() {
             return;
         }
 
         self.stop_spinner();
+        self.flush_line_buffer();
 
         {
             let mut thinking_guard = self.in_thinking.lock().unwrap();
@@ -121,19 +163,27 @@ impl AgentOutput for TuiOutput {
                     style("Thinking...").cyan().italic()
                 );
                 *thinking_guard = true;
+                print!("    ");
             }
         }
 
-        let lines = text.lines();
-        for line in lines {
-            if !line.trim().is_empty() {
-                println!("    {}", style(line.trim()).dim().italic());
+        // For streaming thinking, we print characters immediately.
+        // If there's a newline, we indent the next line.
+        for c in text.chars() {
+            if c == '\n' {
+                println!();
+                print!("    ");
+            } else {
+                print!("{}", style(c).dim().italic());
             }
         }
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
         self.stop_spinner();
+        self.flush_line_buffer();
 
         // Close thinking block if active
         {
@@ -252,6 +302,7 @@ impl AgentOutput for TuiOutput {
 
     async fn on_task_finish(&self, summary: &str) {
         self.stop_spinner();
+        self.flush_line_buffer();
         println!(
             "\n{} {}\n",
             Emoji("🎉", "*"),

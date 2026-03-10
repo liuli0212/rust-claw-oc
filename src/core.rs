@@ -168,7 +168,29 @@ impl AgentLoop {
             "task_id": state.task_id,
             "task_status": state.status,
             "cancelled": self.is_cancelled(),
+            "tools": self.get_tools_metadata(),
         })
+    }
+
+    pub fn get_tools_metadata(&self) -> serde_json::Value {
+        // Include both base tools and dynamically loaded skills
+        let mut all_tools = self.tools.clone();
+        for skill in crate::skills::load_skills("skills") {
+            all_tools.push(std::sync::Arc::new(skill));
+        }
+
+        serde_json::Value::Array(
+            all_tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name(),
+                        "description": t.description(),
+                        "parameters": t.parameters_schema(),
+                    })
+                })
+                .collect(),
+        )
     }
 
     pub fn get_status(&self) -> (String, String, usize, usize) {
@@ -463,17 +485,17 @@ impl AgentLoop {
                 compaction_checked = true;
             }
 
-            // Build cache-aware prompt using ContextAssembler
-            // In a real advanced setup, ContextAssembler budget would be dynamic based on LLM size
-            let max_tokens = self.context.max_history_tokens;
-            let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
-            let (messages, system, _) = self.context.build_llm_payload(&state, &assembler);
-
             // Dynamically load skills on every turn so we don't need to restart
             let mut current_tools = self.tools.clone();
             for skill in crate::skills::load_skills("skills") {
                 current_tools.push(Arc::new(skill));
             }
+
+            // Build cache-aware prompt using ContextAssembler
+            // In a real advanced setup, ContextAssembler budget would be dynamic based on LLM size
+            let max_tokens = self.context.max_history_tokens;
+            let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
+            let (messages, system, _) = self.context.build_llm_payload(&state, &assembler);
 
             let mut llm_attempts = 0;
             let mut tool_calls_accumulated: Vec<(crate::context::FunctionCall, Option<String>)> =
@@ -507,7 +529,18 @@ impl AgentLoop {
                                         }
                                         Some(StreamEvent::Thought(t)) => {
                                             self.output.on_thinking(&t).await;
-                                            current_turn_text.push_str(&format!("<think>{}</think>", t));
+                                            
+                                            // Handle <think> tags properly in current_turn_text for history
+                                            if !in_think_block {
+                                                // If we were processing text, finish it
+                                                self.process_streaming_text(&current_turn_text, &mut processed_idx, &mut in_think_block).await;
+                                                
+                                                current_turn_text.push_str("<think>");
+                                                in_think_block = true;
+                                                processed_idx = current_turn_text.len();
+                                            }
+                                            current_turn_text.push_str(&t);
+                                            // Increment processed_idx to avoid process_streaming_text re-printing it
                                             processed_idx = current_turn_text.len();
                                         }
                                         Some(StreamEvent::ToolCall(tc, sig)) => {
@@ -530,6 +563,10 @@ impl AgentLoop {
                             self.output.flush().await;
                             self.context.end_turn();
                             return Ok(exit);
+                        }
+
+                        if in_think_block {
+                            current_turn_text.push_str("</think>");
                         }
 
                         break current_turn_text;

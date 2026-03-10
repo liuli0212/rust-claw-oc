@@ -70,15 +70,17 @@ impl ContextAssembler {
             required: true,
             content: system_static.to_string(),
         });
-        candidates.push(PromptCandidate {
-            id: "tools".to_string(),
-            kind: CandidateKind::ToolSchema,
-            priority_score: 900.0,
-            token_cost: Self::est_tokens(tool_schemas),
-            layer: 0,
-            required: true,
-            content: format!("TOOLS AVAILABLE:\n{}", tool_schemas),
-        });
+        if !tool_schemas.trim().is_empty() {
+            candidates.push(PromptCandidate {
+                id: "tools".to_string(),
+                kind: CandidateKind::ToolSchema,
+                priority_score: 900.0,
+                token_cost: Self::est_tokens(tool_schemas),
+                layer: 0,
+                required: true,
+                content: format!("TOOLS AVAILABLE:\n{}", tool_schemas),
+            });
+        }
 
         // Layer 1: Durable Memory
         if let Some(mem) = durable_memory {

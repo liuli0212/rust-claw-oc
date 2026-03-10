@@ -15,6 +15,8 @@ struct TelegramOutput {
     chat_id: ChatId,
     text_buffer: Arc<Mutex<String>>,
     active_plan_message_id: Arc<Mutex<Option<teloxide::types::MessageId>>>,
+    streaming_message_id: Arc<Mutex<Option<teloxide::types::MessageId>>>,
+    last_update: Arc<Mutex<std::time::Instant>>,
 }
 
 impl TelegramOutput {
@@ -24,6 +26,8 @@ impl TelegramOutput {
             chat_id,
             text_buffer: Arc::new(Mutex::new(String::new())),
             active_plan_message_id: Arc::new(Mutex::new(None)),
+            streaming_message_id: Arc::new(Mutex::new(None)),
+            last_update: Arc::new(Mutex::new(std::time::Instant::now())),
         }
     }
 
@@ -132,6 +136,70 @@ impl TelegramOutput {
             start = end;
         }
     }
+
+    async fn maybe_update_live_message(&self, force: bool) {
+        let (text, now, last) = {
+            let buf = self.text_buffer.lock().await;
+            let now = std::time::Instant::now();
+            let last = self.last_update.lock().await;
+            (buf.clone(), now, *last)
+        };
+
+        if text.is_empty() {
+            return;
+        }
+
+        // Throttle updates to every 2 seconds unless forced
+        if !force && now.duration_since(last) < std::time::Duration::from_secs(2) {
+            return;
+        }
+
+        let mut streaming_id_guard = self.streaming_message_id.lock().await;
+        if let Some(msg_id) = *streaming_id_guard {
+            // Edit existing message
+            if let Err(e) = self
+                .bot
+                .edit_message_text(self.chat_id, msg_id, &text)
+                .await
+            {
+                tracing::trace!("Failed to edit live message (likely unchanged): {}", e);
+                // If message is too long or other error, we might need a new one
+                if text.len() > 3500 {
+                    self.flush_internal(&mut streaming_id_guard).await;
+                }
+            }
+        } else {
+            // Send new message
+            if let Ok(msg) = self.bot.send_message(self.chat_id, &text).await {
+                *streaming_id_guard = Some(msg.id);
+            }
+        }
+
+        let mut last_guard = self.last_update.lock().await;
+        *last_guard = now;
+    }
+
+    async fn flush_internal(
+        &self,
+        streaming_id_guard: &mut tokio::sync::MutexGuard<'_, Option<teloxide::types::MessageId>>,
+    ) {
+        let text = {
+            let mut buf = self.text_buffer.lock().await;
+            std::mem::take(&mut *buf)
+        };
+        if text.is_empty() {
+            **streaming_id_guard = None;
+            return;
+        }
+
+        if let Some(msg_id) = **streaming_id_guard {
+            // Final edit for this piece
+            let _ = self.bot.edit_message_text(self.chat_id, msg_id, &text).await;
+        } else {
+            self.send_long_message(&text, None).await;
+        }
+        **streaming_id_guard = None;
+    }
 }
 
 #[async_trait]
@@ -150,6 +218,7 @@ impl AgentOutput for TelegramOutput {
         let clean = clean.replace("<final>", "").replace("</final>", "");
         if !clean.is_empty() {
             self.text_buffer.lock().await.push_str(&clean);
+            self.maybe_update_live_message(false).await;
         }
     }
 
@@ -157,12 +226,14 @@ impl AgentOutput for TelegramOutput {
         let clean = Self::strip_ansi(text);
         if !clean.is_empty() {
             let mut buf = self.text_buffer.lock().await;
-            // Use Telegram blockquote format for visual distinction
-            for line in clean.lines() {
-                buf.push_str("> ");
-                buf.push_str(line);
-                buf.push('\n');
+            // For live thinking, we use a prefix per block/line
+            if buf.is_empty() || buf.ends_with('\n') {
+                buf.push_str("> 🧠 ");
             }
+            let indented = clean.replace('\n', "\n> ");
+            buf.push_str(&indented);
+            drop(buf);
+            self.maybe_update_live_message(false).await;
         }
     }
 
@@ -275,14 +346,8 @@ impl AgentOutput for TelegramOutput {
     }
 
     async fn flush(&self) {
-        let text = {
-            let mut buf = self.text_buffer.lock().await;
-            std::mem::take(&mut *buf)
-        };
-        if !text.is_empty() {
-            // Send as plain text to avoid MarkdownV2 escaping issues with LLM output
-            self.send_long_message(&text, None).await;
-        }
+        let mut streaming_id_guard = self.streaming_message_id.lock().await;
+        self.flush_internal(&mut streaming_id_guard).await;
     }
 
     async fn on_plan_update(&self, state: &crate::task_state::TaskStateSnapshot) {

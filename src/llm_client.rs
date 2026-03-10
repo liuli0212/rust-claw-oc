@@ -96,6 +96,7 @@ pub fn create_llm_client(
                     model_final,
                     provider.to_string(),
                     context_window,
+                    prov_config.reasoning_effort.clone(),
                 )))
             }
             "gemini" => {
@@ -146,6 +147,7 @@ pub fn create_llm_client(
                     model_final,
                     "aliyun".to_string(),
                     context_window,
+                    None,
                 )))
             }
             "gemini" | _ => {
@@ -707,9 +709,55 @@ pub struct OpenAiCompatClient {
     client: Client,
     #[allow(dead_code)]
     context_window: usize,
+    reasoning_effort: Option<String>,
 }
 
 impl OpenAiCompatClient {
+    async fn process_delta_json(
+        json: Value,
+        tx: &mpsc::Sender<StreamEvent>,
+        active_tools: &mut std::collections::HashMap<usize, (String, String)>,
+    ) {
+        if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
+            for choice in choices {
+                if let Some(delta) = choice.get("delta") {
+                    // 1. Text content
+                    if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+                        if !content.is_empty() {
+                            let _ = tx.send(StreamEvent::Text(content.to_string())).await;
+                        }
+                    }
+                    // 2. Reasoning/Thinking content (DeepSeek/DashScope format)
+                    if let Some(reasoning) =
+                        delta.get("reasoning_content").and_then(|v| v.as_str())
+                    {
+                        if !reasoning.is_empty() {
+                            let _ = tx.send(StreamEvent::Thought(reasoning.to_string())).await;
+                        }
+                    }
+                    // 3. Tool calls
+                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tool_calls {
+                            let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let entry = active_tools
+                                .entry(idx)
+                                .or_insert_with(|| (String::new(), String::new()));
+
+                            if let Some(func) = tc.get("function") {
+                                if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                                    entry.0.push_str(name);
+                                }
+                                if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                                    entry.1.push_str(args);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn new(
         api_key: String,
@@ -724,6 +772,7 @@ impl OpenAiCompatClient {
             provider_name,
             client: Client::new(),
             context_window: 32_000, // Default fallback
+            reasoning_effort: None,
         }
     }
 
@@ -733,6 +782,7 @@ impl OpenAiCompatClient {
         model_name: String,
         provider_name: String,
         #[allow(dead_code)] context_window: usize,
+        reasoning_effort: Option<String>,
     ) -> Self {
         Self {
             api_key,
@@ -741,6 +791,7 @@ impl OpenAiCompatClient {
             provider_name,
             client: Client::new(),
             context_window,
+            reasoning_effort,
         }
     }
 }
@@ -820,10 +871,14 @@ impl LlmClient for OpenAiCompatClient {
             }
         }
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model_name,
             "messages": openai_messages,
         });
+
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = serde_json::Value::String(effort.clone());
+        }
 
         let body_json = serde_json::to_string(&body).unwrap_or_default();
         tracing::info!("OpenAI generate_text request: url={}", self.base_url);
@@ -939,6 +994,10 @@ impl LlmClient for OpenAiCompatClient {
             "parallel_tool_calls": false, // Prevent buggy multiple identical tool calls from Qwen/OpenAI
         });
 
+        if let Some(effort) = &self.reasoning_effort {
+            body_map["reasoning_effort"] = serde_json::Value::String(effort.clone());
+        }
+
         if !tools.is_empty() {
             let mut openai_tools = Vec::new();
             for tool in tools {
@@ -1045,157 +1104,37 @@ impl LlmClient for OpenAiCompatClient {
 
             while let Some(chunk_res) = stream.next().await {
                 if let Ok(chunk) = chunk_res {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    let chunk_str = String::from_utf8_lossy(&chunk);
+                    tracing::trace!("Received OpenAI streaming chunk: {}", chunk_str);
+                    buffer.push_str(&chunk_str);
 
-                    // Process complete lines
-                    let mut lines = Vec::new();
+                    // Process each line immediately (SSE standard uses single \n for data lines)
                     while let Some(idx) = buffer.find('\n') {
-                        lines.push(buffer[..idx].to_string());
+                        let line = buffer[..idx].trim().to_string();
                         buffer = buffer[idx + 1..].to_string();
-                    }
 
-                    for line in lines {
-                        let line = line.trim();
                         if line.starts_with("data: ") {
                             let data = &line[6..];
                             if data == "[DONE]" {
+                                tracing::debug!("OpenAI stream received [DONE]");
                                 continue;
                             }
                             if let Ok(json) = serde_json::from_str::<Value>(data) {
-                                tracing::trace!(
-                                    "OpenAI SSE chunk: {}",
-                                    crate::utils::truncate_log(data)
-                                );
-                                if let Some(choices) =
-                                    json.get("choices").and_then(|v| v.as_array())
-                                {
-                                    for choice in choices {
-                                        if let Some(delta) = choice.get("delta") {
-                                            // 1. Text content
-                                            if let Some(content) =
-                                                delta.get("content").and_then(|v| v.as_str())
-                                            {
-                                                if !content.is_empty() {
-                                                    let _ = tx
-                                                        .send(StreamEvent::Text(
-                                                            content.to_string(),
-                                                        ))
-                                                        .await;
-                                                }
-                                            }
-                                            // 2. Reasoning/Thinking content (DeepSeek/DashScope format)
-                                            if let Some(reasoning) = delta
-                                                .get("reasoning_content")
-                                                .and_then(|v| v.as_str())
-                                            {
-                                                if !reasoning.is_empty() {
-                                                    tracing::debug!(
-                                                        "OpenAI reasoning chunk: {} chars",
-                                                        reasoning.len()
-                                                    );
-                                                    let _ = tx
-                                                        .send(StreamEvent::Thought(
-                                                            reasoning.to_string(),
-                                                        ))
-                                                        .await;
-                                                }
-                                            }
-                                            // 3. Tool calls
-                                            if let Some(tool_calls) =
-                                                delta.get("tool_calls").and_then(|v| v.as_array())
-                                            {
-                                                for tc in tool_calls {
-                                                    let idx = tc
-                                                        .get("index")
-                                                        .and_then(|v| v.as_u64())
-                                                        .unwrap_or(0)
-                                                        as usize;
-                                                    let entry =
-                                                        active_tools.entry(idx).or_insert_with(
-                                                            || (String::new(), String::new()),
-                                                        );
-
-                                                    if let Some(func) = tc.get("function") {
-                                                        if let Some(name) = func
-                                                            .get("name")
-                                                            .and_then(|v| v.as_str())
-                                                        {
-                                                            entry.0.push_str(name);
-                                                        }
-                                                        if let Some(args) = func
-                                                            .get("arguments")
-                                                            .and_then(|v| v.as_str())
-                                                        {
-                                                            entry.1.push_str(args);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                OpenAiCompatClient::process_delta_json(json, &tx, &mut active_tools).await;
                             }
                         }
                     }
                 }
             }
 
-            // Flush remaining buffer if it looks like a line
-            let final_line = buffer.trim();
-            if final_line.starts_with("data: ") {
-                let data = &final_line[6..];
-                if data != "[DONE]" {
-                    if let Ok(json) = serde_json::from_str::<Value>(data) {
-                        if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
-                            for choice in choices {
-                                if let Some(delta) = choice.get("delta") {
-                                    if let Some(content) =
-                                        delta.get("content").and_then(|v| v.as_str())
-                                    {
-                                        if !content.is_empty() {
-                                            let _ = tx
-                                                .send(StreamEvent::Text(content.to_string()))
-                                                .await;
-                                        }
-                                    }
-                                    if let Some(reasoning) =
-                                        delta.get("reasoning_content").and_then(|v| v.as_str())
-                                    {
-                                        if !reasoning.is_empty() {
-                                            let _ = tx
-                                                .send(StreamEvent::Thought(reasoning.to_string()))
-                                                .await;
-                                        }
-                                    }
-                                    if let Some(tool_calls) =
-                                        delta.get("tool_calls").and_then(|v| v.as_array())
-                                    {
-                                        for tc in tool_calls {
-                                            let idx = tc
-                                                .get("index")
-                                                .and_then(|v| v.as_u64())
-                                                .unwrap_or(0)
-                                                as usize;
-                                            let entry = active_tools
-                                                .entry(idx)
-                                                .or_insert_with(|| (String::new(), String::new()));
-
-                                            if let Some(func) = tc.get("function") {
-                                                if let Some(name) =
-                                                    func.get("name").and_then(|v| v.as_str())
-                                                {
-                                                    entry.0.push_str(name);
-                                                }
-                                                if let Some(args) =
-                                                    func.get("arguments").and_then(|v| v.as_str())
-                                                {
-                                                    entry.1.push_str(args);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+            // Flush remaining partial data as a last resort
+            if !buffer.trim().is_empty() {
+                let line = buffer.trim();
+                if line.starts_with("data: ") {
+                    let data = &line[6..];
+                    if data != "[DONE]" {
+                        if let Ok(json) = serde_json::from_str::<Value>(data) {
+                            OpenAiCompatClient::process_delta_json(json, &tx, &mut active_tools).await;
                         }
                     }
                 }
