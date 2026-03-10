@@ -30,12 +30,14 @@ impl VectorStore {
         let mut opts = InitOptions::new(EmbeddingModel::AllMiniLML6V2);
         opts.show_download_progress = false;
 
-        // WORKAROUND: hf-mirror.com and similar mirrors often strip the `Content-Range` header on 200 OK 
+        // WORKAROUND: hf-mirror.com and similar mirrors often strip the `Content-Range` header on 200 OK
         // responses, which crashes the rust `hf-hub` crate used by `fastembed`.
         // If the user has a proxy configured, we can temporarily unset HF_ENDPOINT to download locally.
         let hf_endpoint = std::env::var("HF_ENDPOINT").unwrap_or_default();
-        let has_proxy = std::env::var("https_proxy").is_ok() || std::env::var("all_proxy").is_ok() || std::env::var("HTTP_PROXY").is_ok();
-        
+        let has_proxy = std::env::var("https_proxy").is_ok()
+            || std::env::var("all_proxy").is_ok()
+            || std::env::var("HTTP_PROXY").is_ok();
+
         if hf_endpoint.contains("hf-mirror") && has_proxy {
             tracing::warn!("[RAG] Temporarily unsetting HF_ENDPOINT to bypass download bug, relying on system proxy...");
             std::env::remove_var("HF_ENDPOINT");
@@ -293,16 +295,16 @@ impl VectorStore {
 
         let mut structured_evidence = Vec::new();
         for (chunk, score) in results {
-             let evidence_id = format!("rag_{}", chunk.id);
-             let ev = crate::evidence::Evidence::new(
-                 evidence_id,
-                 "memory".to_string(),
-                 chunk.source.clone(),
-                 score,
-                 format!("RAG chunk from {}", chunk.source),
-                 chunk.content.clone(),
-             );
-             structured_evidence.push(ev);
+            let evidence_id = format!("rag_{}", chunk.id);
+            let ev = crate::evidence::Evidence::new(
+                evidence_id,
+                "memory".to_string(),
+                chunk.source.clone(),
+                score,
+                format!("RAG chunk from {}", chunk.source),
+                chunk.content.clone(),
+            );
+            structured_evidence.push(ev);
         }
 
         Ok(structured_evidence)

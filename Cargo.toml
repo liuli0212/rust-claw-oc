@@ -37,6 +37,12 @@ termimad = "0.31"
 indicatif = "0.17"
 console = "0.15"
 dialoguer = "0.11"
+axum = { version = "0.7", optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
+
+[features]
+default = []
+acp = ["axum", "tower-http"]
 
 [dev-dependencies]
 serial_test = "3.4.0"

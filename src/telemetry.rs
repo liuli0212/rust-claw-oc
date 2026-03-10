@@ -76,24 +76,20 @@ impl TelemetryExporter {
     }
 
     pub fn end_span(&self, name: &str) {
-        let _ = self.sender.try_send(TelemetryMessage::SpanEnd(
-            name.to_string(),
-            Self::now(),
-        ));
+        let _ = self
+            .sender
+            .try_send(TelemetryMessage::SpanEnd(name.to_string(), Self::now()));
     }
 
     pub fn increment_metric(&self, name: &str, value: u64) {
-        let _ = self.sender.try_send(TelemetryMessage::MetricIncr(
-            name.to_string(),
-            value,
-        ));
+        let _ = self
+            .sender
+            .try_send(TelemetryMessage::MetricIncr(name.to_string(), value));
     }
 
     pub fn record_log(&self, message: &str, ids: CorrelationIds, payload: Value) {
-        let _ = self.sender.try_send(TelemetryMessage::Log(
-            message.to_string(),
-            ids,
-            payload,
-        ));
+        let _ = self
+            .sender
+            .try_send(TelemetryMessage::Log(message.to_string(), ids, payload));
     }
 }

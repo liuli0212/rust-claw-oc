@@ -29,10 +29,9 @@ pub fn init_logging(
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("logs"));
 
-    if enable_file
-        && !log_dir.exists() {
-            fs::create_dir_all(&log_dir)?;
-        }
+    if enable_file && !log_dir.exists() {
+        fs::create_dir_all(&log_dir)?;
+    }
 
     let file_appender = tracing_appender::rolling::daily(&log_dir, "claw.log");
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);

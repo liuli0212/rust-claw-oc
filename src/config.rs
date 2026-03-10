@@ -1,4 +1,3 @@
-#![allow(warnings)]
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -8,8 +7,6 @@ use std::path::PathBuf;
 pub struct AppConfig {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
-    #[serde(default)]
-    pub default_provider: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

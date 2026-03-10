@@ -1,4 +1,3 @@
-
 use crate::evidence::Evidence;
 use crate::task_state::TaskStateSnapshot;
 
@@ -20,7 +19,7 @@ pub enum CandidateKind {
     DurableMemory,
     ToolSchema,
     TaskStateSummary,
-    Evidence(String), // Evidence ID
+    Evidence(String),    // Evidence ID
     VolatileTurn(usize), // Turn Index
     RunContext,
 }
@@ -55,7 +54,10 @@ impl ContextAssembler {
         mut active_evidence: Vec<Evidence>,
         transcript_tail: Vec<String>,
     ) -> (String, AssemblyReport) {
-        let mut report = AssemblyReport { max_tokens: self.budget, ..Default::default() };
+        let mut report = AssemblyReport {
+            max_tokens: self.budget,
+            ..Default::default()
+        };
         let mut candidates = Vec::new();
 
         // Layer 0: System and Rules (Most Stable, High Priority)
@@ -102,7 +104,7 @@ impl ContextAssembler {
                     id: ev.evidence_id.clone(),
                     kind: CandidateKind::Evidence(ev.evidence_id.clone()),
                     // Tie-breaker setup: we use retrieved_at when we sort, but for now we encode score
-                    priority_score: ev.score, 
+                    priority_score: ev.score,
                     token_cost: Self::est_tokens(&text),
                     layer: 2,
                     required: false,
@@ -142,7 +144,7 @@ impl ContextAssembler {
                 id: format!("turn_{}", i),
                 kind: CandidateKind::VolatileTurn(i),
                 // Recent turns are higher priority than older ones
-                priority_score: 100.0 + (i as f32), 
+                priority_score: 100.0 + (i as f32),
                 token_cost: Self::est_tokens(&turn),
                 layer: 4,
                 required: false,
@@ -159,8 +161,9 @@ impl ContextAssembler {
         // 1. Reserve REQUIRED items first
         let mut budget_remaining = self.budget;
         let mut final_selection = Vec::new();
-        
-        let (required, mut optional): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|c| c.required);
+
+        let (required, mut optional): (Vec<_>, Vec<_>) =
+            candidates.into_iter().partition(|c| c.required);
 
         for req in required {
             if req.token_cost <= budget_remaining {
@@ -212,9 +215,11 @@ impl ContextAssembler {
 
         let mut final_prompt = String::new();
         for (i, item) in final_selection.iter().enumerate() {
-            if i > 0 { final_prompt.push_str("\n\n"); }
+            if i > 0 {
+                final_prompt.push_str("\n\n");
+            }
             final_prompt.push_str(&item.content);
-            
+
             report.used_tokens += item.token_cost;
             if item.layer <= 3 {
                 report.stable_tokens += item.token_cost;
@@ -243,25 +248,39 @@ mod tests {
         let assembler = ContextAssembler::new(100);
 
         let active_evidence = vec![
-            Evidence::new("ev1".into(), "memory".into(), "doc1".into(), 0.9, "summary".into(), "This is a very long piece of evidence that will take up tokens...".repeat(20)),
-            Evidence::new("ev2".into(), "memory".into(), "doc2".into(), 0.1, "summary".into(), "Short evidence".into()),
+            Evidence::new(
+                "ev1".into(),
+                "memory".into(),
+                "doc1".into(),
+                0.9,
+                "summary".into(),
+                "This is a very long piece of evidence that will take up tokens...".repeat(20),
+            ),
+            Evidence::new(
+                "ev2".into(),
+                "memory".into(),
+                "doc2".into(),
+                0.1,
+                "summary".into(),
+                "Short evidence".into(),
+            ),
         ];
 
         let state = TaskStateSnapshot::empty();
 
         let (prompt, report) = assembler.assemble_prompt(
             "System Instructions",
-            "Tool Schema", 
+            "Tool Schema",
             None,
             &state,
             active_evidence,
-            vec!["Turn 1".into(), "Turn 2".into()]
+            vec!["Turn 1".into(), "Turn 2".into()],
         );
 
         // Required items should make it.
         assert!(prompt.contains("System Instructions"));
         assert!(prompt.contains("TASK STATE"));
-        
+
         // ev1 was huge but high cost, it won't fit a 100 token budget alongside Sys and State.
         // It should be evicted deterministically.
         assert!(report.evicted_items.contains(&"ev1".to_string()));
@@ -275,10 +294,22 @@ mod tests {
         let mut state = TaskStateSnapshot::empty();
         state.goal = Some("Test Ordering".into());
 
-        let ev1 = Evidence::new("ev1".into(), "memory".into(), "doc1".into(), 0.9, "summary".into(), "Evidence content".into());
+        let ev1 = Evidence::new(
+            "ev1".into(),
+            "memory".into(),
+            "doc1".into(),
+            0.9,
+            "summary".into(),
+            "Evidence content".into(),
+        );
 
         let (prompt, _) = assembler.assemble_prompt(
-            "SYS", "TOOLS", Some("DURABLE MEMORY"), &state, vec![ev1], vec!["LAST VOLATILE".into()]
+            "SYS",
+            "TOOLS",
+            Some("DURABLE MEMORY"),
+            &state,
+            vec![ev1],
+            vec!["LAST VOLATILE".into()],
         );
 
         // Verify layer sorting

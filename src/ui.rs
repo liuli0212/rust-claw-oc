@@ -16,8 +16,8 @@ impl TuiOutput {
     pub fn new() -> Self {
         let mut skin = MadSkin::default();
         skin.set_headers_fg(AnsiValue(208)); // Orange for headers
-        skin.bold.set_fg(AnsiValue(220));    // Gold for bold
-        skin.italic.set_fg(AnsiValue(245));  // Grey for italic
+        skin.bold.set_fg(AnsiValue(220)); // Gold for bold
+        skin.italic.set_fg(AnsiValue(245)); // Grey for italic
         skin.code_block.set_bg(AnsiValue(236)); // Dark grey bg for code
         skin.code_block.set_fg(AnsiValue(250)); // Light grey fg for code
         skin.inline_code.set_fg(AnsiValue(220)); // Gold for inline code
@@ -40,7 +40,7 @@ impl TuiOutput {
         );
         pb.set_message(message.to_string());
         pb.enable_steady_tick(Duration::from_millis(100));
-        
+
         let mut guard = self.spinner.lock().unwrap();
         if let Some(old_pb) = guard.replace(pb) {
             old_pb.finish_and_clear();
@@ -75,7 +75,7 @@ impl AgentOutput for TuiOutput {
 
     async fn on_text(&self, text: &str) {
         self.stop_spinner();
-        
+
         // If we were thinking, print a newline to separate from the reply
         {
             let mut thinking_guard = self.in_thinking.lock().unwrap();
@@ -86,7 +86,11 @@ impl AgentOutput for TuiOutput {
         }
 
         // Remove internal tags if any leak through
-        let clean_text = text.replace("<final>", "").replace("</final>", "").replace("<think>", "").replace("</think>", "");
+        let clean_text = text
+            .replace("<final>", "")
+            .replace("</final>", "")
+            .replace("<think>", "")
+            .replace("</think>", "");
         if clean_text.trim().is_empty() {
             return;
         }
@@ -95,7 +99,7 @@ impl AgentOutput for TuiOutput {
         if clean_text.trim_start().starts_with("[System]") {
             println!("{}", style(clean_text.trim()).cyan());
         } else if clean_text.trim_start().starts_with("[Error]") {
-             println!("{}", style(clean_text.trim()).red());
+            println!("{}", style(clean_text.trim()).red());
         } else {
             self.print_markdown(&clean_text);
         }
@@ -105,13 +109,17 @@ impl AgentOutput for TuiOutput {
         if text.trim().is_empty() {
             return;
         }
-        
+
         self.stop_spinner();
 
         {
             let mut thinking_guard = self.in_thinking.lock().unwrap();
             if !*thinking_guard {
-                println!("  {} {}", style(Emoji("🧠", "*")).cyan(), style("Thinking...").cyan().italic());
+                println!(
+                    "  {} {}",
+                    style(Emoji("🧠", "*")).cyan(),
+                    style("Thinking...").cyan().italic()
+                );
                 *thinking_guard = true;
             }
         }
@@ -119,14 +127,14 @@ impl AgentOutput for TuiOutput {
         let lines = text.lines();
         for line in lines {
             if !line.trim().is_empty() {
-                 println!("    {}", style(line.trim()).dim().italic());
+                println!("    {}", style(line.trim()).dim().italic());
             }
         }
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
         self.stop_spinner();
-        
+
         // Close thinking block if active
         {
             let mut thinking_guard = self.in_thinking.lock().unwrap();
@@ -144,7 +152,7 @@ impl AgentOutput for TuiOutput {
             "search" => "🔍",
             _ => "🔧",
         };
-        
+
         // Truncate args for display
         let display_args = if args.len() > 60 {
             format!("{}...", &args.chars().take(57).collect::<String>())
@@ -153,12 +161,12 @@ impl AgentOutput for TuiOutput {
         };
 
         println!(
-            "{} {} {}", 
-            style(tool_icon).bold(), 
-            style(name).cyan().bold(), 
+            "{} {} {}",
+            style(tool_icon).bold(),
+            style(name).cyan().bold(),
             style(format!("({})", display_args)).dim()
         );
-        
+
         self.start_spinner(&format!("Running {}...", name));
     }
 
@@ -166,33 +174,32 @@ impl AgentOutput for TuiOutput {
         self.stop_spinner();
         // Don't print full result if it's huge, just a success indicator
         let summary = if result.len() > 100 {
-            format!("{}...", &result.chars().take(80).collect::<String>().replace('\n', " "))
+            format!(
+                "{}...",
+                &result
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+                    .replace('\n', " ")
+            )
         } else {
             result.replace('\n', " ")
         };
-        
-        println!(
-            "  {} {}", 
-            style("✔").green(), 
-            style(summary).dim()
-        );
+
+        println!("  {} {}", style("✔").green(), style(summary).dim());
     }
 
     async fn on_error(&self, error: &str) {
         self.stop_spinner();
-        println!(
-            "{} {}", 
-            style("✖").red().bold(), 
-            style(error).red()
-        );
+        println!("{} {}", style("✖").red().bold(), style(error).red());
     }
-    
+
     async fn on_file(&self, path: &str) {
         self.stop_spinner();
         println!(
-             "  {} Created {}", 
-             style("VG").green(), 
-             style(path).bold().underlined()
+            "  {} Created {}",
+            style("VG").green(),
+            style(path).bold().underlined()
         );
     }
 
@@ -201,24 +208,28 @@ impl AgentOutput for TuiOutput {
             return;
         }
         self.stop_spinner();
-        
-        println!("  ╭─ {} {}", style("Plan").bold().cyan(), style("─".repeat(45)).cyan());
+
+        println!(
+            "  ╭─ {} {}",
+            style("Plan").bold().cyan(),
+            style("─".repeat(45)).cyan()
+        );
         if let Some(goal) = &state.goal {
             println!("  │ {}: {}", style("Goal").bold(), style(goal).italic());
             println!("  │");
         }
-        
+
         let mut completed = 0;
         for (i, step) in state.plan_steps.iter().enumerate() {
             let (icon, color_step) = match step.status.as_str() {
                 "completed" => {
                     completed += 1;
                     ("✅", style(&step.step).green().dim())
-                },
+                }
                 "in_progress" => ("🔄", style(&step.step).blue().bold()),
                 _ => ("⏳", style(&step.step).dim()),
             };
-            
+
             let mut line = format!("  │  {} {}. {}", icon, i + 1, color_step);
             if let Some(note) = &step.note {
                 if !note.is_empty() {
@@ -229,14 +240,23 @@ impl AgentOutput for TuiOutput {
         }
         let total = state.plan_steps.len();
         println!("  │");
-        println!("  │ {}: {}/{} completed", style("Progress").dim(), completed, total);
+        println!(
+            "  │ {}: {}/{} completed",
+            style("Progress").dim(),
+            completed,
+            total
+        );
         println!("  ╰{}", style("─".repeat(50)).cyan());
         println!();
     }
 
     async fn on_task_finish(&self, summary: &str) {
         self.stop_spinner();
-        println!("\n{} {}\n", Emoji("🎉", "*"), style("Task Completed!").green().bold());
+        println!(
+            "\n{} {}\n",
+            Emoji("🎉", "*"),
+            style("Task Completed!").green().bold()
+        );
         self.print_markdown(summary);
         println!();
     }

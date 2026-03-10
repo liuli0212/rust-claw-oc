@@ -32,17 +32,16 @@ impl TelegramOutput {
         let mut result = String::with_capacity(text.len());
         let mut chars = text.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '\x1b'
-                && chars.peek() == Some(&'[') {
-                    chars.next(); // skip '['
-                    while let Some(&nc) = chars.peek() {
-                        chars.next();
-                        if nc.is_ascii_alphabetic() {
-                            break;
-                        }
+            if c == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next(); // skip '['
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if nc.is_ascii_alphabetic() {
+                        break;
                     }
-                    continue;
                 }
+                continue;
+            }
             result.push(c);
         }
         result
@@ -137,8 +136,11 @@ impl TelegramOutput {
 
 #[async_trait]
 impl AgentOutput for TelegramOutput {
+    fn clear_waiting(&self) {}
+
     async fn on_waiting(&self, _message: &str) {
-        let _ = self.bot
+        let _ = self
+            .bot
             .send_chat_action(self.chat_id, teloxide::types::ChatAction::Typing)
             .await;
     }
@@ -191,7 +193,11 @@ impl AgentOutput for TelegramOutput {
             tracing::error!("Failed to send Telegram tool start message: {}", e);
             // Fallback to plain text
             let plain_msg = format!("🛠️ {}: {}", name, summary);
-            let _ = self.bot.send_message(self.chat_id, plain_msg).reply_markup(keyboard).await;
+            let _ = self
+                .bot
+                .send_message(self.chat_id, plain_msg)
+                .reply_markup(keyboard)
+                .await;
         }
     }
 
@@ -286,20 +292,31 @@ impl AgentOutput for TelegramOutput {
 
         let mut lines = Vec::new();
         if let Some(goal) = &state.goal {
-            lines.push(format!("🎯 *Objective*: {}", Self::escape_markdown_v2(goal)));
+            lines.push(format!(
+                "🎯 *Objective*: {}",
+                Self::escape_markdown_v2(goal)
+            ));
             lines.push(String::new());
         }
 
-        lines.push(format!("*Plan Overview* \\({}\\):", Self::escape_markdown_v2(&state.status)));
-        
+        lines.push(format!(
+            "*Plan Overview* \\({}\\):",
+            Self::escape_markdown_v2(&state.status)
+        ));
+
         for (i, step) in state.plan_steps.iter().enumerate() {
             let icon = match step.status.as_str() {
                 "completed" => "✅",
                 "in_progress" => "🔄",
                 _ => "⏳",
             };
-            
-            let mut line = format!("{} {}\\. {}", icon, i + 1, Self::escape_markdown_v2(&step.step));
+
+            let mut line = format!(
+                "{} {}\\. {}",
+                icon,
+                i + 1,
+                Self::escape_markdown_v2(&step.step)
+            );
             if let Some(note) = &step.note {
                 if !note.is_empty() {
                     line.push_str(&format!(" \\- _{}_", Self::escape_markdown_v2(note)));
@@ -313,10 +330,12 @@ impl AgentOutput for TelegramOutput {
         let mut active_msg_id = self.active_plan_message_id.lock().await;
 
         if let Some(msg_id) = *active_msg_id {
-            let res = self.bot.edit_message_text(self.chat_id, msg_id, &text)
+            let res = self
+                .bot
+                .edit_message_text(self.chat_id, msg_id, &text)
                 .parse_mode(ParseMode::MarkdownV2)
                 .await;
-            
+
             if res.is_err() {
                 *active_msg_id = None;
             } else {
@@ -324,7 +343,12 @@ impl AgentOutput for TelegramOutput {
             }
         }
 
-        if let Ok(msg) = self.bot.send_message(self.chat_id, &text).parse_mode(ParseMode::MarkdownV2).await {
+        if let Ok(msg) = self
+            .bot
+            .send_message(self.chat_id, &text)
+            .parse_mode(ParseMode::MarkdownV2)
+            .await
+        {
             *active_msg_id = Some(msg.id);
         } else {
             // Fallback to plain text, stripping escape backslashes
@@ -345,7 +369,8 @@ impl AgentOutput for TelegramOutput {
         ];
 
         let text = lines.join("\n");
-        self.send_long_message(&text, Some(ParseMode::MarkdownV2)).await;
+        self.send_long_message(&text, Some(ParseMode::MarkdownV2))
+            .await;
 
         let mut active_msg_id = self.active_plan_message_id.lock().await;
         *active_msg_id = None;
@@ -489,7 +514,7 @@ async fn handle_command(
             };
             let agent_guard = agent.lock().await;
             let details = agent_guard.get_session_details();
-            
+
             let formatted = format!(
                 "📝 *Detailed Session Diagnostics*\n\
                 ━━━━━━━━━━━━━━━━━━━━━\n\

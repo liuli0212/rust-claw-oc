@@ -82,17 +82,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let url = format!("{}/run", cli.url.trim_end_matches('/'));
             println!("🚀 Sending task to {}...", url);
             println!("📝 Task: \x1b[1;33m{}\x1b[0m", task);
-            
+
             let req_body = RunRequest {
                 task: task.clone(),
                 session_id: session.clone(),
             };
 
-            let res = client.post(&url)
-                .json(&req_body)
-                .send()
-                .await?;
-            
+            let res = client.post(&url).json(&req_body).send().await?;
+
             if !res.status().is_success() {
                 eprintln!("❌ Error: Server returned status {}", res.status());
                 return Ok(());

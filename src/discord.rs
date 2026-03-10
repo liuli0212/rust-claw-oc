@@ -27,6 +27,8 @@ impl DiscordOutput {
 
 #[async_trait]
 impl AgentOutput for DiscordOutput {
+    fn clear_waiting(&self) {}
+
     async fn on_waiting(&self, _message: &str) {
         let _ = self.channel_id.broadcast_typing(&self.ctx.http).await;
     }
@@ -100,20 +102,19 @@ impl EventHandler for Handler {
         tokio::spawn(async move {
             // Try to acquire the agent lock without blocking indefinitely.
             // If the previous task is still running, notify the user instead of silently queuing.
-            let mut agent_guard = match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                agent.lock(),
-            )
-            .await
-            {
-                Ok(guard) => guard,
-                Err(_) => {
-                    let _ = channel_id
-                        .say(&http, "⏳ Previous task is still running. Please wait or cancel it first.")
+            let mut agent_guard =
+                match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock()).await {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        let _ = channel_id
+                        .say(
+                            &http,
+                            "⏳ Previous task is still running. Please wait or cancel it first.",
+                        )
                         .await;
-                    return;
-                }
-            };
+                        return;
+                    }
+                };
 
             let _ = output.on_waiting("Processing...").await;
 

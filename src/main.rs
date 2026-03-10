@@ -1,3 +1,5 @@
+#[cfg(feature = "acp")]
+pub mod acp;
 pub mod browser;
 pub mod context_assembler;
 pub mod event_log;
@@ -21,14 +23,13 @@ mod tools;
 mod ui;
 mod utils;
 
-use crate::core::{RunExit, AgentOutput};
+use crate::core::{AgentOutput, RunExit};
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::session_manager::SessionManager;
 use crate::tools::{
-    BashTool, PatchFileTool, RagInsertTool, RagSearchTool, ReadFileTool,
-    ReadMemoryTool, SendFileTool, TavilySearchTool, WebFetchTool, WriteFileTool,
-    WriteMemoryTool,
+    BashTool, PatchFileTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool,
+    SendFileTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool,
 };
 use crate::ui::TuiOutput;
 use clap::Parser;
@@ -104,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tavily_key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
 
-    let tools: Vec<Arc<dyn tools::Tool>> = vec![
+    let mut tools: Vec<Arc<dyn tools::Tool>> = vec![
         Arc::new(BashTool::new()),
         Arc::new(WriteFileTool),
         Arc::new(ReadFileTool),
@@ -118,9 +119,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(SendFileTool),
     ];
 
+    let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+    if let Some(ref token) = telegram_token {
+        tools.push(Arc::new(tools::SendTelegramMessageTool::new(token.clone())));
+    }
+
     let session_manager = Arc::new(SessionManager::new(llm_opt, tools.clone()));
 
-    if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+    if let Some(token) = telegram_token {
         let sm = session_manager.clone();
         tokio::spawn(async move {
             telegram::run_telegram_bot(token, sm).await;
@@ -134,10 +140,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    #[cfg(feature = "acp")]
+    if let Ok(port_str) = std::env::var("ACP_PORT") {
+        if let Ok(port) = port_str.parse::<u16>() {
+            let sm = session_manager.clone();
+            tokio::spawn(async move {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                let acp_server = acp::AcpServer::new(sm);
+                if let Err(e) = acp_server.run(addr).await {
+                    tracing::error!("ACP server failed: {}", e);
+                }
+            });
+        }
+    }
+
     let mut rl = DefaultEditor::new()?;
     let output = Arc::new(TuiOutput::new());
 
-    println!("  Type {} to exit, {} for help.", style("/exit").bold(), style("/help").bold());
+    println!(
+        "  Type {} to exit, {} for help.",
+        style("/exit").bold(),
+        style("/help").bold()
+    );
     println!();
 
     let sm_clone = session_manager.clone();
@@ -151,7 +175,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let task_store_check_cli = crate::task_state::TaskStateStore::new("cli");
     if task_store_check_cli.has_active_plan() {
-        println!("  {} Task plan active. Use {} to abort.", style("ℹ").blue(), style("/cancel_task").bold());
+        println!(
+            "  {} Task plan active. Use {} to abort.",
+            style("ℹ").blue(),
+            style("/cancel_task").bold()
+        );
     }
 
     let mut ctrl_c_count = 0;
@@ -173,7 +201,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!();
                     println!("  {}", style("Available Commands:").bold());
                     println!("  {}  - Start a fresh session", style("/new").green());
-                    println!("  {} - Cancel current API request", style("/cancel").yellow());
+                    println!(
+                        "  {} - Cancel current API request",
+                        style("/cancel").yellow()
+                    );
                     println!("  {} - Abort active task plan", style("/cancel_task").red());
                     println!("  {} - Show model usage", style("/status").cyan());
                     println!("  {} - Switch models", style("/model").magenta());
@@ -209,8 +240,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let agent_guard = agent.lock().await;
                     let (provider, model, tokens, max_tokens) = agent_guard.get_status();
                     let percentage = (tokens as f64 / max_tokens as f64) * 100.0;
-                    println!("  {} Provider: {}, Model: {}, Context: {}/{} tokens ({:.1}%)", 
-                        style("📊").cyan(), provider, model, tokens, max_tokens, percentage);
+                    println!(
+                        "  {} Provider: {}, Model: {}, Context: {}/{} tokens ({:.1}%)",
+                        style("📊").cyan(),
+                        provider,
+                        model,
+                        tokens,
+                        max_tokens,
+                        percentage
+                    );
                     continue;
                 }
                 if line == "/session" {
@@ -221,8 +259,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("    (No sessions found)");
                     } else {
                         for (id, updated, turns) in sessions {
-                            let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(updated);
-                            let datetime: chrono::DateTime<chrono::Local> = chrono::DateTime::from(time);
+                            let time =
+                                std::time::UNIX_EPOCH + std::time::Duration::from_secs(updated);
+                            let datetime: chrono::DateTime<chrono::Local> =
+                                chrono::DateTime::from(time);
                             println!(
                                 "    {} - {} (Turns: {}, Last Updated: {})",
                                 style("•").cyan(),
@@ -295,26 +335,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
                             if let Ok(json_str) = serde_json::to_string_pretty(&dump_data) {
                                 if std::fs::write("debug_context.json", json_str).is_ok() {
-                                    println!("  {} Context dumped to debug_context.json", style("✔").green());
+                                    println!(
+                                        "  {} Context dumped to debug_context.json",
+                                        style("✔").green()
+                                    );
                                 } else {
-                                    println!("  {} Failed to write debug_context.json", style("✖").red());
+                                    println!(
+                                        "  {} Failed to write debug_context.json",
+                                        style("✖").red()
+                                    );
                                 }
                             }
                         }
                         "compact" => {
                             println!("  {} Attempting manual compaction...", style("⚙").yellow());
                             match agent_guard.maybe_compact_history(true).await {
-                                Ok(_) => println!("  {} Compaction attempt finished.", style("✔").green()),
-                                Err(e) => println!("  {} Compaction failed: {}", style("❌").red(), e),
+                                Ok(_) => println!(
+                                    "  {} Compaction attempt finished.",
+                                    style("✔").green()
+                                ),
+                                Err(e) => {
+                                    println!("  {} Compaction failed: {}", style("❌").red(), e)
+                                }
                             }
                         }
                         _ => {
                             let stats = agent_guard.get_detailed_stats();
                             let pct = (stats.total as f64 / stats.max as f64) * 100.0;
-                            println!("  {} {}/{} tokens ({:.1}%)", style("Context Usage").bold().cyan(), stats.total, stats.max, pct);
+                            println!(
+                                "  {} {}/{} tokens ({:.1}%)",
+                                style("Context Usage").bold().cyan(),
+                                stats.total,
+                                stats.max,
+                                pct
+                            );
                             println!("  Identity: {} | Runtime: {} | Custom: {} | Plan: {} | Project: {} | Memory: {} | History: {} | Current: {}", 
                                 stats.system_static, stats.system_runtime, stats.system_custom, stats.system_task_plan, stats.system_project, stats.memory, stats.history, stats.current_turn);
-                            println!("  Use {} for deep dive or {} to see changes.", style("/context audit").bold(), style("/context diff").bold());
+                            println!(
+                                "  Use {} for deep dive or {} to see changes.",
+                                style("/context audit").bold(),
+                                style("/context diff").bold()
+                            );
                         }
                     }
                     continue;
@@ -323,12 +384,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if line.starts_with("/model") {
                     let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() < 2 {
-                        println!("  {} Usage: /model <provider> [model_name]", style("ℹ").blue());
+                        println!(
+                            "  {} Usage: /model <provider> [model_name]",
+                            style("ℹ").blue()
+                        );
                         continue;
                     }
                     let provider = parts[1];
                     let model = parts.get(2).map(|s| s.to_string());
-                    match session_manager.update_session_llm("cli", provider, model).await {
+                    match session_manager
+                        .update_session_llm("cli", provider, model)
+                        .await
+                    {
                         Ok(msg) => println!("  {} {}", style("✔").green(), msg),
                         Err(e) => println!("  {} Error updating model: {}", style("❌").red(), e),
                     }
@@ -371,7 +438,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         RunExit::AgentTurnLimitReached => {
                             println!("\n  {}", style("Turn Limit Reached").yellow());
-                            println!("  The agent reached the maximum allowed consecutive actions.");
+                            println!(
+                                "  The agent reached the maximum allowed consecutive actions."
+                            );
                             println!("  👉 Action required: Review recent actions. If on track, type {} to proceed.", style("continue").green());
                         }
                         RunExit::ContextLimitReached => {

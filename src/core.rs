@@ -14,7 +14,9 @@ pub struct ScopeGuard<F: FnOnce()> {
 
 impl<F: FnOnce()> ScopeGuard<F> {
     pub fn new(closure: F) -> Self {
-        Self { closure: Some(closure) }
+        Self {
+            closure: Some(closure),
+        }
     }
 }
 
@@ -149,7 +151,10 @@ impl AgentLoop {
 
     pub fn get_session_details(&self) -> serde_json::Value {
         let (tokens, max_tokens, turns, system_tokens, _) = self.context.get_context_status();
-        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        let state = self
+            .task_state_store
+            .load()
+            .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
         serde_json::json!({
             "session_id": self.session_id,
             "provider": self.llm.provider_name(),
@@ -213,8 +218,11 @@ impl AgentLoop {
     pub fn build_llm_payload(
         &self,
     ) -> (Vec<Message>, Option<Message>, crate::context::PromptReport) {
-        let state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
-        let max_tokens = self.context.max_history_tokens; 
+        let state = self
+            .task_state_store
+            .load()
+            .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        let max_tokens = self.context.max_history_tokens;
         let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
         self.context.build_llm_payload(&state, &assembler)
     }
@@ -376,16 +384,22 @@ impl AgentLoop {
         self.context.start_turn(goal.clone());
 
         // Init Task state — new task always clears old incomplete plans
-        let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
-        
+        let mut state = self
+            .task_state_store
+            .load()
+            .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+
         if state.status == "in_progress" {
             // New user command arrived while old task still in progress — auto-clear
             tracing::info!("Auto-clearing previous in_progress task plan for new goal");
             state = crate::task_state::TaskStateSnapshot::empty();
         }
 
-        let current_task_id = state.task_id.clone().unwrap_or_else(|| format!("tsk_{}", uuid::Uuid::new_v4().simple()));
-        
+        let current_task_id = state
+            .task_id
+            .clone()
+            .unwrap_or_else(|| format!("tsk_{}", uuid::Uuid::new_v4().simple()));
+
         if state.status == "initialized" || state.status == "empty" {
             state.task_id = Some(current_task_id.clone());
             state.status = "in_progress".to_string();
@@ -398,7 +412,11 @@ impl AgentLoop {
         let c_ids = crate::schema::CorrelationIds {
             session_id: self.session_id.clone(),
             task_id: Some(current_task_id.clone()),
-            turn_id: self.context.current_turn.as_ref().map(|t| t.turn_id.clone()),
+            turn_id: self
+                .context
+                .current_turn
+                .as_ref()
+                .map(|t| t.turn_id.clone()),
             event_id: None,
         };
         self.telemetry.start_span("agent_step", c_ids.clone());
@@ -421,7 +439,7 @@ impl AgentLoop {
                     "Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.",
                     Self::MAX_ITERATIONS
                 );
-                
+
                 self.output.flush().await;
                 self.context.end_turn();
                 return Ok(RunExit::AgentTurnLimitReached);
@@ -434,7 +452,7 @@ impl AgentLoop {
                 self.output
                     .on_text("[System] Energy depleted. Stopping to prevent infinite loops.")
                     .await;
-                
+
                 self.output.flush().await;
                 self.context.end_turn();
                 return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
@@ -447,7 +465,7 @@ impl AgentLoop {
 
             // Build cache-aware prompt using ContextAssembler
             // In a real advanced setup, ContextAssembler budget would be dynamic based on LLM size
-            let max_tokens = self.context.max_history_tokens; 
+            let max_tokens = self.context.max_history_tokens;
             let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
             let (messages, system, _) = self.context.build_llm_payload(&state, &assembler);
 
@@ -502,24 +520,24 @@ impl AgentLoop {
                                     }
                                 }
                                 _ = self.cancel_token.notified() => {
-                                    
+
                                     break Err(RunExit::StoppedByUser);
                                 }
                             }
                         };
 
                         if let Err(exit) = stream_loop_res {
-                        self.output.flush().await;
-                        self.context.end_turn();
-                        return Ok(exit);
+                            self.output.flush().await;
+                            self.context.end_turn();
+                            return Ok(exit);
                         }
 
                         break current_turn_text;
                     }
                     Err(e) => {
                         if !self.handle_llm_error(&e, llm_attempts).await {
-                        self.output.flush().await;
-                        return Err(Box::new(e));
+                            self.output.flush().await;
+                            return Err(Box::new(e));
                         }
                     }
                 }
@@ -598,9 +616,9 @@ impl AgentLoop {
                         }
                     }
                     self.context.end_turn();
-                    
+
                     self.output.on_task_finish(&summary).await;
-                    
+
                     self.telemetry.end_span("agent_step");
                     return Ok(RunExit::Finished(summary));
                 }
@@ -655,7 +673,9 @@ impl AgentLoop {
                                     result.clone(),
                                 );
                                 // Maintain a clean state: remove older versions of the same file
-                                self.context.active_evidence.retain(|e| e.source_kind != "file" || e.source_path != path_val);
+                                self.context.active_evidence.retain(|e| {
+                                    e.source_kind != "file" || e.source_path != path_val
+                                });
                                 self.context.active_evidence.push(evidence);
                             }
                         }
@@ -669,29 +689,53 @@ impl AgentLoop {
                         if let Some(obj) = call.args.as_object() {
                             if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
                                 let cmd_trim = cmd.trim();
-                                let is_diagnostic = cmd_trim.contains("cargo ") || cmd_trim.contains("npm run") || cmd_trim.contains("pytest") || cmd_trim.contains("tsc") || cmd_trim.contains("make");
-                                let is_dir_list = cmd_trim.starts_with("ls ") || cmd_trim == "ls" || cmd_trim.starts_with("tree ") || cmd_trim == "tree" || cmd_trim.starts_with("find ");
+                                let is_diagnostic = cmd_trim.contains("cargo ")
+                                    || cmd_trim.contains("npm run")
+                                    || cmd_trim.contains("pytest")
+                                    || cmd_trim.contains("tsc")
+                                    || cmd_trim.contains("make");
+                                let is_dir_list = cmd_trim.starts_with("ls ")
+                                    || cmd_trim == "ls"
+                                    || cmd_trim.starts_with("tree ")
+                                    || cmd_trim == "tree"
+                                    || cmd_trim.starts_with("find ");
 
                                 if is_diagnostic || is_dir_list {
-                                    let kind = if is_diagnostic { "diagnostic" } else { "directory" };
-                                    let source_path = if is_diagnostic { "workspace_state" } else { cmd_trim };
-                                    let evidence_id = format!("{}_{}", kind, uuid::Uuid::new_v4().simple());
-                                    
+                                    let kind = if is_diagnostic {
+                                        "diagnostic"
+                                    } else {
+                                        "directory"
+                                    };
+                                    let source_path = if is_diagnostic {
+                                        "workspace_state"
+                                    } else {
+                                        cmd_trim
+                                    };
+                                    let evidence_id =
+                                        format!("{}_{}", kind, uuid::Uuid::new_v4().simple());
+
                                     let evidence = crate::evidence::Evidence::new(
                                         evidence_id.clone(),
                                         kind.to_string(),
                                         source_path.to_string(),
                                         1.0,
-                                        format!("Bash snapshot: {}", cmd_trim).chars().take(200).collect(),
+                                        format!("Bash snapshot: {}", cmd_trim)
+                                            .chars()
+                                            .take(200)
+                                            .collect(),
                                         final_result.clone(),
                                     );
-                                    
+
                                     if is_dir_list {
-                                        self.context.active_evidence.retain(|e| e.source_kind != kind || e.source_path != source_path);
+                                        self.context.active_evidence.retain(|e| {
+                                            e.source_kind != kind || e.source_path != source_path
+                                        });
                                     } else {
-                                        self.context.active_evidence.retain(|e| e.source_kind != kind);
+                                        self.context
+                                            .active_evidence
+                                            .retain(|e| e.source_kind != kind);
                                     }
-                                    
+
                                     self.context.active_evidence.push(evidence);
                                 }
                             }
@@ -721,7 +765,10 @@ impl AgentLoop {
                 });
             }
 
-            let state_after_tools = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+            let state_after_tools = self
+                .task_state_store
+                .load()
+                .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
             if state_before_tools != state_after_tools {
                 self.output.on_plan_update(&state_after_tools).await;
             }
@@ -730,7 +777,12 @@ impl AgentLoop {
             // Impose limits on extremely large tool results that might explode the context window
             let truncated = self.context.truncate_current_turn_tool_results(30000);
             if truncated > 0 {
-                let current_turn_id = self.context.current_turn.as_ref().map(|t| t.turn_id.as_str()).unwrap_or("unknown");
+                let current_turn_id = self
+                    .context
+                    .current_turn
+                    .as_ref()
+                    .map(|t| t.turn_id.as_str())
+                    .unwrap_or("unknown");
                 tracing::warn!("Turn {} tool results had {} oversized part(s) automatically truncated to save memory bounds.", current_turn_id, truncated);
             }
 

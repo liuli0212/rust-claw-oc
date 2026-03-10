@@ -188,7 +188,7 @@ impl AgentContext {
         }
 
         // 4. Task Plan
-        // Deprecated: the task plan is now loaded via context assembler dynamically from events. 
+        // Deprecated: the task plan is now loaded via context assembler dynamically from events.
         // We leave the block stubbed here for structural layout compat in build_prompt_sections if any other code relied on length.
         // 5. Project Context
         // [P1-1.4 Fix] Task Planning instruction only injected when NO active plan exists
@@ -1428,13 +1428,17 @@ impl AgentContext {
 
         let mut system_static = Vec::new();
         system_static.push(self.system_prompts.join("\n\n"));
-        
-        let mut runtime = format!("OS: {}\nArchitecture: {}\n", std::env::consts::OS, std::env::consts::ARCH);
+
+        let mut runtime = format!(
+            "OS: {}\nArchitecture: {}\n",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
         if let Ok(dir) = std::env::current_dir() {
             runtime.push_str(&format!("Current Directory: {}\n", dir.display()));
         }
         system_static.push(format!("## Runtime Environment\n{}", runtime));
-        
+
         if let Ok(custom) = fs::read_to_string(".claw_prompt.md") {
             system_static.push(format!("## Custom Instructions\n{}", custom));
         }
@@ -1451,7 +1455,7 @@ impl AgentContext {
             project_context.push_str("\n\n");
         }
         system_static.push(format!("## Project Context\n{}", project_context));
-        
+
         let durable_memory = fs::read_to_string("MEMORY.md").ok();
 
         let mut active_evidence = self.active_evidence.clone();
@@ -1469,11 +1473,11 @@ impl AgentContext {
         // We leverage native LLM tools array, so tool_schemas text is omitted or simplified
         let (assembled_system_text, report_data) = assembler.assemble_prompt(
             &system_static.join("\n\n"),
-            "", 
+            "",
             durable_memory.as_deref(),
             task_state,
             active_evidence,
-            Vec::new() // Not passing transcript tail flatly as we pass via Vec<Message> to preserve function APIs
+            Vec::new(), // Not passing transcript tail flatly as we pass via Vec<Message> to preserve function APIs
         );
 
         let system_msg = Message {
@@ -1488,7 +1492,7 @@ impl AgentContext {
 
         let system_prompt_tokens = report_data.used_tokens;
         let retrieved_memory_snippets = self.retrieved_memory_sources.len();
-        
+
         // The stats are slightly approximated since we delegated to Assembler
         let report = PromptReport {
             max_history_tokens: self.max_history_tokens,

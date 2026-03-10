@@ -1,9 +1,13 @@
 #[cfg(feature = "acp")]
+use crate::core::AgentOutput;
+#[cfg(feature = "acp")]
+use crate::session_manager::SessionManager;
+#[cfg(feature = "acp")]
 use axum::{
-    extract::{State},
+    extract::State,
+    response::Html,
     routing::{get, post},
     Json, Router,
-    response::Html,
 };
 #[cfg(feature = "acp")]
 use serde::{Deserialize, Serialize};
@@ -11,10 +15,6 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 #[cfg(feature = "acp")]
 use std::sync::Arc;
-#[cfg(feature = "acp")]
-use crate::session_manager::SessionManager;
-#[cfg(feature = "acp")]
-use crate::core::AgentOutput;
 
 #[cfg(feature = "acp")]
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,7 +57,10 @@ impl AcpServer {
         Self { session_manager }
     }
 
-    pub async fn run(self, addr: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn run(
+        self,
+        addr: SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let app = Router::new()
             .route("/", get(handle_index))
             .route("/capabilities", get(handle_capabilities))
@@ -73,7 +76,8 @@ impl AcpServer {
 
 #[cfg(feature = "acp")]
 async fn handle_index() -> Html<&'static str> {
-    Html(r#"
+    Html(
+        r#"
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -299,7 +303,8 @@ async fn handle_index() -> Html<&'static str> {
     </script>
 </body>
 </html>
-    "#)
+    "#,
+    )
 }
 
 #[cfg(feature = "acp")]
@@ -307,9 +312,9 @@ async fn handle_capabilities(
     State(server): State<Arc<AcpServer>>,
 ) -> Json<AcpCapabilitiesResponse> {
     let mut caps = Vec::new();
-    
+
     // Get tools from session manager
-    for tool in &server.session_manager.tools {
+    for tool in server.session_manager.tools() {
         caps.push(AcpCapability {
             name: tool.name().to_string(),
             description: tool.description().to_string(),
@@ -344,6 +349,7 @@ struct AcpOutput {
 #[async_trait::async_trait]
 impl AgentOutput for AcpOutput {
     async fn on_waiting(&self, _message: &str) {}
+    fn clear_waiting(&self) {}
     async fn on_text(&self, text: &str) {
         let mut b = self.buffer.lock().unwrap();
         b.push_str(text);
@@ -362,12 +368,19 @@ async fn handle_run(
     State(server): State<Arc<AcpServer>>,
     Json(req): Json<AcpRunRequest>,
 ) -> Json<AcpRunResponse> {
-    let session_id = req.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_id = req
+        .session_id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let buffer = Arc::new(std::sync::Mutex::new(String::new()));
-    let output = Arc::new(AcpOutput { buffer: buffer.clone() });
+    let output = Arc::new(AcpOutput {
+        buffer: buffer.clone(),
+    });
 
-    let agent_res = server.session_manager.get_or_create_session(&session_id, output).await;
-    
+    let agent_res = server
+        .session_manager
+        .get_or_create_session(&session_id, output)
+        .await;
+
     match agent_res {
         Ok(agent_mutex) => {
             let mut agent = agent_mutex.lock().await;
@@ -380,22 +393,18 @@ async fn handle_run(
                         output: final_output,
                     })
                 }
-                Err(e) => {
-                    Json(AcpRunResponse {
-                        session_id,
-                        status: "Error".to_string(),
-                        output: e.to_string(),
-                    })
-                }
+                Err(e) => Json(AcpRunResponse {
+                    session_id,
+                    status: "Error".to_string(),
+                    output: e.to_string(),
+                }),
             }
         }
-        Err(e) => {
-            Json(AcpRunResponse {
-                session_id,
-                status: "SessionCreationFailed".to_string(),
-                output: e,
-            })
-        }
+        Err(e) => Json(AcpRunResponse {
+            session_id,
+            status: "SessionCreationFailed".to_string(),
+            output: e,
+        }),
     }
 }
 
@@ -403,8 +412,13 @@ async fn handle_run(
 pub struct AcpServer;
 #[cfg(not(feature = "acp"))]
 impl AcpServer {
-    pub fn new(_: std::sync::Arc<crate::session_manager::SessionManager>) -> Self { Self }
-    pub async fn run(self, _: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(_: std::sync::Arc<crate::session_manager::SessionManager>) -> Self {
+        Self
+    }
+    pub async fn run(
+        self,
+        _: std::net::SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err("ACP feature not enabled".into())
     }
 }

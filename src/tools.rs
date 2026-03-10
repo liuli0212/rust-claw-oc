@@ -491,7 +491,7 @@ impl Tool for RagSearchTool {
             return Ok(serde_json::json!({"status": "No relevant information found in the knowledge base."}).to_string());
         }
 
-        // Return structured evidence array, LLM understands JSON directly 
+        // Return structured evidence array, LLM understands JSON directly
         // and we fulfill the requirement: "return structured evidence objects instead of text-only tuples"
         Ok(serde_json::to_string_pretty(&results).unwrap_or_else(|_| "[]".to_string()))
     }
@@ -937,9 +937,12 @@ impl Tool for TaskPlanTool {
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
         let action = parsed.action.trim().to_lowercase();
-        
-        let mut state = self.task_state_store.load().unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
-        
+
+        let mut state = self
+            .task_state_store
+            .load()
+            .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+
         // Ensure task has a defined ID and in_progress status
         if state.task_id.is_none() {
             state.task_id = Some(format!("tsk_{}", uuid::Uuid::new_v4().simple()));
@@ -976,14 +979,17 @@ impl Tool for TaskPlanTool {
                         state.plan_steps[index].note = Some(note);
                     }
                 } else {
-                    return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Index {} out of bounds",
+                        index
+                    )));
                 }
             }
             "update_text" => {
                 let index = parsed.index.ok_or_else(|| {
                     ToolError::InvalidArguments("update_text requires 'index'".to_string())
                 })?;
-                
+
                 if index < state.plan_steps.len() {
                     if let Some(step) = parsed.step {
                         state.plan_steps[index].step = step;
@@ -992,7 +998,10 @@ impl Tool for TaskPlanTool {
                         state.plan_steps[index].note = Some(note);
                     }
                 } else {
-                    return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Index {} out of bounds",
+                        index
+                    )));
                 }
             }
             "update_goal" => {
@@ -1008,7 +1017,10 @@ impl Tool for TaskPlanTool {
                 if index < state.plan_steps.len() {
                     state.plan_steps.remove(index);
                 } else {
-                    return Err(ToolError::ExecutionFailed(format!("Index {} out of bounds", index)));
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Index {} out of bounds",
+                        index
+                    )));
                 }
             }
             _ => {
@@ -1018,7 +1030,7 @@ impl Tool for TaskPlanTool {
                 )));
             }
         }
-        
+
         let _ = self.task_state_store.save(&state);
 
         let output = if let Ok(state) = self.task_state_store.load() {
@@ -1104,7 +1116,7 @@ impl Tool for FinishTaskTool {
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
         let parsed: FinishTaskArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        
+
         // Mark the global task state as completed
         if let Ok(mut state) = self.task_state_store.load() {
             if state.status == "in_progress" {
@@ -1144,5 +1156,86 @@ mod tests {
         assert_eq!(content, "Line 1\nLine 2 edited\nLine 3\n");
 
         std::fs::remove_file(test_file).unwrap();
+    }
+}
+
+// --- Telegram Tools ---
+pub struct SendTelegramMessageTool {
+    pub bot_token: String,
+    client: reqwest::Client,
+}
+
+impl SendTelegramMessageTool {
+    pub fn new(bot_token: String) -> Self {
+        Self {
+            bot_token,
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct SendTelegramMessageArgs {
+    /// The target Telegram Chat ID (numeric, e.g., "8578308394")
+    pub chat_id: String,
+    /// The message text to send (max 4096 chars)
+    pub text: String,
+}
+
+#[async_trait]
+impl Tool for SendTelegramMessageTool {
+    fn name(&self) -> String {
+        "send_telegram_message".to_string()
+    }
+    fn description(&self) -> String {
+        "Sends a direct Telegram message to a specific chat ID. Useful for notifications from external triggers.".to_string()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(SendTelegramMessageArgs)).unwrap())
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: SendTelegramMessageArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        // Validate chat_id is numeric
+        if !parsed
+            .chat_id
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-')
+        {
+            return Err(ToolError::InvalidArguments(
+                "chat_id must be a numeric Telegram chat ID".to_string(),
+            ));
+        }
+
+        // Validate text length (Telegram max is 4096)
+        if parsed.text.len() > 4096 {
+            return Err(ToolError::InvalidArguments(
+                "message text exceeds Telegram's 4096 character limit".to_string(),
+            ));
+        }
+
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
+        let resp = self
+            .client
+            .post(&url)
+            .form(&[("chat_id", &parsed.chat_id), ("text", &parsed.text)])
+            .send()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Network error: {}", e)))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            Ok(format!(
+                "Message successfully sent to Telegram chat ID {}",
+                parsed.chat_id
+            ))
+        } else {
+            let err_body = resp.text().await.unwrap_or_default();
+            Err(ToolError::ExecutionFailed(format!(
+                "Telegram API error ({}): {}",
+                status, err_body
+            )))
+        }
     }
 }

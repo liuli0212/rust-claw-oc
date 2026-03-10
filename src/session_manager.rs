@@ -1,4 +1,3 @@
-#![allow(warnings)]
 use crate::context::{transcript_path_for_session, AgentContext};
 use crate::core::{AgentLoop, AgentOutput};
 use crate::llm_client::LlmClient;
@@ -9,6 +8,17 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
+
+type SessionEntryMap = AsyncMutex<
+    HashMap<
+        String,
+        (
+            Arc<AsyncMutex<AgentLoop>>,
+            std::sync::Arc<tokio::sync::Notify>,
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ),
+    >,
+>;
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 struct SessionRegistry {
@@ -26,16 +36,7 @@ pub struct SessionManager {
     llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     tools: Vec<Arc<dyn Tool>>,
     // Active agent sessions (In-Memory) + their cancel mechanisms
-    sessions: AsyncMutex<
-        HashMap<
-            String,
-            (
-                Arc<AsyncMutex<AgentLoop>>,
-                std::sync::Arc<tokio::sync::Notify>,
-                std::sync::Arc<std::sync::atomic::AtomicBool>,
-            ),
-        >,
-    >,
+    sessions: SessionEntryMap,
     transcript_dir: PathBuf,
     registry_path: PathBuf,
     // In-Memory Registry Cache (Fast Read/Write)
@@ -109,7 +110,7 @@ impl SessionManager {
 
         if let Some(agent_mutex) = existing {
             let mut agent = agent_mutex.lock().await;
-            
+
             // Flush any trapped text in the old buffer before dropping it
             agent.flush_output().await;
 
@@ -130,9 +131,12 @@ impl SessionManager {
 
         let llm = {
             let llm_guard = self.llm.read().unwrap();
-            llm_guard.as_ref().ok_or_else(|| {
-                "No LLM provider configured. Use /model <provider> to set one.".to_string()
-            })?.clone()
+            llm_guard
+                .as_ref()
+                .ok_or_else(|| {
+                    "No LLM provider configured. Use /model <provider> to set one.".to_string()
+                })?
+                .clone()
         };
 
         let (telemetry, _telemetry_handle) = crate::telemetry::TelemetryExporter::new();
@@ -162,7 +166,7 @@ impl SessionManager {
         let token = agent_loop.cancel_token.clone();
         let cancelled = agent_loop.cancelled.clone();
         let agent = Arc::new(AsyncMutex::new(agent_loop));
-        
+
         let mut sessions = self.sessions.lock().await;
         sessions.insert(session_id.to_string(), (agent.clone(), token, cancelled));
         Ok(agent)
@@ -246,6 +250,11 @@ impl SessionManager {
             }
             Err(e) => Err(e),
         }
+    }
+
+    #[cfg(feature = "acp")]
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
     }
 
     pub fn list_sessions(&self) -> Vec<(String, u64, usize)> {

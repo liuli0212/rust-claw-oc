@@ -24,6 +24,7 @@ This project is a Rust-native implementation of an AI agent, closely following t
   - **Phase 2 (Execution Engineer):** Executes the plan turn-by-turn with full project context (AGENTS.md, README, Environment) and autonomous tool usage.
 - **🔌 Multi-Platform & Session Management:**
   - **Isolated Sessions:** Concurrent execution across CLI, Telegram, and Discord, with strict state and context isolation per user/chat.
+  - **🌐 ACP Protocol Support:** Optional Agent Communication Protocol (ACP) compatibility layer for inter-agent collaboration.
   - **Live Dashboards:** Real-time bordered TUI task checklists for CLI, and live-updating dashboard messages (via `edit_message_text`) for Telegram.
   - **Providers:** Supports Google Gemini, Aliyun Qwen, and any OpenAI-compatible API (DeepSeek, LocalAI, vLLM).
 - **🛡️ Active Context Curation:**
@@ -39,6 +40,14 @@ This project is a Rust-native implementation of an AI agent, closely following t
 - **🌐 Full-Featured Browser Automation:**
   - **Persistent Session:** Keeps a browser instance across turns for complex workflows like login, navigation, and extraction.
   - **See-Act Loop:** Uses `snapshot` to parse DOM into JSON and `act` to interact with elements using stable IDs.
+
+## 📈 Project Status
+
+Rusty-Claw is currently in active development. Recent stabilization efforts include:
+- **Core Stability**: Fixed critical scoping issues in the LLM streaming client and synchronized tool initialization logic.
+- **Environment**: Verified and optimized for high-performance execution on **Ubuntu 24.04 LTS** with modern Intel hardware.
+- **Code Quality**: Ongoing effort to achieve zero-warning compilation via strict `clippy` audits and dead-code elimination.
+- **Current Version**: `0.1.0` (Alpha)
 
 ## 📊 Claw-Context Profiler
 
@@ -70,7 +79,8 @@ Rusty-Claw comes equipped with a comprehensive suite of engineering tools:
 | | `web_fetch` | Fetch webpages and convert HTML to Markdown. |
 | **Planning** | `task_plan` | Manage session-specific structured task plans (update goals, add/complete steps). |
 | **Memory** | `rag_search` | Semantic search over the project's vector database. |
-| | `rag_insert` | Index new knowledge into long-term memory. |,
+| | `rag_insert` | Index new knowledge into long-term memory. |
+
 ## 🛠️ Setup & Configuration
 
 ### Prerequisites
@@ -101,7 +111,11 @@ TAVILY_API_KEY=tvly-xxxxxxxx
 # Chat Platform Bots
 TELEGRAM_BOT_TOKEN=12345:abcdef...
 DISCORD_BOT_TOKEN=MTAw...
+
+# ACP Server (Optional)
+ACP_PORT=8080
 ```
+
 ### 3. Configuration (Optional)
 You can configure providers using a `config.toml` file in the current directory or `~/.config/rusty-claw/config.toml`.
 
@@ -129,6 +143,14 @@ model = "qwen3.5-plus"
 - `/new`: Clear current session context and start fresh.
 - `exit`: Quit the application.
 - `/context dump`: Export current context to JSON for analysis.
+
+**ACP Server Support:**
+To enable the Agent Communication Protocol (ACP) server:
+1. Build with the `acp` feature: `cargo build --features acp`
+2. Set the `ACP_PORT` environment variable:
+```bash
+ACP_PORT=8080 cargo run --features acp
+```
 
 **Runtime Tuning (Advanced):**
 ```env

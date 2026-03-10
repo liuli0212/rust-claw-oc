@@ -253,8 +253,7 @@ impl GeminiClient {
     pub fn new_with_window(
         api_key: String,
         model_name: Option<String>,
-        #[allow(dead_code)]
-    context_window: usize,
+        #[allow(dead_code)] context_window: usize,
         provider_name: String,
     ) -> Self {
         Self {
@@ -733,8 +732,7 @@ impl OpenAiCompatClient {
         base_url: String,
         model_name: String,
         provider_name: String,
-        #[allow(dead_code)]
-    context_window: usize,
+        #[allow(dead_code)] context_window: usize,
     ) -> Self {
         Self {
             api_key,
