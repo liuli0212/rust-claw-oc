@@ -598,7 +598,8 @@ impl AgentContext {
     fn strip_thinking_tags(text: &str) -> String {
         let mut result = text.to_string();
         while let Some(start) = result.find("<think>") {
-            if let Some(end) = result.find("</think>") {
+            if let Some(end_offset) = result[start..].find("</think>") {
+                let end = start + end_offset;
                 let before = &result[..start];
                 let after = &result[end + 8..]; // 8 is len of </think>
                 result = format!("{}{}", before, after);
@@ -747,13 +748,10 @@ impl AgentContext {
     fn reconstruct_turn_for_history(turn: &Turn) -> (Turn, usize) {
         let mut new_messages = Vec::new();
 
-        println!("      [Reconstruct] processing {} messages", turn.messages.len());
-        for (m_idx, msg) in turn.messages.iter().enumerate() {
-            println!("      [Reconstruct msg {}] {} parts", m_idx, msg.parts.len());
+        for msg in &turn.messages {
             let mut new_parts = Vec::new();
 
-            for (p_idx, part) in msg.parts.iter().enumerate() {
-                println!("        [Reconstruct part {}]", p_idx);
+            for part in &msg.parts {
                 let mut new_part = Part {
                     text: None,
                     function_call: None,
@@ -763,7 +761,6 @@ impl AgentContext {
 
                 // 1. Function Call (Action) - KEEP (but strip task_plan args)
                 if let Some(fc) = &part.function_call {
-                    println!("          - function_call: {}", fc.name);
                     if fc.name == "task_plan" {
                         // For task_plan, only keep the action to save tokens
                         let action = fc
@@ -781,7 +778,6 @@ impl AgentContext {
 
                 // 2. Function Response (Result) - KEEP (Stripped)
                 if let Some(fr) = &part.function_response {
-                    println!("          - function_response: {}", fr.name);
                     let mut stripped_fr = fr.clone();
                     Self::strip_response_payload(&mut stripped_fr);
                     new_part.function_response = Some(stripped_fr);
@@ -789,7 +785,6 @@ impl AgentContext {
 
                 // 3. Text (Intent/Reply) - SELECTIVE KEEP
                 if let Some(text) = &part.text {
-                    println!("          - text (len: {})", text.len());
                     if msg.role == "user" {
                         // User text: Keep, but clean system tags
                         let mut cleaned_text = text.clone();
@@ -807,9 +802,7 @@ impl AgentContext {
                     } else if msg.role == "model" {
                         // Model text: Only keep if NO function call, and strip <think>
                         if new_part.function_call.is_none() {
-                            println!("          - stripping think tags for model text...");
                             let cleaned = Self::strip_thinking_tags(text);
-                            println!("          - think stripping done.");
                             if !cleaned.is_empty() {
                                 new_part.text = Some(cleaned);
                             }
