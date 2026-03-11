@@ -100,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // [OOM-TEST] Temporarily disabled to isolate memory leak
     let vector_store = Arc::new(VectorStore::new()?);
     let workspace_memory = Arc::new(WorkspaceMemory::new("."));
 
@@ -112,6 +113,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(PatchFileTool),
         Arc::new(TavilySearchTool::new(tavily_key)),
         Arc::new(WebFetchTool::new()),
+        // [OOM-TEST] Temporarily disabled to isolate memory leak
         Arc::new(RagSearchTool::new(vector_store.clone())),
         Arc::new(RagInsertTool::new(vector_store.clone())),
         Arc::new(ReadMemoryTool::new(workspace_memory.clone())),

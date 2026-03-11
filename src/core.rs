@@ -89,7 +89,7 @@ pub struct AgentLoop {
     session_id: String,
     llm: Arc<dyn LlmClient>,
     tools: Vec<Arc<dyn Tool>>,
-    context: AgentContext,
+    pub context: AgentContext,
     output: Arc<dyn AgentOutput>,
     telemetry: Arc<crate::telemetry::TelemetryExporter>,
     event_log: Arc<crate::event_log::EventLog>,
