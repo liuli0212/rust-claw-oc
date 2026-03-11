@@ -215,6 +215,10 @@ impl EventHandler for Handler {
 
             let _ = output.on_waiting("Processing...").await;
 
+            // Before stepping, flush any previous buffered un-sent text and update the output
+            agent_guard.flush_output().await;
+            agent_guard.update_output(output.clone());
+
             let result = agent_guard.step(content).await;
             drop(agent_guard);
 

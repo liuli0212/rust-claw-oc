@@ -554,18 +554,33 @@ async fn handle_command(
                     return Ok(());
                 }
             };
-            let agent_guard = agent.lock().await;
-            let (provider, model, tokens, max_tokens) = agent_guard.get_status();
-            let status = format!(
-                "🤖 *Status*\n*Provider*: {}\n*Model*: {}\n*Context*: {} / {} tokens",
-                TelegramOutput::escape_markdown_v2(&provider),
-                TelegramOutput::escape_markdown_v2(&model),
-                tokens,
-                max_tokens
-            );
-            bot.send_message(chat_id, status)
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
+
+            let bot_clone = bot.clone();
+            tokio::spawn(async move {
+                let mut agent_guard = match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock()).await {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        let _ = bot_clone.send_message(chat_id, "⏳ 状态获取超时 (Agnet 繁忙)").await;
+                        return;
+                    }
+                };
+
+                // Flush old text & update output channel
+                agent_guard.flush_output().await;
+                agent_guard.update_output(output);
+
+                let (provider, model, tokens, max_tokens) = agent_guard.get_status();
+                let status = format!(
+                    "🤖 *Status*\n*Provider*: {}\n*Model*: {}\n*Context*: {} / {} tokens",
+                    TelegramOutput::escape_markdown_v2(&provider),
+                    TelegramOutput::escape_markdown_v2(&model),
+                    tokens,
+                    max_tokens
+                );
+                let _ = bot_clone.send_message(chat_id, status)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await;
+            });
         }
         Command::Session => {
             let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
@@ -580,35 +595,50 @@ async fn handle_command(
                     return Ok(());
                 }
             };
-            let agent_guard = agent.lock().await;
-            let details = agent_guard.get_session_details();
 
-            let formatted = format!(
-                "📝 *Detailed Session Diagnostics*\n\
-                ━━━━━━━━━━━━━━━━━━━━━\n\
-                *ID*: `{}`\n\
-                *LLM*: `{}` / `{}`\n\
-                *Task*: `{}` ({})\n\
-                *Context*: {} / {} tokens\n\
-                *Turns*: `{}`\n\
-                *System Prompts*: `{}`\n\
-                *Active Evidence*: `{}`\n\
-                *Cancelled*: `{}`",
-                TelegramOutput::escape_markdown_v2(details["session_id"].as_str().unwrap_or("")),
-                TelegramOutput::escape_markdown_v2(details["provider"].as_str().unwrap_or("")),
-                TelegramOutput::escape_markdown_v2(details["model"].as_str().unwrap_or("unknown")),
-                TelegramOutput::escape_markdown_v2(details["task_id"].as_str().unwrap_or("none")),
-                details["task_status"].as_str().unwrap_or("idle"),
-                details["context"]["tokens"],
-                details["context"]["max_tokens"],
-                details["context"]["turns"],
-                details["context"]["system_tokens"],
-                details["context"]["active_evidence"],
-                details["cancelled"]
-            );
-            bot.send_message(chat_id, formatted)
-                .parse_mode(ParseMode::MarkdownV2)
-                .await?;
+            let bot_clone = bot.clone();
+            tokio::spawn(async move {
+                let mut agent_guard = match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock()).await {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        let _ = bot_clone.send_message(chat_id, "⏳ 会话状态获取超时 (Agnet 繁忙)").await;
+                        return;
+                    }
+                };
+
+                // Flush old text & update output channel
+                agent_guard.flush_output().await;
+                agent_guard.update_output(output);
+
+                let details = agent_guard.get_session_details();
+
+                let formatted = format!(
+                    "📝 *Detailed Session Diagnostics*\n\
+                    ━━━━━━━━━━━━━━━━━━━━━\n\
+                    *ID*: `{}`\n\
+                    *LLM*: `{}` / `{}`\n\
+                    *Task*: `{}` ({})\n\
+                    *Context*: {} / {} tokens\n\
+                    *Turns*: `{}`\n\
+                    *System Prompts*: `{}`\n\
+                    *Active Evidence*: `{}`\n\
+                    *Cancelled*: `{}`",
+                    TelegramOutput::escape_markdown_v2(details["session_id"].as_str().unwrap_or("")),
+                    TelegramOutput::escape_markdown_v2(details["provider"].as_str().unwrap_or("")),
+                    TelegramOutput::escape_markdown_v2(details["model"].as_str().unwrap_or("unknown")),
+                    TelegramOutput::escape_markdown_v2(details["task_id"].as_str().unwrap_or("none")),
+                    details["task_status"].as_str().unwrap_or("idle"),
+                    details["context"]["tokens"],
+                    details["context"]["max_tokens"],
+                    details["context"]["turns"],
+                    details["context"]["system_tokens"],
+                    details["context"]["active_evidence"],
+                    details["cancelled"]
+                );
+                let _ = bot_clone.send_message(chat_id, formatted)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await;
+            });
         }
         Command::Model(args) => {
             let parts: Vec<&str> = args.split_whitespace().collect();
@@ -727,6 +757,10 @@ async fn handle_message(
                     return;
                 }
             };
+
+            // Before stepping, flush any previous buffered un-sent text and update the output
+            agent_guard.flush_output().await;
+            agent_guard.update_output(output.clone());
 
             // Send typing indicator in background
             let bot_typing = bot_clone.clone();

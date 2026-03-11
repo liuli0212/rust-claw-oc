@@ -378,12 +378,14 @@ async fn handle_run(
 
     let agent_res = server
         .session_manager
-        .get_or_create_session(&session_id, output)
+        .get_or_create_session(&session_id, output.clone())
         .await;
 
     match agent_res {
         Ok(agent_mutex) => {
             let mut agent = agent_mutex.lock().await;
+            agent.flush_output().await;
+            agent.update_output(output.clone());
             match agent.step(req.task).await {
                 Ok(exit) => {
                     let final_output = buffer.lock().unwrap().clone();

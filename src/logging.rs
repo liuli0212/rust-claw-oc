@@ -2,7 +2,17 @@ use crate::config::AppConfig;
 use std::fs;
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+
+struct LocalTimer;
+
+impl FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = chrono::Local::now();
+        write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S%.3f"))
+    }
+}
 
 pub fn init_logging(
     _config: &AppConfig,
@@ -40,6 +50,7 @@ pub fn init_logging(
         .with_writer(non_blocking)
         .with_ansi(false)
         .with_target(true)
+        .with_timer(LocalTimer)
         .with_filter(file_filter);
 
     // Only create console layer if explicitly requested.
@@ -50,6 +61,7 @@ pub fn init_logging(
         .map(|filter| {
             fmt::layer()
                 .with_target(false)
+                .with_timer(LocalTimer)
                 .with_filter(filter.add_directive("rustyline=off".parse().unwrap()))
         });
 
