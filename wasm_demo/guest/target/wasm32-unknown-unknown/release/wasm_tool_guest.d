@@ -1,1 +1,0 @@
-/Users/clawbot/.openclaw/workspace-coder/rust-claw-oc/wasm_demo/guest/target/wasm32-unknown-unknown/release/wasm_tool_guest.wasm: /Users/clawbot/.openclaw/workspace-coder/rust-claw-oc/wasm_demo/guest/src/lib.rs
