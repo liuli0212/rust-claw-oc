@@ -67,7 +67,7 @@ impl TuiOutput {
         if !buffer_guard.is_empty() {
             let line = buffer_guard.clone();
             buffer_guard.clear();
-            
+
             let in_code_guard = self.in_code_block.lock().unwrap();
             if line.starts_with("[System]") {
                 println!("{}", style(line.trim()).cyan());
@@ -122,13 +122,13 @@ impl AgentOutput for TuiOutput {
         }
 
         let mut buffer_guard = self.line_buffer.lock().unwrap();
-        
+
         buffer_guard.push_str(&clean_chunk);
-        
+
         while let Some(pos) = buffer_guard.find('\n') {
             let line = buffer_guard[..pos].to_string();
             *buffer_guard = buffer_guard[pos + 1..].to_string();
-            
+
             let mut in_code_guard = self.in_code_block.lock().unwrap();
             if line.trim_start().starts_with("```") {
                 *in_code_guard = !*in_code_guard;

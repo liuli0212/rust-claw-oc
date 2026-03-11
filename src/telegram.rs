@@ -194,7 +194,10 @@ impl TelegramOutput {
 
         if let Some(msg_id) = **streaming_id_guard {
             // Final edit for this piece
-            let _ = self.bot.edit_message_text(self.chat_id, msg_id, &text).await;
+            let _ = self
+                .bot
+                .edit_message_text(self.chat_id, msg_id, &text)
+                .await;
         } else {
             self.send_long_message(&text, None).await;
         }

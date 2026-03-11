@@ -328,6 +328,24 @@ impl AgentLoop {
                     break;
                 }
             } else {
+                // Strip <final> and </final> tags — render their content as plain text
+                if let Some(start_idx) = remaining.find("<final>") {
+                    let before = &remaining[..start_idx];
+                    if !before.is_empty() {
+                        self.output.on_text(before).await;
+                    }
+                    *processed_idx += start_idx + 7; // len("<final>")
+                    continue;
+                }
+                if let Some(end_idx) = remaining.find("</final>") {
+                    let before = &remaining[..end_idx];
+                    if !before.is_empty() {
+                        self.output.on_text(before).await;
+                    }
+                    *processed_idx += end_idx + 8; // len("</final>")
+                    continue;
+                }
+
                 if let Some(start_idx) = remaining.find("<think>") {
                     let content = &remaining[..start_idx];
                     if !content.is_empty() {
@@ -336,7 +354,7 @@ impl AgentLoop {
                     *processed_idx += start_idx + 7;
                     *in_think_block = true;
                 } else {
-                    // Check for partial <think> tag
+                    // Check for partial <think> or <final> tag
                     let potential_tag_start = remaining.rfind('<');
                     let len_to_process = if let Some(pos) = potential_tag_start {
                         pos
@@ -352,6 +370,21 @@ impl AgentLoop {
                 }
             }
         }
+    }
+
+    /// Strip `<think>...</think>` blocks from a string, returning only visible text.
+    fn strip_think_blocks(text: &str) -> String {
+        let mut s = text.to_string();
+        while let Some(start) = s.find("<think>") {
+            if let Some(end) = s.find("</think>") {
+                s = format!("{}{}", &s[..start], &s[end + 8..]);
+            } else {
+                // Unclosed think block — strip from <think> to end
+                s = s[..start].to_string();
+                break;
+            }
+        }
+        s
     }
 
     fn is_transient_llm_error(err: &crate::llm_client::LlmError) -> bool {
@@ -516,32 +549,27 @@ impl AgentLoop {
                 match stream_res {
                     Ok(mut rx) => {
                         let mut current_turn_text = String::new();
-                        let mut processed_idx = 0;
-                        let mut in_think_block = false;
+                        // Text is fully buffered during streaming, then displayed
+                        // after the stream completes. This ensures we can detect
+                        // JSON blobs (like text-based finish_task) and handle them
+                        // properly without partial display leaks.
 
                         let stream_loop_res = loop {
                             tokio::select! {
                                 event = rx.recv() => {
                                     match event {
                                         Some(StreamEvent::Text(t)) => {
+                                            // Buffer only — no display during stream
                                             current_turn_text.push_str(&t);
-                                            self.process_streaming_text(&current_turn_text, &mut processed_idx, &mut in_think_block).await;
                                         }
                                         Some(StreamEvent::Thought(t)) => {
+                                            // Thinking is still streamed in real-time
                                             self.output.on_thinking(&t).await;
-                                            
-                                            // Handle <think> tags properly in current_turn_text for history
-                                            if !in_think_block {
-                                                // If we were processing text, finish it
-                                                self.process_streaming_text(&current_turn_text, &mut processed_idx, &mut in_think_block).await;
-                                                
+
+                                            if !current_turn_text.ends_with("<think>") {
                                                 current_turn_text.push_str("<think>");
-                                                in_think_block = true;
-                                                processed_idx = current_turn_text.len();
                                             }
                                             current_turn_text.push_str(&t);
-                                            // Increment processed_idx to avoid process_streaming_text re-printing it
-                                            processed_idx = current_turn_text.len();
                                         }
                                         Some(StreamEvent::ToolCall(tc, sig)) => {
                                             tool_calls_accumulated.push((tc, sig));
@@ -565,7 +593,10 @@ impl AgentLoop {
                             return Ok(exit);
                         }
 
-                        if in_think_block {
+                        // Close any unclosed think block in history
+                        if current_turn_text.contains("<think>")
+                            && !current_turn_text.contains("</think>")
+                        {
                             current_turn_text.push_str("</think>");
                         }
 
@@ -618,6 +649,34 @@ impl AgentLoop {
             });
 
             if tool_calls_accumulated.is_empty() {
+                // Post-stream text classification:
+                // Check if the buffered text is a finish_task JSON blob streamed as
+                // text content (some models ignore tool_choice: "required").
+                let text_without_think = Self::strip_think_blocks(&full_text);
+                let trimmed_clean = text_without_think.trim();
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed_clean) {
+                    if let Some(summary) = val
+                        .as_object()
+                        .and_then(|obj| obj.get("summary"))
+                        .and_then(|v| v.as_str())
+                    {
+                        tracing::info!(
+                            "Detected text-based finish_task fallback, extracting summary"
+                        );
+                        self.output.on_task_finish(summary).await;
+                        self.context.end_turn();
+                        self.telemetry.end_span("agent_step");
+                        return Ok(RunExit::Finished(summary.to_string()));
+                    }
+                }
+
+                // Normal text response — display it now (post-stream)
+                let visible_text = trimmed_clean;
+                if !visible_text.is_empty() {
+                    self.output.on_text(visible_text).await;
+                    self.output.on_text("\n").await;
+                }
+
                 self.output.flush().await;
                 self.context.end_turn();
                 self.telemetry.end_span("agent_step");
@@ -648,9 +707,19 @@ impl AgentLoop {
 
                 if call.name == "finish_task" {
                     let mut summary = call.args.to_string();
+
                     if let Some(obj) = call.args.as_object() {
                         if let Some(s) = obj.get("summary").and_then(|v| v.as_str()) {
                             summary = s.to_string();
+                        }
+                    } else if let Some(s) = call.args.as_str() {
+                        // Handle double-encoded JSON strings from some models
+                        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
+                            if let Some(obj) = inner.as_object() {
+                                if let Some(inner_s) = obj.get("summary").and_then(|v| v.as_str()) {
+                                    summary = inner_s.to_string();
+                                }
+                            }
                         }
                     }
                     self.context.end_turn();

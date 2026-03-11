@@ -248,13 +248,17 @@ fn create_standard_client(base_url: Option<&str>) -> Client {
         let no_proxy = std::env::var("no_proxy")
             .or_else(|_| std::env::var("NO_PROXY"))
             .unwrap_or_default();
-        
+
         // Simple matching logic: if any entry in no_proxy matches the host or is a suffix
         let bypass = no_proxy.split(',').any(|entry| {
             let entry = entry.trim();
-            if entry.is_empty() { return false; }
-            if entry == "*" { return true; }
-            
+            if entry.is_empty() {
+                return false;
+            }
+            if entry == "*" {
+                return true;
+            }
+
             // Check if URL contains the entry as a host or suffix (e.g., .srv)
             url.contains(entry)
         });
@@ -271,9 +275,11 @@ fn create_standard_client(base_url: Option<&str>) -> Client {
 impl GeminiClient {
     #[allow(dead_code)]
     pub fn new(api_key: String, model_name: Option<String>, provider_name: String) -> Self {
-        let model_str = model_name.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+        let model_str = model_name
+            .clone()
+            .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
         // Gemini base URL is always the Google API
-        let base_url = "https://generativelanguage.googleapis.com"; 
+        let base_url = "https://generativelanguage.googleapis.com";
         Self {
             api_key,
             client: create_standard_client(Some(base_url)),
@@ -290,7 +296,9 @@ impl GeminiClient {
         #[allow(dead_code)] context_window: usize,
         provider_name: String,
     ) -> Self {
-        let model_str = model_name.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+        let model_str = model_name
+            .clone()
+            .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
         let base_url = "https://generativelanguage.googleapis.com";
         Self {
             api_key,
@@ -310,6 +318,8 @@ impl GeminiClient {
         let mut declarations = Vec::with_capacity(tools.len());
         for tool in tools {
             let mut parameters = tool.parameters_schema();
+            let root_schema = parameters.clone();
+            inline_schema_refs(&mut parameters, &root_schema, 0);
             normalize_schema_for_gemini(&mut parameters);
             declarations.push(FunctionDeclaration {
                 name: tool.name().to_string(),
@@ -666,12 +676,12 @@ fn parse_function_call_basic(part: &Value) -> Option<FunctionCall> {
     let func_call = part.get("functionCall")?;
     let name = func_call.get("name")?.as_str()?.to_string();
     let args = func_call.get("args")?.clone();
-    let id = func_call.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-    Some(FunctionCall {
-        name,
-        args,
-        id,
-    })
+    let id = func_call
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| Some(format!("call_{}", uuid::Uuid::new_v4().simple())));
+    Some(FunctionCall { name, args, id })
 }
 
 fn capture_thought_signature(part: &Value) -> Option<String> {
@@ -679,6 +689,63 @@ fn capture_thought_signature(part: &Value) -> Option<String> {
         .or_else(|| part.get("thought_signature"))
         .and_then(|ts| ts.as_str())
         .map(|s| s.to_string())
+}
+
+fn inline_schema_refs(value: &mut Value, root: &Value, depth: usize) {
+    if depth > 20 {
+        return; // safeguard against infinite recursion
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(ref_path)) = map.get("$ref") {
+                let prefix1 = "#/$defs/";
+                let prefix2 = "#/definitions/";
+                let def_name = if ref_path.starts_with(prefix1) {
+                    Some(&ref_path[prefix1.len()..])
+                } else if ref_path.starts_with(prefix2) {
+                    Some(&ref_path[prefix2.len()..])
+                } else {
+                    None
+                };
+
+                if let Some(name) = def_name {
+                    let mut resolved = None;
+                    if let Some(defs) = root.get("$defs").and_then(|v| v.as_object()) {
+                        if let Some(def_val) = defs.get(name) {
+                            resolved = Some(def_val.clone());
+                        }
+                    }
+                    if resolved.is_none() {
+                        if let Some(defs) = root.get("definitions").and_then(|v| v.as_object()) {
+                            if let Some(def_val) = defs.get(name) {
+                                resolved = Some(def_val.clone());
+                            }
+                        }
+                    }
+
+                    if let Some(mut resolved_val) = resolved {
+                        inline_schema_refs(&mut resolved_val, root, depth + 1);
+                        if let Value::Object(resolved_map) = resolved_val {
+                            map.clear();
+                            for (k, v) in resolved_map {
+                                map.insert(k, v);
+                            }
+                        }
+                    }
+                }
+            } else {
+                for nested_val in map.values_mut() {
+                    inline_schema_refs(nested_val, root, depth + 1);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for nested_val in arr {
+                inline_schema_refs(nested_val, root, depth + 1);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn normalize_schema_for_gemini(value: &mut Value) {
@@ -752,6 +819,7 @@ impl OpenAiCompatClient {
         json: Value,
         tx: &mpsc::Sender<StreamEvent>,
         active_tools: &mut std::collections::HashMap<usize, (String, String, Option<String>)>,
+        index_map: &mut std::collections::HashMap<usize, usize>,
     ) {
         if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
             for choice in choices {
@@ -763,8 +831,7 @@ impl OpenAiCompatClient {
                         }
                     }
                     // 2. Reasoning/Thinking content (DeepSeek/DashScope format)
-                    if let Some(reasoning) =
-                        delta.get("reasoning_content").and_then(|v| v.as_str())
+                    if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str())
                     {
                         if !reasoning.is_empty() {
                             let _ = tx.send(StreamEvent::Thought(reasoning.to_string())).await;
@@ -773,18 +840,45 @@ impl OpenAiCompatClient {
                     // 3. Tool calls
                     if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                         for tc in tool_calls {
-                            let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let api_idx =
+                                tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let new_id = tc.get("id").and_then(|v| v.as_str());
+
+                            let mut storage_idx = api_idx;
+                            if let Some(id) = new_id {
+                                if let Some(&k) = active_tools
+                                    .iter()
+                                    .find(|(_, v)| v.2.as_deref() == Some(id))
+                                    .map(|(k, _)| k)
+                                {
+                                    storage_idx = k;
+                                } else {
+                                    // New tool call starting
+                                    storage_idx = active_tools.keys().max().unwrap_or(&0)
+                                        + if active_tools.is_empty() { 0 } else { 1 };
+                                    index_map.insert(api_idx, storage_idx);
+                                }
+                            } else {
+                                storage_idx = *index_map.get(&api_idx).unwrap_or(&api_idx);
+                            }
+
                             let entry = active_tools
-                                .entry(idx)
+                                .entry(storage_idx)
                                 .or_insert_with(|| (String::new(), String::new(), None));
 
-                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                            if let Some(id) = new_id {
                                 entry.2 = Some(id.to_string());
                             }
 
                             if let Some(func) = tc.get("function") {
                                 if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                    entry.0.push_str(name);
+                                    if entry.0.is_empty() {
+                                        entry.0.push_str(name);
+                                    } else if !entry.0.contains(name) {
+                                        entry.0.push_str(name);
+                                    } else {
+                                        entry.0 = name.to_string();
+                                    }
                                 }
                                 if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
                                     entry.1.push_str(args);
@@ -877,7 +971,7 @@ impl LlmClient for OpenAiCompatClient {
                         let call_id = fc
                             .id
                             .clone()
-                            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+                            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
                         tool_calls.push(serde_json::json!({
                             "id": call_id,
                             "type": "function",
@@ -890,9 +984,12 @@ impl LlmClient for OpenAiCompatClient {
                 }
 
                 let mut message_json = serde_json::json!({
-                    "role": "assistant",
-                    "content": if text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(text.to_string()) }
+                    "role": "assistant"
                 });
+
+                if !text.is_empty() {
+                    message_json["content"] = serde_json::Value::String(text.to_string());
+                }
 
                 if !tool_calls.is_empty() {
                     message_json["tool_calls"] = serde_json::Value::Array(tool_calls);
@@ -902,10 +999,10 @@ impl LlmClient for OpenAiCompatClient {
                 for part in &msg.parts {
                     if let Some(fr) = &part.function_response {
                         openai_messages.push(serde_json::json!({
-                             "role": "tool",
-                             "tool_call_id": fr.id.clone().unwrap_or_else(|| "unknown".to_string()),
-                             "content": fr.response.to_string()
-                         }));
+                            "role": "tool",
+                            "tool_call_id": fr.id.clone().unwrap_or_else(|| "unknown".to_string()),
+                            "content": fr.response.to_string()
+                        }));
                     }
                 }
             }
@@ -993,7 +1090,7 @@ impl LlmClient for OpenAiCompatClient {
                         let call_id = fc
                             .id
                             .clone()
-                            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+                            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
                         tool_calls.push(serde_json::json!({
                             "id": call_id,
                             "type": "function",
@@ -1006,9 +1103,12 @@ impl LlmClient for OpenAiCompatClient {
                 }
 
                 let mut message_json = serde_json::json!({
-                    "role": "assistant",
-                    "content": if text.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(text.to_string()) }
+                    "role": "assistant"
                 });
+
+                if !text.is_empty() {
+                    message_json["content"] = serde_json::Value::String(text.to_string());
+                }
 
                 if !tool_calls.is_empty() {
                     message_json["tool_calls"] = serde_json::Value::Array(tool_calls);
@@ -1018,10 +1118,10 @@ impl LlmClient for OpenAiCompatClient {
                 for part in &msg.parts {
                     if let Some(fr) = &part.function_response {
                         openai_messages.push(serde_json::json!({
-                             "role": "tool",
-                             "tool_call_id": fr.id.clone().unwrap_or_else(|| "unknown".to_string()),
-                             "content": fr.response.to_string()
-                         }));
+                            "role": "tool",
+                            "tool_call_id": fr.id.clone().unwrap_or_else(|| "unknown".to_string()),
+                            "content": fr.response.to_string()
+                        }));
                     }
                 }
             }
@@ -1051,6 +1151,16 @@ impl LlmClient for OpenAiCompatClient {
                 }));
             }
             body_map["tools"] = serde_json::json!(openai_tools);
+            body_map["tool_choice"] = serde_json::Value::String("required".to_string());
+
+            // Inject a final system prompt for autonomy
+            openai_messages.push(serde_json::json!({
+                "role": "system",
+                "content": "CRITICAL FINAL REMINDER: You MUST output a tool call now unless the task is completely finished. Do NOT output conversational text asking for permission to continue."
+            }));
+
+            // Update body_map with the expanded messages array
+            body_map["messages"] = serde_json::json!(openai_messages);
         }
 
         let client = self.client.clone();
@@ -1139,13 +1249,17 @@ impl LlmClient for OpenAiCompatClient {
             let mut buffer = String::new();
 
             // To properly parse OpenAI chunked tool calls (they can come with `index`)
-            let mut active_tools: std::collections::HashMap<usize, (String, String, Option<String>)> =
+            let mut active_tools: std::collections::HashMap<
+                usize,
+                (String, String, Option<String>),
+            > = std::collections::HashMap::new();
+            let mut index_map: std::collections::HashMap<usize, usize> =
                 std::collections::HashMap::new();
 
             while let Some(chunk_res) = stream.next().await {
                 if let Ok(chunk) = chunk_res {
                     let chunk_str = String::from_utf8_lossy(&chunk);
-                    tracing::trace!("Received OpenAI streaming chunk: {}", chunk_str);
+                    tracing::debug!("Received OpenAI streaming chunk: {}", chunk_str);
                     buffer.push_str(&chunk_str);
 
                     // Process each line immediately (SSE standard uses single \n for data lines)
@@ -1160,7 +1274,13 @@ impl LlmClient for OpenAiCompatClient {
                                 continue;
                             }
                             if let Ok(json) = serde_json::from_str::<Value>(data) {
-                                OpenAiCompatClient::process_delta_json(json, &tx, &mut active_tools).await;
+                                OpenAiCompatClient::process_delta_json(
+                                    json,
+                                    &tx,
+                                    &mut active_tools,
+                                    &mut index_map,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1174,7 +1294,13 @@ impl LlmClient for OpenAiCompatClient {
                     let data = &line[6..];
                     if data != "[DONE]" {
                         if let Ok(json) = serde_json::from_str::<Value>(data) {
-                            OpenAiCompatClient::process_delta_json(json, &tx, &mut active_tools).await;
+                            OpenAiCompatClient::process_delta_json(
+                                json,
+                                &tx,
+                                &mut active_tools,
+                                &mut index_map,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1191,12 +1317,14 @@ impl LlmClient for OpenAiCompatClient {
                         } else {
                             serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
                         };
+                        let final_id =
+                            id.or_else(|| Some(format!("call_{}", uuid::Uuid::new_v4().simple())));
                         let _ = tx
                             .send(StreamEvent::ToolCall(
                                 FunctionCall {
                                     name,
                                     args,
-                                    id,
+                                    id: final_id,
                                 },
                                 None,
                             ))

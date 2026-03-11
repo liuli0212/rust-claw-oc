@@ -15,7 +15,9 @@ pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
         obj.remove("$schema");
         obj.remove("title");
         // Ensure "properties" exists for objects (required by OpenAI for strict schemas)
-        if obj.get("type").and_then(|t| t.as_str()) == Some("object") && !obj.contains_key("properties") {
+        if obj.get("type").and_then(|t| t.as_str()) == Some("object")
+            && !obj.contains_key("properties")
+        {
             obj.insert("properties".to_string(), serde_json::json!({}));
         }
     }
@@ -167,6 +169,12 @@ impl Tool for BashTool {
 
         let mut cmd = CommandBuilder::new("bash");
         cmd.cwd(self.work_dir.clone());
+        // Disable pagers for git and other interactive commands within the PTY.
+        // Since we use a real PTY, programs detect interactive mode and spawn pagers
+        // (e.g., `less`), which block forever waiting for keyboard input → timeout.
+        cmd.env("GIT_PAGER", "cat");
+        cmd.env("PAGER", "cat");
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
         cmd.arg("-c");
         cmd.arg(&cmd_str);
 
@@ -1158,13 +1166,25 @@ mod tests {
         for tool in tools {
             let schema = tool.parameters_schema();
             let obj = schema.as_object().expect("Schema must be an object");
-            
+
             // Critical checks for OpenAI/Gemini
-            assert!(!obj.contains_key("$schema"), "Schema for {} should not contain $schema", tool.name());
-            assert!(!obj.contains_key("title"), "Schema for {} should not contain title", tool.name());
-            
+            assert!(
+                !obj.contains_key("$schema"),
+                "Schema for {} should not contain $schema",
+                tool.name()
+            );
+            assert!(
+                !obj.contains_key("title"),
+                "Schema for {} should not contain title",
+                tool.name()
+            );
+
             if obj.get("type").and_then(|t| t.as_str()) == Some("object") {
-                assert!(obj.contains_key("properties"), "Schema for {} must contain properties", tool.name());
+                assert!(
+                    obj.contains_key("properties"),
+                    "Schema for {} must contain properties",
+                    tool.name()
+                );
             }
         }
     }

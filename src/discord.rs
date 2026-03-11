@@ -75,7 +75,10 @@ impl DiscordOutput {
 
     async fn flush_internal(
         &self,
-        streaming_id_guard: &mut tokio::sync::MutexGuard<'_, Option<serenity::model::id::MessageId>>,
+        streaming_id_guard: &mut tokio::sync::MutexGuard<
+            '_,
+            Option<serenity::model::id::MessageId>,
+        >,
     ) {
         let text = {
             let mut buf = self.text_buffer.lock().await;
