@@ -632,10 +632,11 @@ fn parse_function_call_basic(part: &Value) -> Option<FunctionCall> {
     let func_call = part.get("functionCall")?;
     let name = func_call.get("name")?.as_str()?.to_string();
     let args = func_call.get("args")?.clone();
+    let id = func_call.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
     Some(FunctionCall {
         name,
         args,
-        id: None,
+        id,
     })
 }
 
@@ -716,7 +717,7 @@ impl OpenAiCompatClient {
     async fn process_delta_json(
         json: Value,
         tx: &mpsc::Sender<StreamEvent>,
-        active_tools: &mut std::collections::HashMap<usize, (String, String)>,
+        active_tools: &mut std::collections::HashMap<usize, (String, String, Option<String>)>,
     ) {
         if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
             for choice in choices {
@@ -741,7 +742,11 @@ impl OpenAiCompatClient {
                             let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                             let entry = active_tools
                                 .entry(idx)
-                                .or_insert_with(|| (String::new(), String::new()));
+                                .or_insert_with(|| (String::new(), String::new(), None));
+
+                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                entry.2 = Some(id.to_string());
+                            }
 
                             if let Some(func) = tc.get("function") {
                                 if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
@@ -863,7 +868,7 @@ impl LlmClient for OpenAiCompatClient {
                     if let Some(fr) = &part.function_response {
                         openai_messages.push(serde_json::json!({
                              "role": "tool",
-                             "tool_call_id": fr.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                             "tool_call_id": fr.id.clone().unwrap_or_else(|| "unknown".to_string()),
                              "content": fr.response.to_string()
                          }));
                     }
@@ -979,7 +984,7 @@ impl LlmClient for OpenAiCompatClient {
                     if let Some(fr) = &part.function_response {
                         openai_messages.push(serde_json::json!({
                              "role": "tool",
-                             "tool_call_id": fr.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string()),
+                             "tool_call_id": fr.id.clone().unwrap_or_else(|| "unknown".to_string()),
                              "content": fr.response.to_string()
                          }));
                     }
@@ -1099,7 +1104,7 @@ impl LlmClient for OpenAiCompatClient {
             let mut buffer = String::new();
 
             // To properly parse OpenAI chunked tool calls (they can come with `index`)
-            let mut active_tools: std::collections::HashMap<usize, (String, String)> =
+            let mut active_tools: std::collections::HashMap<usize, (String, String, Option<String>)> =
                 std::collections::HashMap::new();
 
             while let Some(chunk_res) = stream.next().await {
@@ -1144,7 +1149,7 @@ impl LlmClient for OpenAiCompatClient {
             let mut tool_indices: Vec<usize> = active_tools.keys().cloned().collect();
             tool_indices.sort_unstable();
             for idx in tool_indices {
-                if let Some((name, args_str)) = active_tools.remove(&idx) {
+                if let Some((name, args_str, id)) = active_tools.remove(&idx) {
                     if !name.trim().is_empty() {
                         let args = if args_str.trim().is_empty() {
                             serde_json::Value::Object(serde_json::Map::new())
@@ -1156,7 +1161,7 @@ impl LlmClient for OpenAiCompatClient {
                                 FunctionCall {
                                     name,
                                     args,
-                                    id: None,
+                                    id,
                                 },
                                 None,
                             ))

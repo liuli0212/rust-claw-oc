@@ -628,7 +628,8 @@ impl AgentLoop {
             let mut executed_signatures = HashSet::new();
             let mut stop_loop = false;
 
-            for (mut call, _thought_sig) in tool_calls_accumulated {
+            let mut response_parts = Vec::new();
+            for (mut call, thought_sig) in tool_calls_accumulated {
                 if let Some(obj) = call.args.as_object_mut() {
                     if let Some(thought) = obj.remove("thought") {
                         if let Some(thought_str) = thought.as_str() {
@@ -684,6 +685,17 @@ impl AgentLoop {
                 if stopped {
                     self.output.on_error(&result).await;
                     stop_loop = true;
+                    // Even if stopped, we might want to record the partial result or just break
+                    response_parts.push(Part {
+                        text: None,
+                        function_call: None,
+                        function_response: Some(FunctionResponse {
+                            name: call.name.clone(),
+                            response: serde_json::json!({ "result": result }),
+                            id: call.id.clone(),
+                        }),
+                        thought_signature: thought_sig,
+                    });
                     break;
                 }
 
@@ -787,18 +799,22 @@ impl AgentLoop {
                     }
                 }
 
+                response_parts.push(Part {
+                    text: None,
+                    function_call: None,
+                    function_response: Some(FunctionResponse {
+                        name: call.name.clone(),
+                        response: serde_json::json!({ "result": final_result }),
+                        id: call.id.clone(),
+                    }),
+                    thought_signature: thought_sig,
+                });
+            }
+
+            if !response_parts.is_empty() {
                 self.context.add_message_to_current_turn(Message {
                     role: "function".to_string(),
-                    parts: vec![Part {
-                        text: None,
-                        function_call: None,
-                        function_response: Some(FunctionResponse {
-                            name: call.name.clone(),
-                            response: serde_json::json!({ "result": final_result }),
-                            tool_call_id: call.id.clone(),
-                        }),
-                        thought_signature: None,
-                    }],
+                    parts: response_parts,
                 });
             }
 

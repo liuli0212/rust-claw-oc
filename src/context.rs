@@ -34,8 +34,8 @@ pub struct FunctionCall {
 pub struct FunctionResponse {
     pub name: String,
     pub response: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "tool_call_id")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
