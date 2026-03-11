@@ -239,13 +239,45 @@ pub struct FunctionDeclaration {
     pub parameters: Value,
 }
 
+fn create_standard_client(base_url: Option<&str>) -> Client {
+    let mut builder = Client::builder();
+
+    // Explicitly check for NO_PROXY because reqwest might not pick it up correctly
+    // from std::env if it was set by dotenvy after the process start.
+    if let Some(url) = base_url {
+        let no_proxy = std::env::var("no_proxy")
+            .or_else(|_| std::env::var("NO_PROXY"))
+            .unwrap_or_default();
+        
+        // Simple matching logic: if any entry in no_proxy matches the host or is a suffix
+        let bypass = no_proxy.split(',').any(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() { return false; }
+            if entry == "*" { return true; }
+            
+            // Check if URL contains the entry as a host or suffix (e.g., .srv)
+            url.contains(entry)
+        });
+
+        if bypass {
+            tracing::debug!("Bypassing proxy for URL: {} (matched in NO_PROXY)", url);
+            builder = builder.no_proxy();
+        }
+    }
+
+    builder.build().unwrap_or_else(|_| Client::new())
+}
+
 impl GeminiClient {
     #[allow(dead_code)]
     pub fn new(api_key: String, model_name: Option<String>, provider_name: String) -> Self {
+        let model_str = model_name.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+        // Gemini base URL is always the Google API
+        let base_url = "https://generativelanguage.googleapis.com"; 
         Self {
             api_key,
-            client: Client::new(),
-            model_name: model_name.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
+            client: create_standard_client(Some(base_url)),
+            model_name: model_str,
             provider_name,
             function_declarations_cache: Mutex::new(None),
             context_window: 1_000_000,
@@ -258,10 +290,12 @@ impl GeminiClient {
         #[allow(dead_code)] context_window: usize,
         provider_name: String,
     ) -> Self {
+        let model_str = model_name.clone().unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+        let base_url = "https://generativelanguage.googleapis.com";
         Self {
             api_key,
-            client: Client::new(),
-            model_name: model_name.unwrap_or_else(|| "gemini-3.1-pro-preview".to_string()),
+            client: create_standard_client(Some(base_url)),
+            model_name: model_str,
             provider_name,
             function_declarations_cache: Mutex::new(None),
             context_window,
@@ -772,11 +806,11 @@ impl OpenAiCompatClient {
     ) -> Self {
         Self {
             api_key,
+            client: create_standard_client(Some(&base_url)),
             base_url,
             model_name,
             provider_name,
-            client: Client::new(),
-            context_window: 32_000, // Default fallback
+            context_window: 1_000_000,
             reasoning_effort: None,
         }
     }
@@ -786,15 +820,16 @@ impl OpenAiCompatClient {
         base_url: String,
         model_name: String,
         provider_name: String,
-        #[allow(dead_code)] context_window: usize,
+        context_window: usize,
         reasoning_effort: Option<String>,
     ) -> Self {
+        let client = create_standard_client(Some(&base_url));
         Self {
             api_key,
             base_url,
             model_name,
             provider_name,
-            client: Client::new(),
+            client,
             context_window,
             reasoning_effort,
         }
