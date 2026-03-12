@@ -194,6 +194,41 @@ impl EventHandler for Handler {
         let content = msg.content.clone();
         let channel_id = msg.channel_id;
         let http = ctx.http.clone();
+        let cmd = content.trim().to_lowercase();
+
+        if cmd == "/cancel_task" {
+            self.session_manager.cancel_session(&session_id).await;
+            let _ = channel_id.say(&http, "🛑 Task cancellation requested.").await;
+            return;
+        }
+
+        if cmd == "/status" {
+            let ts = crate::task_state::TaskStateStore::new(&session_id);
+            let mut status_msg = "📊 **Bot Status**
+".to_string();
+            
+            if ts.has_active_plan() {
+                if let Ok(state) = ts.load() {
+                    status_msg.push_str(&format!("🎯 **Active Task**: {}
+", state.goal.unwrap_or_else(|| "Unknown".to_string())));
+                    for (i, step) in state.plan_steps.iter().enumerate() {
+                        let icon = match step.status.as_str() {
+                            "completed" => "✅",
+                            "in_progress" => "⏳",
+                            _ => "⬜",
+                        };
+                        status_msg.push_str(&format!("  [{}] {} {}
+", i, icon, step.step));
+                    }
+                    status_msg.push_str("
+💡 You can say \"continue\" to proceed, or use `/cancel_task` to abort.");
+                }
+            } else {
+                status_msg.push_str("✅ No active task.");
+            }
+            let _ = channel_id.say(&http, status_msg).await;
+            return;
+        }
 
         // Spawn agent execution in background so EventHandler returns immediately
         tokio::spawn(async move {

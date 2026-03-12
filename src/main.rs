@@ -177,11 +177,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let task_store_check_cli = crate::task_state::TaskStateStore::new("cli");
     if task_store_check_cli.has_active_plan() {
-        println!(
-            "  {} Task plan active. Use {} to abort.",
-            style("ℹ").blue(),
-            style("/cancel_task").bold()
-        );
+        if let Ok(state) = task_store_check_cli.load() {
+            println!(
+                "  {} Task plan active: {}",
+                style("🎯").yellow(),
+                style(state.goal.unwrap_or_default()).bold()
+            );
+            println!(
+                "  {} You can say {} to proceed, or {} to abort.",
+                style("ℹ").blue(),
+                style("\"continue\"").green().bold(),
+                style("/cancel_task").red().bold()
+            );
+        }
     }
 
     let mut ctrl_c_count = 0;
@@ -251,6 +259,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         max_tokens,
                         percentage
                     );
+                    let ts = crate::task_state::TaskStateStore::new("cli");
+                    if ts.has_active_plan() {
+                        if let Ok(state) = ts.load() {
+                            println!("  {} Active Task: {}", style("🎯").yellow(), state.goal.unwrap_or_else(|| "Unknown".to_string()));
+                            for (i, step) in state.plan_steps.iter().enumerate() {
+                                let icon = match step.status.as_str() {
+                                    "completed" => "✅",
+                                    "in_progress" => "⏳",
+                                    _ => "⬜",
+                                };
+                                println!("    [{}] {} {}", i, icon, step.step);
+                            }
+                        }
+                    }
                     continue;
                 }
                 if line == "/session" {

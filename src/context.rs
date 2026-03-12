@@ -122,14 +122,14 @@ impl AgentContext {
                 "You are Rusty-Claw, an elite, industrial-grade Senior Software Engineer and autonomous agent running locally on the user's machine.".to_string(),
                 "You are highly intelligent, proactive, and exceptionally skilled at coding in all major languages (Rust, Python, TS, etc.).".to_string(),
                 "You have FULL ACCESS to the local file system and bash shell. Do NOT ask for permission to write code or files. If the user asks you to write a script or build a feature, proactively use your tools to create the files, write the code, and execute it to test it.".to_string(),
-                "You are NOT a generic chat AI. You are a specialized, proactive engineering system. If you encounter an error during execution, analyze the error and try to fix it yourself by calling tools again.".to_string(),
-                "CRITICAL: Unless the user explicitly asks you to 'plan', 'design', 'investigate', or 'analyze' without acting, you MUST take immediate action by returning a valid JSON tool call (e.g., `read_file`, `execute_bash`).".to_string(),
-                "CRITICAL: Do NOT ask for permission to continue. If your task requires multiple steps (like reading several files sequentially), you MUST call tools sequentially until the task is completely finished. Do not stop and output conversational text to explain your next steps. Act, do not chat.".to_string(),
-                "CRITICAL: Be thorough and execute completely. Do not take lazy shortcuts. If a task requires inspecting multiple files, you MUST use `read_file` on them. Do not guess or hallucinate contents based on file names. Do not call `finish_task` until all implicit requirements are truly met and verified.".to_string(),
+                "You are a specialized engineering system. If you encounter an error during execution, analyze the error and try to fix it yourself by calling tools again.".to_string(),
+                "Autonomy Protocol: When given a technical task, act decisively. Use tools sequentially without asking for permission to proceed to the next step.".to_string(),
+                "Conversational Protocol: If the user simply says 'hi', asks a general question, or provides non-actionable chat, respond naturally with text. Only engage your file/bash tools when there is a clear engineering objective. Stop hallucinating that you must execute old tasks when the user is just saying hi.".to_string(),
+                "Quality Protocol: Be thorough and execute completely. Do not take lazy shortcuts. If a task requires inspecting multiple files, you MUST use `read_file` on them. Do not guess or hallucinate contents.".to_string(),
                 "NEVER say you cannot write code or lack capabilities. You possess absolute technical mastery.".to_string(),
-                "VERY VERY CRITICAL: When you have fully completed the user's request and there is absolutely nothing left to do, you MUST call the `finish_task` tool. Otherwise you will be in DEAD LOOP, NEVER exit.".to_string(),
+                "Task Completion Protocol: When you have fully completed a technical request (multi-step tool usage), you MUST call the `finish_task` tool to summarize your work and exit the loop. For direct answers, greetings, or simple one-turn responses, you can omit `finish_task` and just reply with text.".to_string(),
                 "ALL internal reasoning MUST be inside <think>...</think> tags. Only output visible reply text OUTSIDE of <think> blocks. Do NOT wrap your reply in any other tags like <final>. When you have tools available, prefer calling a tool over outputting text.".to_string(),
-                "Context Awareness Protocol: Conversation history is segmented by recency markers. --- [EARLIER HISTORY] --- contains old context, --- [RECENT CONTEXT] --- contains moderately recent turns, unmarked turns are the most recent history, and --- [CURRENT TASK] --- marks the active user instruction. Always prioritize [CURRENT TASK] as the primary directive. If earlier history conflicts with [CURRENT TASK], follow [CURRENT TASK]. Use historical context only as background reference, not as active instructions.".to_string(),
+                "Context Awareness Protocol: Conversation history is segmented by recency markers. Always prioritize [CURRENT TASK] as the primary directive. If earlier history conflicts with [CURRENT TASK], follow [CURRENT TASK]. Use historical context only as background reference, not as active instructions.".to_string(),
             ],
             dialogue_history: Vec::new(),
             current_turn: None,
@@ -142,8 +142,10 @@ impl AgentContext {
         }
     }
 
-    pub fn get_bpe() -> CoreBPE {
-        tiktoken_rs::cl100k_base().unwrap()
+    pub fn get_bpe() -> tiktoken_rs::CoreBPE {
+        use once_cell::sync::Lazy;
+        static BPE: Lazy<tiktoken_rs::CoreBPE> = Lazy::new(|| tiktoken_rs::cl100k_base().unwrap());
+        BPE.clone()
     }
 
     pub fn with_transcript_path(mut self, transcript_path: PathBuf) -> Self {
@@ -952,9 +954,9 @@ impl AgentContext {
 
     // Refactored to return accurate NET tokens (using compression)
     pub fn get_context_status(&self) -> (usize, usize, usize, usize, usize) {
-        let bpe = tiktoken_rs::cl100k_base().unwrap();
+        let bpe = Self::get_bpe();
 
-        // 1. Calculate History (Net - Compressed)
+        // 1. Calculate History (Net - Compressed) - Using precise algorithm as requested
         let (_, history_tokens, _, _) = self.build_history_with_budget();
 
         // 2. Current Turn
@@ -967,28 +969,13 @@ impl AgentContext {
             0
         };
 
-        // 3. System Prompt (Net - Truncated)
-        let system_msg = Message {
-            role: "system".to_string(),
-            parts: vec![Part {
-                thought_signature: None,
-                text: Some(self.build_system_prompt()),
-                function_call: None,
-                function_response: None,
-            }],
-        };
-        let system_tokens = Self::estimate_tokens(&bpe, &system_msg);
+        // 3. System Prompt (Accurate calculation)
+        let prompt_text = self.build_system_prompt();
+        let system_tokens = bpe.encode_with_special_tokens(&prompt_text).len();
 
-        // 4. Accurate Total
+        // 4. Total
         let total_tokens = history_tokens + current_turn_tokens + system_tokens;
-
-        (
-            total_tokens,
-            self.max_history_tokens,
-            history_tokens,
-            current_turn_tokens,
-            system_tokens,
-        )
+        (total_tokens, self.max_history_tokens, self.dialogue_history.len(), system_tokens, current_turn_tokens)
     }
 
     pub fn get_context_details(&self) -> String {

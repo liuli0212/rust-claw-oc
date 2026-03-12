@@ -569,6 +569,32 @@ async fn handle_command(
                 agent_guard.flush_output().await;
                 agent_guard.update_output(output);
 
+                // Task Status check for Command::Status
+                let ts = crate::task_state::TaskStateStore::new(&session_id);
+                if ts.has_active_plan() {
+                    if let Ok(state) = ts.load() {
+                        let mut task_msg = format!(
+                            "🎯 *Active Task*: {}\n",
+                            TelegramOutput::escape_markdown_v2(&state.goal.unwrap_or_else(|| "Unknown".to_string()))
+                        );
+                        for (step_idx, step) in state.plan_steps.iter().enumerate() {
+                            let icon = match step.status.as_str() {
+                                "completed" => "✅",
+                                "in_progress" => "⏳",
+                                _ => "⬜",
+                            };
+                            task_msg.push_str(&format!(
+                                "    \\[{}\\] {} {}\n",
+                                step_idx, icon, TelegramOutput::escape_markdown_v2(&step.step)
+                            ));
+                        }
+                        task_msg.push_str("\n💡 You can say \"continue\" to proceed, or use /cancel to abort\\.");
+                        let _ = bot_clone.send_message(chat_id, task_msg)
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                            .await;
+                    }
+                }
+
                 let (provider, model, tokens, max_tokens) = agent_guard.get_status();
                 let status = format!(
                     "🤖 *Status*\n*Provider*: {}\n*Model*: {}\n*Context*: {} / {} tokens",
@@ -761,6 +787,40 @@ async fn handle_message(
             // Before stepping, flush any previous buffered un-sent text and update the output
             agent_guard.flush_output().await;
             agent_guard.update_output(output.clone());
+
+            // Active Task Reminder with Throttling
+            let ts = crate::task_state::TaskStateStore::new(&session_id);
+            if ts.has_active_plan() && text.to_lowercase() != "continue" && !text.starts_with('/') {
+                static LAST_REMINDED: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = 
+                    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                
+                let mut should_remind = false;
+                {
+                    let mut map = LAST_REMINDED.lock().unwrap();
+                    if let Some(&last) = map.get(&session_id) {
+                        // Throttle: 1 hour (3600 seconds)
+                        if last.elapsed() > std::time::Duration::from_secs(3600) {
+                            should_remind = true;
+                            map.insert(session_id.clone(), std::time::Instant::now());
+                        }
+                    } else {
+                        should_remind = true;
+                        map.insert(session_id.clone(), std::time::Instant::now());
+                    }
+                }
+
+                if should_remind {
+                    if let Ok(state) = ts.load() {
+                        let task_msg = format!(
+                            "🎯 *Active Task Reminder*\nTask: {}\n\n💡 You can say \"continue\" to proceed with this task, or use /cancel to abort\\.",
+                            TelegramOutput::escape_markdown_v2(&state.goal.unwrap_or_else(|| "Unknown".to_string()))
+                        );
+                        let _ = bot_clone.send_message(chat_id, task_msg)
+                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                            .await;
+                    }
+                }
+            }
 
             // Send typing indicator in background
             let bot_typing = bot_clone.clone();

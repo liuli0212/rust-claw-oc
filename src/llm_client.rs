@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::utils::{truncate_log, truncate_log_error};
+use crate::utils::{format_full_error, truncate_log, truncate_log_error};
 #[derive(Error, Debug)]
 pub enum LlmError {
     #[error("Network error: {0}")]
@@ -240,7 +240,13 @@ pub struct FunctionDeclaration {
 }
 
 fn create_standard_client(base_url: Option<&str>) -> Client {
-    let mut builder = Client::builder();
+    let mut builder = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(300)) // 5 minutes for long LLM responses
+        .pool_idle_timeout(std::time::Duration::from_secs(600)) // 10 minutes
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30))) // More aggressive keepalive
+        .gzip(true);
 
     // Explicitly check for NO_PROXY because reqwest might not pick it up correctly
     // from std::env if it was set by dotenvy after the process start.
@@ -354,15 +360,20 @@ impl LlmClient for GeminiClient {
             tool_config: None,
         };
 
+        let req_body_json = serde_json::to_string(&req_body).unwrap_or_default();
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
             self.model_name, self.api_key
         );
 
-        tracing::info!("Gemini generate_text request: url={}", url);
+        tracing::info!(
+            "Gemini generate_text request: url={}, body_size={} bytes",
+            url,
+            req_body_json.len()
+        );
         tracing::debug!(
             "Gemini generate_text body: {}",
-            truncate_log(&serde_json::to_string(&req_body).unwrap_or_default())
+            truncate_log(&req_body_json)
         );
 
         let response = self
@@ -441,9 +452,10 @@ impl LlmClient for GeminiClient {
                 let body_json_string = serde_json::to_string(&req_body).unwrap_or_default();
 
                 tracing::info!(
-                    "Sending Gemini stream request (Attempt {}/{})",
+                    "Sending Gemini stream request (Attempt {}/{}, body_size={} bytes)",
                     attempts,
-                    max_attempts
+                    max_attempts,
+                    body_json_string.len()
                 );
                 tracing::debug!("Gemini stream body: {}", truncate_log(&body_json_string));
 
@@ -481,9 +493,9 @@ impl LlmClient for GeminiClient {
                         }
                     }
                     Err(e) => {
-                        last_error = e.to_string();
+                        last_error = format_full_error(&e);
                         tracing::warn!(
-                            "Gemini Network Error (Attempt {}/{}): {}",
+                            "Gemini Network Error (Attempt {}/{}):\n{}",
                             attempts,
                             max_attempts,
                             last_error
@@ -1018,7 +1030,11 @@ impl LlmClient for OpenAiCompatClient {
         }
 
         let body_json = serde_json::to_string(&body).unwrap_or_default();
-        tracing::info!("OpenAI generate_text request: url={}", self.base_url);
+        tracing::info!(
+            "OpenAI generate_text request: url={}, body_size={} bytes",
+            self.base_url,
+            body_json.len()
+        );
         tracing::debug!("OpenAI generate_text body: {}", truncate_log(&body_json));
         let response = self
             .client
@@ -1177,10 +1193,11 @@ impl LlmClient for OpenAiCompatClient {
                 let body_json_string = serde_json::to_string(&body_map).unwrap_or_default();
 
                 tracing::info!(
-                    "Sending stream request to {} (Attempt {}/{})",
+                    "Sending stream request to {} (Attempt {}/{}, body_size={} bytes)",
                     base_url,
                     attempts,
-                    max_attempts
+                    max_attempts,
+                    body_json_string.len()
                 );
                 tracing::debug!("OpenAI stream body: {}", truncate_log(&body_json_string));
 
@@ -1219,9 +1236,9 @@ impl LlmClient for OpenAiCompatClient {
                         }
                     }
                     Err(e) => {
-                        last_error = e.to_string();
+                        last_error = format_full_error(&e);
                         tracing::warn!(
-                            "OpenAI Network Error (Attempt {}/{}): {}",
+                            "OpenAI Network Error (Attempt {}/{}):\n{}",
                             attempts,
                             max_attempts,
                             last_error

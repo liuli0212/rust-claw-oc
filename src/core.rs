@@ -648,35 +648,36 @@ impl AgentLoop {
                 parts,
             });
 
+            // Post-stream text classification:
+            // Check if the buffered text is a finish_task JSON blob streamed as
+            // text content (some models ignore tool_choice: "required").
+            let text_without_think = Self::strip_think_blocks(&full_text);
+            let trimmed_clean = text_without_think.trim();
+            let mut is_finish_task_fallback = false;
+
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed_clean) {
+                if let Some(summary) = val
+                    .as_object()
+                    .and_then(|obj| obj.get("summary"))
+                    .and_then(|v| v.as_str())
+                {
+                    tracing::info!("Detected text-based finish_task fallback, extracting summary");
+                    self.output.on_task_finish(summary).await;
+                    self.context.end_turn();
+                    self.telemetry.end_span("agent_step");
+                    return Ok(RunExit::Finished(summary.to_string()));
+                }
+            }
+
+            // Normal text response — display it now (post-stream)
+            // We display this even if there are tool calls, as it often contains
+            // conversational context or explanations.
+            if !trimmed_clean.is_empty() {
+                self.output.on_text(trimmed_clean).await;
+                self.output.on_text("\n").await;
+            }
+
             if tool_calls_accumulated.is_empty() {
-                // Post-stream text classification:
-                // Check if the buffered text is a finish_task JSON blob streamed as
-                // text content (some models ignore tool_choice: "required").
-                let text_without_think = Self::strip_think_blocks(&full_text);
-                let trimmed_clean = text_without_think.trim();
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed_clean) {
-                    if let Some(summary) = val
-                        .as_object()
-                        .and_then(|obj| obj.get("summary"))
-                        .and_then(|v| v.as_str())
-                    {
-                        tracing::info!(
-                            "Detected text-based finish_task fallback, extracting summary"
-                        );
-                        self.output.on_task_finish(summary).await;
-                        self.context.end_turn();
-                        self.telemetry.end_span("agent_step");
-                        return Ok(RunExit::Finished(summary.to_string()));
-                    }
-                }
-
-                // Normal text response — display it now (post-stream)
-                let visible_text = trimmed_clean;
-                if !visible_text.is_empty() {
-                    self.output.on_text(visible_text).await;
-                    self.output.on_text("\n").await;
-                }
-
                 self.output.flush().await;
                 self.context.end_turn();
                 self.telemetry.end_span("agent_step");

@@ -174,7 +174,7 @@ impl AgentOutput for TuiOutput {
                 println!();
                 print!("    ");
             } else {
-                print!("{}", style(c).dim().italic());
+                print!("{}", style(c).color256(14).italic());
             }
         }
         use std::io::Write;

@@ -62,3 +62,18 @@ fn truncate_impl(log: &str, max_lines: usize, max_chars: usize) -> String {
         }
     }
 }
+
+pub fn format_full_error(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut s = e.to_string();
+    let mut current = e.source();
+    let mut depth = 0;
+    while let Some(cause) = current {
+        s.push_str(&format!("\n  [{}] Caused by: {}", depth, cause));
+        current = cause.source();
+        depth += 1;
+        if depth > 20 {
+            break;
+        }
+    }
+    s
+}
