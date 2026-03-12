@@ -394,6 +394,7 @@ impl AgentLoop {
             || msg.contains("502")
             || msg.contains("503")
             || msg.contains("rate limit")
+            || msg.contains("connection closed")
     }
 
     async fn handle_llm_error(&self, err: &crate::llm_client::LlmError, attempt: usize) -> bool {
@@ -738,11 +739,16 @@ impl AgentLoop {
                         .await;
 
                     tokio::select! {
-                        exec_res = tool.execute(call.args.clone()) => {
+                        exec_res = tokio::time::timeout(
+                            // Default 120s timeout for any tool execution to prevent hanging
+                            Duration::from_secs(120),
+                            tool.execute(call.args.clone())
+                        ) => {
                             match exec_res {
-                                Ok(res) => (res, false, false),
-                                Err(e) => (format!("Error executing {}: {}", call.name, e), true, false),
-                            }
+                        Ok(Ok(res)) => (res, false, false),
+                        Ok(Err(e)) => (format!("Tool error: {}", e), true, false),
+                        Err(e) => (format!("Timeout executing {}: {}", call.name, e), true, false),
+                    }
                         }
                         _ = self.cancel_token.notified() => {
                             ("Tool execution interrupted by user.".to_string(), true, true)
@@ -801,7 +807,7 @@ impl AgentLoop {
                     }
                 }
 
-                let final_result = result.clone();
+                let final_result = result.to_string();
 
                 if !is_error {
                     if call.name == "execute_bash" {

@@ -557,13 +557,18 @@ async fn handle_command(
 
             let bot_clone = bot.clone();
             tokio::spawn(async move {
-                let mut agent_guard = match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock()).await {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        let _ = bot_clone.send_message(chat_id, "⏳ 状态获取超时 (Agnet 繁忙)").await;
-                        return;
-                    }
-                };
+                let mut agent_guard =
+                    match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock())
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            let _ = bot_clone
+                                .send_message(chat_id, "⏳ 状态获取超时 (Agnet 繁忙)")
+                                .await;
+                            return;
+                        }
+                    };
 
                 // Flush old text & update output channel
                 agent_guard.flush_output().await;
@@ -575,7 +580,9 @@ async fn handle_command(
                     if let Ok(state) = ts.load() {
                         let mut task_msg = format!(
                             "🎯 *Active Task*: {}\n",
-                            TelegramOutput::escape_markdown_v2(&state.goal.unwrap_or_else(|| "Unknown".to_string()))
+                            TelegramOutput::escape_markdown_v2(
+                                &state.goal.unwrap_or_else(|| "Unknown".to_string())
+                            )
                         );
                         for (step_idx, step) in state.plan_steps.iter().enumerate() {
                             let icon = match step.status.as_str() {
@@ -585,11 +592,16 @@ async fn handle_command(
                             };
                             task_msg.push_str(&format!(
                                 "    \\[{}\\] {} {}\n",
-                                step_idx, icon, TelegramOutput::escape_markdown_v2(&step.step)
+                                step_idx,
+                                icon,
+                                TelegramOutput::escape_markdown_v2(&step.step)
                             ));
                         }
-                        task_msg.push_str("\n💡 You can say \"continue\" to proceed, or use /cancel to abort\\.");
-                        let _ = bot_clone.send_message(chat_id, task_msg)
+                        task_msg.push_str(
+                            "\n💡 You can say \"continue\" to proceed, or use /cancel to abort\\.",
+                        );
+                        let _ = bot_clone
+                            .send_message(chat_id, task_msg)
                             .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                             .await;
                     }
@@ -603,7 +615,8 @@ async fn handle_command(
                     tokens,
                     max_tokens
                 );
-                let _ = bot_clone.send_message(chat_id, status)
+                let _ = bot_clone
+                    .send_message(chat_id, status)
                     .parse_mode(ParseMode::MarkdownV2)
                     .await;
             });
@@ -624,13 +637,18 @@ async fn handle_command(
 
             let bot_clone = bot.clone();
             tokio::spawn(async move {
-                let mut agent_guard = match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock()).await {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        let _ = bot_clone.send_message(chat_id, "⏳ 会话状态获取超时 (Agnet 繁忙)").await;
-                        return;
-                    }
-                };
+                let mut agent_guard =
+                    match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock())
+                        .await
+                    {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            let _ = bot_clone
+                                .send_message(chat_id, "⏳ 会话状态获取超时 (Agnet 繁忙)")
+                                .await;
+                            return;
+                        }
+                    };
 
                 // Flush old text & update output channel
                 agent_guard.flush_output().await;
@@ -649,10 +667,16 @@ async fn handle_command(
                     *System Prompts*: `{}`\n\
                     *Active Evidence*: `{}`\n\
                     *Cancelled*: `{}`",
-                    TelegramOutput::escape_markdown_v2(details["session_id"].as_str().unwrap_or("")),
+                    TelegramOutput::escape_markdown_v2(
+                        details["session_id"].as_str().unwrap_or("")
+                    ),
                     TelegramOutput::escape_markdown_v2(details["provider"].as_str().unwrap_or("")),
-                    TelegramOutput::escape_markdown_v2(details["model"].as_str().unwrap_or("unknown")),
-                    TelegramOutput::escape_markdown_v2(details["task_id"].as_str().unwrap_or("none")),
+                    TelegramOutput::escape_markdown_v2(
+                        details["model"].as_str().unwrap_or("unknown")
+                    ),
+                    TelegramOutput::escape_markdown_v2(
+                        details["task_id"].as_str().unwrap_or("none")
+                    ),
                     details["task_status"].as_str().unwrap_or("idle"),
                     details["context"]["tokens"],
                     details["context"]["max_tokens"],
@@ -661,7 +685,8 @@ async fn handle_command(
                     details["context"]["active_evidence"],
                     details["cancelled"]
                 );
-                let _ = bot_clone.send_message(chat_id, formatted)
+                let _ = bot_clone
+                    .send_message(chat_id, formatted)
                     .parse_mode(ParseMode::MarkdownV2)
                     .await;
             });
@@ -791,9 +816,12 @@ async fn handle_message(
             // Active Task Reminder with Throttling
             let ts = crate::task_state::TaskStateStore::new(&session_id);
             if ts.has_active_plan() && text.to_lowercase() != "continue" && !text.starts_with('/') {
-                static LAST_REMINDED: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> = 
-                    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-                
+                static LAST_REMINDED: once_cell::sync::Lazy<
+                    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+                > = once_cell::sync::Lazy::new(|| {
+                    std::sync::Mutex::new(std::collections::HashMap::new())
+                });
+
                 let mut should_remind = false;
                 {
                     let mut map = LAST_REMINDED.lock().unwrap();
@@ -815,7 +843,8 @@ async fn handle_message(
                             "🎯 *Active Task Reminder*\nTask: {}\n\n💡 You can say \"continue\" to proceed with this task, or use /cancel to abort\\.",
                             TelegramOutput::escape_markdown_v2(&state.goal.unwrap_or_else(|| "Unknown".to_string()))
                         );
-                        let _ = bot_clone.send_message(chat_id, task_msg)
+                        let _ = bot_clone
+                            .send_message(chat_id, task_msg)
                             .parse_mode(teloxide::types::ParseMode::MarkdownV2)
                             .await;
                     }

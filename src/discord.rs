@@ -198,30 +198,41 @@ impl EventHandler for Handler {
 
         if cmd == "/cancel_task" {
             self.session_manager.cancel_session(&session_id).await;
-            let _ = channel_id.say(&http, "🛑 Task cancellation requested.").await;
+            let _ = channel_id
+                .say(&http, "🛑 Task cancellation requested.")
+                .await;
             return;
         }
 
         if cmd == "/status" {
             let ts = crate::task_state::TaskStateStore::new(&session_id);
             let mut status_msg = "📊 **Bot Status**
-".to_string();
-            
+"
+            .to_string();
+
             if ts.has_active_plan() {
                 if let Ok(state) = ts.load() {
-                    status_msg.push_str(&format!("🎯 **Active Task**: {}
-", state.goal.unwrap_or_else(|| "Unknown".to_string())));
+                    status_msg.push_str(&format!(
+                        "🎯 **Active Task**: {}
+",
+                        state.goal.unwrap_or_else(|| "Unknown".to_string())
+                    ));
                     for (i, step) in state.plan_steps.iter().enumerate() {
                         let icon = match step.status.as_str() {
                             "completed" => "✅",
                             "in_progress" => "⏳",
                             _ => "⬜",
                         };
-                        status_msg.push_str(&format!("  [{}] {} {}
-", i, icon, step.step));
+                        status_msg.push_str(&format!(
+                            "  [{}] {} {}
+",
+                            i, icon, step.step
+                        ));
                     }
-                    status_msg.push_str("
-💡 You can say \"continue\" to proceed, or use `/cancel_task` to abort.");
+                    status_msg.push_str(
+                        "
+💡 You can say \"continue\" to proceed, or use `/cancel_task` to abort.",
+                    );
                 }
             } else {
                 status_msg.push_str("✅ No active task.");

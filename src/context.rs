@@ -975,7 +975,13 @@ impl AgentContext {
 
         // 4. Total
         let total_tokens = history_tokens + current_turn_tokens + system_tokens;
-        (total_tokens, self.max_history_tokens, self.dialogue_history.len(), system_tokens, current_turn_tokens)
+        (
+            total_tokens,
+            self.max_history_tokens,
+            self.dialogue_history.len(),
+            system_tokens,
+            current_turn_tokens,
+        )
     }
 
     pub fn get_context_details(&self) -> String {
