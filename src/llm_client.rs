@@ -461,7 +461,7 @@ impl LlmClient for GeminiClient {
                 self.model_name, self.api_key
             ),
             GeminiPlatform::Vertex => format!(
-                "https://aiplatform.googleapis.com/v1/publishers/google/models/{}:generateContent?key={}",
+                "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:generateContent?key={}",
                 self.model_name, self.api_key
             ),
         };
@@ -560,7 +560,7 @@ impl LlmClient for GeminiClient {
                     model_name, api_key
                 ),
                 GeminiPlatform::Vertex => format!(
-                    "https://aiplatform.googleapis.com/v1/publishers/google/models/{}:streamGenerateContent?key={}",
+                    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:streamGenerateContent?alt=sse&key={}",
                     model_name, api_key
                 ),
             };
