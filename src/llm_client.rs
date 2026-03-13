@@ -271,6 +271,8 @@ struct VertexPart {
     function_call: Option<VertexFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "functionResponse")]
     function_response: Option<VertexFunctionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -306,6 +308,7 @@ fn to_vertex_message(msg: &Message) -> VertexMessage {
                     name: fr.name.clone(),
                     response: fr.response.clone(),
                 }),
+                thought_signature: p.thought_signature.clone(),
             })
             .collect(),
     }
