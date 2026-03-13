@@ -17,6 +17,7 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub platform: Option<String>, // "gen" (default), "vertex"
     pub context_window: Option<usize>,
     pub reasoning_effort: Option<String>,
 }

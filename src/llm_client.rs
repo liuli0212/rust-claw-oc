@@ -58,6 +58,7 @@ fn estimate_context_window(model: &str) -> usize {
 pub fn create_llm_client(
     provider: &str,
     model: Option<String>,
+    platform_override: Option<String>,
     config: &crate::config::AppConfig,
 ) -> Result<Arc<dyn LlmClient>, String> {
     if let Some(prov_config) = config.get_provider(provider) {
@@ -121,11 +122,21 @@ pub fn create_llm_client(
                     .context_window
                     .unwrap_or_else(|| estimate_context_window(&model_str));
 
-                Ok(Arc::new(GeminiClient::new_with_window(
+                let platform = match platform_override.as_deref() {
+                    Some("vertex") => GeminiPlatform::Vertex,
+                    Some("gen") => GeminiPlatform::Gen,
+                    _ => match prov_config.platform.as_deref() {
+                        Some("vertex") => GeminiPlatform::Vertex,
+                        _ => GeminiPlatform::Gen,
+                    },
+                };
+
+                Ok(Arc::new(GeminiClient::new_with_platform_and_window(
                     api_key,
                     model_final,
                     context_window,
                     provider.to_string(),
+                    platform,
                 )))
             }
             _ => Err(format!("Unknown provider type '{}'", prov_config.type_name)),
@@ -162,11 +173,16 @@ pub fn create_llm_client(
                     .clone()
                     .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
                 let context_window = estimate_context_window(&model_str);
-                Ok(Arc::new(GeminiClient::new_with_window(
+                let platform = match platform_override.as_deref() {
+                    Some("vertex") => GeminiPlatform::Vertex,
+                    _ => GeminiPlatform::Gen,
+                };
+                Ok(Arc::new(GeminiClient::new_with_platform_and_window(
                     api_key,
                     model,
                     context_window,
                     provider.to_string(),
+                    platform,
                 )))
             }
         }
@@ -196,11 +212,18 @@ pub trait LlmClient: Send + Sync {
 
 // --- Gemini Implementation ---
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiPlatform {
+    Gen,    // generativelanguage.googleapis.com
+    Vertex, // aiplatform.googleapis.com
+}
+
 pub struct GeminiClient {
     api_key: String,
     client: Client,
     model_name: String,
     provider_name: String,
+    platform: GeminiPlatform,
     #[allow(dead_code)]
     function_declarations_cache: Mutex<Option<CachedFunctionDeclarations>>,
     #[allow(dead_code)]
@@ -291,26 +314,32 @@ impl GeminiClient {
             client: create_standard_client(Some(base_url)),
             model_name: model_str,
             provider_name,
+            platform: GeminiPlatform::Gen,
             function_declarations_cache: Mutex::new(None),
             context_window: 1_000_000,
         }
     }
 
-    pub fn new_with_window(
+    pub fn new_with_platform_and_window(
         api_key: String,
         model_name: Option<String>,
         #[allow(dead_code)] context_window: usize,
         provider_name: String,
+        platform: GeminiPlatform,
     ) -> Self {
         let model_str = model_name
             .clone()
             .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
-        let base_url = "https://generativelanguage.googleapis.com";
+        let base_url = match platform {
+            GeminiPlatform::Gen => "https://generativelanguage.googleapis.com",
+            GeminiPlatform::Vertex => "https://aiplatform.googleapis.com",
+        };
         Self {
             api_key,
             client: create_standard_client(Some(base_url)),
             model_name: model_str,
             provider_name,
+            platform,
             function_declarations_cache: Mutex::new(None),
             context_window,
         }
@@ -361,10 +390,16 @@ impl LlmClient for GeminiClient {
         };
 
         let req_body_json = serde_json::to_string(&req_body).unwrap_or_default();
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.model_name, self.api_key
-        );
+        let url = match self.platform {
+            GeminiPlatform::Gen => format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+                self.model_name, self.api_key
+            ),
+            GeminiPlatform::Vertex => format!(
+                "https://aiplatform.googleapis.com/v1/publishers/google/models/{}:generateContent?key={}",
+                self.model_name, self.api_key
+            ),
+        };
 
         tracing::info!(
             "Gemini generate_text request: url={}, body_size={} bytes",
@@ -423,6 +458,7 @@ impl LlmClient for GeminiClient {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let model_name = self.model_name.clone();
+        let platform = self.platform;
 
         tokio::spawn(async move {
             let req_body = GeminiRequest {
@@ -438,10 +474,16 @@ impl LlmClient for GeminiClient {
                 tool_config: None,
             };
 
-            let url = format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-                model_name, api_key
-            );
+            let url = match platform {
+                GeminiPlatform::Gen => format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
+                    model_name, api_key
+                ),
+                GeminiPlatform::Vertex => format!(
+                    "https://aiplatform.googleapis.com/v1/publishers/google/models/{}:streamGenerateContent?key={}",
+                    model_name, api_key
+                ),
+            };
 
             let mut attempts = 0;
             let max_attempts = 5;

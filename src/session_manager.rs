@@ -218,7 +218,7 @@ impl SessionManager {
     ) -> Result<String, String> {
         let config = crate::config::AppConfig::load();
         // We use the factory function from llm_client
-        match crate::llm_client::create_llm_client(provider, model.clone(), &config) {
+        match crate::llm_client::create_llm_client(provider, model.clone(), None, &config) {
             Ok(new_llm) => {
                 // Update global default for new sessions
                 {

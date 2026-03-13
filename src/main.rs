@@ -69,6 +69,9 @@ struct CliArgs {
     /// Enable prompt caching (if supported by the provider)
     #[arg(long)]
     cache: bool,
+    /// Gemini platform (gen, vertex)
+    #[arg(long, default_value = "gen")]
+    gemini_platform: String,
 }
 
 #[tokio::main]
@@ -83,7 +86,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::AppConfig::load();
     let _guards = logging::init_logging(&config);
 
-    let llm_opt = match llm_client::create_llm_client(&args.provider, args.model.clone(), &config) {
+    let llm_platform = if args.provider == "gemini" {
+        Some(args.gemini_platform.clone())
+    } else {
+        None
+    };
+
+    let llm_opt = match llm_client::create_llm_client(
+        &args.provider,
+        args.model.clone(),
+        llm_platform,
+        &config,
+    ) {
         Ok(llm) => Some(llm),
         Err(e) => {
             tracing::error!("Failed to initialize default LLM: {}", e);
