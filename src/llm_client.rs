@@ -564,7 +564,7 @@ impl LlmClient for GeminiClient {
                     model_name, api_key
                 ),
             };
-
+            
             let mut attempts = 0;
             let max_attempts = 5;
             let mut last_error = String::from("initialization");
