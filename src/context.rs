@@ -20,6 +20,9 @@ pub struct Part {
 
     #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
     pub thought_signature: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fileData")]
+    pub file_data: Option<FileData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +31,12 @@ pub struct FunctionCall {
     pub args: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileData {
+    pub mime_type: String,
+    pub file_uri: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -615,7 +624,7 @@ impl AgentContext {
         result.trim().to_string()
     }
 
-    fn strip_response_payload(fr: &mut FunctionResponse) {
+    pub fn strip_response_payload(fr: &mut FunctionResponse) {
         // All tool results from core.rs are wrapped as: { "result": "{...serialized ToolExecutionEnvelope...}" }
         // We unwrap the envelope, strip per-tool, remove noise fields, and re-serialize.
         let obj = match fr.response.as_object_mut() {
@@ -759,6 +768,7 @@ impl AgentContext {
                     function_call: None,
                     function_response: None,
                     thought_signature: None, // Strip for history — Gemini only validates current turn
+                    file_data: None,
                 };
 
                 // 1. Function Call (Action) - KEEP (but strip task_plan args)
@@ -819,7 +829,7 @@ impl AgentContext {
                 {
                     new_parts.push(new_part);
                 }
-            }
+        }
 
             if !new_parts.is_empty() {
                 new_messages.push(Message {
@@ -921,8 +931,9 @@ impl AgentContext {
                             function_call: None,
                             function_response: None,
                             thought_signature: None,
-                        }],
-                    });
+                            file_data: None,
+                }],
+        });
                 }
             }
             prev_zone = Some(zone);
@@ -1215,8 +1226,9 @@ impl AgentContext {
                     function_call: None,
                     function_response: None,
                     thought_signature: None,
+                    file_data: None,
                 }],
-            }],
+        }],
         };
 
         // Insert at beginning
@@ -1331,8 +1343,9 @@ impl AgentContext {
                     function_call: None,
                     function_response: None,
                     thought_signature: None,
+                    file_data: None,
                 }],
-            }],
+        }],
         });
     }
 
@@ -1340,6 +1353,71 @@ impl AgentContext {
         if let Some(turn) = &mut self.current_turn {
             turn.messages.push(msg);
         }
+    }
+
+        /// Proactively compresses older tool results in the current turn to save payload size.
+    /// If the current turn's tool response total size exceeds `max_bytes`,
+    /// older results are stripped until we are under the limit.
+    pub fn compress_current_turn(&mut self, max_bytes: usize) -> usize {
+        let Some(turn) = &mut self.current_turn else {
+            return 0;
+        };
+
+        let function_indices: Vec<usize> = turn.messages.iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == "function")
+            .map(|(i, _)| i)
+            .collect();
+        
+        if function_indices.is_empty() {
+            return 0;
+        }
+
+        // Calculate total size of function responses
+        let mut current_size = 0;
+        for &idx in &function_indices {
+            let msg = &turn.messages[idx];
+            for part in &msg.parts {
+                if let Some(fr) = &part.function_response {
+                    current_size += fr.response.to_string().len();
+                }
+            }
+        }
+
+        if current_size <= max_bytes {
+            return 0;
+        }
+
+        let mut compressed_count = 0;
+        // Compress messages from oldest to newest until size is okay, 
+        // but always keep at least the last 1 result if possible.
+        let limit = function_indices.len().saturating_sub(1);
+        for i in 0..limit {
+            let idx = function_indices[i];
+            let msg = &mut turn.messages[idx];
+            
+            for part in &mut msg.parts {
+                if let Some(fr) = &mut part.function_response {
+                    let response_str = fr.response.to_string();
+                    if response_str.contains("stripped") && response_str.len() < 1000 {
+                        continue; 
+                    }
+                    
+                    let old_len = response_str.len();
+                    Self::strip_response_payload(fr);
+                    let new_len = fr.response.to_string().len();
+                    
+                    compressed_count += 1;
+                    current_size = current_size.saturating_sub(old_len.saturating_sub(new_len));
+                }
+            }
+
+            if current_size <= max_bytes {
+                break;
+            }
+        }
+
+        compressed_count
     }
 
     pub fn truncate_current_turn_tool_results(&mut self, max_chars: usize) -> usize {
@@ -1412,8 +1490,9 @@ impl AgentContext {
                         function_call: None,
                         function_response: None,
                         thought_signature: None,
-                    }],
-                };
+                        file_data: None,
+                }],
+        };
                 current_turn_tokens += Self::estimate_tokens(&bpe, &separator);
                 messages.push(separator);
 
@@ -1487,7 +1566,8 @@ impl AgentContext {
                 text: Some(assembled_system_text),
                 function_call: None,
                 function_response: None,
-            }],
+                file_data: None,
+                }],
         };
 
         let system_prompt_tokens = report_data.used_tokens;
@@ -1647,7 +1727,8 @@ mod tests {
                 function_call: None,
                 function_response: None,
                 thought_signature: None,
-            }],
+                file_data: None,
+                }],
         });
 
         ctx.end_turn();

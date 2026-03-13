@@ -502,7 +502,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 RunExit::Finished(ref summary) => {
                     println!("\n{}", style(summary).green().bold());
-                    println!("  {}", style("Task Finished").green());
+                    println!("  {} {}", style("✔").green().bold(), style("Mission accomplished. All tasks have been completed.").green());
+                    println!("  {} {}", style("ℹ").blue().bold(), style("I am standing by. Please let me know if you have any new instructions.").dim());
                 }
                 RunExit::StoppedByUser => {
                     println!("\n  {}", style("Execution Stopped by User").yellow());

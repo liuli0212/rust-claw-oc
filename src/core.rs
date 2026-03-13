@@ -394,7 +394,7 @@ impl AgentLoop {
             || msg.contains("502")
             || msg.contains("503")
             || msg.contains("rate limit")
-            || msg.contains("connection closed")
+            || msg.contains("connection closed") || msg.contains("connection reset") || msg.contains("eof")
     }
 
     async fn handle_llm_error(&self, err: &crate::llm_client::LlmError, attempt: usize) -> bool {
@@ -445,9 +445,10 @@ impl AgentLoop {
             .load()
             .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
 
-        if state.status == "in_progress" {
-            // New user command arrived while old task still in progress — auto-clear
-            tracing::info!("Auto-clearing previous in_progress task plan for new goal");
+        if state.status == "in_progress" || state.status == "finished" || state.status == "failed" {
+            // If a previous task exists, we clear it to start fresh for the new goal.
+            // This prevents the "finished" status from immediately terminating the next turn.
+            tracing::info!("Starting new task: cleaning previous {} task state", state.status);
             state = crate::task_state::TaskStateSnapshot::empty();
         }
 
@@ -633,16 +634,18 @@ impl AgentLoop {
                     function_call: None,
                     function_response: None,
                     thought_signature: None,
+                    file_data: None,
                 });
-            }
+        }
             for (tc, sig) in &tool_calls_accumulated {
                 parts.push(Part {
                     text: None,
                     function_call: Some(tc.clone()),
                     function_response: None,
                     thought_signature: sig.clone(),
+                    file_data: None,
                 });
-            }
+        }
 
             self.context.add_message_to_current_turn(Message {
                 role: "model".to_string(),
@@ -686,11 +689,25 @@ impl AgentLoop {
             }
 
             let state_before_tools = state.clone();
-            let mut executed_signatures = HashSet::new();
             let mut stop_loop = false;
+            let mut skip_remaining = false;
 
             let mut response_parts = Vec::new();
             for (mut call, thought_sig) in tool_calls_accumulated {
+                if skip_remaining {
+                    response_parts.push(Part {
+                        text: None,
+                        function_call: None,
+                        function_response: Some(FunctionResponse {
+                            name: call.name.clone(),
+                            response: serde_json::json!({ "result": "Execution skipped as turn was interrupted." }),
+                            id: call.id.clone(),
+                        }),
+                        thought_signature: thought_sig.clone(),
+                        file_data: None,
+                    });
+                    continue;
+                }
                 if let Some(obj) = call.args.as_object_mut() {
                     if let Some(thought) = obj.remove("thought") {
                         if let Some(thought_str) = thought.as_str() {
@@ -702,11 +719,22 @@ impl AgentLoop {
                     }
                 }
 
-                let sig = format!("{}:{}", call.name, call.args);
-                if !executed_signatures.insert(sig) || call.name.trim().is_empty() {
+                if call.name.trim().is_empty() {
+                    response_parts.push(Part {
+                        text: None,
+                        function_call: None,
+                        function_response: Some(FunctionResponse {
+                            name: "unknown".to_string(),
+                            response: serde_json::json!({ "result": "Error: Empty tool name" }),
+                            id: call.id.clone(),
+                        }),
+                        thought_signature: thought_sig.clone(),
+                        file_data: None,
+                });
                     continue;
-                }
+        }
 
+                let mut is_finished = false;
                 if call.name == "finish_task" {
                     let mut summary = call.args.to_string();
 
@@ -724,13 +752,29 @@ impl AgentLoop {
                             }
                         }
                     }
-                    self.context.end_turn();
+                    is_finished = true;
+                    // We still add a response part for finish_task for API consistency
+                    response_parts.push(Part {
+                        text: None,
+                        function_call: None,
+                        function_response: Some(FunctionResponse {
+                            name: call.name.clone(),
+                            response: serde_json::json!({ "result": "Task finished." }),
+                            id: call.id.clone(),
+                        }),
+                        thought_signature: thought_sig.clone(),
+                        file_data: None,
+                });
 
-                    self.output.on_task_finish(&summary).await;
-
-                    self.telemetry.end_span("agent_step");
-                    return Ok(RunExit::Finished(summary));
-                }
+                    if is_finished {
+                        state.status = "finished".to_string();
+                        // State doesn't have a mutable 'summary' field, but the summary() method returns a String.
+                        // We store it in a local variable before continue.
+                        let _ = self.task_state_store.save(&state);
+                        self.output.on_task_finish(&summary).await;
+                        continue;
+                    }
+        }
 
                 let tool_opt = self.tools.iter().find(|t| t.name() == call.name);
                 let (result, is_error, stopped) = if let Some(tool) = tool_opt {
@@ -760,8 +804,7 @@ impl AgentLoop {
 
                 if stopped {
                     self.output.on_error(&result).await;
-                    stop_loop = true;
-                    // Even if stopped, we might want to record the partial result or just break
+                    // Even if stopped, we MUST record the result for this part to maintain count
                     response_parts.push(Part {
                         text: None,
                         function_call: None,
@@ -770,10 +813,12 @@ impl AgentLoop {
                             response: serde_json::json!({ "result": result }),
                             id: call.id.clone(),
                         }),
-                        thought_signature: thought_sig,
-                    });
-                    break;
-                }
+                        thought_signature: thought_sig.clone(),
+                        file_data: None,
+                });
+                    skip_remaining = true;
+                    continue;
+        }
 
                 if is_error {
                     self.output.on_error(&result).await;
@@ -795,7 +840,7 @@ impl AgentLoop {
                                     path_val.to_string(),
                                     1.0,
                                     format!("Direct read of {}", path_val),
-                                    result.clone(),
+                                    result.to_string(),
                                 );
                                 // Maintain a clean state: remove older versions of the same file
                                 self.context.active_evidence.retain(|e| {
@@ -884,14 +929,22 @@ impl AgentLoop {
                         id: call.id.clone(),
                     }),
                     thought_signature: thought_sig,
+                    file_data: None,
                 });
-            }
+        }
 
             if !response_parts.is_empty() {
                 self.context.add_message_to_current_turn(Message {
                     role: "function".to_string(),
                     parts: response_parts,
                 });
+            }
+
+            if state.status == "finished" {
+                let summary = state.summary();
+                self.context.end_turn();
+                self.telemetry.end_span("agent_step");
+                return Ok(RunExit::Finished(summary));
             }
 
             let state_after_tools = self
@@ -903,16 +956,20 @@ impl AgentLoop {
             }
             state = state_after_tools;
 
-            // Impose limits on extremely large tool results that might explode the context window
+            // [PROACTIVE COMPRESSION] 
+            // Stay under proxy limits (1MB) by stripping older results in the current turn.
+            // We keep raw tool output total under 400KB to be safe.
+            let compressed = self.context.compress_current_turn(400 * 1024);
             let truncated = self.context.truncate_current_turn_tool_results(30000);
-            if truncated > 0 {
+            
+            if compressed > 0 || truncated > 0 {
                 let current_turn_id = self
                     .context
                     .current_turn
                     .as_ref()
-                    .map(|t| t.turn_id.as_str())
-                    .unwrap_or("unknown");
-                tracing::warn!("Turn {} tool results had {} oversized part(s) automatically truncated to save memory bounds.", current_turn_id, truncated);
+                    .map(|t| t.turn_id.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                tracing::info!("Turn {} compression: {} compressed, {} truncated.", current_turn_id, compressed, truncated);
             }
 
             if stop_loop {

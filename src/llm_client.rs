@@ -7,7 +7,10 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -208,6 +211,13 @@ pub trait LlmClient: Send + Sync {
         system_instruction: Option<Message>,
         tools: Vec<Arc<dyn Tool>>,
     ) -> Result<mpsc::Receiver<StreamEvent>, LlmError>;
+
+    async fn generate_structured(
+        &self,
+        messages: Vec<Message>,
+        system_instruction: Option<Message>,
+        response_schema: Value,
+    ) -> Result<Value, LlmError>;
 }
 
 // --- Gemini Implementation ---
@@ -226,11 +236,17 @@ pub struct GeminiClient {
     platform: GeminiPlatform,
     #[allow(dead_code)]
     function_declarations_cache: Mutex<Option<CachedFunctionDeclarations>>,
+    cached_content: tokio::sync::Mutex<Option<CachedContentInfo>>,
     #[allow(dead_code)]
     context_window: usize,
 }
 
 #[derive(Clone)]
+struct CachedContentInfo {
+    id: String,
+    hash: u64,
+}
+
 struct CachedFunctionDeclarations {
     #[allow(dead_code)]
     signature: String,
@@ -247,6 +263,10 @@ pub struct GeminiRequest {
     pub tools: Option<Vec<ToolDeclarationWrapper>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
     pub tool_config: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
+    pub generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cachedContent")]
+    pub cached_content: Option<String>,
 }
 
 // --- Vertex-compatible types (no 'id' field) ---
@@ -273,6 +293,8 @@ struct VertexPart {
     function_response: Option<VertexFunctionResponse>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
     pub thought_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fileData")]
+    pub file_data: Option<crate::context::FileData>,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,6 +312,10 @@ struct VertexGeminiRequest {
     tools: Option<Vec<ToolDeclarationWrapper>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
     pub tool_config: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
+    pub generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cachedContent")]
+    pub cached_content: Option<String>,
 }
 
 fn to_vertex_message(msg: &Message) -> VertexMessage {
@@ -309,6 +335,7 @@ fn to_vertex_message(msg: &Message) -> VertexMessage {
                     response: fr.response.clone(),
                 }),
                 thought_signature: p.thought_signature.clone(),
+                file_data: p.file_data.clone(),
             })
             .collect(),
     }
@@ -330,10 +357,21 @@ pub struct FunctionDeclaration {
 fn create_standard_client(base_url: Option<&str>) -> Client {
     let mut builder = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(300))
-        .timeout(std::time::Duration::from_secs(300)) // 5 minutes for long LLM responses
+        .timeout(std::time::Duration::from_secs(600)) // 10 minutes for large context
         .pool_idle_timeout(std::time::Duration::from_secs(600)) // 10 minutes
         .pool_max_idle_per_host(10)
         .tcp_keepalive(Some(std::time::Duration::from_secs(30))) // More aggressive keepalive
+        .http2_keep_alive_interval(Some(std::time::Duration::from_secs(15)))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(20))
+        .http2_keep_alive_while_idle(true)
+        .http2_initial_stream_window_size(4 * 1024 * 1024)
+        .http2_initial_connection_window_size(4 * 1024 * 1024)
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("X-Server-Timeout", reqwest::header::HeaderValue::from_static("600"));
+            headers.insert("x-goog-api-client", reqwest::header::HeaderValue::from_static("rusty-claw/0.1.0"));
+            headers
+        })
         .gzip(true);
 
     // Explicitly check for NO_PROXY because reqwest might not pick it up correctly
@@ -381,6 +419,7 @@ impl GeminiClient {
             provider_name,
             platform: GeminiPlatform::Gen,
             function_declarations_cache: Mutex::new(None),
+            cached_content: tokio::sync::Mutex::new(None),
             context_window: 1_000_000,
         }
     }
@@ -406,6 +445,7 @@ impl GeminiClient {
             provider_name,
             platform,
             function_declarations_cache: Mutex::new(None),
+            cached_content: tokio::sync::Mutex::new(None),
             context_window,
         }
     }
@@ -429,6 +469,119 @@ impl GeminiClient {
         }
         declarations
     }
+
+    /// Uploads content as a file to Gemini File API and returns the file URI.
+    async fn upload_content(&self, content: &str, mime_type: &str) -> Result<String, LlmError> {
+        let url = format!(
+            "https://generativelanguage.googleapis.com/upload/v1beta/files?key={}",
+            self.api_key
+        );
+
+        let metadata = serde_json::json!({
+            "file": {
+                "display_name": format!("payload_{}", uuid::Uuid::new_v4().simple()),
+            }
+        });
+
+        tracing::info!("Starting resumable upload to Gemini File API ({} bytes)", content.len());
+
+        let response = self.client
+            .post(&url)
+            .header("X-Goog-Upload-Protocol", "resumable")
+            .header("X-Goog-Upload-Command", "start")
+            .header("X-Goog-Upload-Header-Content-Length", content.len().to_string())
+            .header("X-Goog-Upload-Header-Content-Type", mime_type)
+            .json(&metadata)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error = response.text().await.unwrap_or_default();
+            return Err(LlmError::ApiError(format!("Failed to start upload: {}", error)));
+        }
+
+        let session_url = response.headers().get("X-Goog-Upload-URL").and_then(|v| v.to_str().ok()).unwrap();
+
+        // 2. Multi-part chunked upload for robustness
+        let bytes = content.as_bytes();
+        let chunk_size = 5 * 1024 * 1024; // 5MB chunks
+        let total_len = bytes.len();
+        let mut offset = 0;
+        let mut final_uri = String::new();
+
+        while offset < total_len {
+            let end = (offset + chunk_size).min(total_len);
+            let chunk = bytes[offset..end].to_vec();
+            let is_last = end == total_len;
+
+            let upload_response = self.client
+                .put(session_url)
+                .header("X-Goog-Upload-Offset", offset.to_string())
+                .header("X-Goog-Upload-Command", if is_last { "upload, finalize" } else { "upload" })
+                .body(chunk)
+                .send()
+                .await?;
+
+            if !upload_response.status().is_success() {
+                let error = upload_response.text().await.unwrap_or_default();
+                return Err(LlmError::ApiError(format!("Failed to upload chunk at offset {}: {}", offset, error)));
+            }
+
+            if is_last {
+                let final_json: serde_json::Value = upload_response.json().await?;
+                final_uri = final_json["file"]["uri"].as_str().unwrap().to_string();
+                break;
+            }
+
+            offset = end;
+        }
+        Ok(final_uri)
+    }
+
+    async fn dehydrate_messages(&self, messages: &mut Vec<Message>) -> Result<(), LlmError> {
+        for msg in messages {
+            self.dehydrate_message(msg).await?;
+        }
+        Ok(())
+    }
+
+    async fn dehydrate_message(&self, msg: &mut Message) -> Result<(), LlmError> {
+        for part in &mut msg.parts {
+            if let Some(text) = &part.text {
+                if text.len() > 512 * 1024 {
+                    let file_uri = self.upload_content(text, "text/plain").await?;
+                    part.text = None;
+                    part.file_data = Some(crate::context::FileData { mime_type: "text/plain".to_string(), file_uri });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn create_context_cache(
+        &self,
+        system_instruction: &Message,
+    ) -> Result<String, LlmError> {
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/cachedContents?key={}",
+            self.api_key
+        );
+
+        let body = serde_json::json!({
+            "model": format!("models/{}", self.model_name),
+            "systemInstruction": system_instruction,
+            "ttl": "3600s"
+        });
+
+        let response = self.client.post(&url).json(&body).send().await?;
+        if !response.status().is_success() {
+            let error = response.text().await.unwrap_or_default();
+            return Err(LlmError::ApiError(format!("Cache creation failed: {}", error)));
+        }
+        let json: serde_json::Value = response.json().await?;
+        let name = json["name"].as_str().ok_or_else(|| LlmError::ApiError("No name in cache response".to_string()))?;
+        Ok(name.to_string())
+    }
 }
 
 #[async_trait]
@@ -447,22 +600,88 @@ impl LlmClient for GeminiClient {
         messages: Vec<Message>,
         system_instruction: Option<Message>,
     ) -> Result<String, LlmError> {
-        let req_body = GeminiRequest {
+        let mut messages = messages;
+        let mut system_instruction = system_instruction;
+        self.dehydrate_messages(&mut messages).await?;
+        if let Some(ref mut sys_msg) = system_instruction {
+            self.dehydrate_message(sys_msg).await?;
+        }
+
+        let mut cached_content_id = None;
+        if let Some(ref sys_msg) = system_instruction {
+            // Check if caching is worth it (> 128KB roughly 32k tokens)
+            let sys_str = serde_json::to_string(sys_msg).unwrap_or_default();
+            if sys_str.len() > 128 * 1024 {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                sys_str.hash(&mut hasher);
+                let current_hash = hasher.finish();
+
+                let mut cache_guard = self.cached_content.lock().await;
+                if let Some(cache_info) = &*cache_guard {
+                    if cache_info.hash == current_hash {
+                        cached_content_id = Some(cache_info.id.clone());
+                    }
+                }
+
+                if cached_content_id.is_none() {
+                    tracing::info!("Creating context cache for system instruction ({} bytes)", sys_str.len());
+                    match self.create_context_cache(sys_msg).await {
+                        Ok(id) => {
+                            *cache_guard = Some(CachedContentInfo { id: id.clone(), hash: current_hash });
+                            cached_content_id = Some(id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to create context cache: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we have a cache, we might want to clear system_instruction from the request
+        // but only if it's identical to what's in the cache.
+        // For simplicity, if cached_content_id is Some, we set system_instruction = None.
+        let final_system_instruction = if cached_content_id.is_some() { None } else { system_instruction.clone() };
+
+
+        let generation_config = if self.model_name.contains("thinking") {
+            Some(GenerationConfig {
+                temperature: Some(0.7),
+                max_output_tokens: Some(64000),
+                thinking_config: Some(ThinkingConfig {
+                    include_thoughts: true,
+                    quota_tokens: 32000,
+                }),
+                response_mime_type: None,
+                response_schema: None,
+            })
+        } else {
+            Some(GenerationConfig {
+                temperature: Some(0.0),
+                max_output_tokens: Some(8192),
+                thinking_config: None,
+                response_mime_type: None,
+                response_schema: None,
+            })
+        };
+
+        
+            let req_body = GeminiRequest {
             contents: messages,
-            system_instruction,
+            system_instruction: final_system_instruction,
             tools: None,
             tool_config: None,
+            generation_config: generation_config.clone(),
+            cached_content: cached_content_id,
         };
 
         let req_body_json = serde_json::to_string(&req_body).unwrap_or_default();
         let url = match self.platform {
             GeminiPlatform::Gen => format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-                self.model_name, self.api_key
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", self.model_name
             ),
             GeminiPlatform::Vertex => format!(
-                "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:generateContent?key={}",
-                self.model_name, self.api_key
+                "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:generateContent", self.model_name
             ),
         };
 
@@ -479,21 +698,21 @@ impl LlmClient for GeminiClient {
         let response = match self.platform {
             GeminiPlatform::Gen => self.client
                 .post(&url)
-                .header(CONTENT_TYPE, "application/json")
-                .json(&req_body)
+                .header(CONTENT_TYPE, "application/json").header("x-goog-api-key", self.api_key.clone()).json(&req_body)
                 .send()
                 .await?,
             GeminiPlatform::Vertex => {
                 let vertex_req = VertexGeminiRequest {
                     contents: req_body.contents.iter().map(to_vertex_message).collect(),
                     system_instruction: req_body.system_instruction.as_ref().map(to_vertex_message),
-                    tools: req_body.tools,
-                    tool_config: req_body.tool_config,
+                    tools: req_body.tools.clone(),
+                    tool_config: req_body.tool_config.clone(),
+                    generation_config: req_body.generation_config.clone(),
+                    cached_content: None,
                 };
                 self.client
                     .post(&url)
-                    .header(CONTENT_TYPE, "application/json")
-                    .json(&vertex_req)
+                    .header(CONTENT_TYPE, "application/json").header("x-goog-api-key", self.api_key.clone()).json(&vertex_req)
                     .send()
                     .await?
             }
@@ -532,6 +751,50 @@ impl LlmClient for GeminiClient {
         system_instruction: Option<Message>,
         tools: Vec<Arc<dyn Tool>>,
     ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+        let mut messages = messages;
+        let mut system_instruction = system_instruction;
+        self.dehydrate_messages(&mut messages).await?;
+        if let Some(ref mut sys_msg) = system_instruction {
+            self.dehydrate_message(sys_msg).await?;
+        }
+
+        let mut cached_content_id = None;
+        if let Some(ref sys_msg) = system_instruction {
+            // Check if caching is worth it (> 128KB roughly 32k tokens)
+            let sys_str = serde_json::to_string(sys_msg).unwrap_or_default();
+            if sys_str.len() > 128 * 1024 {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                sys_str.hash(&mut hasher);
+                let current_hash = hasher.finish();
+
+                let mut cache_guard = self.cached_content.lock().await;
+                if let Some(cache_info) = &*cache_guard {
+                    if cache_info.hash == current_hash {
+                        cached_content_id = Some(cache_info.id.clone());
+                    }
+                }
+
+                if cached_content_id.is_none() {
+                    tracing::info!("Creating context cache for system instruction ({} bytes)", sys_str.len());
+                    match self.create_context_cache(sys_msg).await {
+                        Ok(id) => {
+                            *cache_guard = Some(CachedContentInfo { id: id.clone(), hash: current_hash });
+                            cached_content_id = Some(id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to create context cache: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // If we have a cache, we might want to clear system_instruction from the request
+        // but only if it's identical to what's in the cache.
+        // For simplicity, if cached_content_id is Some, we set system_instruction = None.
+        let final_system_instruction = if cached_content_id.is_some() { None } else { system_instruction.clone() };
+
+
         let function_declarations = self.get_function_declarations(&tools);
         let (tx, rx) = mpsc::channel(100);
 
@@ -541,9 +804,31 @@ impl LlmClient for GeminiClient {
         let platform = self.platform;
 
         tokio::spawn(async move {
+            
+            let generation_config = if model_name.contains("thinking") {
+                Some(GenerationConfig {
+                    temperature: Some(0.7),
+                    max_output_tokens: Some(64000),
+                    thinking_config: Some(ThinkingConfig {
+                        include_thoughts: true,
+                        quota_tokens: 32000,
+                    }),
+                    response_mime_type: None,
+                    response_schema: None,
+                })
+            } else {
+                Some(GenerationConfig {
+                    temperature: Some(0.0),
+                    max_output_tokens: Some(8192),
+                    thinking_config: None,
+                    response_mime_type: None,
+                    response_schema: None,
+                })
+            };
+
             let req_body = GeminiRequest {
                 contents: messages,
-                system_instruction,
+                system_instruction: final_system_instruction,
                 tools: if function_declarations.is_empty() {
                     None
                 } else {
@@ -552,16 +837,16 @@ impl LlmClient for GeminiClient {
                     }])
                 },
                 tool_config: None,
+                generation_config,
+                cached_content: cached_content_id,
             };
 
             let url = match platform {
                 GeminiPlatform::Gen => format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-                    model_name, api_key
+                    "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse", model_name
                 ),
                 GeminiPlatform::Vertex => format!(
-                    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:streamGenerateContent?alt=sse&key={}",
-                    model_name, api_key
+                    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:streamGenerateContent?alt=sse", model_name
                 ),
             };
             
@@ -577,6 +862,8 @@ impl LlmClient for GeminiClient {
                         system_instruction: req_body.system_instruction.as_ref().map(to_vertex_message),
                         tools: req_body.tools.clone(),
                         tool_config: req_body.tool_config.clone(),
+                        generation_config: req_body.generation_config.clone(),
+                        cached_content: None,
                     };
                     serde_json::to_string(&vertex_req).unwrap_or_default()
                 }
@@ -595,8 +882,7 @@ impl LlmClient for GeminiClient {
 
                 let req_result = client
                     .post(&url)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(body_json_string.clone())
+                    .header(CONTENT_TYPE, "application/json").header("x-goog-api-key", api_key.clone()).body(body_json_string.clone())
                     .send()
                     .await;
 
@@ -816,6 +1102,144 @@ impl LlmClient for GeminiClient {
 
         Ok(rx)
     }
+
+    async fn generate_structured(
+        &self,
+        messages: Vec<Message>,
+        system_instruction: Option<Message>,
+        response_schema: Value,
+    ) -> Result<Value, LlmError> {
+        let mut messages = messages;
+        let mut system_instruction = system_instruction;
+        self.dehydrate_messages(&mut messages).await?;
+        if let Some(ref mut sys_msg) = system_instruction {
+            self.dehydrate_message(sys_msg).await?;
+        }
+
+        let mut cached_content_id = None;
+        if let Some(ref sys_msg) = system_instruction {
+            let sys_str = serde_json::to_string(sys_msg).unwrap_or_default();
+            if sys_str.len() > 128 * 1024 {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                sys_str.hash(&mut hasher);
+                let current_hash = hasher.finish();
+
+                let mut cache_guard = self.cached_content.lock().await;
+                if let Some(cache_info) = &*cache_guard {
+                    if cache_info.hash == current_hash {
+                        cached_content_id = Some(cache_info.id.clone());
+                    }
+                }
+
+                if cached_content_id.is_none() {
+                    tracing::info!("Creating context cache for structured output ({} bytes)", sys_str.len());
+                    match self.create_context_cache(sys_msg).await {
+                        Ok(id) => {
+                            *cache_guard = Some(CachedContentInfo { id: id.clone(), hash: current_hash });
+                            cached_content_id = Some(id);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to create context cache: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        let final_system_instruction = if cached_content_id.is_some() { None } else { system_instruction.clone() };
+
+        let generation_config = GenerationConfig {
+            temperature: Some(0.0),
+            max_output_tokens: Some(8192),
+            thinking_config: None,
+            response_mime_type: Some("application/json".to_string()),
+            response_schema: Some(response_schema),
+        };
+
+        let req_body = GeminiRequest {
+            contents: messages,
+            system_instruction: final_system_instruction,
+            tools: None,
+            tool_config: None,
+            generation_config: Some(generation_config),
+            cached_content: cached_content_id,
+        };
+
+        let url = match self.platform {
+            GeminiPlatform::Gen => format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", self.model_name
+            ),
+            GeminiPlatform::Vertex => format!(
+                "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:generateContent", self.model_name
+            ),
+        };
+
+        let mut attempts = 0;
+        let max_attempts = 5;
+        let mut last_error = String::from("initialization");
+
+        let response_json = loop {
+            attempts += 1;
+            let response = match self.platform {
+                GeminiPlatform::Gen => self.client
+                    .post(&url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("x-goog-api-key", self.api_key.clone())
+                    .json(&req_body)
+                    .send()
+                    .await,
+                GeminiPlatform::Vertex => {
+                    let vertex_req = VertexGeminiRequest {
+                        contents: req_body.contents.iter().map(to_vertex_message).collect(),
+                        system_instruction: req_body.system_instruction.as_ref().map(to_vertex_message),
+                        tools: req_body.tools.clone(),
+                        tool_config: req_body.tool_config.clone(),
+                        generation_config: req_body.generation_config.clone(),
+                        cached_content: req_body.cached_content.clone(),
+                    };
+                    self.client
+                        .post(&url)
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("x-goog-api-key", self.api_key.clone())
+                        .json(&vertex_req)
+                        .send()
+                        .await
+                }
+            };
+
+            match response {
+                Ok(r) if r.status().is_success() => {
+                    break r.json::<Value>().await?;
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    let error_text = r.text().await.unwrap_or_default();
+                    last_error = format!("status={} body={}", status, truncate_log_error(&error_text));
+                    tracing::warn!("Gemini Structured API Error (Attempt {}/{}): {}", attempts, max_attempts, last_error);
+                    
+                    let is_transient = status.is_server_error() || status.as_u16() == 429;
+                    if !is_transient || attempts >= max_attempts {
+                        return Err(LlmError::ApiError(last_error));
+                    }
+                }
+                Err(e) => {
+                    last_error = format_full_error(&e);
+                    tracing::warn!("Gemini Structured Network Error (Attempt {}/{}): {}", attempts, max_attempts, last_error);
+                    if attempts >= max_attempts {
+                        return Err(LlmError::NetworkError(e));
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1000 * attempts)).await;
+        };
+
+        let text = response_json["candidates"][0]["content"]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or("{}");
+        
+        let parsed: Value = serde_json::from_str(text)?;
+        Ok(parsed)
+    }
 }
 
 fn parse_function_call_basic(part: &Value) -> Option<FunctionCall> {
@@ -825,8 +1249,7 @@ fn parse_function_call_basic(part: &Value) -> Option<FunctionCall> {
     let id = func_call
         .get("id")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| Some(format!("call_{}", uuid::Uuid::new_v4().simple())));
+        .map(|s| s.to_string());
     Some(FunctionCall { name, args, id })
 }
 
@@ -1488,6 +1911,15 @@ impl LlmClient for OpenAiCompatClient {
         });
         Ok(rx)
     }
+
+    async fn generate_structured(
+        &self,
+        _messages: Vec<Message>,
+        _system_instruction: Option<Message>,
+        _response_schema: Value,
+    ) -> Result<Value, LlmError> {
+        Err(LlmError::ApiError("Structured output not yet implemented for OpenAI Compat".to_string()))
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1542,4 +1974,26 @@ mod tests {
         assert_eq!(estimate_context_window("qwen-plus"), 128_000);
         assert_eq!(estimate_context_window("unknown-model"), 128_000);
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GenerationConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "maxOutputTokens")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
+    pub thinking_config: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseMimeType")]
+    pub response_mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "responseSchema")]
+    pub response_schema: Option<Value>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ThinkingConfig {
+    #[serde(rename = "includeThoughts")]
+    pub include_thoughts: bool,
+    #[serde(rename = "thinkingProcessQuotaTokens")]
+    pub quota_tokens: u32,
 }
