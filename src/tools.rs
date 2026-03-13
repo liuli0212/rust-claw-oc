@@ -1270,3 +1270,182 @@ impl Tool for SendTelegramMessageTool {
         }
     }
 }
+
+// --- LSP Tools ---
+pub struct LspGotoDefinitionTool {
+    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct LspGotoDefinitionArgs {
+    /// Path to the file
+    pub path: String,
+    /// Line number (0-indexed)
+    pub line: u32,
+    /// Character position (0-indexed)
+    pub character: u32,
+}
+
+#[async_trait]
+impl Tool for LspGotoDefinitionTool {
+    fn name(&self) -> String { "lsp_goto_definition".to_string() }
+    fn description(&self) -> String {
+        "Go to definition of a symbol using rust-analyzer.".to_string()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(LspGotoDefinitionArgs)).unwrap())
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: LspGotoDefinitionArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        
+        let path = std::path::PathBuf::from(&parsed.path);
+        let result = self.lsp_client.goto_definition(path, parsed.line, parsed.character)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+        
+        Ok(serde_json::to_string_pretty(&result).unwrap())
+    }
+}
+
+// --- LSP Find References Tool ---
+pub struct LspFindReferencesTool {
+    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct LspFindReferencesArgs {
+    /// Path to the file
+    pub path: String,
+    /// Line number (0-indexed)
+    pub line: u32,
+    /// Character position (0-indexed)
+    pub character: u32,
+    /// Whether to include the declaration of the symbol
+    pub include_declaration: bool,
+}
+
+#[async_trait]
+impl Tool for LspFindReferencesTool {
+    fn name(&self) -> String { "lsp_find_references".to_string() }
+    fn description(&self) -> String {
+        "Find all references to a symbol using rust-analyzer.".to_string()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(LspFindReferencesArgs)).unwrap())
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: LspFindReferencesArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        
+        let path = std::path::PathBuf::from(&parsed.path);
+        let result = self.lsp_client.find_references(path, parsed.line, parsed.character, parsed.include_declaration)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+        
+        Ok(serde_json::to_string_pretty(&result).unwrap())
+    }
+}
+
+// --- LSP Hover Tool ---
+pub struct LspHoverTool {
+    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct LspHoverArgs {
+    /// Path to the file
+    pub path: String,
+    /// Line number (0-indexed)
+    pub line: u32,
+    /// Character position (0-indexed)
+    pub character: u32,
+}
+
+#[async_trait]
+impl Tool for LspHoverTool {
+    fn name(&self) -> String { "lsp_hover".to_string() }
+    fn description(&self) -> String {
+        "Get hover information (types, docs) for a symbol using rust-analyzer.".to_string()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(LspHoverArgs)).unwrap())
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: LspHoverArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        
+        let path = std::path::PathBuf::from(&parsed.path);
+        let result = self.lsp_client.hover(path, parsed.line, parsed.character)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+        
+        Ok(serde_json::to_string_pretty(&result).unwrap())
+    }
+}
+
+// --- LSP Get Diagnostics Tool ---
+pub struct LspGetDiagnosticsTool {
+    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct LspGetDiagnosticsArgs {
+    /// Path to the file
+    pub path: String,
+}
+
+#[async_trait]
+impl Tool for LspGetDiagnosticsTool {
+    fn name(&self) -> String { "lsp_get_diagnostics".to_string() }
+    fn description(&self) -> String {
+        "Get compilation errors and warnings for a file from rust-analyzer.".to_string()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(LspGetDiagnosticsArgs)).unwrap())
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: LspGetDiagnosticsArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        
+        let path = std::path::PathBuf::from(&parsed.path);
+        let result = self.lsp_client.get_diagnostics(path)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+        
+        Ok(serde_json::to_string_pretty(&result).unwrap())
+    }
+}
+
+// --- LSP Get Symbols Tool ---
+pub struct LspGetSymbolsTool {
+    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct LspGetSymbolsArgs {
+    /// Path to the file
+    pub path: String,
+}
+
+#[async_trait]
+impl Tool for LspGetSymbolsTool {
+    fn name(&self) -> String { "lsp_get_symbols".to_string() }
+    fn description(&self) -> String {
+        "Get all symbols (structs, enums, functions) in a file using rust-analyzer.".to_string()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schemars::schema_for!(LspGetSymbolsArgs)).unwrap())
+    }
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: LspGetSymbolsArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        
+        let path = std::path::PathBuf::from(&parsed.path);
+        let result = self.lsp_client.document_symbols(path)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+        
+        Ok(serde_json::to_string_pretty(&result).unwrap())
+    }
+}

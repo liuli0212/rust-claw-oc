@@ -1,5 +1,6 @@
 #[cfg(feature = "acp")]
 pub mod acp;
+pub mod lsp;
 pub mod browser;
 pub mod context_assembler;
 pub mod event_log;
@@ -69,9 +70,9 @@ struct CliArgs {
     /// Enable prompt caching (if supported by the provider)
     #[arg(long)]
     cache: bool,
-    /// Gemini platform (gen, vertex)
-    #[arg(long, default_value = "gen")]
-    gemini_platform: String,
+    /// Gemini platform (gen, vertex). Defaults to vertex if not specified.
+    #[arg(long)]
+    gemini_platform: Option<String>,
 }
 
 #[tokio::main]
@@ -89,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let llm_opt = match llm_client::create_llm_client(
         &args.provider,
         args.model.clone(),
-        Some(args.gemini_platform.clone()),
+        args.gemini_platform.clone(),
         &config,
     ) {
         Ok(llm) => Some(llm),
@@ -128,6 +129,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(WriteMemoryTool::new(workspace_memory.clone())),
         Arc::new(SendFileTool),
     ];
+
+    // Initialize LSP Client
+    let lsp_client = match lsp::LspClient::start(std::env::current_dir()?).await {
+        Ok(client) => {
+            println!("  {} Rust LSP (rust-analyzer) initialized.", style("✔").green());
+            Some(client)
+        }
+        Err(e) => {
+            println!("  {} Failed to start Rust LSP: {}", style("⚠️").yellow(), e);
+            None
+        }
+    };
+
+    if let Some(client) = lsp_client {
+        tools.push(Arc::new(tools::LspGotoDefinitionTool { lsp_client: client.clone() }));
+        tools.push(Arc::new(tools::LspFindReferencesTool { lsp_client: client.clone() }));
+        tools.push(Arc::new(tools::LspHoverTool { lsp_client: client.clone() }));
+        tools.push(Arc::new(tools::LspGetDiagnosticsTool { lsp_client: client.clone() }));
+        tools.push(Arc::new(tools::LspGetSymbolsTool { lsp_client: client.clone() }));
+    }
 
     let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
     if let Some(ref token) = telegram_token {

@@ -129,8 +129,8 @@ pub fn create_llm_client(
                     Some("vertex") => GeminiPlatform::Vertex,
                     Some("gen") => GeminiPlatform::Gen,
                     _ => match prov_config.platform.as_deref() {
-                        Some("vertex") => GeminiPlatform::Vertex,
-                        _ => GeminiPlatform::Gen,
+                        Some("gen") => GeminiPlatform::Gen,
+                        _ => GeminiPlatform::Vertex,
                     },
                 };
 
@@ -156,7 +156,7 @@ pub fn create_llm_client(
                 let context_window = estimate_context_window(&model_final);
                 Ok(Arc::new(OpenAiCompatClient::new_with_window(
                     api_key,
-                    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+                    "https://coding.dashscope.aliyuncs.com/v1/chat/completions"
                         .to_string(),
                     model_final,
                     "aliyun".to_string(),
@@ -177,8 +177,9 @@ pub fn create_llm_client(
                     .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
                 let context_window = estimate_context_window(&model_str);
                 let platform = match platform_override.as_deref() {
-                    Some("vertex") => GeminiPlatform::Vertex,
-                    _ => GeminiPlatform::Gen,
+                        Some("gen") => GeminiPlatform::Gen,
+                        _ => GeminiPlatform::Vertex,
+
                 };
                 Ok(Arc::new(GeminiClient::new_with_platform_and_window(
                     api_key,
