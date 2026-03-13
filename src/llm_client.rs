@@ -249,13 +249,75 @@ pub struct GeminiRequest {
     pub tool_config: Option<serde_json::Value>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+// --- Vertex-compatible types (no 'id' field) ---
+
+#[derive(Debug, Serialize)]
+struct VertexFunctionCall {
+    name: String,
+    args: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct VertexFunctionResponse {
+    name: String,
+    response: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct VertexPart {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "functionCall")]
+    function_call: Option<VertexFunctionCall>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "functionResponse")]
+    function_response: Option<VertexFunctionResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct VertexMessage {
+    role: String,
+    parts: Vec<VertexPart>,
+}
+
+#[derive(Debug, Serialize)]
+struct VertexGeminiRequest {
+    contents: Vec<VertexMessage>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "systemInstruction")]
+    system_instruction: Option<VertexMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDeclarationWrapper>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
+    pub tool_config: Option<serde_json::Value>,
+}
+
+fn to_vertex_message(msg: &Message) -> VertexMessage {
+    VertexMessage {
+        role: msg.role.clone(),
+        parts: msg
+            .parts
+            .iter()
+            .map(|p| VertexPart {
+                text: p.text.clone(),
+                function_call: p.function_call.as_ref().map(|fc| VertexFunctionCall {
+                    name: fc.name.clone(),
+                    args: fc.args.clone(),
+                }),
+                function_response: p.function_response.as_ref().map(|fr| VertexFunctionResponse {
+                    name: fr.name.clone(),
+                    response: fr.response.clone(),
+                }),
+            })
+            .collect(),
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ToolDeclarationWrapper {
     #[serde(rename = "functionDeclarations")]
     pub function_declarations: Vec<FunctionDeclaration>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FunctionDeclaration {
     pub name: String,
     pub description: String,
@@ -411,13 +473,28 @@ impl LlmClient for GeminiClient {
             truncate_log(&req_body_json)
         );
 
-        let response = self
-            .client
-            .post(&url)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&req_body)
-            .send()
-            .await?;
+        let response = match self.platform {
+            GeminiPlatform::Gen => self.client
+                .post(&url)
+                .header(CONTENT_TYPE, "application/json")
+                .json(&req_body)
+                .send()
+                .await?,
+            GeminiPlatform::Vertex => {
+                let vertex_req = VertexGeminiRequest {
+                    contents: req_body.contents.iter().map(to_vertex_message).collect(),
+                    system_instruction: req_body.system_instruction.as_ref().map(to_vertex_message),
+                    tools: req_body.tools,
+                    tool_config: req_body.tool_config,
+                };
+                self.client
+                    .post(&url)
+                    .header(CONTENT_TYPE, "application/json")
+                    .json(&vertex_req)
+                    .send()
+                    .await?
+            }
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -489,9 +566,21 @@ impl LlmClient for GeminiClient {
             let max_attempts = 5;
             let mut last_error = String::from("initialization");
 
+            let body_json_string = match platform {
+                GeminiPlatform::Gen => serde_json::to_string(&req_body).unwrap_or_default(),
+                GeminiPlatform::Vertex => {
+                    let vertex_req = VertexGeminiRequest {
+                        contents: req_body.contents.iter().map(to_vertex_message).collect(),
+                        system_instruction: req_body.system_instruction.as_ref().map(to_vertex_message),
+                        tools: req_body.tools.clone(),
+                        tool_config: req_body.tool_config.clone(),
+                    };
+                    serde_json::to_string(&vertex_req).unwrap_or_default()
+                }
+            };
+
             let resp = loop {
                 attempts += 1;
-                let body_json_string = serde_json::to_string(&req_body).unwrap_or_default();
 
                 tracing::info!(
                     "Sending Gemini stream request (Attempt {}/{}, body_size={} bytes)",
@@ -504,7 +593,7 @@ impl LlmClient for GeminiClient {
                 let req_result = client
                     .post(&url)
                     .header(CONTENT_TYPE, "application/json")
-                    .body(body_json_string)
+                    .body(body_json_string.clone())
                     .send()
                     .await;
 
