@@ -162,8 +162,17 @@ impl TelegramOutput {
                 .edit_message_text(self.chat_id, msg_id, &text)
                 .await
             {
-                tracing::trace!("Failed to edit live message (likely unchanged): {}", e);
-                // If message is too long or other error, we might need a new one
+                // Check if it's the "message is not modified" error, which we can ignore
+                let err_str = e.to_string();
+                if err_str.contains("message is not modified") {
+                    tracing::trace!("Telegram live update: message not modified");
+                } else {
+                    tracing::error!("Failed to edit live Telegram message: {}", e);
+                    // If it's a real error, clear the streaming ID so next update starts a new message
+                    *streaming_id_guard = None;
+                }
+                
+                // If message is too long, we definitely need a new one
                 if text.len() > 3500 {
                     self.flush_internal(&mut streaming_id_guard).await;
                 }
@@ -194,11 +203,20 @@ impl TelegramOutput {
 
         if let Some(msg_id) = **streaming_id_guard {
             // Final edit for this piece
-            let _ = self
+            tracing::debug!("Flushing Telegram stream via edit: msg_id={:?}, len={}", msg_id, text.len());
+            if let Err(e) = self
                 .bot
                 .edit_message_text(self.chat_id, msg_id, &text)
-                .await;
+                .await
+            {
+                let err_str = e.to_string();
+                if !err_str.contains("message is not modified") {
+                    tracing::error!("Failed to flush Telegram message via edit: {}. Falling back to new message.", e);
+                    self.send_long_message(&text, None).await;
+                }
+            }
         } else {
+            tracing::debug!("Flushing Telegram stream via new message: len={}", text.len());
             self.send_long_message(&text, None).await;
         }
         **streaming_id_guard = None;
