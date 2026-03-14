@@ -776,7 +776,7 @@ impl AgentLoop {
                     }
         }
 
-                let tool_opt = self.tools.iter().find(|t| t.name() == call.name);
+                let tool_opt = current_tools.iter().find(|t| t.name() == call.name);
                 let (result, is_error, stopped) = if let Some(tool) = tool_opt {
                     self.output
                         .on_tool_start(&call.name, &call.args.to_string())

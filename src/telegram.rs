@@ -2,6 +2,7 @@ use crate::core::{AgentOutput, RunExit};
 use crate::session_manager::SessionManager;
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::time::Duration;
 use teloxide::{
     net::Download,
     prelude::*,
@@ -487,26 +488,55 @@ enum Command {
 
 pub async fn run_telegram_bot(token: String, session_manager: Arc<SessionManager>) {
     tracing::info!("Starting Telegram bot");
-    let bot = Bot::new(token);
+    let mut retry_count = 0;
+    loop {
+        // Use the compatible reqwest 0.11 client for teloxide
+        let client = reqwest_teloxide::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest_teloxide::Client::new());
 
-    let handler = dptree::entry()
-        .branch(Update::filter_callback_query().endpoint(handle_callback_query))
-        .branch(
-            Update::filter_message()
-                .branch(
-                    dptree::entry()
-                        .filter_command::<Command>()
-                        .endpoint(handle_command),
-                )
-                .branch(dptree::endpoint(handle_message)),
-        );
+        let bot = Bot::with_client(token.clone(), client);
+        let handler = dptree::entry()
+            .branch(Update::filter_callback_query().endpoint(handle_callback_query))
+            .branch(
+                Update::filter_message()
+                    .branch(
+                        dptree::entry()
+                            .filter_command::<Command>()
+                            .endpoint(handle_command),
+                    )
+                    .branch(dptree::endpoint(handle_message)),
+            );
 
-    Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![session_manager])
-        .enable_ctrlc_handler()
-        .build()
-        .dispatch()
-        .await;
+        tracing::info!("Checking Telegram connection (Attempt {})", retry_count + 1);
+        match bot.get_me().await {
+            Ok(me) => {
+                tracing::info!("Telegram bot @{} connected successfully.", me.username());
+                let mut dispatcher = Dispatcher::builder(bot, handler)
+                    .dependencies(dptree::deps![session_manager.clone()])
+                    .enable_ctrlc_handler()
+                    .build();
+
+                // Use spawn to isolate potential panics from the main process
+                match tokio::spawn(async move { dispatcher.dispatch().await }).await {
+                    Ok(_) => {
+                        tracing::warn!("Telegram dispatcher exited normally.");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!("Telegram dispatcher crashed: {}. Retrying...", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("Telegram connection failed: {}. Retrying in 30s...", e);
+            }
+        }
+        retry_count += 1;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
 }
 
 async fn handle_callback_query(
