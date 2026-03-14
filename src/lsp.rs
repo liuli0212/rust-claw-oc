@@ -17,6 +17,32 @@ use tokio::sync::{oneshot, Mutex};
 
 // JSON-RPC message structures are now handled via serde_json::Value for more robust matching.
 
+pub struct LazyLspClient {
+    root_dir: PathBuf,
+    client: Mutex<Option<Arc<LspClient>>>,
+}
+
+impl LazyLspClient {
+    pub fn new(root_dir: PathBuf) -> Self {
+        Self {
+            root_dir,
+            client: Mutex::new(None),
+        }
+    }
+
+    pub async fn get_client(&self) -> Result<Arc<LspClient>, String> {
+        let mut guard = self.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            return Ok(client.clone());
+        }
+
+        tracing::info!("Lazy initializing LSP client (rust-analyzer)...");
+        let client = LspClient::start(self.root_dir.clone()).await?;
+        *guard = Some(client.clone());
+        Ok(client)
+    }
+}
+
 pub struct LspClient {
     _child: Mutex<Child>,
     writer: Mutex<tokio::process::ChildStdin>,

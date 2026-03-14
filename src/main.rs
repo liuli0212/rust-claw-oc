@@ -73,6 +73,9 @@ struct CliArgs {
     /// Gemini platform (gen, vertex). Defaults to vertex if not specified.
     #[arg(long)]
     gemini_platform: Option<String>,
+    /// Execute a single command and exit (headless mode)
+    #[arg(long, short = 'c')]
+    command: Option<String>,
 }
 
 #[tokio::main]
@@ -80,9 +83,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     let args = CliArgs::parse();
 
-    println!();
-    println!("  {}", style("Rusty-Claw AGENT-OS v0.1.0").bold().cyan());
-    println!("  {}", style("---------------------------").dim());
+    let is_headless = args.command.is_some();
+
+    if !is_headless {
+        println!();
+        println!("  {}", style("Rusty-Claw AGENT-OS v0.1.0").bold().cyan());
+        println!("  {}", style("---------------------------").dim());
+    }
 
     let config = config::AppConfig::load();
     let _guards = logging::init_logging(&config);
@@ -95,21 +102,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         Ok(llm) => Some(llm),
         Err(e) => {
-            tracing::error!("Failed to initialize default LLM: {}", e);
-            println!(
-                "  {} Failed to initialize default LLM: {}",
-                style("⚠️").yellow(),
-                e
-            );
-            println!(
-                "  Starting without default LLM. Use {} to configure one.",
-                style("/model <provider> [model_name]").bold()
-            );
+            if !is_headless {
+                tracing::error!("Failed to initialize default LLM: {}", e);
+                println!(
+                    "  {} Failed to initialize default LLM: {}",
+                    style("⚠️").yellow(),
+                    e
+                );
+                println!(
+                    "  Starting without default LLM. Use {} to configure one.",
+                    style("/model <provider> [model_name]").bold()
+                );
+            }
             None
         }
     };
 
-    // [OOM-TEST] Temporarily disabled to isolate memory leak
     let vector_store = Arc::new(VectorStore::new()?);
     let workspace_memory = Arc::new(WorkspaceMemory::new("."));
 
@@ -122,7 +130,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(PatchFileTool),
         Arc::new(TavilySearchTool::new(tavily_key)),
         Arc::new(WebFetchTool::new()),
-        // [OOM-TEST] Temporarily disabled to isolate memory leak
         Arc::new(RagSearchTool::new(vector_store.clone())),
         Arc::new(RagInsertTool::new(vector_store.clone())),
         Arc::new(ReadMemoryTool::new(workspace_memory.clone())),
@@ -130,25 +137,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(SendFileTool),
     ];
 
-    // Initialize LSP Client
-    let lsp_client = match lsp::LspClient::start(std::env::current_dir()?).await {
-        Ok(client) => {
-            println!("  {} Rust LSP (rust-analyzer) initialized.", style("✔").green());
-            Some(client)
-        }
-        Err(e) => {
-            println!("  {} Failed to start Rust LSP: {}", style("⚠️").yellow(), e);
-            None
-        }
-    };
+    // Initialize Lazy LSP Client
+    let lazy_lsp = Arc::new(lsp::LazyLspClient::new(std::env::current_dir()?));
 
-    if let Some(client) = lsp_client {
-        tools.push(Arc::new(tools::LspGotoDefinitionTool { lsp_client: client.clone() }));
-        tools.push(Arc::new(tools::LspFindReferencesTool { lsp_client: client.clone() }));
-        tools.push(Arc::new(tools::LspHoverTool { lsp_client: client.clone() }));
-        tools.push(Arc::new(tools::LspGetDiagnosticsTool { lsp_client: client.clone() }));
-        tools.push(Arc::new(tools::LspGetSymbolsTool { lsp_client: client.clone() }));
-    }
+    tools.push(Arc::new(tools::LspGotoDefinitionTool { lsp_client: lazy_lsp.clone() }));
+    tools.push(Arc::new(tools::LspFindReferencesTool { lsp_client: lazy_lsp.clone() }));
+    tools.push(Arc::new(tools::LspHoverTool { lsp_client: lazy_lsp.clone() }));
+    tools.push(Arc::new(tools::LspGetDiagnosticsTool { lsp_client: lazy_lsp.clone() }));
+    tools.push(Arc::new(tools::LspGetSymbolsTool { lsp_client: lazy_lsp.clone() }));
 
     let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
     if let Some(ref token) = telegram_token {
@@ -156,37 +152,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let session_manager = Arc::new(SessionManager::new(llm_opt, tools.clone()));
+    let output = Arc::new(TuiOutput::new());
 
-    if let Some(token) = telegram_token {
-        let sm = session_manager.clone();
-        tokio::spawn(async move {
-            telegram::run_telegram_bot(token, sm).await;
-        });
-    }
-
-    if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN") {
-        let sm = session_manager.clone();
-        tokio::spawn(async move {
-            discord::run_discord_bot(token, sm).await;
-        });
-    }
-
-    #[cfg(feature = "acp")]
-    if let Ok(port_str) = std::env::var("ACP_PORT") {
-        if let Ok(port) = port_str.parse::<u16>() {
+    if !is_headless {
+        if let Some(token) = telegram_token {
             let sm = session_manager.clone();
             tokio::spawn(async move {
-                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-                let acp_server = acp::AcpServer::new(sm);
-                if let Err(e) = acp_server.run(addr).await {
-                    tracing::error!("ACP server failed: {}", e);
-                }
+                telegram::run_telegram_bot(token, sm).await;
             });
+        }
+
+        if let Ok(token) = std::env::var("DISCORD_BOT_TOKEN") {
+            let sm = session_manager.clone();
+            tokio::spawn(async move {
+                discord::run_discord_bot(token, sm).await;
+            });
+        }
+
+        #[cfg(feature = "acp")]
+        if let Ok(port_str) = std::env::var("ACP_PORT") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                let sm = session_manager.clone();
+                tokio::spawn(async move {
+                    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+                    let acp_server = acp::AcpServer::new(sm);
+                    if let Err(e) = acp_server.run(addr).await {
+                        tracing::error!("ACP server failed: {}", e);
+                    }
+                });
+            }
         }
     }
 
+    if let Some(cmd) = args.command {
+        let agent = session_manager
+            .get_or_create_session("headless", output.clone())
+            .await?;
+        
+        let mut agent_guard = agent.lock().await;
+        let _ = output.on_waiting("Processing headless command...").await;
+        
+        match agent_guard.step(cmd).await {
+            Ok(exit) => match exit {
+                RunExit::Finished(summary) => {
+                    println!("\n{}", style(summary).green().bold());
+                }
+                RunExit::RecoverableFailed(msg) => {
+                    eprintln!("\n  {} Error: {}", style("⚠️").yellow(), msg);
+                    std::process::exit(1);
+                }
+                RunExit::CriticallyFailed(msg) => {
+                    eprintln!("\n  {} Critical Error: {}", style("✖").red(), msg);
+                    std::process::exit(1);
+                }
+                _ => {
+                    println!("\n  Execution ended with status: {:?}", exit);
+                }
+            },
+            Err(e) => {
+                eprintln!("  {} Agent error: {}", style("✖").red(), e);
+                std::process::exit(1);
+            }
+        }
+        
+        return Ok(());
+    }
+
     let mut rl = DefaultEditor::new()?;
-    let output = Arc::new(TuiOutput::new());
 
     println!(
         "  Type {} to exit, {} for help, end line with {} for multi-line.",

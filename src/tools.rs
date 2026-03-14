@@ -1273,7 +1273,7 @@ impl Tool for SendTelegramMessageTool {
 
 // --- LSP Tools ---
 pub struct LspGotoDefinitionTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1300,7 +1300,8 @@ impl Tool for LspGotoDefinitionTool {
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         
         let path = std::path::PathBuf::from(&parsed.path);
-        let result = self.lsp_client.goto_definition(path, parsed.line, parsed.character)
+        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
+        let result = client.goto_definition(path, parsed.line, parsed.character)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
         
@@ -1310,7 +1311,7 @@ impl Tool for LspGotoDefinitionTool {
 
 // --- LSP Find References Tool ---
 pub struct LspFindReferencesTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1339,7 +1340,8 @@ impl Tool for LspFindReferencesTool {
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         
         let path = std::path::PathBuf::from(&parsed.path);
-        let result = self.lsp_client.find_references(path, parsed.line, parsed.character, parsed.include_declaration)
+        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
+        let result = client.find_references(path, parsed.line, parsed.character, parsed.include_declaration)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
         
@@ -1349,7 +1351,7 @@ impl Tool for LspFindReferencesTool {
 
 // --- LSP Hover Tool ---
 pub struct LspHoverTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1376,7 +1378,8 @@ impl Tool for LspHoverTool {
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         
         let path = std::path::PathBuf::from(&parsed.path);
-        let result = self.lsp_client.hover(path, parsed.line, parsed.character)
+        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
+        let result = client.hover(path, parsed.line, parsed.character)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
         
@@ -1386,7 +1389,7 @@ impl Tool for LspHoverTool {
 
 // --- LSP Get Diagnostics Tool ---
 pub struct LspGetDiagnosticsTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1409,7 +1412,8 @@ impl Tool for LspGetDiagnosticsTool {
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         
         let path = std::path::PathBuf::from(&parsed.path);
-        let result = self.lsp_client.get_diagnostics(path)
+        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
+        let result = client.get_diagnostics(path)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
         
@@ -1419,7 +1423,7 @@ impl Tool for LspGetDiagnosticsTool {
 
 // --- LSP Get Symbols Tool ---
 pub struct LspGetSymbolsTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -1442,7 +1446,8 @@ impl Tool for LspGetSymbolsTool {
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
         
         let path = std::path::PathBuf::from(&parsed.path);
-        let result = self.lsp_client.document_symbols(path)
+        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
+        let result = client.document_symbols(path)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
         
