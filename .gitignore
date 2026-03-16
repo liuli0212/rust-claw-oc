@@ -7,3 +7,8 @@ Cargo.lock
 rusty_claw/
 logs/
 .DS_Store
+*.pyc
+\.*
+*~
+*.orig
+*.rej

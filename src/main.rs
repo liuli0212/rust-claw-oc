@@ -1,14 +1,14 @@
 #[cfg(feature = "acp")]
-pub mod acp;
-pub mod lsp;
-pub mod browser;
-pub mod context_assembler;
-pub mod event_log;
-pub mod evidence;
-pub mod rag;
-pub mod schema;
-pub mod task_state;
-pub mod telemetry;
+mod acp;
+mod lsp;
+mod browser;
+mod context_assembler;
+mod event_log;
+mod evidence;
+mod rag;
+mod schema;
+mod task_state;
+mod telemetry;
 
 mod config;
 mod context;

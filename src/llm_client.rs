@@ -1954,6 +1954,7 @@ mod tests {
                 function_call: None,
                 function_response: None,
                 thought_signature: None,
+                file_data: None,
             }],
         }];
 

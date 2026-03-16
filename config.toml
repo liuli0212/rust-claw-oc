@@ -20,6 +20,13 @@ base_url = "https://coding.dashscope.aliyuncs.com/v1/chat/completions"
 model = "qwen3.5-plus"
 context_window = 1000000
 
+[providers.openrouter]
+type = "openai_compat"
+api_key_env = "OPENROUTER_API_KEY"
+base_url = "https://openrouter.ai/api/v1/chat/completions"
+model = "google/gemini-2.0-flash-lite-preview-02-05:free"
+context_window = 128000
+
 [providers.deepseek]
 type = "openai_compat"
 api_key_env = "DEEPSEEK_API_KEY"

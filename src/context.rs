@@ -216,11 +216,6 @@ impl AgentContext {
             project_context.push_str(&Self::truncate_chars(&content, 3_000));
             project_context.push_str("\n\n");
         }
-        if let Ok(content) = fs::read_to_string("README.md") {
-            project_context.push_str("### README.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 2_500));
-            project_context.push_str("\n\n");
-        }
         if let Ok(content) = fs::read_to_string("MEMORY.md") {
             project_context.push_str("### MEMORY.md\n");
             project_context.push_str(&Self::truncate_chars(&content, 1_500));
@@ -511,6 +506,7 @@ impl AgentContext {
         let mut cloned = turn.clone();
         for msg in &mut cloned.messages {
             for part in &mut msg.parts {
+                part.thought_signature = None; // Strip for history items to save tokens
                 if let Some(fr) = &mut part.function_response {
                     // Smart truncation: Try to truncate the "result" field inside the JSON first
                     let mut truncated_in_place = false;
@@ -867,7 +863,8 @@ impl AgentContext {
             };
 
             // Heuristic: If this turn asks about history, protect the *next* turn we process (which is the older one)
-            let user_asks_for_context = Self::is_user_referencing_history(&turn.user_message);
+            // Limit heuristic protection to recent 10 turns to avoid noise in deep history
+            let user_asks_for_context = i < 10 && Self::is_user_referencing_history(&turn.user_message);
 
             // Context Optimization:
             // 1. Safety Buffer (Hot State): Keep last 3 turns in Full Fidelity.
@@ -1526,11 +1523,6 @@ impl AgentContext {
         if let Ok(content) = fs::read_to_string("AGENTS.md") {
             project_context.push_str("### AGENTS.md\n");
             project_context.push_str(&Self::truncate_chars(&content, 3_000));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("README.md") {
-            project_context.push_str("### README.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 2_500));
             project_context.push_str("\n\n");
         }
         system_static.push(format!("## Project Context\n{}", project_context));
