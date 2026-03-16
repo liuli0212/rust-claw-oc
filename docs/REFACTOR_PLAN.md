@@ -145,34 +145,38 @@ Objective:
 
 - reduce `src/core.rs` from a monolithic orchestrator to a thin runtime coordinator
 
+Status:
+
+- in progress
+
 Sub-steps:
 
-1. Extract task lifecycle helpers.
+1. [x] Extract task lifecycle helpers.
    - initialization
    - completion
    - cancellation exit paths
    - task-state persistence hooks
 
-2. Extract streaming response processing.
+2. [x] Extract streaming response processing.
    - receive stream events
    - buffer visible text
    - route thinking output
    - collect tool calls
    - normalize stream termination and stream interruption
 
-3. Extract tool dispatch.
+3. [x] Extract tool dispatch.
    - tool lookup
    - timeout wrapper
    - interruption wrapper
    - result normalization
    - per-tool post-processing hooks
 
-4. Extract evidence updates.
+4. [ ] Extract evidence updates.
    - read-file evidence insertion
    - bash diagnostic/directory evidence insertion
    - write-induced invalidation
 
-5. Extract post-tool state reconciliation.
+5. [ ] Extract post-tool state reconciliation.
    - reload task plan state
    - detect plan updates
    - determine finish conditions

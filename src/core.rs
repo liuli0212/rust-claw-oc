@@ -85,6 +85,22 @@ struct TaskState {
     energy_points: usize,
 }
 
+type ToolCallRecord = (crate::context::FunctionCall, Option<String>);
+
+enum StreamCollectionOutcome {
+    Completed {
+        full_text: String,
+        tool_calls: Vec<ToolCallRecord>,
+    },
+    Exit(RunExit),
+}
+
+struct ToolDispatchOutcome {
+    result: String,
+    is_error: bool,
+    stopped: bool,
+}
+
 pub struct AgentLoop {
     session_id: String,
     llm: Arc<dyn LlmClient>,
@@ -417,6 +433,90 @@ impl AgentLoop {
         false
     }
 
+    async fn collect_stream_response(
+        &mut self,
+        messages: Vec<Message>,
+        system: Option<Message>,
+        current_tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<StreamCollectionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let mut llm_attempts = 0;
+        let mut tool_calls_accumulated: Vec<ToolCallRecord> = Vec::new();
+
+        let full_text = loop {
+            llm_attempts += 1;
+
+            let stream_res = tokio::select! {
+                res = self.llm.stream(messages.clone(), system.clone(), current_tools.clone()) => res,
+                _ = self.cancel_token.notified() => {
+                    self.output.flush().await;
+                    self.context.end_turn();
+                    return Ok(StreamCollectionOutcome::Exit(RunExit::StoppedByUser));
+                }
+            };
+
+            match stream_res {
+                Ok(mut rx) => {
+                    let mut current_turn_text = String::new();
+
+                    let stream_loop_res = loop {
+                        tokio::select! {
+                            event = rx.recv() => {
+                                match event {
+                                    Some(StreamEvent::Text(t)) => {
+                                        current_turn_text.push_str(&t);
+                                    }
+                                    Some(StreamEvent::Thought(t)) => {
+                                        self.output.on_thinking(&t).await;
+
+                                        if !current_turn_text.ends_with("<think>") {
+                                            current_turn_text.push_str("<think>");
+                                        }
+                                        current_turn_text.push_str(&t);
+                                    }
+                                    Some(StreamEvent::ToolCall(tc, sig)) => {
+                                        tool_calls_accumulated.push((tc, sig));
+                                    }
+                                    Some(StreamEvent::Done) | None => break Ok(()),
+                                    Some(StreamEvent::Error(e)) => {
+                                        self.output.on_error(&format!("Stream error: {}", e)).await;
+                                    }
+                                }
+                            }
+                            _ = self.cancel_token.notified() => {
+                                break Err(RunExit::StoppedByUser);
+                            }
+                        }
+                    };
+
+                    if let Err(exit) = stream_loop_res {
+                        self.output.flush().await;
+                        self.context.end_turn();
+                        return Ok(StreamCollectionOutcome::Exit(exit));
+                    }
+
+                    if current_turn_text.contains("<think>")
+                        && !current_turn_text.contains("</think>")
+                    {
+                        current_turn_text.push_str("</think>");
+                    }
+
+                    break current_turn_text;
+                }
+                Err(e) => {
+                    if !self.handle_llm_error(&e, llm_attempts).await {
+                        self.output.flush().await;
+                        return Err(Box::new(e));
+                    }
+                }
+            }
+        };
+
+        Ok(StreamCollectionOutcome::Completed {
+            full_text,
+            tool_calls: tool_calls_accumulated,
+        })
+    }
+
     fn initialize_task_state(
         &self,
         goal: &str,
@@ -480,6 +580,71 @@ impl AgentLoop {
         }
 
         args.to_string()
+    }
+
+    fn build_function_response_part(
+        name: String,
+        id: Option<String>,
+        response: serde_json::Value,
+        thought_signature: Option<String>,
+    ) -> Part {
+        Part {
+            text: None,
+            function_call: None,
+            function_response: Some(FunctionResponse { name, response, id }),
+            thought_signature,
+            file_data: None,
+        }
+    }
+
+    fn extract_tool_thought(call: &mut crate::context::FunctionCall) -> Option<String> {
+        call.args
+            .as_object_mut()
+            .and_then(|obj| obj.remove("thought"))
+            .and_then(|thought| thought.as_str().map(|value| value.to_string()))
+            .filter(|thought| !thought.is_empty())
+    }
+
+    async fn dispatch_tool_call(
+        &self,
+        call: &crate::context::FunctionCall,
+        current_tools: &[Arc<dyn Tool>],
+    ) -> ToolDispatchOutcome {
+        let tool_opt = current_tools.iter().find(|tool| tool.name() == call.name);
+
+        if let Some(tool) = tool_opt {
+            self.output
+                .on_tool_start(&call.name, &call.args.to_string())
+                .await;
+
+            let (result, is_error, stopped) = tokio::select! {
+                exec_res = tokio::time::timeout(
+                    Duration::from_secs(120),
+                    tool.execute(call.args.clone())
+                ) => {
+                    match exec_res {
+                        Ok(Ok(res)) => (res, false, false),
+                        Ok(Err(e)) => (format!("Tool error: {}", e), true, false),
+                        Err(e) => (format!("Timeout executing {}: {}", call.name, e), true, false),
+                    }
+                }
+                _ = self.cancel_token.notified() => {
+                    ("Tool execution interrupted by user.".to_string(), true, true)
+                }
+            };
+
+            return ToolDispatchOutcome {
+                result,
+                is_error,
+                stopped,
+            };
+        }
+
+        ToolDispatchOutcome {
+            result: format!("Tool not found: {}", call.name),
+            is_error: true,
+            stopped: false,
+        }
     }
 
     pub async fn step(
@@ -565,85 +730,15 @@ impl AgentLoop {
             let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
             let (messages, system, _) = self.context.build_llm_payload(&state, &assembler);
 
-            let mut llm_attempts = 0;
-            let mut tool_calls_accumulated: Vec<(crate::context::FunctionCall, Option<String>)> =
-                Vec::new();
-
-            let full_text = loop {
-                llm_attempts += 1;
-
-                let stream_res = tokio::select! {
-                    res = self.llm.stream(messages.clone(), system.clone(), current_tools.clone()) => res,
-                    _ = self.cancel_token.notified() => {
-                        self.output.flush().await;
-                        self.context.end_turn();
-                        return Ok(RunExit::StoppedByUser);
-                    }
-                };
-
-                match stream_res {
-                    Ok(mut rx) => {
-                        let mut current_turn_text = String::new();
-                        // Text is fully buffered during streaming, then displayed
-                        // after the stream completes. This ensures we can detect
-                        // JSON blobs (like text-based finish_task) and handle them
-                        // properly without partial display leaks.
-
-                        let stream_loop_res = loop {
-                            tokio::select! {
-                                event = rx.recv() => {
-                                    match event {
-                                        Some(StreamEvent::Text(t)) => {
-                                            // Buffer only — no display during stream
-                                            current_turn_text.push_str(&t);
-                                        }
-                                        Some(StreamEvent::Thought(t)) => {
-                                            // Thinking is still streamed in real-time
-                                            self.output.on_thinking(&t).await;
-
-                                            if !current_turn_text.ends_with("<think>") {
-                                                current_turn_text.push_str("<think>");
-                                            }
-                                            current_turn_text.push_str(&t);
-                                        }
-                                        Some(StreamEvent::ToolCall(tc, sig)) => {
-                                            tool_calls_accumulated.push((tc, sig));
-                                        }
-                                        Some(StreamEvent::Done) | None => break Ok(()),
-                                        Some(StreamEvent::Error(e)) => {
-                                            self.output.on_error(&format!("Stream error: {}", e)).await;
-                                        }
-                                    }
-                                }
-                                _ = self.cancel_token.notified() => {
-
-                                    break Err(RunExit::StoppedByUser);
-                                }
-                            }
-                        };
-
-                        if let Err(exit) = stream_loop_res {
-                            self.output.flush().await;
-                            self.context.end_turn();
-                            return Ok(exit);
-                        }
-
-                        // Close any unclosed think block in history
-                        if current_turn_text.contains("<think>")
-                            && !current_turn_text.contains("</think>")
-                        {
-                            current_turn_text.push_str("</think>");
-                        }
-
-                        break current_turn_text;
-                    }
-                    Err(e) => {
-                        if !self.handle_llm_error(&e, llm_attempts).await {
-                            self.output.flush().await;
-                            return Err(Box::new(e));
-                        }
-                    }
-                }
+            let (full_text, tool_calls_accumulated) = match self
+                .collect_stream_response(messages, system, current_tools.clone())
+                .await?
+            {
+                StreamCollectionOutcome::Completed {
+                    full_text,
+                    tool_calls,
+                } => (full_text, tool_calls),
+                StreamCollectionOutcome::Exit(exit) => return Ok(exit),
             };
 
             if full_text.trim().is_empty() && tool_calls_accumulated.is_empty() {
@@ -728,112 +823,57 @@ impl AgentLoop {
             let mut response_parts = Vec::new();
             for (mut call, thought_sig) in tool_calls_accumulated {
                 if skip_remaining {
-                    response_parts.push(Part {
-                        text: None,
-                        function_call: None,
-                        function_response: Some(FunctionResponse {
-                            name: call.name.clone(),
-                            response: serde_json::json!({ "result": "Execution skipped as turn was interrupted." }),
-                            id: call.id.clone(),
-                        }),
-                        thought_signature: thought_sig.clone(),
-                        file_data: None,
-                    });
+                    response_parts.push(Self::build_function_response_part(
+                        call.name.clone(),
+                        call.id.clone(),
+                        serde_json::json!({ "result": "Execution skipped as turn was interrupted." }),
+                        thought_sig.clone(),
+                    ));
                     continue;
                 }
-                if let Some(obj) = call.args.as_object_mut() {
-                    if let Some(thought) = obj.remove("thought") {
-                        if let Some(thought_str) = thought.as_str() {
-                            if !thought_str.is_empty() {
-                                self.output.on_thinking(thought_str).await;
-                                self.output.on_thinking("\n").await;
-                            }
-                        }
-                    }
+                if let Some(thought_str) = Self::extract_tool_thought(&mut call) {
+                    self.output.on_thinking(&thought_str).await;
+                    self.output.on_thinking("\n").await;
                 }
 
                 if call.name.trim().is_empty() {
-                    response_parts.push(Part {
-                        text: None,
-                        function_call: None,
-                        function_response: Some(FunctionResponse {
-                            name: "unknown".to_string(),
-                            response: serde_json::json!({ "result": "Error: Empty tool name" }),
-                            id: call.id.clone(),
-                        }),
-                        thought_signature: thought_sig.clone(),
-                        file_data: None,
-                    });
+                    response_parts.push(Self::build_function_response_part(
+                        "unknown".to_string(),
+                        call.id.clone(),
+                        serde_json::json!({ "result": "Error: Empty tool name" }),
+                        thought_sig.clone(),
+                    ));
                     continue;
                 }
 
-                let mut is_finished = false;
                 if call.name == "finish_task" {
                     let summary = Self::extract_finish_task_summary(&call.args);
-                    is_finished = true;
-                    // We still add a response part for finish_task for API consistency
-                    response_parts.push(Part {
-                        text: None,
-                        function_call: None,
-                        function_response: Some(FunctionResponse {
-                            name: call.name.clone(),
-                            response: serde_json::json!({ "result": "Task finished." }),
-                            id: call.id.clone(),
-                        }),
-                        thought_signature: thought_sig.clone(),
-                        file_data: None,
-                    });
-
-                    if is_finished {
-                        state.status = "finished".to_string();
-                        // State doesn't have a mutable 'summary' field, but the summary() method returns a String.
-                        // We store it in a local variable before continue.
-                        let _ = self.task_state_store.save(&state);
-                        self.output.on_task_finish(&summary).await;
-                        continue;
-                    }
+                    response_parts.push(Self::build_function_response_part(
+                        call.name.clone(),
+                        call.id.clone(),
+                        serde_json::json!({ "result": "Task finished." }),
+                        thought_sig.clone(),
+                    ));
+                    state.status = "finished".to_string();
+                    let _ = self.task_state_store.save(&state);
+                    self.output.on_task_finish(&summary).await;
+                    continue;
                 }
 
-                let tool_opt = current_tools.iter().find(|t| t.name() == call.name);
-                let (result, is_error, stopped) = if let Some(tool) = tool_opt {
-                    self.output
-                        .on_tool_start(&call.name, &call.args.to_string())
-                        .await;
-
-                    tokio::select! {
-                        exec_res = tokio::time::timeout(
-                            // Default 120s timeout for any tool execution to prevent hanging
-                            Duration::from_secs(120),
-                            tool.execute(call.args.clone())
-                        ) => {
-                            match exec_res {
-                        Ok(Ok(res)) => (res, false, false),
-                        Ok(Err(e)) => (format!("Tool error: {}", e), true, false),
-                        Err(e) => (format!("Timeout executing {}: {}", call.name, e), true, false),
-                    }
-                        }
-                        _ = self.cancel_token.notified() => {
-                            ("Tool execution interrupted by user.".to_string(), true, true)
-                        }
-                    }
-                } else {
-                    (format!("Tool not found: {}", call.name), true, false)
-                };
+                let ToolDispatchOutcome {
+                    result,
+                    is_error,
+                    stopped,
+                } = self.dispatch_tool_call(&call, &current_tools).await;
 
                 if stopped {
                     self.output.on_error(&result).await;
-                    // Even if stopped, we MUST record the result for this part to maintain count
-                    response_parts.push(Part {
-                        text: None,
-                        function_call: None,
-                        function_response: Some(FunctionResponse {
-                            name: call.name.clone(),
-                            response: serde_json::json!({ "result": result }),
-                            id: call.id.clone(),
-                        }),
-                        thought_signature: thought_sig.clone(),
-                        file_data: None,
-                    });
+                    response_parts.push(Self::build_function_response_part(
+                        call.name.clone(),
+                        call.id.clone(),
+                        serde_json::json!({ "result": result }),
+                        thought_sig.clone(),
+                    ));
                     skip_remaining = true;
                     continue;
                 }
@@ -939,15 +979,12 @@ impl AgentLoop {
                 }
 
                 response_parts.push(Part {
-                    text: None,
-                    function_call: None,
-                    function_response: Some(FunctionResponse {
-                        name: call.name.clone(),
-                        response: serde_json::json!({ "result": final_result }),
-                        id: call.id.clone(),
-                    }),
-                    thought_signature: thought_sig,
-                    file_data: None,
+                    ..Self::build_function_response_part(
+                        call.name.clone(),
+                        call.id.clone(),
+                        serde_json::json!({ "result": final_result }),
+                        thought_sig,
+                    )
                 });
             }
 
