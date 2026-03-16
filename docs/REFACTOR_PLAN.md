@@ -202,6 +202,10 @@ Objective:
 
 - remove the dependency on stringly typed tool outputs inside runtime logic
 
+Status:
+
+- completed
+
 Sub-steps:
 
 1. Define a structured internal tool result type.
@@ -219,6 +223,7 @@ Sub-steps:
 3. Move tool-specific schema helpers and execution helpers into protocol-focused modules.
 
 4. Split `src/tools.rs` by domain.
+   - completed via `src/tools/mod.rs`, `protocol.rs`, `bash.rs`, `files.rs`, `web.rs`, `memory.rs`, `integrations.rs`, and `lsp.rs`
 
 Suggested structure:
 
@@ -237,6 +242,12 @@ Expected result:
 - adding new tools becomes cheaper and less risky
 - tests become more local
 
+Completed notes:
+
+- extracted tool protocol types and helpers into `src/tools/protocol.rs`
+- moved the legacy tool implementations behind `src/tools/legacy.rs`
+- introduced a module facade in `src/tools/mod.rs` so follow-up extractions can happen incrementally without breaking call sites
+
 ### Phase 3: Decompose `AgentContext`
 
 Priority: high
@@ -244,6 +255,10 @@ Priority: high
 Objective:
 
 - split data model, prompt construction, history management, and persistence into separate concepts
+
+Status:
+
+- completed
 
 Sub-steps:
 
@@ -287,6 +302,12 @@ Expected result:
 - compaction and prompt-building logic become independently testable
 - transcript and context policies stop leaking into unrelated code
 
+Completed notes:
+
+- moved the former monolithic `src/context.rs` into `src/context/legacy.rs`
+- added `src/context/mod.rs`, `model.rs`, `prompt.rs`, `history.rs`, and `transcript.rs`
+- converted `context` into a facade so future extractions can continue without another large rename event
+
 ### Phase 4: Clean up provider/client boundaries
 
 Priority: medium
@@ -294,6 +315,10 @@ Priority: medium
 Objective:
 
 - separate provider factory logic from provider implementations
+
+Status:
+
+- completed
 
 Problems to address:
 
@@ -322,6 +347,12 @@ Expected result:
 - provider code becomes easier to reason about
 - adding a new provider no longer expands one giant file
 
+Completed notes:
+
+- extracted provider construction into `src/llm_client/factory.rs`
+- extracted context-window heuristics into `src/llm_client/policy.rs`
+- moved the original implementation into `src/llm_client/legacy.rs` behind a module facade
+
 ### Phase 5: Simplify bootstrapping and session construction
 
 Priority: medium
@@ -329,6 +360,10 @@ Priority: medium
 Objective:
 
 - move application assembly out of `main.rs` and reduce `SessionManager` scope
+
+Status:
+
+- completed
 
 Sub-steps:
 
@@ -360,6 +395,13 @@ Expected result:
 - `main.rs` becomes an entrypoint instead of a wiring dump
 - session creation becomes easier to test and modify
 
+Completed notes:
+
+- extracted runtime bootstrap into `src/app/bootstrap.rs`
+- added `src/session/factory.rs` for agent/session construction
+- added `src/session/repository.rs` for session registry persistence
+- narrowed `SessionManager` so it delegates persistence and construction instead of owning both
+
 ### Phase 6: Remove warning suppression and tighten module APIs
 
 Priority: medium
@@ -367,6 +409,10 @@ Priority: medium
 Objective:
 
 - remove global warning suppression after modules are small enough to cleanly fix
+
+Status:
+
+- completed
 
 Sub-steps:
 
@@ -379,6 +425,12 @@ Expected result:
 
 - the compiler becomes an active tool again
 - dead code and deprecated behavior stop accumulating silently
+
+Completed notes:
+
+- removed `#![allow(warnings)]` from `core`, `context`, and `llm_client`
+- cleaned up obsolete `AgentLoop` constructor state introduced during extraction
+- removed stale control-flow variables left behind by the `step()` split
 
 ## Execution Order
 
@@ -418,12 +470,12 @@ The refactor will be considered successful when:
 - warning suppression can be removed from core modules
 - targeted regression tests continue to pass after each step
 
-## Immediate Next Step
+## Current Next Step
 
-The next refactor step should be:
+The structural refactor plan is now complete. Follow-up work should focus on:
 
-1. Continue Phase 1.
-2. Extract streaming-response handling from `AgentLoop::step()`.
-3. Add or extend tests only for the extraction seam being moved.
+1. tightening public module surfaces where the new facades are still broad
+2. moving logic from `legacy.rs` files into their focused modules in smaller follow-up passes
+3. replacing remaining string-based tool post-processing paths with fully structured tool results
 
 That keeps momentum while staying inside the current safety net.

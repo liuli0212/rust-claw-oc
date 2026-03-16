@@ -1,5 +1,6 @@
 #[cfg(feature = "acp")]
 mod acp;
+mod app;
 mod browser;
 mod context_assembler;
 mod event_log;
@@ -18,6 +19,7 @@ mod llm_client;
 mod logging;
 mod memory;
 mod session_manager;
+mod session;
 mod skills;
 mod telegram;
 mod tools;
@@ -25,13 +27,7 @@ mod ui;
 mod utils;
 
 use crate::core::{AgentOutput, RunExit};
-use crate::memory::WorkspaceMemory;
-use crate::rag::VectorStore;
 use crate::session_manager::SessionManager;
-use crate::tools::{
-    BashTool, PatchFileTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool,
-    SendFileTool, TavilySearchTool, WebFetchTool, WriteFileTool, WriteMemoryTool,
-};
 use crate::ui::TuiOutput;
 use clap::Parser;
 use console::style;
@@ -118,50 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let vector_store = Arc::new(VectorStore::new()?);
-    let workspace_memory = Arc::new(WorkspaceMemory::new("."));
-
-    let tavily_key = std::env::var("TAVILY_API_KEY").unwrap_or_default();
-
-    let mut tools: Vec<Arc<dyn tools::Tool>> = vec![
-        Arc::new(BashTool::new()),
-        Arc::new(WriteFileTool),
-        Arc::new(ReadFileTool),
-        Arc::new(PatchFileTool),
-        Arc::new(TavilySearchTool::new(tavily_key)),
-        Arc::new(WebFetchTool::new()),
-        Arc::new(RagSearchTool::new(vector_store.clone())),
-        Arc::new(RagInsertTool::new(vector_store.clone())),
-        Arc::new(ReadMemoryTool::new(workspace_memory.clone())),
-        Arc::new(WriteMemoryTool::new(workspace_memory.clone())),
-        Arc::new(SendFileTool),
-    ];
-
-    // Initialize Lazy LSP Client
-    let lazy_lsp = Arc::new(lsp::LazyLspClient::new(std::env::current_dir()?));
-
-    tools.push(Arc::new(tools::LspGotoDefinitionTool {
-        lsp_client: lazy_lsp.clone(),
-    }));
-    tools.push(Arc::new(tools::LspFindReferencesTool {
-        lsp_client: lazy_lsp.clone(),
-    }));
-    tools.push(Arc::new(tools::LspHoverTool {
-        lsp_client: lazy_lsp.clone(),
-    }));
-    tools.push(Arc::new(tools::LspGetDiagnosticsTool {
-        lsp_client: lazy_lsp.clone(),
-    }));
-    tools.push(Arc::new(tools::LspGetSymbolsTool {
-        lsp_client: lazy_lsp.clone(),
-    }));
-
+    let bootstrap = app::bootstrap::build_app_bootstrap()?;
     let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
-    if let Some(ref token) = telegram_token {
-        tools.push(Arc::new(tools::SendTelegramMessageTool::new(token.clone())));
-    }
 
-    let session_manager = Arc::new(SessionManager::new(llm_opt, tools.clone()));
+    let session_manager = Arc::new(SessionManager::new(llm_opt, bootstrap.tools.clone()));
     let output = Arc::new(TuiOutput::new());
 
     if !is_headless {

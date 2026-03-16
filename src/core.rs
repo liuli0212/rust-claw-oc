@@ -1,9 +1,7 @@
-#![allow(warnings)]
 use crate::context::{AgentContext, ContextDiff, FunctionResponse, Message, Part};
 use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;
 use async_trait::async_trait;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -108,7 +106,6 @@ pub struct AgentLoop {
     pub context: AgentContext,
     output: Arc<dyn AgentOutput>,
     telemetry: Arc<crate::telemetry::TelemetryExporter>,
-    event_log: Arc<crate::event_log::EventLog>,
     task_state_store: Arc<crate::task_state::TaskStateStore>,
     pub cancel_token: Arc<Notify>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
@@ -127,7 +124,6 @@ impl AgentLoop {
         context: AgentContext,
         output: Arc<dyn AgentOutput>,
         telemetry: Arc<crate::telemetry::TelemetryExporter>,
-        event_log: Arc<crate::event_log::EventLog>,
         task_state_store: Arc<crate::task_state::TaskStateStore>,
     ) -> Self {
         Self {
@@ -137,7 +133,6 @@ impl AgentLoop {
             context,
             output,
             telemetry,
-            event_log,
             task_state_store,
             cancel_token: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -520,11 +515,7 @@ impl AgentLoop {
     fn initialize_task_state(
         &self,
         goal: &str,
-    ) -> (
-        crate::task_state::TaskStateSnapshot,
-        String,
-        crate::schema::CorrelationIds,
-    ) {
+    ) -> (crate::task_state::TaskStateSnapshot, crate::schema::CorrelationIds) {
         let mut state = self
             .task_state_store
             .load()
@@ -561,7 +552,7 @@ impl AgentLoop {
             event_id: None,
         };
 
-        (state, current_task_id, correlation_ids)
+        (state, correlation_ids)
     }
 
     fn extract_finish_task_summary(args: &serde_json::Value) -> String {
@@ -804,7 +795,7 @@ impl AgentLoop {
 
         self.context.start_turn(goal.clone());
 
-        let (mut state, current_task_id, c_ids) = self.initialize_task_state(&goal);
+        let (mut state, c_ids) = self.initialize_task_state(&goal);
 
         let _run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
         self.telemetry.start_span("agent_step", c_ids.clone());
@@ -918,8 +909,6 @@ impl AgentLoop {
             // text content (some models ignore tool_choice: "required").
             let text_without_think = Self::strip_think_blocks(&full_text);
             let trimmed_clean = text_without_think.trim();
-            let mut is_finish_task_fallback = false;
-
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed_clean) {
                 if let Some(summary) = val
                     .as_object()
@@ -950,7 +939,6 @@ impl AgentLoop {
             }
 
             let state_before_tools = state.clone();
-            let mut stop_loop = false;
             let mut skip_remaining = false;
 
             let mut response_parts = Vec::new();
@@ -1046,11 +1034,6 @@ impl AgentLoop {
 
             state = self.reconcile_after_tool_calls(&state_before_tools).await;
 
-            if stop_loop {
-                self.output.flush().await;
-                self.context.end_turn();
-                return Ok(RunExit::StoppedByUser);
-            }
         }
     }
 }
@@ -1194,7 +1177,6 @@ mod tests {
             AgentContext::new(),
             output,
             Arc::new(telemetry),
-            Arc::new(crate::event_log::EventLog::new(session_id)),
             Arc::new(crate::task_state::TaskStateStore::new(session_id)),
         )
     }
