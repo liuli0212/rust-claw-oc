@@ -479,3 +479,11 @@ The structural refactor plan is now complete. Follow-up work should focus on:
 3. replacing remaining string-based tool post-processing paths with fully structured tool results
 
 That keeps momentum while staying inside the current safety net.
+
+## Post-Plan Progress
+
+Follow-up decomposition completed so far:
+
+- [x] moved `BashTool` into `src/tools/bash.rs`
+- [x] moved `WebFetchTool` into `src/tools/web.rs`
+- [x] moved file-oriented tools into `src/tools/files.rs`

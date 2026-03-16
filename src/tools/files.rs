@@ -1,6 +1,445 @@
-#![allow(unused_imports)]
+use super::protocol::{clean_schema, serialize_tool_envelope, Tool, ToolError};
+use async_trait::async_trait;
+use schemars::{schema_for, JsonSchema};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::time::Instant;
 
-pub use super::legacy::{
-    FinishTaskArgs, FinishTaskTool, PatchFileArgs, PatchFileTool, ReadFileArgs, ReadFileTool,
-    SendFileArgs, SendFileTool, TaskPlanArgs, TaskPlanTool, WriteFileArgs, WriteFileTool,
-};
+pub struct PatchFileTool;
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct PatchFileArgs {
+    /// Explain what changes you are making and why
+    pub thought: Option<String>,
+    /// Absolute or relative path to the file to edit
+    pub path: String,
+    /// The unified diff patch content to apply
+    pub patch: String,
+}
+
+#[async_trait]
+impl Tool for PatchFileTool {
+    fn name(&self) -> String {
+        "patch_file".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Applies a unified diff patch to a file. This is the preferred way to edit existing files."
+            .to_string()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        clean_schema(serde_json::to_value(schema_for!(PatchFileArgs)).unwrap())
+    }
+
+    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let start = Instant::now();
+        let parsed: PatchFileArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        let patch_path = format!("{}.patch", parsed.path);
+        std::fs::write(&patch_path, &parsed.patch).map_err(ToolError::IoError)?;
+
+        let output = std::process::Command::new("patch")
+            .arg("-u")
+            .arg(&parsed.path)
+            .arg("-i")
+            .arg(&patch_path)
+            .output()
+            .map_err(ToolError::IoError)?;
+
+        let _ = std::fs::remove_file(&patch_path);
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let ok = output.status.success();
+
+        serialize_tool_envelope(
+            "patch_file",
+            ok,
+            if ok {
+                stdout
+            } else {
+                format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr)
+            },
+            output.status.code(),
+            Some(start.elapsed().as_millis()),
+            false,
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct WriteFileArgs {
+    /// Explain what changes you are making and why
+    pub thought: Option<String>,
+    /// Absolute or relative path to the file to write
+    pub path: String,
+    /// The complete content to write into the file
+    pub content: String,
+}
+
+pub struct WriteFileTool;
+
+#[async_trait]
+impl Tool for WriteFileTool {
+    fn name(&self) -> String {
+        "write_file".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Writes complete content to a specified file. Overwrites if exists. Very reliable for writing code."
+            .to_string()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schema_for!(WriteFileArgs)).unwrap())
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let start = Instant::now();
+        let parsed: WriteFileArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        if let Some(parent) = std::path::Path::new(&parsed.path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        match std::fs::write(&parsed.path, &parsed.content) {
+            Ok(_) => serialize_tool_envelope(
+                "write_file",
+                true,
+                format!(
+                    "Successfully wrote {} bytes to {}",
+                    parsed.content.len(),
+                    parsed.path
+                ),
+                None,
+                Some(start.elapsed().as_millis()),
+                false,
+            ),
+            Err(e) => serialize_tool_envelope(
+                "write_file",
+                false,
+                format!("Failed to write {}: {}", parsed.path, e),
+                Some(1),
+                Some(start.elapsed().as_millis()),
+                false,
+            ),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct ReadFileArgs {
+    /// Explain briefly why you need to read this file
+    pub thought: Option<String>,
+    /// Path to the file to read
+    pub path: String,
+}
+
+pub struct ReadFileTool;
+
+#[async_trait]
+impl Tool for ReadFileTool {
+    fn name(&self) -> String {
+        "read_file".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Reads the exact contents of a file from disk.".to_string()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schema_for!(ReadFileArgs)).unwrap())
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let start = Instant::now();
+        let parsed: ReadFileArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        match std::fs::read_to_string(&parsed.path) {
+            Ok(content) => {
+                let truncated_content = crate::utils::truncate_tool_output(&content);
+                let truncated = truncated_content.len() != content.len();
+                serialize_tool_envelope(
+                    "read_file",
+                    true,
+                    truncated_content,
+                    None,
+                    Some(start.elapsed().as_millis()),
+                    truncated,
+                )
+            }
+            Err(e) => serialize_tool_envelope(
+                "read_file",
+                false,
+                format!("Failed to read {}: {}", parsed.path, e),
+                Some(1),
+                Some(start.elapsed().as_millis()),
+                false,
+            ),
+        }
+    }
+}
+
+pub struct TaskPlanTool {
+    #[allow(dead_code)]
+    pub session_id: String,
+    pub task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TaskPlanArgs {
+    /// Action: get, add, update_status, update_text, update_goal, remove, clear.
+    pub action: String,
+    /// For "add", "update_text": The step description.
+    pub step: Option<String>,
+    /// For "update_goal": The new concise goal description.
+    pub goal: Option<String>,
+    /// For "add", "update_status", "update_text": Optional note.
+    pub note: Option<String>,
+    /// For "update_status", "update_text", "remove": The 0-based index of the item.
+    pub index: Option<usize>,
+    /// For "update_status": pending, in_progress, completed.
+    pub status: Option<String>,
+}
+
+impl TaskPlanTool {
+    pub fn new(
+        session_id: String,
+        task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
+    ) -> Self {
+        Self {
+            session_id,
+            task_state_store,
+        }
+    }
+
+    fn normalize_status(status: &str) -> Result<String, ToolError> {
+        let normalized = status.trim().to_lowercase();
+        match normalized.as_str() {
+            "pending" | "in_progress" | "completed" => Ok(normalized),
+            _ => Err(ToolError::InvalidArguments(format!(
+                "invalid status '{}'; expected pending|in_progress|completed",
+                status
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for TaskPlanTool {
+    fn name(&self) -> String {
+        "task_plan".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Manages the strict execution plan. You MUST update this plan as you progress. Actions: get, add, update_status (index, status), update_text (index, step), update_goal (goal), remove (index), clear. If the task completely changes, use update_goal to set a new concise goal.".to_string()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schema_for!(TaskPlanArgs)).unwrap())
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let start = Instant::now();
+        let parsed: TaskPlanArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        let action = parsed.action.trim().to_lowercase();
+
+        let mut state = self
+            .task_state_store
+            .load()
+            .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+
+        if state.task_id.is_none() {
+            state.task_id = Some(format!("tsk_{}", uuid::Uuid::new_v4().simple()));
+            state.status = "in_progress".to_string();
+        }
+
+        match action.as_str() {
+            "get" => {}
+            "clear" => state.plan_steps.clear(),
+            "add" => {
+                let step = parsed.step.ok_or_else(|| {
+                    ToolError::InvalidArguments("add requires 'step'".to_string())
+                })?;
+                state.plan_steps.push(crate::task_state::PlanStep {
+                    step,
+                    status: "pending".to_string(),
+                    note: None,
+                });
+            }
+            "update_status" => {
+                let index = parsed.index.ok_or_else(|| {
+                    ToolError::InvalidArguments("update_status requires 'index'".to_string())
+                })?;
+                let status = parsed.status.ok_or_else(|| {
+                    ToolError::InvalidArguments("update_status requires 'status'".to_string())
+                })?;
+                let normalized_status = Self::normalize_status(&status)?;
+
+                if index < state.plan_steps.len() {
+                    state.plan_steps[index].status = normalized_status;
+                    if let Some(note) = parsed.note {
+                        state.plan_steps[index].note = Some(note);
+                    }
+                } else {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Index {} out of bounds",
+                        index
+                    )));
+                }
+            }
+            "update_text" => {
+                let index = parsed.index.ok_or_else(|| {
+                    ToolError::InvalidArguments("update_text requires 'index'".to_string())
+                })?;
+
+                if index < state.plan_steps.len() {
+                    if let Some(step) = parsed.step {
+                        state.plan_steps[index].step = step;
+                    }
+                    if let Some(note) = parsed.note {
+                        state.plan_steps[index].note = Some(note);
+                    }
+                } else {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Index {} out of bounds",
+                        index
+                    )));
+                }
+            }
+            "update_goal" => {
+                let new_goal = parsed.goal.ok_or_else(|| {
+                    ToolError::InvalidArguments("update_goal requires 'goal'".to_string())
+                })?;
+                state.goal = Some(new_goal);
+            }
+            "remove" => {
+                let index = parsed.index.ok_or_else(|| {
+                    ToolError::InvalidArguments("remove requires 'index'".to_string())
+                })?;
+                if index < state.plan_steps.len() {
+                    state.plan_steps.remove(index);
+                } else {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Index {} out of bounds",
+                        index
+                    )));
+                }
+            }
+            _ => {
+                return Err(ToolError::InvalidArguments(format!(
+                    "unsupported action '{}'",
+                    parsed.action
+                )));
+            }
+        }
+
+        let _ = self.task_state_store.save(&state);
+
+        let output = if let Ok(state) = self.task_state_store.load() {
+            state.summary()
+        } else {
+            "Plan updated.".to_string()
+        };
+
+        serialize_tool_envelope(
+            "task_plan",
+            true,
+            output,
+            Some(0),
+            Some(start.elapsed().as_millis()),
+            false,
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct FinishTaskArgs {
+    /// A summary of what was accomplished and the final answer to the user
+    pub summary: String,
+}
+
+pub struct FinishTaskTool {
+    pub task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct SendFileArgs {
+    /// Explain what file you are sending and why
+    pub thought: Option<String>,
+    /// Absolute or relative path to the file to send
+    pub path: String,
+}
+
+pub struct SendFileTool;
+
+#[async_trait]
+impl Tool for SendFileTool {
+    fn name(&self) -> String {
+        "send_file".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Sends a file (image, document, audio, etc.) to the user's chat.".to_string()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schema_for!(SendFileArgs)).unwrap())
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: SendFileArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        if !std::path::Path::new(&parsed.path).exists() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "File not found: {}",
+                parsed.path
+            )));
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "tool_name": "send_file",
+            "path": parsed.path,
+            "output": format!("File {} sent to user.", parsed.path)
+        })
+        .to_string())
+    }
+}
+
+#[async_trait]
+impl Tool for FinishTaskTool {
+    fn name(&self) -> String {
+        "finish_task".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Call this tool ONLY when you have fully completed the user's request and have nothing else to do. This will end your execution loop.".to_string()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schema_for!(FinishTaskArgs)).unwrap())
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+        let parsed: FinishTaskArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        if let Ok(mut state) = self.task_state_store.load() {
+            if state.status == "in_progress" {
+                state.status = "completed".to_string();
+                let _ = self.task_state_store.save(&state);
+            }
+        }
+
+        Ok(format!(
+            "Task marked as finished. Summary: {}",
+            parsed.summary
+        ))
+    }
+}
