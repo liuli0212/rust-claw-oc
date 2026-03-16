@@ -647,6 +647,139 @@ impl AgentLoop {
         }
     }
 
+    async fn handle_successful_tool_effects(
+        &mut self,
+        call: &crate::context::FunctionCall,
+        result: &str,
+    ) {
+        if call.name == "send_file" {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(result) {
+                if let Some(path) = val.get("path").and_then(|value| value.as_str()) {
+                    self.output.on_file(path).await;
+                }
+            }
+            return;
+        }
+
+        if call.name == "read_file" {
+            if let Some(obj) = call.args.as_object() {
+                if let Some(path_val) = obj.get("path").and_then(|value| value.as_str()) {
+                    let evidence = crate::evidence::Evidence::new(
+                        format!("file_{}", path_val),
+                        "file".to_string(),
+                        path_val.to_string(),
+                        1.0,
+                        format!("Direct read of {}", path_val),
+                        result.to_string(),
+                    );
+                    self.context.active_evidence.retain(|existing| {
+                        existing.source_kind != "file" || existing.source_path != path_val
+                    });
+                    self.context.active_evidence.push(evidence);
+                }
+            }
+            return;
+        }
+
+        let final_result = result.to_string();
+        if call.name == "execute_bash" {
+            if let Some(obj) = call.args.as_object() {
+                if let Some(cmd) = obj.get("command").and_then(|value| value.as_str()) {
+                    let cmd_trim = cmd.trim();
+                    let is_diagnostic = cmd_trim.contains("cargo ")
+                        || cmd_trim.contains("npm run")
+                        || cmd_trim.contains("pytest")
+                        || cmd_trim.contains("tsc")
+                        || cmd_trim.contains("make");
+                    let is_dir_list = cmd_trim.starts_with("ls ")
+                        || cmd_trim == "ls"
+                        || cmd_trim.starts_with("tree ")
+                        || cmd_trim == "tree"
+                        || cmd_trim.starts_with("find ");
+
+                    if is_diagnostic || is_dir_list {
+                        let kind = if is_diagnostic {
+                            "diagnostic"
+                        } else {
+                            "directory"
+                        };
+                        let source_path = if is_diagnostic {
+                            "workspace_state"
+                        } else {
+                            cmd_trim
+                        };
+
+                        let evidence = crate::evidence::Evidence::new(
+                            format!("{}_{}", kind, uuid::Uuid::new_v4().simple()),
+                            kind.to_string(),
+                            source_path.to_string(),
+                            1.0,
+                            format!("Bash snapshot: {}", cmd_trim)
+                                .chars()
+                                .take(200)
+                                .collect(),
+                            final_result,
+                        );
+
+                        if is_dir_list {
+                            self.context.active_evidence.retain(|existing| {
+                                existing.source_kind != kind || existing.source_path != source_path
+                            });
+                        } else {
+                            self.context
+                                .active_evidence
+                                .retain(|existing| existing.source_kind != kind);
+                        }
+
+                        self.context.active_evidence.push(evidence);
+                    }
+                }
+            }
+            return;
+        }
+
+        if call.name == "write_file" || call.name == "patch_file" {
+            for evidence in &mut self.context.active_evidence {
+                if evidence.source_kind == "diagnostic" {
+                    evidence.source_version = Some("invalidated_by_write".to_string());
+                }
+            }
+        }
+    }
+
+    async fn reconcile_after_tool_calls(
+        &mut self,
+        state_before_tools: &crate::task_state::TaskStateSnapshot,
+    ) -> crate::task_state::TaskStateSnapshot {
+        let state_after_tools = self
+            .task_state_store
+            .load()
+            .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+        if state_before_tools != &state_after_tools {
+            self.output.on_plan_update(&state_after_tools).await;
+        }
+
+        let compressed = self.context.compress_current_turn(400 * 1024);
+        let truncated = self.context.truncate_current_turn_tool_results(30000);
+
+        if compressed > 0 || truncated > 0 {
+            let current_turn_id = self
+                .context
+                .current_turn
+                .as_ref()
+                .map(|turn| turn.turn_id.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            tracing::info!(
+                "Turn {} compression: {} compressed, {} truncated.",
+                current_turn_id,
+                compressed,
+                truncated
+            );
+        }
+
+        state_after_tools
+    }
+
     pub async fn step(
         &mut self,
         goal: String,
@@ -882,101 +1015,10 @@ impl AgentLoop {
                     self.output.on_error(&result).await;
                 } else {
                     self.output.on_tool_end(&result).await;
-                    if call.name == "send_file" {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&result) {
-                            if let Some(path) = val.get("path").and_then(|v| v.as_str()) {
-                                self.output.on_file(path).await;
-                            }
-                        }
-                    } else if call.name == "read_file" {
-                        if let Some(obj) = call.args.as_object() {
-                            if let Some(path_val) = obj.get("path").and_then(|v| v.as_str()) {
-                                let evidence_id = format!("file_{}", path_val);
-                                let evidence = crate::evidence::Evidence::new(
-                                    evidence_id.clone(),
-                                    "file".to_string(),
-                                    path_val.to_string(),
-                                    1.0,
-                                    format!("Direct read of {}", path_val),
-                                    result.to_string(),
-                                );
-                                // Maintain a clean state: remove older versions of the same file
-                                self.context.active_evidence.retain(|e| {
-                                    e.source_kind != "file" || e.source_path != path_val
-                                });
-                                self.context.active_evidence.push(evidence);
-                            }
-                        }
-                    }
+                    self.handle_successful_tool_effects(&call, &result).await;
                 }
 
                 let final_result = result.to_string();
-
-                if !is_error {
-                    if call.name == "execute_bash" {
-                        if let Some(obj) = call.args.as_object() {
-                            if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
-                                let cmd_trim = cmd.trim();
-                                let is_diagnostic = cmd_trim.contains("cargo ")
-                                    || cmd_trim.contains("npm run")
-                                    || cmd_trim.contains("pytest")
-                                    || cmd_trim.contains("tsc")
-                                    || cmd_trim.contains("make");
-                                let is_dir_list = cmd_trim.starts_with("ls ")
-                                    || cmd_trim == "ls"
-                                    || cmd_trim.starts_with("tree ")
-                                    || cmd_trim == "tree"
-                                    || cmd_trim.starts_with("find ");
-
-                                if is_diagnostic || is_dir_list {
-                                    let kind = if is_diagnostic {
-                                        "diagnostic"
-                                    } else {
-                                        "directory"
-                                    };
-                                    let source_path = if is_diagnostic {
-                                        "workspace_state"
-                                    } else {
-                                        cmd_trim
-                                    };
-                                    let evidence_id =
-                                        format!("{}_{}", kind, uuid::Uuid::new_v4().simple());
-
-                                    let evidence = crate::evidence::Evidence::new(
-                                        evidence_id.clone(),
-                                        kind.to_string(),
-                                        source_path.to_string(),
-                                        1.0,
-                                        format!("Bash snapshot: {}", cmd_trim)
-                                            .chars()
-                                            .take(200)
-                                            .collect(),
-                                        final_result.clone(),
-                                    );
-
-                                    if is_dir_list {
-                                        self.context.active_evidence.retain(|e| {
-                                            e.source_kind != kind || e.source_path != source_path
-                                        });
-                                    } else {
-                                        self.context
-                                            .active_evidence
-                                            .retain(|e| e.source_kind != kind);
-                                    }
-
-                                    self.context.active_evidence.push(evidence);
-                                }
-                            }
-                        }
-                    } else if call.name == "write_file" || call.name == "patch_file" {
-                        // Invalidate diagnostic evidence because source code changed
-                        for ev in self.context.active_evidence.iter_mut() {
-                            if ev.source_kind == "diagnostic" {
-                                ev.source_version = Some("invalidated_by_write".to_string());
-                            }
-                        }
-                    }
-                }
 
                 response_parts.push(Part {
                     ..Self::build_function_response_part(
@@ -1002,35 +1044,7 @@ impl AgentLoop {
                 return Ok(RunExit::Finished(summary));
             }
 
-            let state_after_tools = self
-                .task_state_store
-                .load()
-                .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
-            if state_before_tools != state_after_tools {
-                self.output.on_plan_update(&state_after_tools).await;
-            }
-            state = state_after_tools;
-
-            // [PROACTIVE COMPRESSION]
-            // Stay under proxy limits (1MB) by stripping older results in the current turn.
-            // We keep raw tool output total under 400KB to be safe.
-            let compressed = self.context.compress_current_turn(400 * 1024);
-            let truncated = self.context.truncate_current_turn_tool_results(30000);
-
-            if compressed > 0 || truncated > 0 {
-                let current_turn_id = self
-                    .context
-                    .current_turn
-                    .as_ref()
-                    .map(|t| t.turn_id.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                tracing::info!(
-                    "Turn {} compression: {} compressed, {} truncated.",
-                    current_turn_id,
-                    compressed,
-                    truncated
-                );
-            }
+            state = self.reconcile_after_tool_calls(&state_before_tools).await;
 
             if stop_loop {
                 self.output.flush().await;

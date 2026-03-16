@@ -147,7 +147,7 @@ Objective:
 
 Status:
 
-- in progress
+- completed
 
 Sub-steps:
 
@@ -171,12 +171,12 @@ Sub-steps:
    - result normalization
    - per-tool post-processing hooks
 
-4. [ ] Extract evidence updates.
+4. [x] Extract evidence updates.
    - read-file evidence insertion
    - bash diagnostic/directory evidence insertion
    - write-induced invalidation
 
-5. [ ] Extract post-tool state reconciliation.
+5. [x] Extract post-tool state reconciliation.
    - reload task plan state
    - detect plan updates
    - determine finish conditions
