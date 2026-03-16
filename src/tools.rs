@@ -1128,6 +1128,12 @@ impl Tool for FinishTaskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn cleanup_session(session_id: &str) {
+        let session_dir = crate::schema::StoragePaths::session_dir(session_id);
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
 
     #[tokio::test]
     async fn test_patch_file_tool() {
@@ -1187,6 +1193,143 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_clean_schema_removes_metadata_and_injects_properties_for_objects() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Example",
+            "type": "object"
+        });
+
+        let cleaned = clean_schema(schema);
+
+        assert_eq!(cleaned.get("$schema"), None);
+        assert_eq!(cleaned.get("title"), None);
+        assert_eq!(cleaned["properties"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_serialize_tool_envelope_sets_expected_defaults() {
+        let serialized = serialize_tool_envelope(
+            "write_file",
+            true,
+            "ok".to_string(),
+            Some(0),
+            Some(42),
+            false,
+        )
+        .unwrap();
+        let envelope: ToolExecutionEnvelope = serde_json::from_str(&serialized).unwrap();
+
+        assert!(envelope.ok);
+        assert_eq!(envelope.tool_name, "write_file");
+        assert_eq!(envelope.output, "ok");
+        assert_eq!(envelope.exit_code, Some(0));
+        assert_eq!(envelope.duration_ms, Some(42));
+        assert!(!envelope.truncated);
+        assert!(!envelope.recovery_attempted);
+        assert_eq!(envelope.recovery_output, None);
+        assert_eq!(envelope.recovery_rule, None);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_marks_large_output_as_truncated() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("large.txt");
+        let large_content = (0..3000)
+            .map(|idx| format!("line-{idx:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &large_content).unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool
+            .execute(serde_json::json!({
+                "path": file_path,
+                "thought": "inspect large file"
+            }))
+            .await
+            .unwrap();
+
+        let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
+        assert!(envelope.ok);
+        assert!(envelope.truncated);
+        assert!(envelope.output.contains("line-0000"));
+        assert!(envelope.output.contains("Truncated"));
+    }
+
+    #[tokio::test]
+    async fn test_web_fetch_tool_rejects_non_http_url() {
+        let tool = WebFetchTool::new();
+        let err = tool
+            .execute(serde_json::json!({
+                "url": "ftp://example.com/file.txt"
+            }))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::InvalidArguments(_)));
+        assert!(err.to_string().contains("http:// or https://"));
+    }
+
+    #[tokio::test]
+    async fn test_send_telegram_message_tool_validates_inputs_before_network() {
+        let tool = SendTelegramMessageTool::new("fake-token".to_string());
+
+        let invalid_chat = tool
+            .execute(serde_json::json!({
+                "chat_id": "abc123",
+                "text": "hello"
+            }))
+            .await
+            .unwrap_err();
+        assert!(invalid_chat
+            .to_string()
+            .contains("chat_id must be a numeric Telegram chat ID"));
+
+        let long_text = tool
+            .execute(serde_json::json!({
+                "chat_id": "12345",
+                "text": "x".repeat(4097)
+            }))
+            .await
+            .unwrap_err();
+        assert!(long_text
+            .to_string()
+            .contains("message text exceeds Telegram's 4096 character limit"));
+    }
+
+    #[tokio::test]
+    async fn test_finish_task_tool_marks_in_progress_state_completed() {
+        let session_id = "test-finish-task-tool";
+        cleanup_session(session_id);
+        let store = std::sync::Arc::new(crate::task_state::TaskStateStore::new(session_id));
+        store
+            .save(&crate::task_state::TaskStateSnapshot {
+                status: "in_progress".to_string(),
+                goal: Some("Ship refactor".to_string()),
+                ..crate::task_state::TaskStateSnapshot::empty()
+            })
+            .unwrap();
+
+        let tool = FinishTaskTool {
+            task_state_store: store.clone(),
+        };
+
+        let result = tool
+            .execute(serde_json::json!({
+                "summary": "Refactor complete"
+            }))
+            .await
+            .unwrap();
+        let updated = store.load().unwrap();
+
+        assert!(result.contains("Refactor complete"));
+        assert_eq!(updated.status, "completed");
+        assert_eq!(updated.goal.as_deref(), Some("Ship refactor"));
+        cleanup_session(session_id);
     }
 }
 
@@ -1288,7 +1431,9 @@ pub struct LspGotoDefinitionArgs {
 
 #[async_trait]
 impl Tool for LspGotoDefinitionTool {
-    fn name(&self) -> String { "lsp_goto_definition".to_string() }
+    fn name(&self) -> String {
+        "lsp_goto_definition".to_string()
+    }
     fn description(&self) -> String {
         "Go to definition of a symbol using rust-analyzer.".to_string()
     }
@@ -1298,13 +1443,18 @@ impl Tool for LspGotoDefinitionTool {
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
         let parsed: LspGotoDefinitionArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        
+
         let path = std::path::PathBuf::from(&parsed.path);
-        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
-        let result = client.goto_definition(path, parsed.line, parsed.character)
+        let client = self
+            .lsp_client
+            .get_client()
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
-        
+        let result = client
+            .goto_definition(path, parsed.line, parsed.character)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+
         Ok(serde_json::to_string_pretty(&result).unwrap())
     }
 }
@@ -1328,7 +1478,9 @@ pub struct LspFindReferencesArgs {
 
 #[async_trait]
 impl Tool for LspFindReferencesTool {
-    fn name(&self) -> String { "lsp_find_references".to_string() }
+    fn name(&self) -> String {
+        "lsp_find_references".to_string()
+    }
     fn description(&self) -> String {
         "Find all references to a symbol using rust-analyzer.".to_string()
     }
@@ -1338,13 +1490,23 @@ impl Tool for LspFindReferencesTool {
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
         let parsed: LspFindReferencesArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        
+
         let path = std::path::PathBuf::from(&parsed.path);
-        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
-        let result = client.find_references(path, parsed.line, parsed.character, parsed.include_declaration)
+        let client = self
+            .lsp_client
+            .get_client()
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
-        
+        let result = client
+            .find_references(
+                path,
+                parsed.line,
+                parsed.character,
+                parsed.include_declaration,
+            )
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+
         Ok(serde_json::to_string_pretty(&result).unwrap())
     }
 }
@@ -1366,7 +1528,9 @@ pub struct LspHoverArgs {
 
 #[async_trait]
 impl Tool for LspHoverTool {
-    fn name(&self) -> String { "lsp_hover".to_string() }
+    fn name(&self) -> String {
+        "lsp_hover".to_string()
+    }
     fn description(&self) -> String {
         "Get hover information (types, docs) for a symbol using rust-analyzer.".to_string()
     }
@@ -1376,13 +1540,18 @@ impl Tool for LspHoverTool {
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
         let parsed: LspHoverArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        
+
         let path = std::path::PathBuf::from(&parsed.path);
-        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
-        let result = client.hover(path, parsed.line, parsed.character)
+        let client = self
+            .lsp_client
+            .get_client()
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
-        
+        let result = client
+            .hover(path, parsed.line, parsed.character)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+
         Ok(serde_json::to_string_pretty(&result).unwrap())
     }
 }
@@ -1400,7 +1569,9 @@ pub struct LspGetDiagnosticsArgs {
 
 #[async_trait]
 impl Tool for LspGetDiagnosticsTool {
-    fn name(&self) -> String { "lsp_get_diagnostics".to_string() }
+    fn name(&self) -> String {
+        "lsp_get_diagnostics".to_string()
+    }
     fn description(&self) -> String {
         "Get compilation errors and warnings for a file from rust-analyzer.".to_string()
     }
@@ -1410,13 +1581,18 @@ impl Tool for LspGetDiagnosticsTool {
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
         let parsed: LspGetDiagnosticsArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        
+
         let path = std::path::PathBuf::from(&parsed.path);
-        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
-        let result = client.get_diagnostics(path)
+        let client = self
+            .lsp_client
+            .get_client()
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
-        
+        let result = client
+            .get_diagnostics(path)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+
         Ok(serde_json::to_string_pretty(&result).unwrap())
     }
 }
@@ -1434,7 +1610,9 @@ pub struct LspGetSymbolsArgs {
 
 #[async_trait]
 impl Tool for LspGetSymbolsTool {
-    fn name(&self) -> String { "lsp_get_symbols".to_string() }
+    fn name(&self) -> String {
+        "lsp_get_symbols".to_string()
+    }
     fn description(&self) -> String {
         "Get all symbols (structs, enums, functions) in a file using rust-analyzer.".to_string()
     }
@@ -1444,13 +1622,18 @@ impl Tool for LspGetSymbolsTool {
     async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
         let parsed: LspGetSymbolsArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        
+
         let path = std::path::PathBuf::from(&parsed.path);
-        let client = self.lsp_client.get_client().await.map_err(|e| ToolError::ExecutionFailed(e))?;
-        let result = client.document_symbols(path)
+        let client = self
+            .lsp_client
+            .get_client()
             .await
             .map_err(|e| ToolError::ExecutionFailed(e))?;
-        
+        let result = client
+            .document_symbols(path)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e))?;
+
         Ok(serde_json::to_string_pretty(&result).unwrap())
     }
 }

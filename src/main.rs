@@ -1,10 +1,10 @@
 #[cfg(feature = "acp")]
 mod acp;
-mod lsp;
 mod browser;
 mod context_assembler;
 mod event_log;
 mod evidence;
+mod lsp;
 mod rag;
 mod schema;
 mod task_state;
@@ -140,11 +140,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Lazy LSP Client
     let lazy_lsp = Arc::new(lsp::LazyLspClient::new(std::env::current_dir()?));
 
-    tools.push(Arc::new(tools::LspGotoDefinitionTool { lsp_client: lazy_lsp.clone() }));
-    tools.push(Arc::new(tools::LspFindReferencesTool { lsp_client: lazy_lsp.clone() }));
-    tools.push(Arc::new(tools::LspHoverTool { lsp_client: lazy_lsp.clone() }));
-    tools.push(Arc::new(tools::LspGetDiagnosticsTool { lsp_client: lazy_lsp.clone() }));
-    tools.push(Arc::new(tools::LspGetSymbolsTool { lsp_client: lazy_lsp.clone() }));
+    tools.push(Arc::new(tools::LspGotoDefinitionTool {
+        lsp_client: lazy_lsp.clone(),
+    }));
+    tools.push(Arc::new(tools::LspFindReferencesTool {
+        lsp_client: lazy_lsp.clone(),
+    }));
+    tools.push(Arc::new(tools::LspHoverTool {
+        lsp_client: lazy_lsp.clone(),
+    }));
+    tools.push(Arc::new(tools::LspGetDiagnosticsTool {
+        lsp_client: lazy_lsp.clone(),
+    }));
+    tools.push(Arc::new(tools::LspGetSymbolsTool {
+        lsp_client: lazy_lsp.clone(),
+    }));
 
     let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
     if let Some(ref token) = telegram_token {
@@ -188,10 +198,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let agent = session_manager
             .get_or_create_session("headless", output.clone())
             .await?;
-        
+
         let mut agent_guard = agent.lock().await;
         let _ = output.on_waiting("Processing headless command...").await;
-        
+
         match agent_guard.step(cmd).await {
             Ok(exit) => match exit {
                 RunExit::Finished(summary) => {
@@ -214,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
-        
+
         return Ok(());
     }
 
@@ -555,7 +565,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 RunExit::Finished(ref summary) => {
                     println!("\n{}", style(summary).green().bold());
-                    println!("  {} {}", style("✔").green().bold(), style("Mission accomplished. All tasks have been completed.").green());
+                    println!(
+                        "  {} {}",
+                        style("✔").green().bold(),
+                        style("Mission accomplished. All tasks have been completed.").green()
+                    );
                     println!("  {} {}", style("ℹ").blue().bold(), style("I am standing by. Please let me know if you have any new instructions.").dim());
                 }
                 RunExit::StoppedByUser => {

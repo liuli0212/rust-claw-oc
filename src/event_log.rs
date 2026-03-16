@@ -188,4 +188,35 @@ mod tests {
         let events = log.read_all().await.unwrap();
         assert_eq!(events.len(), 100);
     }
+
+    #[tokio::test]
+    async fn test_event_log_read_all_skips_invalid_lines() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let valid = serde_json::to_string(&AgentEvent::new(
+            "ValidEvent",
+            "sess1",
+            None,
+            None,
+            serde_json::json!({"ok": true}),
+        ))
+        .unwrap();
+
+        tokio::fs::write(
+            &path,
+            format!("{valid}\nnot-json\n\n{{\"missing\":\"fields\"}}\n"),
+        )
+        .await
+        .unwrap();
+
+        let log = EventLog {
+            file_path: path,
+            writer_mutex: Arc::new(Mutex::new(None)),
+        };
+
+        let events = log.read_all().await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "ValidEvent");
+    }
 }

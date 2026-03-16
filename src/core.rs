@@ -394,7 +394,9 @@ impl AgentLoop {
             || msg.contains("502")
             || msg.contains("503")
             || msg.contains("rate limit")
-            || msg.contains("connection closed") || msg.contains("connection reset") || msg.contains("eof")
+            || msg.contains("connection closed")
+            || msg.contains("connection reset")
+            || msg.contains("eof")
     }
 
     async fn handle_llm_error(&self, err: &crate::llm_client::LlmError, attempt: usize) -> bool {
@@ -413,6 +415,71 @@ impl AgentLoop {
             return true;
         }
         false
+    }
+
+    fn initialize_task_state(
+        &self,
+        goal: &str,
+    ) -> (
+        crate::task_state::TaskStateSnapshot,
+        String,
+        crate::schema::CorrelationIds,
+    ) {
+        let mut state = self
+            .task_state_store
+            .load()
+            .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
+
+        if state.status == "in_progress" || state.status == "finished" || state.status == "failed" {
+            tracing::info!(
+                "Starting new task: cleaning previous {} task state",
+                state.status
+            );
+            state = crate::task_state::TaskStateSnapshot::empty();
+        }
+
+        let current_task_id = state
+            .task_id
+            .clone()
+            .unwrap_or_else(|| format!("tsk_{}", uuid::Uuid::new_v4().simple()));
+
+        if state.status == "initialized" || state.status == "empty" {
+            state.task_id = Some(current_task_id.clone());
+            state.status = "in_progress".to_string();
+            state.goal = Some(goal.to_string());
+            let _ = self.task_state_store.save(&state);
+        }
+
+        let correlation_ids = crate::schema::CorrelationIds {
+            session_id: self.session_id.clone(),
+            task_id: Some(current_task_id.clone()),
+            turn_id: self
+                .context
+                .current_turn
+                .as_ref()
+                .map(|turn| turn.turn_id.clone()),
+            event_id: None,
+        };
+
+        (state, current_task_id, correlation_ids)
+    }
+
+    fn extract_finish_task_summary(args: &serde_json::Value) -> String {
+        if let Some(obj) = args.as_object() {
+            if let Some(summary) = obj.get("summary").and_then(|value| value.as_str()) {
+                return summary.to_string();
+            }
+        } else if let Some(raw) = args.as_str() {
+            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(raw) {
+                if let Some(obj) = inner.as_object() {
+                    if let Some(summary) = obj.get("summary").and_then(|value| value.as_str()) {
+                        return summary.to_string();
+                    }
+                }
+            }
+        }
+
+        args.to_string()
     }
 
     pub async fn step(
@@ -439,43 +506,9 @@ impl AgentLoop {
 
         self.context.start_turn(goal.clone());
 
-        // Init Task state — new task always clears old incomplete plans
-        let mut state = self
-            .task_state_store
-            .load()
-            .unwrap_or_else(|_| crate::task_state::TaskStateSnapshot::empty());
-
-        if state.status == "in_progress" || state.status == "finished" || state.status == "failed" {
-            // If a previous task exists, we clear it to start fresh for the new goal.
-            // This prevents the "finished" status from immediately terminating the next turn.
-            tracing::info!("Starting new task: cleaning previous {} task state", state.status);
-            state = crate::task_state::TaskStateSnapshot::empty();
-        }
-
-        let current_task_id = state
-            .task_id
-            .clone()
-            .unwrap_or_else(|| format!("tsk_{}", uuid::Uuid::new_v4().simple()));
-
-        if state.status == "initialized" || state.status == "empty" {
-            state.task_id = Some(current_task_id.clone());
-            state.status = "in_progress".to_string();
-            state.goal = Some(goal.clone());
-            let _ = self.task_state_store.save(&state);
-        }
+        let (mut state, current_task_id, c_ids) = self.initialize_task_state(&goal);
 
         let _run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
-
-        let c_ids = crate::schema::CorrelationIds {
-            session_id: self.session_id.clone(),
-            task_id: Some(current_task_id.clone()),
-            turn_id: self
-                .context
-                .current_turn
-                .as_ref()
-                .map(|t| t.turn_id.clone()),
-            event_id: None,
-        };
         self.telemetry.start_span("agent_step", c_ids.clone());
 
         let output_clone = Arc::clone(&self.output);
@@ -636,7 +669,7 @@ impl AgentLoop {
                     thought_signature: None,
                     file_data: None,
                 });
-        }
+            }
             for (tc, sig) in &tool_calls_accumulated {
                 parts.push(Part {
                     text: None,
@@ -645,7 +678,7 @@ impl AgentLoop {
                     thought_signature: sig.clone(),
                     file_data: None,
                 });
-        }
+            }
 
             self.context.add_message_to_current_turn(Message {
                 role: "model".to_string(),
@@ -730,28 +763,13 @@ impl AgentLoop {
                         }),
                         thought_signature: thought_sig.clone(),
                         file_data: None,
-                });
+                    });
                     continue;
-        }
+                }
 
                 let mut is_finished = false;
                 if call.name == "finish_task" {
-                    let mut summary = call.args.to_string();
-
-                    if let Some(obj) = call.args.as_object() {
-                        if let Some(s) = obj.get("summary").and_then(|v| v.as_str()) {
-                            summary = s.to_string();
-                        }
-                    } else if let Some(s) = call.args.as_str() {
-                        // Handle double-encoded JSON strings from some models
-                        if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
-                            if let Some(obj) = inner.as_object() {
-                                if let Some(inner_s) = obj.get("summary").and_then(|v| v.as_str()) {
-                                    summary = inner_s.to_string();
-                                }
-                            }
-                        }
-                    }
+                    let summary = Self::extract_finish_task_summary(&call.args);
                     is_finished = true;
                     // We still add a response part for finish_task for API consistency
                     response_parts.push(Part {
@@ -764,7 +782,7 @@ impl AgentLoop {
                         }),
                         thought_signature: thought_sig.clone(),
                         file_data: None,
-                });
+                    });
 
                     if is_finished {
                         state.status = "finished".to_string();
@@ -774,7 +792,7 @@ impl AgentLoop {
                         self.output.on_task_finish(&summary).await;
                         continue;
                     }
-        }
+                }
 
                 let tool_opt = current_tools.iter().find(|t| t.name() == call.name);
                 let (result, is_error, stopped) = if let Some(tool) = tool_opt {
@@ -815,10 +833,10 @@ impl AgentLoop {
                         }),
                         thought_signature: thought_sig.clone(),
                         file_data: None,
-                });
+                    });
                     skip_remaining = true;
                     continue;
-        }
+                }
 
                 if is_error {
                     self.output.on_error(&result).await;
@@ -931,7 +949,7 @@ impl AgentLoop {
                     thought_signature: thought_sig,
                     file_data: None,
                 });
-        }
+            }
 
             if !response_parts.is_empty() {
                 self.context.add_message_to_current_turn(Message {
@@ -956,12 +974,12 @@ impl AgentLoop {
             }
             state = state_after_tools;
 
-            // [PROACTIVE COMPRESSION] 
+            // [PROACTIVE COMPRESSION]
             // Stay under proxy limits (1MB) by stripping older results in the current turn.
             // We keep raw tool output total under 400KB to be safe.
             let compressed = self.context.compress_current_turn(400 * 1024);
             let truncated = self.context.truncate_current_turn_tool_results(30000);
-            
+
             if compressed > 0 || truncated > 0 {
                 let current_turn_id = self
                     .context
@@ -969,7 +987,12 @@ impl AgentLoop {
                     .as_ref()
                     .map(|t| t.turn_id.clone())
                     .unwrap_or_else(|| "unknown".to_string());
-                tracing::info!("Turn {} compression: {} compressed, {} truncated.", current_turn_id, compressed, truncated);
+                tracing::info!(
+                    "Turn {} compression: {} compressed, {} truncated.",
+                    current_turn_id,
+                    compressed,
+                    truncated
+                );
             }
 
             if stop_loop {
@@ -978,5 +1001,267 @@ impl AgentLoop {
                 return Ok(RunExit::StoppedByUser);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::Message;
+    use crate::llm_client::LlmError;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    struct TestLlmClient {
+        stream_calls: AtomicUsize,
+        stream_delay_ms: u64,
+    }
+
+    impl TestLlmClient {
+        fn new() -> Self {
+            Self {
+                stream_calls: AtomicUsize::new(0),
+                stream_delay_ms: 0,
+            }
+        }
+
+        fn new_with_delay(stream_delay_ms: u64) -> Self {
+            Self {
+                stream_calls: AtomicUsize::new(0),
+                stream_delay_ms,
+            }
+        }
+
+        fn stream_call_count(&self) -> usize {
+            self.stream_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for TestLlmClient {
+        fn model_name(&self) -> &str {
+            "test-model"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn context_window_size(&self) -> usize {
+            1024
+        }
+
+        async fn generate_text(
+            &self,
+            _messages: Vec<Message>,
+            _system_instruction: Option<Message>,
+        ) -> Result<String, LlmError> {
+            Err(LlmError::ApiError("unused".to_string()))
+        }
+
+        async fn stream(
+            &self,
+            _messages: Vec<Message>,
+            _system_instruction: Option<Message>,
+            _tools: Vec<Arc<dyn Tool>>,
+        ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+            if self.stream_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.stream_delay_ms)).await;
+            }
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn generate_structured(
+            &self,
+            _messages: Vec<Message>,
+            _system_instruction: Option<Message>,
+            _response_schema: Value,
+        ) -> Result<Value, LlmError> {
+            Err(LlmError::ApiError("unused".to_string()))
+        }
+    }
+
+    #[derive(Default)]
+    struct OutputState {
+        text: String,
+        thinking: String,
+    }
+
+    struct TestOutput {
+        state: Mutex<OutputState>,
+    }
+
+    impl TestOutput {
+        fn new() -> Self {
+            Self {
+                state: Mutex::new(OutputState::default()),
+            }
+        }
+
+        fn snapshot(&self) -> (String, String) {
+            let state = self.state.lock().unwrap();
+            (state.text.clone(), state.thinking.clone())
+        }
+    }
+
+    #[async_trait]
+    impl AgentOutput for TestOutput {
+        async fn on_text(&self, text: &str) {
+            self.state.lock().unwrap().text.push_str(text);
+        }
+
+        async fn on_thinking(&self, text: &str) {
+            self.state.lock().unwrap().thinking.push_str(text);
+        }
+
+        async fn on_tool_start(&self, _name: &str, _args: &str) {}
+
+        async fn on_tool_end(&self, _result: &str) {}
+
+        async fn on_error(&self, _error: &str) {}
+    }
+
+    fn cleanup_session(session_id: &str) {
+        let session_dir = crate::schema::StoragePaths::session_dir(session_id);
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    fn make_agent_loop(
+        output: Arc<TestOutput>,
+        llm: Arc<TestLlmClient>,
+        session_id: &str,
+    ) -> AgentLoop {
+        let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+        AgentLoop::new(
+            session_id.to_string(),
+            llm,
+            Vec::new(),
+            AgentContext::new(),
+            output,
+            Arc::new(telemetry),
+            Arc::new(crate::event_log::EventLog::new(session_id)),
+            Arc::new(crate::task_state::TaskStateStore::new(session_id)),
+        )
+    }
+
+    #[test]
+    fn test_run_exit_label_matches_public_status_names() {
+        assert_eq!(RunExit::Finished("done".to_string()).label(), "finished");
+        assert_eq!(RunExit::StoppedByUser.label(), "stopped_by_user");
+        assert_eq!(RunExit::AgentTurnLimitReached.label(), "turn_limit_reached");
+        assert_eq!(
+            RunExit::ContextLimitReached.label(),
+            "context_limit_reached"
+        );
+        assert_eq!(RunExit::YieldedToUser.label(), "yielded_to_user");
+        assert_eq!(
+            RunExit::RecoverableFailed("retry".to_string()).label(),
+            "recoverable_failed"
+        );
+        assert_eq!(
+            RunExit::CriticallyFailed("boom".to_string()).label(),
+            "critically_failed"
+        );
+    }
+
+    #[test]
+    fn test_strip_think_blocks_removes_closed_and_unclosed_blocks() {
+        assert_eq!(
+            AgentLoop::strip_think_blocks("hello<think>secret</think>world"),
+            "helloworld"
+        );
+        assert_eq!(
+            AgentLoop::strip_think_blocks("visible<think>hidden forever"),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn test_is_transient_llm_error_matches_retryable_signals_only() {
+        assert!(AgentLoop::is_transient_llm_error(&LlmError::ApiError(
+            "HTTP 503 upstream timeout".to_string()
+        )));
+        assert!(AgentLoop::is_transient_llm_error(&LlmError::ApiError(
+            "connection reset by peer".to_string()
+        )));
+        assert!(!AgentLoop::is_transient_llm_error(&LlmError::ApiError(
+            "invalid API key".to_string()
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_process_streaming_text_routes_visible_and_thinking_segments() {
+        let output = Arc::new(TestOutput::new());
+        let llm = Arc::new(TestLlmClient::new());
+        let session_id = "test-streaming-text";
+        cleanup_session(session_id);
+        let agent = make_agent_loop(output.clone(), llm, session_id);
+        let mut processed_idx = 0;
+        let mut in_think_block = false;
+        let mut full_text = "Visible <think>internal".to_string();
+
+        agent
+            .process_streaming_text(&full_text, &mut processed_idx, &mut in_think_block)
+            .await;
+
+        full_text.push_str(" reasoning</think> done <final>answer</final>");
+        agent
+            .process_streaming_text(&full_text, &mut processed_idx, &mut in_think_block)
+            .await;
+
+        let (text, thinking) = output.snapshot();
+        assert_eq!(text, "Visible  done answer");
+        assert_eq!(thinking, "internal reasoning");
+        assert_eq!(processed_idx, full_text.len());
+        assert!(!in_think_block);
+        cleanup_session(session_id);
+    }
+
+    #[tokio::test]
+    async fn test_step_with_empty_goal_yields_without_starting_turn_or_llm() {
+        let output = Arc::new(TestOutput::new());
+        let llm = Arc::new(TestLlmClient::new());
+        let session_id = "test-empty-goal";
+        cleanup_session(session_id);
+        let mut agent = make_agent_loop(output, llm.clone(), session_id);
+
+        let exit = agent.step("   ".to_string()).await.unwrap();
+
+        assert_eq!(exit, RunExit::YieldedToUser);
+        assert!(agent.context.current_turn.is_none());
+        assert_eq!(llm.stream_call_count(), 0);
+        assert!(!crate::schema::StoragePaths::task_state_file(session_id).exists());
+        cleanup_session(session_id);
+    }
+
+    #[tokio::test]
+    async fn test_step_honors_cancel_during_pending_llm_stream_start() {
+        let output = Arc::new(TestOutput::new());
+        let llm = Arc::new(TestLlmClient::new_with_delay(200));
+        let session_id = "test-cancel-before-stream";
+        cleanup_session(session_id);
+        let mut agent = make_agent_loop(output, llm.clone(), session_id);
+        let cancel_token = agent.cancel_token.clone();
+        let cancelled = agent.cancelled.clone();
+
+        let step_handle =
+            tokio::spawn(async move { agent.step("Refactor the core loop".to_string()).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancelled.store(true, Ordering::SeqCst);
+        cancel_token.notify_waiters();
+
+        let exit = step_handle.await.unwrap().unwrap();
+        let store = crate::task_state::TaskStateStore::new(session_id);
+        let stored_state = store.load().unwrap();
+
+        assert_eq!(exit, RunExit::StoppedByUser);
+        assert_eq!(llm.stream_call_count(), 0);
+        assert_eq!(stored_state.status, "in_progress");
+        assert_eq!(stored_state.goal.as_deref(), Some("Refactor the core loop"));
+        cleanup_session(session_id);
     }
 }

@@ -172,7 +172,7 @@ impl TelegramOutput {
                     // If it's a real error, clear the streaming ID so next update starts a new message
                     *streaming_id_guard = None;
                 }
-                
+
                 // If message is too long, we definitely need a new one
                 if text.len() > 3500 {
                     self.flush_internal(&mut streaming_id_guard).await;
@@ -204,7 +204,11 @@ impl TelegramOutput {
 
         if let Some(msg_id) = **streaming_id_guard {
             // Final edit for this piece
-            tracing::debug!("Flushing Telegram stream via edit: msg_id={:?}, len={}", msg_id, text.len());
+            tracing::debug!(
+                "Flushing Telegram stream via edit: msg_id={:?}, len={}",
+                msg_id,
+                text.len()
+            );
             if let Err(e) = self
                 .bot
                 .edit_message_text(self.chat_id, msg_id, &text)
@@ -217,7 +221,10 @@ impl TelegramOutput {
                 }
             }
         } else {
-            tracing::debug!("Flushing Telegram stream via new message: len={}", text.len());
+            tracing::debug!(
+                "Flushing Telegram stream via new message: len={}",
+                text.len()
+            );
             self.send_long_message(&text, None).await;
         }
         **streaming_id_guard = None;

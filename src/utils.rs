@@ -77,3 +77,34 @@ pub fn format_full_error(e: &(dyn std::error::Error + 'static)) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_impl_preserves_head_and_tail_when_line_limited() {
+        let log = (0..10)
+            .map(|idx| format!("line-{idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let truncated = truncate_impl(&log, 4, 10_000);
+
+        assert!(truncated.contains("line-0"));
+        assert!(truncated.contains("line-1"));
+        assert!(truncated.contains("line-8"));
+        assert!(truncated.contains("line-9"));
+        assert!(truncated.contains("[... Truncated 6 lines ...]"));
+    }
+
+    #[test]
+    fn test_truncate_impl_keeps_valid_utf8_when_char_limited() {
+        let log = "你好世界".repeat(20);
+
+        let truncated = truncate_impl(&log, 1_000, 24);
+
+        assert!(truncated.contains("[... Truncated"));
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+}

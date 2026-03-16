@@ -825,7 +825,7 @@ impl AgentContext {
                 {
                     new_parts.push(new_part);
                 }
-        }
+            }
 
             if !new_parts.is_empty() {
                 new_messages.push(Message {
@@ -864,7 +864,8 @@ impl AgentContext {
 
             // Heuristic: If this turn asks about history, protect the *next* turn we process (which is the older one)
             // Limit heuristic protection to recent 10 turns to avoid noise in deep history
-            let user_asks_for_context = i < 10 && Self::is_user_referencing_history(&turn.user_message);
+            let user_asks_for_context =
+                i < 10 && Self::is_user_referencing_history(&turn.user_message);
 
             // Context Optimization:
             // 1. Safety Buffer (Hot State): Keep last 3 turns in Full Fidelity.
@@ -929,8 +930,8 @@ impl AgentContext {
                             function_response: None,
                             thought_signature: None,
                             file_data: None,
-                }],
-        });
+                        }],
+                    });
                 }
             }
             prev_zone = Some(zone);
@@ -1225,7 +1226,7 @@ impl AgentContext {
                     thought_signature: None,
                     file_data: None,
                 }],
-        }],
+            }],
         };
 
         // Insert at beginning
@@ -1342,7 +1343,7 @@ impl AgentContext {
                     thought_signature: None,
                     file_data: None,
                 }],
-        }],
+            }],
         });
     }
 
@@ -1352,7 +1353,7 @@ impl AgentContext {
         }
     }
 
-        /// Proactively compresses older tool results in the current turn to save payload size.
+    /// Proactively compresses older tool results in the current turn to save payload size.
     /// If the current turn's tool response total size exceeds `max_bytes`,
     /// older results are stripped until we are under the limit.
     pub fn compress_current_turn(&mut self, max_bytes: usize) -> usize {
@@ -1360,12 +1361,14 @@ impl AgentContext {
             return 0;
         };
 
-        let function_indices: Vec<usize> = turn.messages.iter()
+        let function_indices: Vec<usize> = turn
+            .messages
+            .iter()
             .enumerate()
             .filter(|(_, m)| m.role == "function")
             .map(|(i, _)| i)
             .collect();
-        
+
         if function_indices.is_empty() {
             return 0;
         }
@@ -1386,24 +1389,24 @@ impl AgentContext {
         }
 
         let mut compressed_count = 0;
-        // Compress messages from oldest to newest until size is okay, 
+        // Compress messages from oldest to newest until size is okay,
         // but always keep at least the last 1 result if possible.
         let limit = function_indices.len().saturating_sub(1);
         for i in 0..limit {
             let idx = function_indices[i];
             let msg = &mut turn.messages[idx];
-            
+
             for part in &mut msg.parts {
                 if let Some(fr) = &mut part.function_response {
                     let response_str = fr.response.to_string();
                     if response_str.contains("stripped") && response_str.len() < 1000 {
-                        continue; 
+                        continue;
                     }
-                    
+
                     let old_len = response_str.len();
                     Self::strip_response_payload(fr);
                     let new_len = fr.response.to_string().len();
-                    
+
                     compressed_count += 1;
                     current_size = current_size.saturating_sub(old_len.saturating_sub(new_len));
                 }
@@ -1488,8 +1491,8 @@ impl AgentContext {
                         function_response: None,
                         thought_signature: None,
                         file_data: None,
-                }],
-        };
+                    }],
+                };
                 current_turn_tokens += Self::estimate_tokens(&bpe, &separator);
                 messages.push(separator);
 
@@ -1559,7 +1562,7 @@ impl AgentContext {
                 function_call: None,
                 function_response: None,
                 file_data: None,
-                }],
+            }],
         };
 
         let system_prompt_tokens = report_data.used_tokens;
@@ -1720,7 +1723,7 @@ mod tests {
                 function_response: None,
                 thought_signature: None,
                 file_data: None,
-                }],
+            }],
         });
 
         ctx.end_turn();
@@ -1747,5 +1750,17 @@ mod tests {
             payload.last().unwrap().parts[0].text.as_ref().unwrap(),
             "Short message"
         );
+    }
+
+    #[test]
+    fn test_transcript_path_for_session_sanitizes_special_characters() {
+        let dir = tempdir().unwrap();
+        let path = transcript_path_for_session(dir.path(), "session:/with spaces?and*symbols");
+
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "session__with_spaces_and_symbols.jsonl"
+        );
+        assert!(path.starts_with(dir.path()));
     }
 }

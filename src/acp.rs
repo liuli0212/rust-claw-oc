@@ -537,7 +537,9 @@ async fn handle_run(
                         let _ = tx_for_run.send(AcpEvent::Finish {
                             summary: match &exit {
                                 crate::core::RunExit::Finished(s) => s.clone(),
-                                crate::core::RunExit::YieldedToUser => "Agent is waiting for your input.".to_string(),
+                                crate::core::RunExit::YieldedToUser => {
+                                    "Agent is waiting for your input.".to_string()
+                                }
                                 _ => exit.label().to_string(),
                             },
                             status: exit.label().to_string(),
@@ -549,9 +551,7 @@ async fn handle_run(
                 }
             });
 
-            Some(CancelGuard {
-                agent: agent_mutex,
-            })
+            Some(CancelGuard { agent: agent_mutex })
         }
         Err(e) => {
             let _ = tx.send(AcpEvent::Error(format!("Session creation failed: {}", e)));

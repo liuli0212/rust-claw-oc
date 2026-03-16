@@ -110,3 +110,80 @@ impl TaskStateStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_summary_uses_first_incomplete_plan_step_when_current_step_missing() {
+        let state = TaskStateSnapshot {
+            status: "in_progress".to_string(),
+            goal: Some("Refactor safely".to_string()),
+            current_step: None,
+            plan_steps: vec![
+                PlanStep {
+                    step: "Old completed step".to_string(),
+                    status: "completed".to_string(),
+                    note: None,
+                },
+                PlanStep {
+                    step: "Add regression tests".to_string(),
+                    status: "pending".to_string(),
+                    note: Some("Protect refactor".to_string()),
+                },
+            ],
+            ..TaskStateSnapshot::empty()
+        };
+
+        let summary = state.summary();
+
+        assert!(summary.contains("Current task (in_progress)"));
+        assert!(summary.contains("- Goal: Refactor safely"));
+        assert!(summary.contains("- Current step: Add regression tests (pending)"));
+        assert!(summary.contains("[1] Add regression tests (pending) - Protect refactor"));
+    }
+
+    #[test]
+    fn test_load_invalid_json_falls_back_to_empty_snapshot() {
+        let dir = tempdir().unwrap();
+        let store = TaskStateStore {
+            file_path: dir.path().join("task_state.json"),
+        };
+
+        fs::write(&store.file_path, "{ not valid json").unwrap();
+
+        let loaded = store.load().unwrap();
+
+        assert_eq!(loaded, TaskStateSnapshot::empty());
+    }
+
+    #[test]
+    fn test_has_active_plan_requires_in_progress_status() {
+        let dir = tempdir().unwrap();
+        let store = TaskStateStore {
+            file_path: dir.path().join("task_state.json"),
+        };
+
+        let active_state = TaskStateSnapshot {
+            status: "in_progress".to_string(),
+            plan_steps: vec![PlanStep {
+                step: "Do work".to_string(),
+                status: "pending".to_string(),
+                note: None,
+            }],
+            ..TaskStateSnapshot::empty()
+        };
+        store.save(&active_state).unwrap();
+        assert!(store.has_active_plan());
+
+        let inactive_state = TaskStateSnapshot {
+            status: "completed".to_string(),
+            plan_steps: active_state.plan_steps.clone(),
+            ..TaskStateSnapshot::empty()
+        };
+        store.save(&inactive_state).unwrap();
+        assert!(!store.has_active_plan());
+    }
+}

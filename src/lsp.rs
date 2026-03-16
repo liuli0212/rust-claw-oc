@@ -82,7 +82,9 @@ impl LspClient {
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
             while let Ok(n) = reader.read_line(&mut line).await {
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 tracing::debug!("LSP stderr: {}", line.trim());
                 line.clear();
             }
@@ -102,10 +104,8 @@ impl LspClient {
                 }
 
                 if line.starts_with("Content-Length: ") {
-                    let len_res: Result<usize, _> = line["Content-Length: ".len()..]
-                        .trim()
-                        .parse();
-                    
+                    let len_res: Result<usize, _> = line["Content-Length: ".len()..].trim().parse();
+
                     let len = match len_res {
                         Ok(l) => l,
                         Err(_) => {
@@ -130,7 +130,11 @@ impl LspClient {
                     let val: Value = match serde_json::from_str(&body_str) {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::error!("Failed to parse LSP message: {} | Body: {}", e, body_str);
+                            tracing::error!(
+                                "Failed to parse LSP message: {} | Body: {}",
+                                e,
+                                body_str
+                            );
                             continue;
                         }
                     };
@@ -142,14 +146,19 @@ impl LspClient {
                             if let Some(error) = val.get("error") {
                                 let _ = tx.send(Err(error.to_string()));
                             } else {
-                                let _ = tx.send(Ok(val.get("result").cloned().unwrap_or(Value::Null)));
+                                let _ =
+                                    tx.send(Ok(val.get("result").cloned().unwrap_or(Value::Null)));
                             }
                         }
                     } else if let Some(method) = val.get("method").and_then(|m| m.as_str()) {
                         // It's a notification
                         if method == "textDocument/publishDiagnostics" {
                             if let Some(params) = val.get("params") {
-                                if let Ok(diagnostics) = serde_json::from_value::<PublishDiagnosticsParams>(params.clone()) {
+                                if let Ok(diagnostics) =
+                                    serde_json::from_value::<PublishDiagnosticsParams>(
+                                        params.clone(),
+                                    )
+                                {
                                     let mut diags = client_clone.diagnostics.lock().await;
                                     diags.insert(diagnostics.uri, diagnostics.diagnostics);
                                 }
@@ -222,10 +231,15 @@ impl LspClient {
                 .write_all(msg.as_bytes())
                 .await
                 .map_err(|e| format!("Failed to write to LSP: {}", e))?;
-            writer.flush().await.map_err(|e| format!("Failed to flush LSP: {}", e))?;
+            writer
+                .flush()
+                .await
+                .map_err(|e| format!("Failed to flush LSP: {}", e))?;
         }
 
-        let res_val = rx.await.map_err(|_| "LSP request cancelled".to_string())??;
+        let res_val = rx
+            .await
+            .map_err(|_| "LSP request cancelled".to_string())??;
         serde_json::from_value(res_val).map_err(|e| format!("Failed to parse LSP response: {}", e))
     }
 
@@ -244,12 +258,17 @@ impl LspClient {
             .write_all(msg.as_bytes())
             .await
             .map_err(|e| format!("Failed to write to LSP: {}", e))?;
-        writer.flush().await.map_err(|e| format!("Failed to flush LSP: {}", e))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| format!("Failed to flush LSP: {}", e))?;
         Ok(())
     }
 
     fn get_uri(&self, path: &PathBuf) -> Result<Url, String> {
-        let abs_path = path.canonicalize().map_err(|e| format!("Failed to canonicalize path {:?}: {}", path, e))?;
+        let abs_path = path
+            .canonicalize()
+            .map_err(|e| format!("Failed to canonicalize path {:?}: {}", path, e))?;
         Url::from_file_path(&abs_path).map_err(|_| format!("Invalid file path: {:?}", abs_path))
     }
 
@@ -327,7 +346,10 @@ impl LspClient {
         self.request::<DocumentSymbolRequest>(params).await
     }
 
-    pub async fn get_diagnostics(&self, path: PathBuf) -> Result<Vec<lsp_types::Diagnostic>, String> {
+    pub async fn get_diagnostics(
+        &self,
+        path: PathBuf,
+    ) -> Result<Vec<lsp_types::Diagnostic>, String> {
         let uri = self.get_uri(&path)?;
         let diags = self.diagnostics.lock().await;
         Ok(diags.get(&uri).cloned().unwrap_or_default())
