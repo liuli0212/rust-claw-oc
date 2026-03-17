@@ -1,5 +1,3 @@
-#![allow(unused_imports)]
-
 pub mod bash;
 pub mod files;
 pub mod integrations;
@@ -8,10 +6,15 @@ pub mod memory;
 pub mod protocol;
 pub mod web;
 
-pub use bash::*;
-pub use files::*;
-pub use integrations::*;
-pub use lsp::*;
-pub use memory::*;
-pub use protocol::*;
-pub use web::*;
+pub use bash::BashTool;
+pub use files::{
+    FinishTaskTool, PatchFileTool, ReadFileTool, SendFileTool, TaskPlanTool, WriteFileTool,
+};
+pub use integrations::SendTelegramMessageTool;
+pub use lsp::{
+    LspFindReferencesTool, LspGetDiagnosticsTool, LspGetSymbolsTool, LspGotoDefinitionTool,
+    LspHoverTool,
+};
+pub use memory::{RagInsertTool, RagSearchTool, ReadMemoryTool, WriteMemoryTool};
+pub use protocol::{clean_schema, Tool, ToolError};
+pub use web::{TavilySearchTool, WebFetchTool};

@@ -1,4 +1,4 @@
-use super::legacy::AgentContext;
+use super::agent_context::AgentContext;
 use super::model::{Message, Part, Turn};
 
 pub fn start_turn(ctx: &mut AgentContext, text: String) {

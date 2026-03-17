@@ -1,4 +1,4 @@
-use super::legacy::AgentContext;
+use super::agent_context::AgentContext;
 pub use super::model::Turn;
 use super::prompt::DetailedContextStats;
 use serde::{Deserialize, Serialize};

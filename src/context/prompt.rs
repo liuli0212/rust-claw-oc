@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-use super::legacy::AgentContext;
+use super::agent_context::AgentContext;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DetailedContextStats {

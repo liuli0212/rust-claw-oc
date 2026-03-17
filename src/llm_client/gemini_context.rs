@@ -1,7 +1,7 @@
 use super::gemini::{
     capture_thought_signature, inline_schema_refs, normalize_schema_for_gemini,
-    parse_function_call_basic, to_vertex_message, FunctionDeclaration, GeminiRequest,
-    GenerationConfig, ThinkingConfig, VertexGeminiRequest,
+    parse_function_call_basic, to_vertex_message, CachedContentInfo, FunctionDeclaration,
+    GeminiRequest, GenerationConfig, ThinkingConfig, VertexGeminiRequest,
 };
 use super::protocol::{GeminiPlatform, LlmError};
 use crate::context::{FileData, Message};
@@ -11,8 +11,8 @@ use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 pub(crate) fn build_function_declarations(tools: &[Arc<dyn Tool>]) -> Vec<FunctionDeclaration> {
     if tools.is_empty() {
@@ -60,7 +60,10 @@ pub(crate) async fn upload_content(
         .post(&url)
         .header("X-Goog-Upload-Protocol", "resumable")
         .header("X-Goog-Upload-Command", "start")
-        .header("X-Goog-Upload-Header-Content-Length", content.len().to_string())
+        .header(
+            "X-Goog-Upload-Header-Content-Length",
+            content.len().to_string(),
+        )
         .header("X-Goog-Upload-Header-Content-Type", mime_type)
         .json(&metadata)
         .send()
@@ -195,7 +198,7 @@ pub(crate) async fn resolve_cached_content(
     client: &Client,
     api_key: &str,
     model_name: &str,
-    cached_content: &Mutex<Option<super::legacy::CachedContentInfo>>,
+    cached_content: &Mutex<Option<CachedContentInfo>>,
     system_instruction: &Option<Message>,
     log_label: &str,
 ) -> Option<String> {
@@ -217,10 +220,14 @@ pub(crate) async fn resolve_cached_content(
         }
     }
 
-    tracing::info!("Creating context cache for {} ({} bytes)", log_label, sys_str.len());
+    tracing::info!(
+        "Creating context cache for {} ({} bytes)",
+        log_label,
+        sys_str.len()
+    );
     match create_context_cache(client, api_key, model_name, sys_msg).await {
         Ok(id) => {
-            *cache_guard = Some(super::legacy::CachedContentInfo {
+            *cache_guard = Some(CachedContentInfo {
                 id: id.clone(),
                 hash: current_hash,
             });
@@ -267,11 +274,7 @@ pub(crate) fn text_generation_config(model_name: &str) -> Option<GenerationConfi
     }
 }
 
-pub(crate) fn request_url(
-    platform: GeminiPlatform,
-    model_name: &str,
-    streaming: bool,
-) -> String {
+pub(crate) fn request_url(platform: GeminiPlatform, model_name: &str, streaming: bool) -> String {
     match (platform, streaming) {
         (GeminiPlatform::Gen, false) => format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
@@ -364,9 +367,15 @@ pub(crate) async fn generate_with_retry(
     let max_attempts = 5;
     loop {
         attempts += 1;
-        let response =
-            send_generate_request(client, api_key, platform, url, req_body, req_body.cached_content.clone())
-                .await;
+        let response = send_generate_request(
+            client,
+            api_key,
+            platform,
+            url,
+            req_body,
+            req_body.cached_content.clone(),
+        )
+        .await;
 
         match response {
             Ok(r) if r.status().is_success() => {
@@ -375,11 +384,8 @@ pub(crate) async fn generate_with_retry(
             Ok(r) => {
                 let status = r.status();
                 let error_text = r.text().await.unwrap_or_default();
-                let last_error = format!(
-                    "status={} body={}",
-                    status,
-                    truncate_log_error(&error_text)
-                );
+                let last_error =
+                    format!("status={} body={}", status, truncate_log_error(&error_text));
                 tracing::warn!(
                     "Gemini Structured API Error (Attempt {}/{}): {}",
                     attempts,
@@ -429,7 +435,10 @@ pub(crate) async fn stream_connect_with_retry(
             max_attempts,
             body_json_string.len()
         );
-        tracing::debug!("Gemini stream body: {}", crate::utils::truncate_log(body_json_string));
+        tracing::debug!(
+            "Gemini stream body: {}",
+            crate::utils::truncate_log(body_json_string)
+        );
 
         let req_result = client
             .post(url)

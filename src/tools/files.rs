@@ -447,7 +447,7 @@ impl Tool for FinishTaskTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolExecutionEnvelope;
+    use crate::tools::protocol::ToolExecutionEnvelope;
     use tempfile::tempdir;
 
     fn cleanup_session(session_id: &str) {

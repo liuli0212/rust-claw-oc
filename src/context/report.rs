@@ -1,5 +1,5 @@
+use super::agent_context::AgentContext;
 use super::history::ContextDiff;
-use super::legacy::AgentContext;
 
 pub fn format_context_details(ctx: &AgentContext) -> String {
     let stats = ctx.get_detailed_stats(None);
@@ -63,7 +63,10 @@ pub fn format_context_details(ctx: &AgentContext) -> String {
 
     if stats.memory > 0 {
         details.push_str("\n\x1b[1;33m[RAG Memory]\x1b[0m\n");
-        details.push_str(&format!("  - Retrieved:          {} tokens\n", stats.memory));
+        details.push_str(&format!(
+            "  - Retrieved:          {} tokens\n",
+            stats.memory
+        ));
         for src in &ctx.retrieved_memory_sources {
             details.push_str(&format!("    * {}\n", src));
         }
@@ -114,7 +117,11 @@ pub fn format_context_diff(diff: &ContextDiff) -> String {
         trunc_color, trunc_sign, diff.truncated_delta
     ));
 
-    let turn_sign = if diff.history_turns_delta >= 0 { "+" } else { "" };
+    let turn_sign = if diff.history_turns_delta >= 0 {
+        "+"
+    } else {
+        ""
+    };
     output.push_str(&format!(
         "  History:      {}{}\x1b[0m turns\n",
         turn_sign, diff.history_turns_delta

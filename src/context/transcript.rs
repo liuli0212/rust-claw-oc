@@ -1,4 +1,4 @@
-use super::legacy::AgentContext;
+use super::agent_context::AgentContext;
 use super::model::Turn;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};

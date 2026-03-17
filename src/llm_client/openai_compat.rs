@@ -8,8 +8,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use super::legacy::create_standard_client;
-use super::protocol::{LlmClient, LlmError, StreamEvent};
+use super::protocol::{create_standard_client, LlmClient, LlmError, StreamEvent};
 use crate::utils::{format_full_error, truncate_log, truncate_log_error};
 
 pub struct OpenAiCompatClient {
@@ -377,7 +376,6 @@ impl LlmClient for OpenAiCompatClient {
         tokio::spawn(async move {
             let mut attempts = 0;
             let max_attempts = 5;
-            let mut last_error = String::from("initialization");
 
             let resp = loop {
                 attempts += 1;
@@ -406,7 +404,7 @@ impl LlmClient for OpenAiCompatClient {
                         let status = r.status();
                         let is_transient = status.is_server_error() || status.as_u16() == 429;
                         let body = r.text().await.unwrap_or_default();
-                        last_error =
+                        let last_error =
                             format!("status={} body={}", status, truncate_log_error(&body));
 
                         tracing::warn!(
@@ -427,7 +425,7 @@ impl LlmClient for OpenAiCompatClient {
                         }
                     }
                     Err(e) => {
-                        last_error = format_full_error(&e);
+                        let last_error = format_full_error(&e);
                         tracing::warn!(
                             "OpenAI Network Error (Attempt {}/{}):\n{}",
                             attempts,

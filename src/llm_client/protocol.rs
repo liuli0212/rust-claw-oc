@@ -1,6 +1,7 @@
 use crate::context::{FunctionCall, Message};
 use crate::tools::Tool;
 use async_trait::async_trait;
+use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
@@ -56,4 +57,56 @@ pub trait LlmClient: Send + Sync {
 pub enum GeminiPlatform {
     Gen,
     Vertex,
+}
+
+pub(super) fn create_standard_client(base_url: Option<&str>) -> Client {
+    let mut builder = Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(600))
+        .pool_idle_timeout(std::time::Duration::from_secs(600))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+        .http2_keep_alive_interval(Some(std::time::Duration::from_secs(15)))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(20))
+        .http2_keep_alive_while_idle(true)
+        .http2_initial_stream_window_size(4 * 1024 * 1024)
+        .http2_initial_connection_window_size(4 * 1024 * 1024)
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "X-Server-Timeout",
+                reqwest::header::HeaderValue::from_static("600"),
+            );
+            headers.insert(
+                "x-goog-api-client",
+                reqwest::header::HeaderValue::from_static("rusty-claw/0.1.0"),
+            );
+            headers
+        })
+        .gzip(true);
+
+    if let Some(url) = base_url {
+        let no_proxy = std::env::var("no_proxy")
+            .or_else(|_| std::env::var("NO_PROXY"))
+            .unwrap_or_default();
+
+        let bypass = no_proxy.split(',').any(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return false;
+            }
+            if entry == "*" {
+                return true;
+            }
+
+            url.contains(entry)
+        });
+
+        if bypass {
+            tracing::debug!("Bypassing proxy for URL: {} (matched in NO_PROXY)", url);
+            builder = builder.no_proxy();
+        }
+    }
+
+    builder.build().unwrap_or_else(|_| Client::new())
 }

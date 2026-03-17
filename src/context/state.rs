@@ -1,5 +1,5 @@
+use super::agent_context::AgentContext;
 use super::history::{ContextDiff, ContextSnapshot};
-use super::legacy::AgentContext;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -21,8 +21,16 @@ pub fn take_snapshot(ctx: &mut AgentContext) -> ContextSnapshot {
             .map(|t| t.turn_id.clone())
             .unwrap_or_default(),
         stats,
-        messages_count: ctx.dialogue_history.iter().map(|t| t.messages.len()).sum::<usize>()
-            + ctx.current_turn.as_ref().map(|t| t.messages.len()).unwrap_or(0),
+        messages_count: ctx
+            .dialogue_history
+            .iter()
+            .map(|t| t.messages.len())
+            .sum::<usize>()
+            + ctx
+                .current_turn
+                .as_ref()
+                .map(|t| t.messages.len())
+                .unwrap_or(0),
         system_prompt_hash: hash,
         retrieved_memory_sources: ctx.retrieved_memory_sources.clone(),
         history_turns_count: ctx.dialogue_history.len(),
