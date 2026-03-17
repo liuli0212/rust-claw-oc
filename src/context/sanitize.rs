@@ -16,6 +16,54 @@ pub(crate) fn strip_thinking_tags(text: &str) -> String {
     result.trim().to_string()
 }
 
+fn truncate_chars_with_marker(input: &str, head_chars: usize, tail_chars: usize) -> String {
+    let char_count = input.chars().count();
+    if char_count <= head_chars + tail_chars {
+        return input.to_string();
+    }
+
+    let head: String = input.chars().take(head_chars).collect();
+    let tail: String = input
+        .chars()
+        .skip(char_count.saturating_sub(tail_chars))
+        .collect();
+    format!(
+        "{}\n... [stripped {} chars] ...\n{}",
+        head, char_count, tail
+    )
+}
+
+fn truncate_lines_with_marker(input: &str, head_lines: usize, tail_lines: usize) -> String {
+    let lines: Vec<_> = input.lines().collect();
+    if lines.len() <= head_lines + tail_lines {
+        return input.to_string();
+    }
+
+    let head = lines
+        .iter()
+        .take(head_lines)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tail = lines
+        .iter()
+        .rev()
+        .take(tail_lines)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "{}\n... [stripped {} lines] ...\n{}",
+        head,
+        lines.len(),
+        tail
+    )
+}
+
 pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
     let obj = match fr.response.as_object_mut() {
         Some(o) => o,
@@ -50,50 +98,42 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
         None => return,
     };
 
-    match fr.name.as_str() {
-        "task_plan" => {
+    let tool_name = env_obj
+        .get("tool_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or(fr.name.as_str());
+    let evidence_kind = env_obj
+        .get("evidence_kind")
+        .and_then(|value| value.as_str());
+    let payload_kind = env_obj.get("payload_kind").and_then(|value| value.as_str());
+
+    match (payload_kind, tool_name) {
+        (Some("plan"), _) | (_, "task_plan") => {
             *result_val = serde_json::Value::String("[plan updated]".to_string());
             return;
         }
-        "read_file" => {
+        _ if evidence_kind == Some("file") => {
             if let Some(output) = env_obj.get_mut("output") {
                 if let Some(s) = output.as_str() {
-                    let line_count = s.lines().count();
-                    if line_count > 10 {
-                        let head: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
-                        let tail: String = s
-                            .lines()
-                            .rev()
-                            .take(5)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        *output = serde_json::Value::String(format!(
-                            "{}\n... [stripped {} lines] ...\n{}",
-                            head, line_count, tail
-                        ));
+                    if s.lines().count() > 10 {
+                        *output = serde_json::Value::String(truncate_lines_with_marker(s, 5, 5));
                     }
                 }
             }
         }
-        "execute_bash" => {
+        _ if matches!(evidence_kind, Some("diagnostic" | "directory"))
+            || tool_name == "execute_bash" =>
+        {
             if let Some(output) = env_obj.get_mut("output") {
                 if let Some(s) = output.as_str() {
-                    let char_count = s.chars().count();
-                    if char_count > 500 {
-                        let head: String = s.chars().take(200).collect();
-                        let tail: String = s.chars().skip(char_count - 200).collect();
-                        *output = serde_json::Value::String(format!(
-                            "{}\n... [stripped {} chars] ...\n{}",
-                            head, char_count, tail
-                        ));
+                    if s.chars().count() > 500 {
+                        *output =
+                            serde_json::Value::String(truncate_chars_with_marker(s, 200, 200));
                     }
                 }
             }
         }
-        "web_fetch" | "web_search_tavily" => {
+        (Some("web_content" | "web_search"), _) | (_, "web_fetch" | "web_search_tavily") => {
             if let Some(output) = env_obj.get_mut("output") {
                 if let Some(s) = output.as_str() {
                     *output = serde_json::Value::String(format!(
@@ -103,24 +143,18 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
                 }
             }
         }
-        "skill" | "use_skill" => {
+        (Some("skill"), _) | (_, "skill" | "use_skill") => {
             if let Some(output) = env_obj.get_mut("output") {
                 *output = serde_json::Value::String("Skill loaded.".to_string());
             }
         }
-        "write_file" | "patch_file" => {}
+        (_, "write_file" | "patch_file") => {}
         _ => {
             if let Some(output) = env_obj.get_mut("output") {
                 if let Some(s) = output.as_str() {
                     if s.len() > 500 {
-                        let head: String = s.chars().take(200).collect();
-                        let tail: String = s.chars().skip(s.chars().count() - 100).collect();
-                        *output = serde_json::Value::String(format!(
-                            "{}\n... [stripped {} chars] ...\n{}",
-                            head,
-                            s.len(),
-                            tail
-                        ));
+                        *output =
+                            serde_json::Value::String(truncate_chars_with_marker(s, 200, 100));
                     }
                 }
             }
@@ -135,5 +169,96 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
 
     if let Ok(stripped_str) = serde_json::to_string(env_obj) {
         *result_val = serde_json::Value::String(stripped_str);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::model::FunctionResponse;
+
+    #[test]
+    fn strip_response_payload_uses_envelope_metadata() {
+        let mut response = FunctionResponse {
+            name: "finish_task".to_string(),
+            id: None,
+            response: serde_json::json!({
+                "result": serde_json::json!({
+                    "ok": true,
+                    "tool_name": "read_file",
+                    "output": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11",
+                    "evidence_kind": "file",
+                    "finish_task_summary": "done"
+                }).to_string()
+            }),
+        };
+
+        strip_response_payload(&mut response);
+
+        let result = response.response["result"].as_str().unwrap();
+        assert!(result.contains("line1"));
+        assert!(result.contains("stripped 11 lines"));
+        assert!(result.contains("\"finish_task_summary\":\"done\""));
+    }
+
+    #[test]
+    fn strip_response_payload_uses_payload_kind_for_plan_and_web() {
+        let mut plan_response = FunctionResponse {
+            name: "unknown_tool".to_string(),
+            id: None,
+            response: serde_json::json!({
+                "result": serde_json::json!({
+                    "ok": true,
+                    "tool_name": "task_plan",
+                    "payload_kind": "plan",
+                    "output": "full plan contents"
+                }).to_string()
+            }),
+        };
+
+        strip_response_payload(&mut plan_response);
+        assert_eq!(
+            plan_response.response["result"].as_str(),
+            Some("[plan updated]")
+        );
+
+        let mut web_response = FunctionResponse {
+            name: "unknown_tool".to_string(),
+            id: None,
+            response: serde_json::json!({
+                "result": serde_json::json!({
+                    "ok": true,
+                    "tool_name": "web_fetch",
+                    "payload_kind": "web_content",
+                    "output": "abcdefghijklmnopqrstuvwxyz"
+                }).to_string()
+            }),
+        };
+
+        strip_response_payload(&mut web_response);
+
+        let result = web_response.response["result"].as_str().unwrap();
+        assert!(result.contains("[web content stripped - 26 chars]"));
+    }
+
+    #[test]
+    fn strip_response_payload_uses_payload_kind_for_skill() {
+        let mut skill_response = FunctionResponse {
+            name: "dynamic_tool".to_string(),
+            id: None,
+            response: serde_json::json!({
+                "result": serde_json::json!({
+                    "ok": true,
+                    "tool_name": "echo_skill",
+                    "payload_kind": "skill",
+                    "output": "STDOUT:\\nhello"
+                }).to_string()
+            }),
+        };
+
+        strip_response_payload(&mut skill_response);
+
+        let result = skill_response.response["result"].as_str().unwrap();
+        assert!(result.contains("\"output\":\"Skill loaded.\""));
     }
 }

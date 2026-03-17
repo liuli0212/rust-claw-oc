@@ -1,4 +1,4 @@
-use super::protocol::{clean_schema, serialize_tool_envelope, Tool, ToolError};
+use super::protocol::{clean_schema, StructuredToolOutput, Tool, ToolError};
 use async_trait::async_trait;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use regex::Regex;
@@ -39,6 +39,42 @@ impl BashTool {
             .to_string_lossy()
             .to_string();
         Self { work_dir }
+    }
+
+    fn classify_command_effect(cmd: &str) -> Option<(&'static str, String, String)> {
+        let cmd_trim = cmd.trim();
+        let is_diagnostic = cmd_trim.contains("cargo ")
+            || cmd_trim.contains("npm run")
+            || cmd_trim.contains("pytest")
+            || cmd_trim.contains("tsc")
+            || cmd_trim.contains("make");
+        let is_dir_list = cmd_trim.starts_with("ls ")
+            || cmd_trim == "ls"
+            || cmd_trim.starts_with("tree ")
+            || cmd_trim == "tree"
+            || cmd_trim.starts_with("find ");
+
+        if is_diagnostic {
+            Some((
+                "diagnostic",
+                "workspace_state".to_string(),
+                format!("Bash snapshot: {}", cmd_trim)
+                    .chars()
+                    .take(200)
+                    .collect(),
+            ))
+        } else if is_dir_list {
+            Some((
+                "directory",
+                cmd_trim.to_string(),
+                format!("Bash snapshot: {}", cmd_trim)
+                    .chars()
+                    .take(200)
+                    .collect(),
+            ))
+        } else {
+            None
+        }
     }
 }
 
@@ -174,14 +210,19 @@ impl Tool for BashTool {
                 } else {
                     format!("{}\n{}", result.stdout, result.stderr)
                 };
-                serialize_tool_envelope(
+                let mut structured = StructuredToolOutput::new(
                     "execute_bash",
                     result.ok,
                     output,
                     Some(result.exit_code),
                     Some(result.duration_ms),
                     result.truncated,
-                )
+                );
+                if let Some((kind, source_path, summary)) = Self::classify_command_effect(&cmd_str)
+                {
+                    structured = structured.with_evidence(kind, source_path, summary);
+                }
+                structured.to_json_string()
             }
             Err(_) => {
                 let mut c = child.lock().unwrap();

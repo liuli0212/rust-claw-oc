@@ -1,4 +1,6 @@
-use super::protocol::{clean_schema, serialize_tool_envelope, Tool, ToolError};
+use super::protocol::{
+    clean_schema, serialize_tool_envelope, StructuredToolOutput, Tool, ToolError,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use schemars::JsonSchema;
@@ -117,7 +119,7 @@ impl Tool for WebFetchTool {
             (rendered, false)
         };
 
-        serialize_tool_envelope(
+        StructuredToolOutput::new(
             "web_fetch",
             true,
             content,
@@ -125,6 +127,8 @@ impl Tool for WebFetchTool {
             Some(start.elapsed().as_millis()),
             truncated,
         )
+        .with_payload_kind("web_content")
+        .to_json_string()
     }
 }
 
@@ -206,7 +210,7 @@ impl Tool for TavilySearchTool {
             );
         }
 
-        serialize_tool_envelope(
+        StructuredToolOutput::new(
             "web_search_tavily",
             true,
             json.to_string(),
@@ -214,6 +218,8 @@ impl Tool for TavilySearchTool {
             Some(start.elapsed().as_millis()),
             false,
         )
+        .with_payload_kind("web_search")
+        .to_json_string()
     }
 }
 

@@ -558,22 +558,12 @@ impl AgentLoop {
         (state, correlation_ids)
     }
 
-    fn extract_finish_task_summary(args: &serde_json::Value) -> String {
-        if let Some(obj) = args.as_object() {
-            if let Some(summary) = obj.get("summary").and_then(|value| value.as_str()) {
-                return summary.to_string();
-            }
-        } else if let Some(raw) = args.as_str() {
-            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(raw) {
-                if let Some(obj) = inner.as_object() {
-                    if let Some(summary) = obj.get("summary").and_then(|value| value.as_str()) {
-                        return summary.to_string();
-                    }
-                }
-            }
-        }
+    fn parse_tool_envelope(result: &str) -> Option<crate::tools::protocol::ToolExecutionEnvelope> {
+        serde_json::from_str(result).ok()
+    }
 
-        args.to_string()
+    fn extract_finish_task_summary_from_result(result: &str) -> Option<String> {
+        Self::parse_tool_envelope(result).and_then(|envelope| envelope.finish_task_summary)
     }
 
     fn build_function_response_part(
@@ -597,6 +587,152 @@ impl AgentLoop {
             .and_then(|obj| obj.remove("thought"))
             .and_then(|thought| thought.as_str().map(|value| value.to_string()))
             .filter(|thought| !thought.is_empty())
+    }
+
+    fn load_current_tools(&self) -> Vec<Arc<dyn Tool>> {
+        let mut current_tools = self.tools.clone();
+        for skill in crate::skills::load_skills("skills") {
+            current_tools.push(Arc::new(skill));
+        }
+        current_tools
+    }
+
+    async fn record_model_turn_and_maybe_yield(
+        &mut self,
+        full_text: &str,
+        tool_calls_accumulated: &[ToolCallRecord],
+    ) -> Option<RunExit> {
+        let mut parts = Vec::new();
+        if !full_text.is_empty() {
+            parts.push(Part {
+                text: Some(full_text.to_string()),
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+                file_data: None,
+            });
+        }
+        for (tc, sig) in tool_calls_accumulated {
+            parts.push(Part {
+                text: None,
+                function_call: Some(tc.clone()),
+                function_response: None,
+                thought_signature: sig.clone(),
+                file_data: None,
+            });
+        }
+
+        self.context.add_message_to_current_turn(Message {
+            role: "model".to_string(),
+            parts,
+        });
+
+        let text_without_think = Self::strip_think_blocks(full_text);
+        let trimmed_clean = text_without_think.trim();
+
+        if !trimmed_clean.is_empty() {
+            self.output.on_text(trimmed_clean).await;
+            self.output.on_text("\n").await;
+        }
+
+        if tool_calls_accumulated.is_empty() {
+            self.output.flush().await;
+            self.context.end_turn();
+            self.telemetry.end_span("agent_step");
+            return Some(RunExit::YieldedToUser);
+        }
+
+        None
+    }
+
+    async fn finalize_exit(&mut self, exit: RunExit, end_span: bool) -> RunExit {
+        self.output.flush().await;
+        self.context.end_turn();
+        if end_span {
+            self.telemetry.end_span("agent_step");
+        }
+        exit
+    }
+
+    async fn finalize_finished_run(&mut self, summary: String) -> RunExit {
+        self.context.end_turn();
+        self.telemetry.end_span("agent_step");
+        RunExit::Finished(summary)
+    }
+
+    async fn check_loop_guards(&mut self, task_state: &mut TaskState) -> Option<RunExit> {
+        if self.is_cancelled() {
+            return Some(self.finalize_exit(RunExit::StoppedByUser, true).await);
+        }
+
+        if task_state.iterations >= Self::MAX_ITERATIONS {
+            tracing::warn!(
+                "Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.",
+                Self::MAX_ITERATIONS
+            );
+            return Some(
+                self.finalize_exit(RunExit::AgentTurnLimitReached, false)
+                    .await,
+            );
+        }
+
+        task_state.iterations += 1;
+        task_state.energy_points = task_state.energy_points.saturating_sub(1);
+
+        if task_state.energy_points == 0 {
+            tracing::error!("Energy points depleted.");
+            self.output
+                .on_text("[System] Energy depleted. Stopping to prevent infinite loops.")
+                .await;
+            return Some(
+                self.finalize_exit(
+                    RunExit::CriticallyFailed("Energy depleted".to_string()),
+                    false,
+                )
+                .await,
+            );
+        }
+
+        None
+    }
+
+    async fn collect_iteration_response(
+        &mut self,
+        state: &crate::task_state::TaskStateSnapshot,
+        current_tools: &[Arc<dyn Tool>],
+    ) -> Result<StreamCollectionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let max_tokens = self.context.max_history_tokens;
+        let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
+        let (messages, system, _) = self.context.build_llm_payload(state, &assembler);
+
+        self.collect_stream_response(messages, system, current_tools.to_vec())
+            .await
+    }
+
+    async fn handle_empty_iteration_response(
+        &mut self,
+        full_text: &str,
+        tool_calls_accumulated: &[ToolCallRecord],
+        consecutive_empty_responses: &mut usize,
+    ) -> Option<RunExit> {
+        if full_text.trim().is_empty() && tool_calls_accumulated.is_empty() {
+            *consecutive_empty_responses += 1;
+            if *consecutive_empty_responses >= Self::MAX_CONSECUTIVE_EMPTY_RESPONSES {
+                return Some(
+                    self.finalize_exit(
+                        RunExit::CriticallyFailed("Too many empty responses".to_string()),
+                        false,
+                    )
+                    .await,
+                );
+            }
+            return Some(RunExit::RecoverableFailed(
+                "Empty iteration response".to_string(),
+            ));
+        }
+
+        *consecutive_empty_responses = 0;
+        None
     }
 
     async fn dispatch_tool_call(
@@ -641,104 +777,126 @@ impl AgentLoop {
         }
     }
 
-    async fn handle_successful_tool_effects(
-        &mut self,
-        call: &crate::context::FunctionCall,
-        result: &str,
-    ) {
-        if call.name == "send_file" {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(result) {
-                if let Some(path) = val.get("path").and_then(|value| value.as_str()) {
-                    self.output.on_file(path).await;
-                }
-            }
+    async fn handle_successful_tool_effects(&mut self, result: &str) {
+        let Some(envelope) = Self::parse_tool_envelope(result) else {
             return;
+        };
+
+        if let Some(path) = envelope.file_path.as_deref() {
+            self.output.on_file(path).await;
         }
 
-        if call.name == "read_file" {
-            if let Some(obj) = call.args.as_object() {
-                if let Some(path_val) = obj.get("path").and_then(|value| value.as_str()) {
-                    let evidence = crate::evidence::Evidence::new(
-                        format!("file_{}", path_val),
-                        "file".to_string(),
-                        path_val.to_string(),
-                        1.0,
-                        format!("Direct read of {}", path_val),
-                        result.to_string(),
-                    );
-                    self.context.active_evidence.retain(|existing| {
-                        existing.source_kind != "file" || existing.source_path != path_val
-                    });
-                    self.context.active_evidence.push(evidence);
-                }
+        if let (Some(kind), Some(source_path), Some(summary)) = (
+            envelope.evidence_kind.as_deref(),
+            envelope.evidence_source_path.as_deref(),
+            envelope.evidence_summary.as_deref(),
+        ) {
+            let evidence = crate::evidence::Evidence::new(
+                format!("{}_{}", kind, uuid::Uuid::new_v4().simple()),
+                kind.to_string(),
+                source_path.to_string(),
+                1.0,
+                summary.to_string(),
+                envelope.output.clone(),
+            );
+
+            if kind == "directory" || kind == "file" {
+                self.context.active_evidence.retain(|existing| {
+                    existing.source_kind != kind || existing.source_path != source_path
+                });
+            } else if kind == "diagnostic" {
+                self.context
+                    .active_evidence
+                    .retain(|existing| existing.source_kind != kind);
             }
-            return;
+
+            self.context.active_evidence.push(evidence);
         }
 
-        let final_result = result.to_string();
-        if call.name == "execute_bash" {
-            if let Some(obj) = call.args.as_object() {
-                if let Some(cmd) = obj.get("command").and_then(|value| value.as_str()) {
-                    let cmd_trim = cmd.trim();
-                    let is_diagnostic = cmd_trim.contains("cargo ")
-                        || cmd_trim.contains("npm run")
-                        || cmd_trim.contains("pytest")
-                        || cmd_trim.contains("tsc")
-                        || cmd_trim.contains("make");
-                    let is_dir_list = cmd_trim.starts_with("ls ")
-                        || cmd_trim == "ls"
-                        || cmd_trim.starts_with("tree ")
-                        || cmd_trim == "tree"
-                        || cmd_trim.starts_with("find ");
-
-                    if is_diagnostic || is_dir_list {
-                        let kind = if is_diagnostic {
-                            "diagnostic"
-                        } else {
-                            "directory"
-                        };
-                        let source_path = if is_diagnostic {
-                            "workspace_state"
-                        } else {
-                            cmd_trim
-                        };
-
-                        let evidence = crate::evidence::Evidence::new(
-                            format!("{}_{}", kind, uuid::Uuid::new_v4().simple()),
-                            kind.to_string(),
-                            source_path.to_string(),
-                            1.0,
-                            format!("Bash snapshot: {}", cmd_trim)
-                                .chars()
-                                .take(200)
-                                .collect(),
-                            final_result,
-                        );
-
-                        if is_dir_list {
-                            self.context.active_evidence.retain(|existing| {
-                                existing.source_kind != kind || existing.source_path != source_path
-                            });
-                        } else {
-                            self.context
-                                .active_evidence
-                                .retain(|existing| existing.source_kind != kind);
-                        }
-
-                        self.context.active_evidence.push(evidence);
-                    }
-                }
-            }
-            return;
-        }
-
-        if call.name == "write_file" || call.name == "patch_file" {
+        if envelope.invalidate_diagnostic_evidence {
             for evidence in &mut self.context.active_evidence {
                 if evidence.source_kind == "diagnostic" {
                     evidence.source_version = Some("invalidated_by_write".to_string());
                 }
             }
         }
+    }
+
+    async fn execute_tool_round(
+        &mut self,
+        tool_calls_accumulated: Vec<ToolCallRecord>,
+        current_tools: &[Arc<dyn Tool>],
+        state: &mut crate::task_state::TaskStateSnapshot,
+    ) -> Vec<Part> {
+        let mut skip_remaining = false;
+        let mut response_parts = Vec::new();
+
+        for (mut call, thought_sig) in tool_calls_accumulated {
+            if skip_remaining {
+                response_parts.push(Self::build_function_response_part(
+                    call.name.clone(),
+                    call.id.clone(),
+                    serde_json::json!({ "result": "Execution skipped as turn was interrupted." }),
+                    thought_sig.clone(),
+                ));
+                continue;
+            }
+            if let Some(thought_str) = Self::extract_tool_thought(&mut call) {
+                self.output.on_thinking(&thought_str).await;
+                self.output.on_thinking("\n").await;
+            }
+
+            if call.name.trim().is_empty() {
+                response_parts.push(Self::build_function_response_part(
+                    "unknown".to_string(),
+                    call.id.clone(),
+                    serde_json::json!({ "result": "Error: Empty tool name" }),
+                    thought_sig.clone(),
+                ));
+                continue;
+            }
+
+            let ToolDispatchOutcome {
+                result,
+                is_error,
+                stopped,
+            } = self.dispatch_tool_call(&call, current_tools).await;
+
+            if stopped {
+                self.output.on_error(&result).await;
+                response_parts.push(Self::build_function_response_part(
+                    call.name.clone(),
+                    call.id.clone(),
+                    serde_json::json!({ "result": result }),
+                    thought_sig.clone(),
+                ));
+                skip_remaining = true;
+                continue;
+            }
+
+            if is_error {
+                self.output.on_error(&result).await;
+            } else {
+                self.output.on_tool_end(&result).await;
+                self.handle_successful_tool_effects(&result).await;
+                if let Some(summary) = Self::extract_finish_task_summary_from_result(&result) {
+                    state.status = "finished".to_string();
+                    let _ = self.task_state_store.save(state);
+                    self.output.on_task_finish(&summary).await;
+                }
+            }
+
+            response_parts.push(Part {
+                ..Self::build_function_response_part(
+                    call.name.clone(),
+                    call.id.clone(),
+                    serde_json::json!({ "result": result }),
+                    thought_sig,
+                )
+            });
+        }
+
+        response_parts
     }
 
     async fn reconcile_after_tool_calls(
@@ -809,35 +967,8 @@ impl AgentLoop {
         });
 
         loop {
-            // Check persistent cancel flag at top of each iteration
-            if self.is_cancelled() {
-                self.output.flush().await;
-                self.context.end_turn();
-                self.telemetry.end_span("agent_step");
-                return Ok(RunExit::StoppedByUser);
-            }
-            if task_state.iterations >= Self::MAX_ITERATIONS {
-                tracing::warn!(
-                    "Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.",
-                    Self::MAX_ITERATIONS
-                );
-
-                self.output.flush().await;
-                self.context.end_turn();
-                return Ok(RunExit::AgentTurnLimitReached);
-            }
-            task_state.iterations += 1;
-            task_state.energy_points = task_state.energy_points.saturating_sub(1);
-
-            if task_state.energy_points == 0 {
-                tracing::error!("Energy points depleted.");
-                self.output
-                    .on_text("[System] Energy depleted. Stopping to prevent infinite loops.")
-                    .await;
-
-                self.output.flush().await;
-                self.context.end_turn();
-                return Ok(RunExit::CriticallyFailed("Energy depleted".to_string()));
+            if let Some(exit) = self.check_loop_guards(&mut task_state).await {
+                return Ok(exit);
             }
 
             if !compaction_checked {
@@ -845,20 +976,10 @@ impl AgentLoop {
                 compaction_checked = true;
             }
 
-            // Dynamically load skills on every turn so we don't need to restart
-            let mut current_tools = self.tools.clone();
-            for skill in crate::skills::load_skills("skills") {
-                current_tools.push(Arc::new(skill));
-            }
-
-            // Build cache-aware prompt using ContextAssembler
-            // In a real advanced setup, ContextAssembler budget would be dynamic based on LLM size
-            let max_tokens = self.context.max_history_tokens;
-            let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
-            let (messages, system, _) = self.context.build_llm_payload(&state, &assembler);
+            let current_tools = self.load_current_tools();
 
             let (full_text, tool_calls_accumulated) = match self
-                .collect_stream_response(messages, system, current_tools.clone())
+                .collect_iteration_response(&state, &current_tools)
                 .await?
             {
                 StreamCollectionOutcome::Completed {
@@ -868,158 +989,31 @@ impl AgentLoop {
                 StreamCollectionOutcome::Exit(exit) => return Ok(exit),
             };
 
-            if full_text.trim().is_empty() && tool_calls_accumulated.is_empty() {
-                consecutive_empty_responses += 1;
-                if consecutive_empty_responses >= Self::MAX_CONSECUTIVE_EMPTY_RESPONSES {
-                    self.output.flush().await;
-                    self.context.end_turn();
-                    return Ok(RunExit::CriticallyFailed(
-                        "Too many empty responses".to_string(),
-                    ));
+            if let Some(exit) = self
+                .handle_empty_iteration_response(
+                    &full_text,
+                    &tool_calls_accumulated,
+                    &mut consecutive_empty_responses,
+                )
+                .await
+            {
+                if matches!(exit, RunExit::RecoverableFailed(_)) {
+                    continue;
                 }
-                continue;
-            } else {
-                consecutive_empty_responses = 0;
+                return Ok(exit);
             }
 
-            let mut parts = Vec::new();
-            if !full_text.is_empty() {
-                parts.push(Part {
-                    text: Some(full_text.clone()),
-                    function_call: None,
-                    function_response: None,
-                    thought_signature: None,
-                    file_data: None,
-                });
-            }
-            for (tc, sig) in &tool_calls_accumulated {
-                parts.push(Part {
-                    text: None,
-                    function_call: Some(tc.clone()),
-                    function_response: None,
-                    thought_signature: sig.clone(),
-                    file_data: None,
-                });
-            }
-
-            self.context.add_message_to_current_turn(Message {
-                role: "model".to_string(),
-                parts,
-            });
-
-            // Post-stream text classification:
-            // Check if the buffered text is a finish_task JSON blob streamed as
-            // text content (some models ignore tool_choice: "required").
-            let text_without_think = Self::strip_think_blocks(&full_text);
-            let trimmed_clean = text_without_think.trim();
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed_clean) {
-                if let Some(summary) = val
-                    .as_object()
-                    .and_then(|obj| obj.get("summary"))
-                    .and_then(|v| v.as_str())
-                {
-                    tracing::info!("Detected text-based finish_task fallback, extracting summary");
-                    self.output.on_task_finish(summary).await;
-                    self.context.end_turn();
-                    self.telemetry.end_span("agent_step");
-                    return Ok(RunExit::Finished(summary.to_string()));
-                }
-            }
-
-            // Normal text response — display it now (post-stream)
-            // We display this even if there are tool calls, as it often contains
-            // conversational context or explanations.
-            if !trimmed_clean.is_empty() {
-                self.output.on_text(trimmed_clean).await;
-                self.output.on_text("\n").await;
-            }
-
-            if tool_calls_accumulated.is_empty() {
-                self.output.flush().await;
-                self.context.end_turn();
-                self.telemetry.end_span("agent_step");
-                return Ok(RunExit::YieldedToUser);
+            if let Some(exit) = self
+                .record_model_turn_and_maybe_yield(&full_text, &tool_calls_accumulated)
+                .await
+            {
+                return Ok(exit);
             }
 
             let state_before_tools = state.clone();
-            let mut skip_remaining = false;
-
-            let mut response_parts = Vec::new();
-            for (mut call, thought_sig) in tool_calls_accumulated {
-                if skip_remaining {
-                    response_parts.push(Self::build_function_response_part(
-                        call.name.clone(),
-                        call.id.clone(),
-                        serde_json::json!({ "result": "Execution skipped as turn was interrupted." }),
-                        thought_sig.clone(),
-                    ));
-                    continue;
-                }
-                if let Some(thought_str) = Self::extract_tool_thought(&mut call) {
-                    self.output.on_thinking(&thought_str).await;
-                    self.output.on_thinking("\n").await;
-                }
-
-                if call.name.trim().is_empty() {
-                    response_parts.push(Self::build_function_response_part(
-                        "unknown".to_string(),
-                        call.id.clone(),
-                        serde_json::json!({ "result": "Error: Empty tool name" }),
-                        thought_sig.clone(),
-                    ));
-                    continue;
-                }
-
-                if call.name == "finish_task" {
-                    let summary = Self::extract_finish_task_summary(&call.args);
-                    response_parts.push(Self::build_function_response_part(
-                        call.name.clone(),
-                        call.id.clone(),
-                        serde_json::json!({ "result": "Task finished." }),
-                        thought_sig.clone(),
-                    ));
-                    state.status = "finished".to_string();
-                    let _ = self.task_state_store.save(&state);
-                    self.output.on_task_finish(&summary).await;
-                    continue;
-                }
-
-                let ToolDispatchOutcome {
-                    result,
-                    is_error,
-                    stopped,
-                } = self.dispatch_tool_call(&call, &current_tools).await;
-
-                if stopped {
-                    self.output.on_error(&result).await;
-                    response_parts.push(Self::build_function_response_part(
-                        call.name.clone(),
-                        call.id.clone(),
-                        serde_json::json!({ "result": result }),
-                        thought_sig.clone(),
-                    ));
-                    skip_remaining = true;
-                    continue;
-                }
-
-                if is_error {
-                    self.output.on_error(&result).await;
-                } else {
-                    self.output.on_tool_end(&result).await;
-                    self.handle_successful_tool_effects(&call, &result).await;
-                }
-
-                let final_result = result.to_string();
-
-                response_parts.push(Part {
-                    ..Self::build_function_response_part(
-                        call.name.clone(),
-                        call.id.clone(),
-                        serde_json::json!({ "result": final_result }),
-                        thought_sig,
-                    )
-                });
-            }
+            let response_parts = self
+                .execute_tool_round(tool_calls_accumulated, &current_tools, &mut state)
+                .await;
 
             if !response_parts.is_empty() {
                 self.context.add_message_to_current_turn(Message {
@@ -1030,9 +1024,7 @@ impl AgentLoop {
 
             if state.status == "finished" {
                 let summary = state.summary();
-                self.context.end_turn();
-                self.telemetry.end_span("agent_step");
-                return Ok(RunExit::Finished(summary));
+                return Ok(self.finalize_finished_run(summary).await);
             }
 
             state = self.reconcile_after_tool_calls(&state_before_tools).await;

@@ -245,8 +245,10 @@ Expected result:
 Completed notes:
 
 - extracted tool protocol types and helpers into `src/tools/protocol.rs`
-- moved the legacy tool implementations behind `src/tools/legacy.rs`
-- introduced a module facade in `src/tools/mod.rs` so follow-up extractions can happen incrementally without breaking call sites
+- split concrete tools across `src/tools/bash.rs`, `files.rs`, `web.rs`, `memory.rs`, `integrations.rs`, and `lsp.rs`
+- tightened the public facade in `src/tools/mod.rs` so it exports the actually-consumed runtime entry points instead of broad wildcard re-exports
+- tool results now consistently use envelope helpers, and runtime effect handling in `core` now consumes structured envelope metadata instead of hard-coded post-processing by tool name
+- tool outputs now carry structured metadata for file evidence, bash evidence, finish-task summaries, plan payloads, and web payloads so context sanitization can keep moving off string matching
 
 ### Phase 3: Decompose `AgentContext`
 
@@ -304,9 +306,9 @@ Expected result:
 
 Completed notes:
 
-- moved the former monolithic `src/context.rs` into `src/context/legacy.rs`
-- added `src/context/mod.rs`, `model.rs`, `prompt.rs`, `history.rs`, and `transcript.rs`
-- converted `context` into a facade so future extractions can continue without another large rename event
+- extracted `AgentContext` into `src/context/agent_context.rs`
+- split prompt, history, transcript, report, sanitize, token, state, and turn-management helpers into focused modules under `src/context/`
+- removed the temporary `src/context/legacy.rs` facade after internal callers were migrated to the new module layout
 
 ### Phase 4: Clean up provider/client boundaries
 
@@ -351,7 +353,9 @@ Completed notes:
 
 - extracted provider construction into `src/llm_client/factory.rs`
 - extracted context-window heuristics into `src/llm_client/policy.rs`
-- moved the original implementation into `src/llm_client/legacy.rs` behind a module facade
+- moved shared transport setup into `src/llm_client/protocol.rs`
+- moved `GeminiClient` and its cache metadata into `src/llm_client/gemini.rs`
+- removed the temporary `src/llm_client/legacy.rs` facade after `factory`, `openai_compat`, and `gemini_context` were migrated
 
 ### Phase 5: Simplify bootstrapping and session construction
 
@@ -474,11 +478,34 @@ The refactor will be considered successful when:
 
 The structural refactor plan is now complete. Follow-up work should focus on:
 
-1. tightening public module surfaces where the new facades are still broad
-2. moving logic from `legacy.rs` files into their focused modules in smaller follow-up passes
-3. replacing remaining string-based tool post-processing paths with fully structured tool results
+1. replacing the remaining text- or name-based tool special cases in `src/core.rs` and `src/context/` with structured tool metadata
+2. tightening or removing the text-only `finish_task` fallback now that the tool runtime emits structured finish summaries directly
+3. tightening the remaining warning-heavy surfaces now that `context` and `llm_client` no longer depend on legacy facades
 
 That keeps momentum while staying inside the current safety net.
+
+## Current Recommendation
+
+The highest-value next refactor is to finish the structured tool runtime end to end.
+
+Why this is the best next step:
+
+- `src/core.rs` still carries a text-only `finish_task` fallback outside the structured tool path
+- `src/context/sanitize.rs` and `src/context/history.rs` still contain a small number of tool-name-specific payload trimming and argument summarization rules
+- skills and a few fallback paths still rely on string matching because their outputs do not yet advertise richer metadata
+
+Concretely, the remaining architectural gap is:
+
+- tools already emit structured envelopes and `core` now consumes them for successful tool effects
+- but some runtime and history code still infer semantic meaning from tool names instead of consuming richer structured result metadata everywhere
+
+Recommended implementation order:
+
+1. continue extending the internal tool result model in `src/tools/protocol.rs` where a remaining string branch still exists
+2. finish removing the last non-structured `finish_task` completion fallback from `src/core.rs`
+3. update the remaining `context` sanitization and history paths to rely on structured metadata instead of tool-name pattern matching wherever possible
+
+This path reduces complexity in the runtime hot path, removes duplicated tool semantics across `core` and `context`, and directly addresses the main remaining item from the original plan.
 
 ## Post-Plan Progress
 

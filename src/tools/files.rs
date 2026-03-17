@@ -1,4 +1,6 @@
-use super::protocol::{clean_schema, serialize_tool_envelope, Tool, ToolError};
+use super::protocol::{
+    clean_schema, serialize_tool_envelope, StructuredToolOutput, Tool, ToolError,
+};
 use async_trait::async_trait;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -105,7 +107,7 @@ impl Tool for WriteFileTool {
         }
 
         match std::fs::write(&parsed.path, &parsed.content) {
-            Ok(_) => serialize_tool_envelope(
+            Ok(_) => StructuredToolOutput::new(
                 "write_file",
                 true,
                 format!(
@@ -116,7 +118,9 @@ impl Tool for WriteFileTool {
                 None,
                 Some(start.elapsed().as_millis()),
                 false,
-            ),
+            )
+            .with_invalidated_diagnostics()
+            .to_json_string(),
             Err(e) => serialize_tool_envelope(
                 "write_file",
                 false,
@@ -161,7 +165,7 @@ impl Tool for ReadFileTool {
             Ok(content) => {
                 let truncated_content = crate::utils::truncate_tool_output(&content);
                 let truncated = truncated_content.len() != content.len();
-                serialize_tool_envelope(
+                StructuredToolOutput::new(
                     "read_file",
                     true,
                     truncated_content,
@@ -169,6 +173,12 @@ impl Tool for ReadFileTool {
                     Some(start.elapsed().as_millis()),
                     truncated,
                 )
+                .with_evidence(
+                    "file",
+                    parsed.path.clone(),
+                    format!("Direct read of {}", parsed.path),
+                )
+                .to_json_string()
             }
             Err(e) => serialize_tool_envelope(
                 "read_file",
@@ -346,7 +356,7 @@ impl Tool for TaskPlanTool {
             "Plan updated.".to_string()
         };
 
-        serialize_tool_envelope(
+        StructuredToolOutput::new(
             "task_plan",
             true,
             output,
@@ -354,6 +364,8 @@ impl Tool for TaskPlanTool {
             Some(start.elapsed().as_millis()),
             false,
         )
+        .with_payload_kind("plan")
+        .to_json_string()
     }
 }
 
@@ -402,13 +414,16 @@ impl Tool for SendFileTool {
             )));
         }
 
-        Ok(serde_json::json!({
-            "ok": true,
-            "tool_name": "send_file",
-            "path": parsed.path,
-            "output": format!("File {} sent to user.", parsed.path)
-        })
-        .to_string())
+        StructuredToolOutput::new(
+            "send_file",
+            true,
+            format!("File {} sent to user.", parsed.path),
+            Some(0),
+            None,
+            false,
+        )
+        .with_file_path(parsed.path)
+        .to_json_string()
     }
 }
 
@@ -437,10 +452,16 @@ impl Tool for FinishTaskTool {
             }
         }
 
-        Ok(format!(
-            "Task marked as finished. Summary: {}",
-            parsed.summary
-        ))
+        StructuredToolOutput::new(
+            "finish_task",
+            true,
+            format!("Task marked as finished. Summary: {}", parsed.summary),
+            Some(0),
+            None,
+            false,
+        )
+        .with_finish_task_summary(parsed.summary)
+        .to_json_string()
     }
 }
 
@@ -528,7 +549,12 @@ mod tests {
             .unwrap();
         let updated = store.load().unwrap();
 
-        assert!(result.contains("Refactor complete"));
+        let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
+        assert!(envelope.ok);
+        assert_eq!(
+            envelope.finish_task_summary.as_deref(),
+            Some("Refactor complete")
+        );
         assert_eq!(updated.status, "completed");
         assert_eq!(updated.goal.as_deref(), Some("Ship refactor"));
         cleanup_session(session_id);

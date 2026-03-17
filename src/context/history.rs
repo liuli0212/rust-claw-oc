@@ -356,41 +356,84 @@ fn detect_tool_error(response: &serde_json::Value) -> bool {
     has_error_keyword && !is_false_positive
 }
 
-fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
+fn summarize_tool_args(_tool_name: &str, args: &serde_json::Value) -> String {
     if let Some(obj) = args.as_object() {
-        match tool_name {
-            "read_file" | "write_file" | "patch_file" => obj
-                .get("path")
+        if let Some(action) = obj.get("action").and_then(|v| v.as_str()) {
+            let target = obj
+                .get("target_url")
+                .or_else(|| obj.get("url"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("?")
-                .to_string(),
-            "execute_bash" => {
-                let cmd = obj.get("command").and_then(|v| v.as_str()).unwrap_or("?");
-                AgentContext::truncate_chars(cmd, 80)
-            }
-            "web_fetch" => obj
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-                .to_string(),
-            "browser" => {
-                let action = obj.get("action").and_then(|v| v.as_str()).unwrap_or("?");
-                let url = obj.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                format!("{} {}", action, AgentContext::truncate_chars(url, 60))
-            }
-            "task_plan" => obj
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-                .to_string(),
-            _ => {
-                let s = args.to_string();
-                AgentContext::truncate_chars(&s, 60)
-            }
+                .map(|value| AgentContext::truncate_chars(value, 60))
+                .unwrap_or_default();
+            return if target.is_empty() {
+                action.to_string()
+            } else {
+                format!("{} {}", action, target)
+            };
         }
+
+        if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+            return path.to_string();
+        }
+
+        if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+            return AgentContext::truncate_chars(cmd, 80);
+        }
+
+        if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
+            return url.to_string();
+        }
+
+        let s = args.to_string();
+        AgentContext::truncate_chars(&s, 60)
     } else {
         AgentContext::truncate_chars(&args.to_string(), 60)
     }
+}
+
+fn compact_function_call_args_for_history(
+    _tool_name: &str,
+    args: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let obj = args.as_object()?;
+
+    if let Some(action) = obj.get("action").and_then(|v| v.as_str()) {
+        let mut compact = serde_json::Map::new();
+        compact.insert(
+            "action".to_string(),
+            serde_json::Value::String(action.to_string()),
+        );
+
+        if let Some(target_url) = obj.get("target_url").and_then(|v| v.as_str()) {
+            compact.insert(
+                "target_url".to_string(),
+                serde_json::Value::String(AgentContext::truncate_chars(target_url, 60)),
+            );
+        } else if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
+            compact.insert(
+                "url".to_string(),
+                serde_json::Value::String(AgentContext::truncate_chars(url, 60)),
+            );
+        }
+
+        return Some(serde_json::Value::Object(compact));
+    }
+
+    if let Some(path) = obj.get("path").and_then(|v| v.as_str()) {
+        return Some(serde_json::json!({ "path": path }));
+    }
+
+    if let Some(command) = obj.get("command").and_then(|v| v.as_str()) {
+        return Some(serde_json::json!({
+            "command": AgentContext::truncate_chars(command, 80)
+        }));
+    }
+
+    if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
+        return Some(serde_json::json!({ "url": url }));
+    }
+
+    None
 }
 
 pub(crate) fn sanitize_turn(turn: &Turn) -> Option<Turn> {
@@ -634,18 +677,13 @@ fn reconstruct_turn_for_history(turn: &Turn) -> (Turn, usize) {
                 file_data: None,
             };
             if let Some(fc) = &part.function_call {
-                if fc.name == "task_plan" {
-                    let action = fc
-                        .args
-                        .get("action")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    let mut stripped_fc = fc.clone();
-                    stripped_fc.args = serde_json::json!({ "action": action });
-                    new_part.function_call = Some(stripped_fc);
-                } else {
-                    new_part.function_call = Some(fc.clone());
+                let mut stripped_fc = fc.clone();
+                if let Some(compact_args) =
+                    compact_function_call_args_for_history(&fc.name, &fc.args)
+                {
+                    stripped_fc.args = compact_args;
                 }
+                new_part.function_call = Some(stripped_fc);
             }
             if let Some(fr) = &part.function_response {
                 let mut stripped_fr = fr.clone();
@@ -694,4 +732,64 @@ fn reconstruct_turn_for_history(turn: &Turn) -> (Turn, usize) {
         },
         0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::model::{FunctionCall, Message, Part};
+
+    #[test]
+    fn reconstruct_turn_compacts_task_plan_and_path_based_calls() {
+        let turn = Turn {
+            turn_id: "turn-1".to_string(),
+            user_message: "do work".to_string(),
+            messages: vec![Message {
+                role: "model".to_string(),
+                parts: vec![
+                    Part {
+                        text: None,
+                        function_call: Some(FunctionCall {
+                            name: "task_plan".to_string(),
+                            args: serde_json::json!({
+                                "action": "update_status",
+                                "index": 1,
+                                "status": "completed"
+                            }),
+                            id: None,
+                        }),
+                        function_response: None,
+                        thought_signature: None,
+                        file_data: None,
+                    },
+                    Part {
+                        text: None,
+                        function_call: Some(FunctionCall {
+                            name: "read_file".to_string(),
+                            args: serde_json::json!({
+                                "path": "/tmp/demo.txt",
+                                "thought": "inspect"
+                            }),
+                            id: None,
+                        }),
+                        function_response: None,
+                        thought_signature: None,
+                        file_data: None,
+                    },
+                ],
+            }],
+        };
+
+        let (rebuilt, _) = reconstruct_turn_for_history(&turn);
+        let parts = &rebuilt.messages[0].parts;
+
+        assert_eq!(
+            parts[0].function_call.as_ref().unwrap().args,
+            serde_json::json!({ "action": "update_status" })
+        );
+        assert_eq!(
+            parts[1].function_call.as_ref().unwrap().args,
+            serde_json::json!({ "path": "/tmp/demo.txt" })
+        );
+    }
 }

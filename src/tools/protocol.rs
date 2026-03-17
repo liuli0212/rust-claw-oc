@@ -48,6 +48,13 @@ pub struct StructuredToolOutput {
     pub recovery_attempted: bool,
     pub recovery_output: Option<String>,
     pub recovery_rule: Option<String>,
+    pub file_path: Option<String>,
+    pub evidence_kind: Option<String>,
+    pub evidence_source_path: Option<String>,
+    pub evidence_summary: Option<String>,
+    pub payload_kind: Option<String>,
+    pub invalidate_diagnostic_evidence: bool,
+    pub finish_task_summary: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -64,6 +71,20 @@ pub struct ToolExecutionEnvelope {
     pub recovery_output: Option<String>,
     #[serde(default)]
     pub recovery_rule: Option<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub evidence_kind: Option<String>,
+    #[serde(default)]
+    pub evidence_source_path: Option<String>,
+    #[serde(default)]
+    pub evidence_summary: Option<String>,
+    #[serde(default)]
+    pub payload_kind: Option<String>,
+    #[serde(default)]
+    pub invalidate_diagnostic_evidence: bool,
+    #[serde(default)]
+    pub finish_task_summary: Option<String>,
 }
 
 impl StructuredToolOutput {
@@ -85,7 +106,46 @@ impl StructuredToolOutput {
             recovery_attempted: false,
             recovery_output: None,
             recovery_rule: None,
+            file_path: None,
+            evidence_kind: None,
+            evidence_source_path: None,
+            evidence_summary: None,
+            payload_kind: None,
+            invalidate_diagnostic_evidence: false,
+            finish_task_summary: None,
         }
+    }
+
+    pub fn with_file_path(mut self, path: impl Into<String>) -> Self {
+        self.file_path = Some(path.into());
+        self
+    }
+
+    pub fn with_evidence(
+        mut self,
+        kind: impl Into<String>,
+        source_path: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Self {
+        self.evidence_kind = Some(kind.into());
+        self.evidence_source_path = Some(source_path.into());
+        self.evidence_summary = Some(summary.into());
+        self
+    }
+
+    pub fn with_invalidated_diagnostics(mut self) -> Self {
+        self.invalidate_diagnostic_evidence = true;
+        self
+    }
+
+    pub fn with_payload_kind(mut self, kind: impl Into<String>) -> Self {
+        self.payload_kind = Some(kind.into());
+        self
+    }
+
+    pub fn with_finish_task_summary(mut self, summary: impl Into<String>) -> Self {
+        self.finish_task_summary = Some(summary.into());
+        self
     }
 
     pub fn into_envelope(self) -> ToolExecutionEnvelope {
@@ -99,6 +159,13 @@ impl StructuredToolOutput {
             recovery_attempted: self.recovery_attempted,
             recovery_output: self.recovery_output,
             recovery_rule: self.recovery_rule,
+            file_path: self.file_path,
+            evidence_kind: self.evidence_kind,
+            evidence_source_path: self.evidence_source_path,
+            evidence_summary: self.evidence_summary,
+            payload_kind: self.payload_kind,
+            invalidate_diagnostic_evidence: self.invalidate_diagnostic_evidence,
+            finish_task_summary: self.finish_task_summary,
         }
     }
 
@@ -204,5 +271,11 @@ mod tests {
         assert!(!envelope.recovery_attempted);
         assert_eq!(envelope.recovery_output, None);
         assert_eq!(envelope.recovery_rule, None);
+        assert_eq!(envelope.file_path, None);
+        assert_eq!(envelope.evidence_kind, None);
+        assert_eq!(envelope.evidence_source_path, None);
+        assert_eq!(envelope.evidence_summary, None);
+        assert!(!envelope.invalidate_diagnostic_evidence);
+        assert_eq!(envelope.finish_task_summary, None);
     }
 }

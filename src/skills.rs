@@ -1,7 +1,9 @@
+use crate::tools::protocol::StructuredToolOutput;
 use crate::tools::{Tool, ToolError};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
+use std::time::Instant;
 use tokio::process::Command;
 
 pub struct SkillTool {
@@ -26,6 +28,7 @@ impl Tool for SkillTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, ToolError> {
+        let start = Instant::now();
         let mut script = self.script_template.clone();
 
         // Very basic template replacement for string arguments
@@ -68,7 +71,9 @@ impl Tool for SkillTool {
             res.push_str(&stderr_str);
         }
 
-        if !output.status.success() {
+        let ok = output.status.success();
+
+        if !ok {
             res.push_str(&format!(
                 "\nExit code: {}",
                 output.status.code().unwrap_or(-1)
@@ -77,7 +82,16 @@ impl Tool for SkillTool {
             res.push_str("Skill executed successfully with no output.");
         }
 
-        Ok(res)
+        StructuredToolOutput::new(
+            self.name.clone(),
+            ok,
+            res,
+            output.status.code(),
+            Some(start.elapsed().as_millis()),
+            false,
+        )
+        .with_payload_kind("skill")
+        .to_json_string()
     }
 }
 
@@ -217,5 +231,33 @@ echo "{{n}}"
         assert_eq!(skill.description, "Echoes a number");
         assert!(skill.script_template.contains("{{n}}"));
         assert_eq!(skill.schema["required"], serde_json::json!(["n"]));
+    }
+
+    #[tokio::test]
+    async fn test_skill_execute_returns_structured_envelope() {
+        let skill = SkillTool {
+            name: "echo_skill".to_string(),
+            description: "Echoes text".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                }
+            }),
+            script_template: "echo \"{{message}}\"".to_string(),
+        };
+
+        let result = skill
+            .execute(serde_json::json!({ "message": "hello" }))
+            .await
+            .unwrap();
+        let envelope: crate::tools::protocol::ToolExecutionEnvelope =
+            serde_json::from_str(&result).unwrap();
+
+        assert!(envelope.ok);
+        assert_eq!(envelope.tool_name, "echo_skill");
+        assert_eq!(envelope.payload_kind.as_deref(), Some("skill"));
+        assert!(envelope.output.contains("STDOUT:"));
+        assert!(envelope.output.contains("hello"));
     }
 }
