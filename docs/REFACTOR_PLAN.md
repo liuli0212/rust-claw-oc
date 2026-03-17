@@ -508,3 +508,4 @@ Follow-up decomposition completed so far:
 - [x] extracted Gemini non-stream request sending from `src/llm_client/legacy.rs` into `src/llm_client/gemini_context.rs`
 - [x] extracted Gemini structured retry handling from `src/llm_client/legacy.rs` into `src/llm_client/gemini_context.rs`
 - [x] extracted Gemini streaming connection retry handling from `src/llm_client/legacy.rs` into `src/llm_client/gemini_context.rs`
+- [x] extracted Gemini SSE data-block parsing and event emission from `src/llm_client/legacy.rs` into `src/llm_client/gemini_context.rs`

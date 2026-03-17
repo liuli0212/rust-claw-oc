@@ -9,8 +9,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 use super::gemini::{
-    capture_thought_signature, parse_function_call_basic, FunctionDeclaration, GeminiRequest,
-    ToolDeclarationWrapper,
+    FunctionDeclaration, GeminiRequest, ToolDeclarationWrapper,
 };
 use super::gemini_context;
 use super::protocol::{GeminiPlatform, LlmClient, LlmError, StreamEvent};
@@ -347,132 +346,16 @@ impl LlmClient for GeminiClient {
                         buffer = buffer[idx + sep_len..].to_string();
                         if line.starts_with("data: ") {
                             let data = &line[6..];
-                            if data == "[DONE]" {
-                                tracing::debug!("Gemini stream received [DONE] signal");
-                                let _ = tx.send(StreamEvent::Done).await;
+                            if gemini_context::emit_sse_data_block(
+                                &tx,
+                                data,
+                                &mut total_text_len,
+                                &mut total_tool_calls,
+                                &mut chunk_count,
+                            )
+                            .await
+                            {
                                 return;
-                            }
-                            match serde_json::from_str::<Value>(data) {
-                                Ok(json) => {
-                                    chunk_count += 1;
-                                    tracing::debug!(
-                                        "Gemini SSE chunk #{}: keys={:?}\nRaw: {}",
-                                        chunk_count,
-                                        json.as_object().map(|m| m.keys().collect::<Vec<_>>()),
-                                        crate::utils::truncate_log(data)
-                                    );
-
-                                    // 1. Check for thinking at candidate level (some models/versions)
-                                    if let Some(candidate) =
-                                        json["candidates"].as_array().and_then(|a| a.first())
-                                    {
-                                        if let Some(thought) =
-                                            candidate.get("thought").and_then(|v| v.as_str())
-                                        {
-                                            if !thought.is_empty() {
-                                                let _ = tx
-                                                    .send(StreamEvent::Thought(thought.to_string()))
-                                                    .await;
-                                            }
-                                        }
-                                        // Also check for 'thinking' field
-                                        if let Some(thinking) =
-                                            candidate.get("thinking").and_then(|v| v.as_str())
-                                        {
-                                            if !thinking.is_empty() {
-                                                let _ = tx
-                                                    .send(StreamEvent::Thought(
-                                                        thinking.to_string(),
-                                                    ))
-                                                    .await;
-                                            }
-                                        }
-                                    }
-
-                                    if let Some(parts) =
-                                        json["candidates"][0]["content"]["parts"].as_array()
-                                    {
-                                        // Capture thought_signature from candidate level if not found in part
-                                        let candidate_signature = json["candidates"][0]
-                                            .get("thoughtSignature")
-                                            .or_else(|| {
-                                                json["candidates"][0].get("thought_signature")
-                                            })
-                                            .and_then(|ts| ts.as_str())
-                                            .map(|s| s.to_string());
-
-                                        for part in parts {
-                                            tracing::trace!("Gemini part: {}", part);
-                                            // Check if this is a thought part (Gemini sends thought: true boolean)
-                                            let is_thought =
-                                                part["thought"].as_bool().unwrap_or(false);
-
-                                            // [Fix] Also check if 'thought' is a string itself (common in some API versions)
-                                            if let Some(thought_text) = part["thought"].as_str() {
-                                                let _ = tx
-                                                    .send(StreamEvent::Thought(
-                                                        thought_text.to_string(),
-                                                    ))
-                                                    .await;
-                                            }
-
-                                            if is_thought {
-                                                // thought: true means the text field contains thinking content
-                                                if let Some(text) = part["text"].as_str() {
-                                                    let _ = tx
-                                                        .send(StreamEvent::Thought(
-                                                            text.to_string(),
-                                                        ))
-                                                        .await;
-                                                    tracing::debug!(
-                                                        "Gemini thought: {} chars, content={}",
-                                                        text.len(),
-                                                        crate::utils::truncate_log(text)
-                                                    );
-                                                }
-                                            } else if let Some(text) = part["text"].as_str() {
-                                                total_text_len += text.len();
-                                                tracing::debug!(
-                                                    "Gemini text: {} chars (total: {}), content={}",
-                                                    text.len(),
-                                                    total_text_len,
-                                                    crate::utils::truncate_log(text)
-                                                );
-                                                let _ = tx
-                                                    .send(StreamEvent::Text(text.to_string()))
-                                                    .await;
-                                            }
-                                            if let Some(func_call) = parse_function_call_basic(part)
-                                            {
-                                                total_tool_calls += 1;
-                                                tracing::debug!(
-                                                    "Gemini tool_call: name={}",
-                                                    func_call.name
-                                                );
-                                                let signature = capture_thought_signature(part)
-                                                    .or_else(|| candidate_signature.clone());
-                                                let _ = tx
-                                                    .send(StreamEvent::ToolCall(
-                                                        func_call, signature,
-                                                    ))
-                                                    .await;
-                                            }
-                                        }
-                                    } else {
-                                        tracing::debug!(
-                                            "Gemini SSE chunk #{} has no candidates/parts. Raw: {}",
-                                            chunk_count,
-                                            truncate_log(data)
-                                        );
-                                    }
-                                }
-                                Err(parse_err) => {
-                                    tracing::warn!(
-                                        "Gemini SSE JSON parse error: {}. Raw data: {}",
-                                        parse_err,
-                                        truncate_log(data)
-                                    );
-                                }
                             }
                         }
                     }

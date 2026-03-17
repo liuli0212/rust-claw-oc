@@ -1,6 +1,7 @@
 use super::gemini::{
-    inline_schema_refs, normalize_schema_for_gemini, to_vertex_message, FunctionDeclaration,
-    GeminiRequest, GenerationConfig, ThinkingConfig, VertexGeminiRequest,
+    capture_thought_signature, inline_schema_refs, normalize_schema_for_gemini,
+    parse_function_call_basic, to_vertex_message, FunctionDeclaration, GeminiRequest,
+    GenerationConfig, ThinkingConfig, VertexGeminiRequest,
 };
 use super::protocol::{GeminiPlatform, LlmError};
 use crate::context::{FileData, Message};
@@ -11,6 +12,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 pub(crate) fn build_function_declarations(tools: &[Arc<dyn Tool>]) -> Vec<FunctionDeclaration> {
     if tools.is_empty() {
@@ -481,4 +483,118 @@ pub(crate) async fn stream_connect_with_retry(
         tracing::info!("Transient error detected. Retrying in {:?}...", backoff);
         tokio::time::sleep(backoff).await;
     }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn emit_sse_data_block(
+    tx: &mpsc::Sender<super::protocol::StreamEvent>,
+    data: &str,
+    total_text_len: &mut usize,
+    total_tool_calls: &mut usize,
+    chunk_count: &mut usize,
+) -> bool {
+    if data == "[DONE]" {
+        tracing::debug!("Gemini stream received [DONE] signal");
+        let _ = tx.send(super::protocol::StreamEvent::Done).await;
+        return true;
+    }
+
+    match serde_json::from_str::<Value>(data) {
+        Ok(json) => {
+            *chunk_count += 1;
+            tracing::debug!(
+                "Gemini SSE chunk #{}: keys={:?}\nRaw: {}",
+                *chunk_count,
+                json.as_object().map(|m| m.keys().collect::<Vec<_>>()),
+                crate::utils::truncate_log(data)
+            );
+
+            if let Some(candidate) = json["candidates"].as_array().and_then(|a| a.first()) {
+                if let Some(thought) = candidate.get("thought").and_then(|v| v.as_str()) {
+                    if !thought.is_empty() {
+                        let _ = tx
+                            .send(super::protocol::StreamEvent::Thought(thought.to_string()))
+                            .await;
+                    }
+                }
+                if let Some(thinking) = candidate.get("thinking").and_then(|v| v.as_str()) {
+                    if !thinking.is_empty() {
+                        let _ = tx
+                            .send(super::protocol::StreamEvent::Thought(thinking.to_string()))
+                            .await;
+                    }
+                }
+            }
+
+            if let Some(parts) = json["candidates"][0]["content"]["parts"].as_array() {
+                let candidate_signature = json["candidates"][0]
+                    .get("thoughtSignature")
+                    .or_else(|| json["candidates"][0].get("thought_signature"))
+                    .and_then(|ts| ts.as_str())
+                    .map(|s| s.to_string());
+
+                for part in parts {
+                    tracing::trace!("Gemini part: {}", part);
+                    let is_thought = part["thought"].as_bool().unwrap_or(false);
+
+                    if let Some(thought_text) = part["thought"].as_str() {
+                        let _ = tx
+                            .send(super::protocol::StreamEvent::Thought(
+                                thought_text.to_string(),
+                            ))
+                            .await;
+                    }
+
+                    if is_thought {
+                        if let Some(text) = part["text"].as_str() {
+                            let _ = tx
+                                .send(super::protocol::StreamEvent::Thought(text.to_string()))
+                                .await;
+                            tracing::debug!(
+                                "Gemini thought: {} chars, content={}",
+                                text.len(),
+                                crate::utils::truncate_log(text)
+                            );
+                        }
+                    } else if let Some(text) = part["text"].as_str() {
+                        *total_text_len += text.len();
+                        tracing::debug!(
+                            "Gemini text: {} chars (total: {}), content={}",
+                            text.len(),
+                            *total_text_len,
+                            crate::utils::truncate_log(text)
+                        );
+                        let _ = tx
+                            .send(super::protocol::StreamEvent::Text(text.to_string()))
+                            .await;
+                    }
+
+                    if let Some(func_call) = parse_function_call_basic(part) {
+                        *total_tool_calls += 1;
+                        tracing::debug!("Gemini tool_call: name={}", func_call.name);
+                        let signature =
+                            capture_thought_signature(part).or_else(|| candidate_signature.clone());
+                        let _ = tx
+                            .send(super::protocol::StreamEvent::ToolCall(func_call, signature))
+                            .await;
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    "Gemini SSE chunk #{} has no candidates/parts. Raw: {}",
+                    *chunk_count,
+                    crate::utils::truncate_log(data)
+                );
+            }
+        }
+        Err(parse_err) => {
+            tracing::warn!(
+                "Gemini SSE JSON parse error: {}. Raw data: {}",
+                parse_err,
+                crate::utils::truncate_log(data)
+            );
+        }
+    }
+
+    false
 }
