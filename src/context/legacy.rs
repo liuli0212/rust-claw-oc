@@ -690,43 +690,11 @@ impl AgentContext {
     }
 
     pub fn dialogue_history_token_estimate(&self) -> usize {
-        let bpe = tiktoken_rs::cl100k_base().unwrap();
-        self.dialogue_history
-            .iter()
-            .map(|turn| Self::turn_token_estimate(turn, &bpe))
-            .sum()
+        super::history::dialogue_history_token_estimate(self)
     }
 
-    // Refactored to return accurate NET tokens (using compression)
     pub fn get_context_status(&self) -> (usize, usize, usize, usize, usize) {
-        let bpe = Self::get_bpe();
-
-        // 1. Calculate History (Net - Compressed) - Using precise algorithm as requested
-        let (_, history_tokens, _, _) = self.build_history_with_budget();
-
-        // 2. Current Turn
-        let current_turn_tokens = if let Some(turn) = &self.current_turn {
-            Self::turn_token_estimate(turn, &bpe)
-        } else if let Some(last) = self.dialogue_history.last() {
-            // For status display when idle, show last turn
-            Self::turn_token_estimate(last, &bpe)
-        } else {
-            0
-        };
-
-        // 3. System Prompt (Accurate calculation)
-        let prompt_text = self.build_system_prompt();
-        let system_tokens = bpe.encode_with_special_tokens(&prompt_text).len();
-
-        // 4. Total
-        let total_tokens = history_tokens + current_turn_tokens + system_tokens;
-        (
-            total_tokens,
-            self.max_history_tokens,
-            self.dialogue_history.len(),
-            system_tokens,
-            current_turn_tokens,
-        )
+        super::history::get_context_status(self)
     }
 
     pub fn get_context_details(&self) -> String {
@@ -734,21 +702,7 @@ impl AgentContext {
     }
 
     pub fn oldest_turns_for_compaction(&self, target_tokens: usize, min_turns: usize) -> usize {
-        if self.dialogue_history.is_empty() {
-            return 0;
-        }
-
-        let bpe = tiktoken_rs::cl100k_base().unwrap();
-        let mut selected = 0;
-        let mut tokens = 0;
-        for turn in &self.dialogue_history {
-            tokens += Self::turn_token_estimate(turn, &bpe);
-            selected += 1;
-            if selected >= min_turns && tokens >= target_tokens {
-                break;
-            }
-        }
-        selected.min(self.dialogue_history.len())
+        super::history::oldest_turns_for_compaction(self, target_tokens, min_turns)
     }
 
     /// Rule-based compaction: compress oldest N turns into a single structured summary Turn.
