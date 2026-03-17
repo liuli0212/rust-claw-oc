@@ -443,3 +443,94 @@ impl Tool for FinishTaskTool {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ToolExecutionEnvelope;
+    use tempfile::tempdir;
+
+    fn cleanup_session(session_id: &str) {
+        let session_dir = crate::schema::StoragePaths::session_dir(session_id);
+        let _ = std::fs::remove_dir_all(session_dir);
+    }
+
+    #[tokio::test]
+    async fn test_patch_file_tool() {
+        let tool = PatchFileTool;
+        let test_file = "test_patch.txt";
+        std::fs::write(test_file, "Line 1\nLine 2\nLine 3\n").unwrap();
+
+        let patch = "--- test_patch.txt\n+++ test_patch.txt\n@@ -1,3 +1,3 @@\n Line 1\n-Line 2\n+Line 2 edited\n Line 3\n";
+        let args = serde_json::json!({
+            "thought": "edit line 2",
+            "path": test_file,
+            "patch": patch
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(result.contains("true"));
+
+        let content = std::fs::read_to_string(test_file).unwrap();
+        assert_eq!(content, "Line 1\nLine 2 edited\nLine 3\n");
+
+        std::fs::remove_file(test_file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_marks_large_output_as_truncated() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("large.txt");
+        let large_content = (0..3000)
+            .map(|idx| format!("line-{idx:04}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &large_content).unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool
+            .execute(serde_json::json!({
+                "path": file_path,
+                "thought": "inspect large file"
+            }))
+            .await
+            .unwrap();
+
+        let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
+        assert!(envelope.ok);
+        assert!(envelope.truncated);
+        assert!(envelope.output.contains("line-0000"));
+        assert!(envelope.output.contains("Truncated"));
+    }
+
+    #[tokio::test]
+    async fn test_finish_task_tool_marks_in_progress_state_completed() {
+        let session_id = "test-finish-task-tool";
+        cleanup_session(session_id);
+        let store = std::sync::Arc::new(crate::task_state::TaskStateStore::new(session_id));
+        store
+            .save(&crate::task_state::TaskStateSnapshot {
+                status: "in_progress".to_string(),
+                goal: Some("Ship refactor".to_string()),
+                ..crate::task_state::TaskStateSnapshot::empty()
+            })
+            .unwrap();
+
+        let tool = FinishTaskTool {
+            task_state_store: store.clone(),
+        };
+
+        let result = tool
+            .execute(serde_json::json!({
+                "summary": "Refactor complete"
+            }))
+            .await
+            .unwrap();
+        let updated = store.load().unwrap();
+
+        assert!(result.contains("Refactor complete"));
+        assert_eq!(updated.status, "completed");
+        assert_eq!(updated.goal.as_deref(), Some("Ship refactor"));
+        cleanup_session(session_id);
+    }
+}

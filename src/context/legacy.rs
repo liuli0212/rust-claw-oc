@@ -5,111 +5,10 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tiktoken_rs::CoreBPE;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Part {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none", rename = "functionCall")]
-    pub function_call: Option<FunctionCall>,
-
-    #[serde(skip_serializing_if = "Option::is_none", rename = "functionResponse")]
-    pub function_response: Option<FunctionResponse>,
-
-    #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
-    pub thought_signature: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none", rename = "fileData")]
-    pub file_data: Option<FileData>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionCall {
-    pub name: String,
-    pub args: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileData {
-    pub mime_type: String,
-    pub file_uri: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionResponse {
-    pub name: String,
-    pub response: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none", alias = "tool_call_id")]
-    pub id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    #[serde(rename = "role")]
-    pub role: String,
-    pub parts: Vec<Part>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Turn {
-    pub turn_id: String,
-    pub user_message: String,
-    pub messages: Vec<Message>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DetailedContextStats {
-    pub system_static: usize,
-    pub system_runtime: usize,
-    pub system_custom: usize,  // .claw_prompt.md
-    pub system_project: usize, // AGENTS.md, etc.
-    pub system_task_plan: usize,
-    pub memory: usize,
-    pub history: usize,
-    pub current_turn: usize,
-    pub last_turn: usize,
-    pub total: usize,
-    pub max: usize,
-    pub truncated_chars: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextSnapshot {
-    pub timestamp: u64,
-    pub turn_id: String,
-    pub stats: DetailedContextStats,
-    pub messages_count: usize,
-    pub system_prompt_hash: u64,
-    pub retrieved_memory_sources: Vec<String>,
-    pub history_turns_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextDiff {
-    pub token_delta: i64,
-    pub history_turns_delta: i32,
-    pub system_prompt_changed: bool,
-    pub new_sources: Vec<String>,
-    pub removed_sources: Vec<String>,
-    pub memory_changed: bool,
-    pub truncated_delta: i64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PromptReport {
-    pub max_history_tokens: usize,
-    pub history_tokens_used: usize,
-    pub history_turns_included: usize,
-    pub current_turn_tokens: usize,
-    pub system_prompt_tokens: usize,
-    pub total_prompt_tokens: usize,
-    pub retrieved_memory_snippets: usize,
-    pub retrieved_memory_sources: Vec<String>,
-    pub detailed_stats: DetailedContextStats,
-}
+use super::history::{ContextDiff, ContextSnapshot};
+use super::model::{FileData, FunctionCall, FunctionResponse, Message, Part, Turn};
+use super::prompt::{DetailedContextStats, PromptReport};
+use super::transcript;
 
 pub struct AgentContext {
     pub system_prompts: Vec<String>,
@@ -1688,20 +1587,6 @@ impl AgentContext {
     }
 }
 
-pub fn transcript_path_for_session(base_dir: &Path, session_id: &str) -> PathBuf {
-    let sanitized = session_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    base_dir.join(format!("{sanitized}.jsonl"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1754,7 +1639,8 @@ mod tests {
     #[test]
     fn test_transcript_path_for_session_sanitizes_special_characters() {
         let dir = tempdir().unwrap();
-        let path = transcript_path_for_session(dir.path(), "session:/with spaces?and*symbols");
+        let path =
+            transcript::transcript_path_for_session(dir.path(), "session:/with spaces?and*symbols");
 
         assert_eq!(
             path.file_name().unwrap().to_str().unwrap(),

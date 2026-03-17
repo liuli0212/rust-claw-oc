@@ -487,3 +487,5 @@ Follow-up decomposition completed so far:
 - [x] moved `BashTool` into `src/tools/bash.rs`
 - [x] moved `WebFetchTool` into `src/tools/web.rs`
 - [x] moved file-oriented tools into `src/tools/files.rs`
+- [x] moved memory, integration, and LSP tools into dedicated modules
+- [x] removed `src/tools/legacy.rs`

@@ -122,3 +122,77 @@ pub fn serialize_tool_envelope(
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct EmptyArgs {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{BashTool, PatchFileTool, ReadFileTool, ReadMemoryTool, WriteFileTool, WriteMemoryTool};
+
+    #[test]
+    fn test_tool_schema_validation() {
+        let workspace = std::sync::Arc::new(crate::memory::WorkspaceMemory::new("test_memory.md"));
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(BashTool::new()),
+            Box::new(ReadMemoryTool::new(workspace.clone())),
+            Box::new(WriteMemoryTool::new(workspace)),
+            Box::new(PatchFileTool),
+            Box::new(WriteFileTool),
+            Box::new(ReadFileTool),
+        ];
+
+        for tool in tools {
+            let schema = tool.parameters_schema();
+            let obj = schema.as_object().expect("Schema must be an object");
+
+            assert!(!obj.contains_key("$schema"), "Schema for {} should not contain $schema", tool.name());
+            assert!(!obj.contains_key("title"), "Schema for {} should not contain title", tool.name());
+
+            if obj.get("type").and_then(|t| t.as_str()) == Some("object") {
+                assert!(
+                    obj.contains_key("properties"),
+                    "Schema for {} must contain properties",
+                    tool.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_clean_schema_removes_metadata_and_injects_properties_for_objects() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Example",
+            "type": "object"
+        });
+
+        let cleaned = clean_schema(schema);
+
+        assert_eq!(cleaned.get("$schema"), None);
+        assert_eq!(cleaned.get("title"), None);
+        assert_eq!(cleaned["properties"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_serialize_tool_envelope_sets_expected_defaults() {
+        let serialized = serialize_tool_envelope(
+            "write_file",
+            true,
+            "ok".to_string(),
+            Some(0),
+            Some(42),
+            false,
+        )
+        .unwrap();
+        let envelope: ToolExecutionEnvelope = serde_json::from_str(&serialized).unwrap();
+
+        assert!(envelope.ok);
+        assert_eq!(envelope.tool_name, "write_file");
+        assert_eq!(envelope.output, "ok");
+        assert_eq!(envelope.exit_code, Some(0));
+        assert_eq!(envelope.duration_ms, Some(42));
+        assert!(!envelope.truncated);
+        assert!(!envelope.recovery_attempted);
+        assert_eq!(envelope.recovery_output, None);
+        assert_eq!(envelope.recovery_rule, None);
+    }
+}
