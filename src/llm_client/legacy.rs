@@ -5,15 +5,13 @@ use futures::StreamExt;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::Value;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 use super::gemini::{
-    capture_thought_signature, parse_function_call_basic, to_vertex_message,
-    FunctionDeclaration, GeminiRequest, GenerationConfig, ThinkingConfig,
-    ToolDeclarationWrapper, VertexGeminiRequest,
+    capture_thought_signature, parse_function_call_basic, to_vertex_message, FunctionDeclaration,
+    GeminiRequest, ToolDeclarationWrapper, VertexGeminiRequest,
 };
 use super::gemini_context;
 use super::protocol::{GeminiPlatform, LlmClient, LlmError, StreamEvent};
@@ -35,9 +33,9 @@ pub struct GeminiClient {
 }
 
 #[derive(Clone)]
-struct CachedContentInfo {
-    id: String,
-    hash: u64,
+pub(crate) struct CachedContentInfo {
+    pub(crate) id: String,
+    pub(crate) hash: u64,
 }
 
 struct CachedFunctionDeclarations {
@@ -161,15 +159,6 @@ impl GeminiClient {
         gemini_context::dehydrate_message(&self.client, &self.api_key, msg).await
     }
 
-    async fn create_context_cache(&self, system_instruction: &Message) -> Result<String, LlmError> {
-        gemini_context::create_context_cache(
-            &self.client,
-            &self.api_key,
-            &self.model_name,
-            system_instruction,
-        )
-        .await
-    }
 }
 
 #[async_trait]
@@ -195,72 +184,18 @@ impl LlmClient for GeminiClient {
             self.dehydrate_message(sys_msg).await?;
         }
 
-        let mut cached_content_id = None;
-        if let Some(ref sys_msg) = system_instruction {
-            // Check if caching is worth it (> 128KB roughly 32k tokens)
-            let sys_str = serde_json::to_string(sys_msg).unwrap_or_default();
-            if sys_str.len() > 128 * 1024 {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                sys_str.hash(&mut hasher);
-                let current_hash = hasher.finish();
-
-                let mut cache_guard = self.cached_content.lock().await;
-                if let Some(cache_info) = &*cache_guard {
-                    if cache_info.hash == current_hash {
-                        cached_content_id = Some(cache_info.id.clone());
-                    }
-                }
-
-                if cached_content_id.is_none() {
-                    tracing::info!(
-                        "Creating context cache for system instruction ({} bytes)",
-                        sys_str.len()
-                    );
-                    match self.create_context_cache(sys_msg).await {
-                        Ok(id) => {
-                            *cache_guard = Some(CachedContentInfo {
-                                id: id.clone(),
-                                hash: current_hash,
-                            });
-                            cached_content_id = Some(id);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to create context cache: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // If we have a cache, we might want to clear system_instruction from the request
-        // but only if it's identical to what's in the cache.
-        // For simplicity, if cached_content_id is Some, we set system_instruction = None.
-        let final_system_instruction = if cached_content_id.is_some() {
-            None
-        } else {
-            system_instruction.clone()
-        };
-
-        let generation_config = if self.model_name.contains("thinking") {
-            Some(GenerationConfig {
-                temperature: Some(0.7),
-                max_output_tokens: Some(64000),
-                thinking_config: Some(ThinkingConfig {
-                    include_thoughts: true,
-                    quota_tokens: 32000,
-                }),
-                response_mime_type: None,
-                response_schema: None,
-            })
-        } else {
-            Some(GenerationConfig {
-                temperature: Some(0.0),
-                max_output_tokens: Some(8192),
-                thinking_config: None,
-                response_mime_type: None,
-                response_schema: None,
-            })
-        };
+        let cached_content_id = gemini_context::resolve_cached_content(
+            &self.client,
+            &self.api_key,
+            &self.model_name,
+            &self.cached_content,
+            &system_instruction,
+            "system instruction",
+        )
+        .await;
+        let final_system_instruction =
+            gemini_context::final_system_instruction(&system_instruction, &cached_content_id);
+        let generation_config = gemini_context::text_generation_config(&self.model_name);
 
         let req_body = GeminiRequest {
             contents: messages,
@@ -360,51 +295,17 @@ impl LlmClient for GeminiClient {
             self.dehydrate_message(sys_msg).await?;
         }
 
-        let mut cached_content_id = None;
-        if let Some(ref sys_msg) = system_instruction {
-            // Check if caching is worth it (> 128KB roughly 32k tokens)
-            let sys_str = serde_json::to_string(sys_msg).unwrap_or_default();
-            if sys_str.len() > 128 * 1024 {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                sys_str.hash(&mut hasher);
-                let current_hash = hasher.finish();
-
-                let mut cache_guard = self.cached_content.lock().await;
-                if let Some(cache_info) = &*cache_guard {
-                    if cache_info.hash == current_hash {
-                        cached_content_id = Some(cache_info.id.clone());
-                    }
-                }
-
-                if cached_content_id.is_none() {
-                    tracing::info!(
-                        "Creating context cache for system instruction ({} bytes)",
-                        sys_str.len()
-                    );
-                    match self.create_context_cache(sys_msg).await {
-                        Ok(id) => {
-                            *cache_guard = Some(CachedContentInfo {
-                                id: id.clone(),
-                                hash: current_hash,
-                            });
-                            cached_content_id = Some(id);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to create context cache: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // If we have a cache, we might want to clear system_instruction from the request
-        // but only if it's identical to what's in the cache.
-        // For simplicity, if cached_content_id is Some, we set system_instruction = None.
-        let final_system_instruction = if cached_content_id.is_some() {
-            None
-        } else {
-            system_instruction.clone()
-        };
+        let cached_content_id = gemini_context::resolve_cached_content(
+            &self.client,
+            &self.api_key,
+            &self.model_name,
+            &self.cached_content,
+            &system_instruction,
+            "system instruction",
+        )
+        .await;
+        let final_system_instruction =
+            gemini_context::final_system_instruction(&system_instruction, &cached_content_id);
 
         let function_declarations = self.get_function_declarations(&tools);
         let (tx, rx) = mpsc::channel(100);
@@ -415,26 +316,7 @@ impl LlmClient for GeminiClient {
         let platform = self.platform;
 
         tokio::spawn(async move {
-            let generation_config = if model_name.contains("thinking") {
-                Some(GenerationConfig {
-                    temperature: Some(0.7),
-                    max_output_tokens: Some(64000),
-                    thinking_config: Some(ThinkingConfig {
-                        include_thoughts: true,
-                        quota_tokens: 32000,
-                    }),
-                    response_mime_type: None,
-                    response_schema: None,
-                })
-            } else {
-                Some(GenerationConfig {
-                    temperature: Some(0.0),
-                    max_output_tokens: Some(8192),
-                    thinking_config: None,
-                    response_mime_type: None,
-                    response_schema: None,
-                })
-            };
+            let generation_config = gemini_context::text_generation_config(&model_name);
 
             let req_body = GeminiRequest {
                 contents: messages,
@@ -731,49 +613,19 @@ impl LlmClient for GeminiClient {
             self.dehydrate_message(sys_msg).await?;
         }
 
-        let mut cached_content_id = None;
-        if let Some(ref sys_msg) = system_instruction {
-            let sys_str = serde_json::to_string(sys_msg).unwrap_or_default();
-            if sys_str.len() > 128 * 1024 {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                sys_str.hash(&mut hasher);
-                let current_hash = hasher.finish();
+        let cached_content_id = gemini_context::resolve_cached_content(
+            &self.client,
+            &self.api_key,
+            &self.model_name,
+            &self.cached_content,
+            &system_instruction,
+            "structured output",
+        )
+        .await;
+        let final_system_instruction =
+            gemini_context::final_system_instruction(&system_instruction, &cached_content_id);
 
-                let mut cache_guard = self.cached_content.lock().await;
-                if let Some(cache_info) = &*cache_guard {
-                    if cache_info.hash == current_hash {
-                        cached_content_id = Some(cache_info.id.clone());
-                    }
-                }
-
-                if cached_content_id.is_none() {
-                    tracing::info!(
-                        "Creating context cache for structured output ({} bytes)",
-                        sys_str.len()
-                    );
-                    match self.create_context_cache(sys_msg).await {
-                        Ok(id) => {
-                            *cache_guard = Some(CachedContentInfo {
-                                id: id.clone(),
-                                hash: current_hash,
-                            });
-                            cached_content_id = Some(id);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to create context cache: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        let final_system_instruction = if cached_content_id.is_some() {
-            None
-        } else {
-            system_instruction.clone()
-        };
-
-        let generation_config = GenerationConfig {
+        let generation_config = super::gemini::GenerationConfig {
             temperature: Some(0.0),
             max_output_tokens: Some(8192),
             thinking_config: None,

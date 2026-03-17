@@ -499,3 +499,4 @@ Follow-up decomposition completed so far:
 - [x] narrowed `src/context/mod.rs` to selective facade re-exports and removed stale bridge imports from `src/context/legacy.rs`
 - [x] extracted context snapshot/diff helpers into `src/context/state.rs` and turn lifecycle helpers into `src/context/turns.rs`
 - [x] extracted Gemini tool declaration, upload, dehydration, and context cache helpers into `src/llm_client/gemini_context.rs`
+- [x] moved Gemini cached-content resolution and text generation config selection out of `src/llm_client/legacy.rs`

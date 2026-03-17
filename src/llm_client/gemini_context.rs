@@ -1,9 +1,13 @@
-use super::gemini::{inline_schema_refs, normalize_schema_for_gemini, FunctionDeclaration};
+use super::gemini::{
+    inline_schema_refs, normalize_schema_for_gemini, FunctionDeclaration, GenerationConfig,
+    ThinkingConfig,
+};
 use super::protocol::LlmError;
 use crate::context::{FileData, Message};
 use crate::tools::Tool;
 use reqwest::Client;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub(crate) fn build_function_declarations(tools: &[Arc<dyn Tool>]) -> Vec<FunctionDeclaration> {
     if tools.is_empty() {
@@ -180,4 +184,80 @@ pub(crate) async fn create_context_cache(
         .as_str()
         .ok_or_else(|| LlmError::ApiError("No name in cache response".to_string()))?;
     Ok(name.to_string())
+}
+
+pub(crate) async fn resolve_cached_content(
+    client: &Client,
+    api_key: &str,
+    model_name: &str,
+    cached_content: &Mutex<Option<super::legacy::CachedContentInfo>>,
+    system_instruction: &Option<Message>,
+    log_label: &str,
+) -> Option<String> {
+    let sys_msg = system_instruction.as_ref()?;
+    let sys_str = serde_json::to_string(sys_msg).unwrap_or_default();
+    if sys_str.len() <= 128 * 1024 {
+        return None;
+    }
+
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sys_str.hash(&mut hasher);
+    let current_hash = hasher.finish();
+
+    let mut cache_guard = cached_content.lock().await;
+    if let Some(cache_info) = &*cache_guard {
+        if cache_info.hash == current_hash {
+            return Some(cache_info.id.clone());
+        }
+    }
+
+    tracing::info!("Creating context cache for {} ({} bytes)", log_label, sys_str.len());
+    match create_context_cache(client, api_key, model_name, sys_msg).await {
+        Ok(id) => {
+            *cache_guard = Some(super::legacy::CachedContentInfo {
+                id: id.clone(),
+                hash: current_hash,
+            });
+            Some(id)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to create context cache: {}", e);
+            None
+        }
+    }
+}
+
+pub(crate) fn final_system_instruction(
+    system_instruction: &Option<Message>,
+    cached_content_id: &Option<String>,
+) -> Option<Message> {
+    if cached_content_id.is_some() {
+        None
+    } else {
+        system_instruction.clone()
+    }
+}
+
+pub(crate) fn text_generation_config(model_name: &str) -> Option<GenerationConfig> {
+    if model_name.contains("thinking") {
+        Some(GenerationConfig {
+            temperature: Some(0.7),
+            max_output_tokens: Some(64000),
+            thinking_config: Some(ThinkingConfig {
+                include_thoughts: true,
+                quota_tokens: 32000,
+            }),
+            response_mime_type: None,
+            response_schema: None,
+        })
+    } else {
+        Some(GenerationConfig {
+            temperature: Some(0.0),
+            max_output_tokens: Some(8192),
+            thinking_config: None,
+            response_mime_type: None,
+            response_schema: None,
+        })
+    }
 }
