@@ -503,3 +503,4 @@ Follow-up decomposition completed so far:
 - [x] extracted response sanitization helpers from `src/context/legacy.rs` into `src/context/sanitize.rs`
 - [x] extracted token and truncation helpers from `src/context/legacy.rs` into `src/context/token.rs`
 - [x] extracted Gemini request URL selection and Vertex request serialization from `src/llm_client/legacy.rs`
+- [x] moved transcript context loading/appending and shared BPE access out of `src/context/legacy.rs`

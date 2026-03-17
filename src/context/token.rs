@@ -1,6 +1,12 @@
 use super::model::{Message, Turn};
 use tiktoken_rs::CoreBPE;
 
+pub(crate) fn get_bpe() -> CoreBPE {
+    use once_cell::sync::Lazy;
+    static BPE: Lazy<CoreBPE> = Lazy::new(|| tiktoken_rs::cl100k_base().unwrap());
+    BPE.clone()
+}
+
 pub(crate) fn estimate_tokens(bpe: &CoreBPE, msg: &Message) -> usize {
     let mut count = 0;
     for part in &msg.parts {

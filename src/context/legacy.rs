@@ -45,9 +45,7 @@ impl AgentContext {
     }
 
     pub(crate) fn get_bpe() -> tiktoken_rs::CoreBPE {
-        use once_cell::sync::Lazy;
-        static BPE: Lazy<tiktoken_rs::CoreBPE> = Lazy::new(|| tiktoken_rs::cl100k_base().unwrap());
-        BPE.clone()
+        token::get_bpe()
     }
 
     pub fn with_transcript_path(mut self, transcript_path: PathBuf) -> Self {
@@ -68,17 +66,11 @@ impl AgentContext {
     }
 
     pub fn load_transcript(&mut self) -> std::io::Result<usize> {
-        let Some(path) = &self.transcript_path else {
-            return Ok(0);
-        };
-        let turns = transcript::load_turns(path)?;
-        let loaded = turns.len();
-        self.dialogue_history.extend(turns);
-        Ok(loaded)
+        transcript::load_into_context(self)
     }
 
     pub(crate) fn append_turn_to_transcript(&self, turn: &Turn) -> std::io::Result<()> {
-        transcript::append_turn(self.transcript_path.as_deref(), turn)
+        transcript::append_context_turn(self, turn)
     }
 
     pub(crate) fn estimate_tokens(bpe: &CoreBPE, msg: &Message) -> usize {

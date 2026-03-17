@@ -1,3 +1,4 @@
+use super::legacy::AgentContext;
 use super::model::Turn;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -47,4 +48,18 @@ pub fn append_turn(path: Option<&Path>, turn: &Turn) -> std::io::Result<()> {
     let serialized = serde_json::to_string(turn)?;
     writeln!(file, "{serialized}")?;
     Ok(())
+}
+
+pub(crate) fn load_into_context(ctx: &mut AgentContext) -> std::io::Result<usize> {
+    let Some(path) = &ctx.transcript_path else {
+        return Ok(0);
+    };
+    let turns = load_turns(path)?;
+    let loaded = turns.len();
+    ctx.dialogue_history.extend(turns);
+    Ok(loaded)
+}
+
+pub(crate) fn append_context_turn(ctx: &AgentContext, turn: &Turn) -> std::io::Result<()> {
+    append_turn(ctx.transcript_path.as_deref(), turn)
 }
