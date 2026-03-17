@@ -1,20 +1,20 @@
+use super::history::{ContextDiff, ContextSnapshot};
+use super::model::{FileData, FunctionCall, FunctionResponse, Message, Part, Turn};
+use super::prompt::{self, DetailedContextStats, PromptReport};
+use super::{report, transcript};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tiktoken_rs::CoreBPE;
-use super::history::{ContextDiff, ContextSnapshot};
-use super::model::{FileData, FunctionCall, FunctionResponse, Message, Part, Turn};
-use super::prompt::{DetailedContextStats, PromptReport};
-use super::{report, transcript};
 
 pub struct AgentContext {
     pub system_prompts: Vec<String>,
     pub dialogue_history: Vec<Turn>,
     pub current_turn: Option<Turn>,
     pub max_history_tokens: usize,
-    transcript_path: Option<PathBuf>,
+    pub(crate) transcript_path: Option<PathBuf>,
     pub(crate) retrieved_memory: Option<String>,
     pub(crate) retrieved_memory_sources: Vec<String>,
     pub last_snapshot: Option<ContextSnapshot>,
@@ -48,7 +48,7 @@ impl AgentContext {
         }
     }
 
-    pub fn get_bpe() -> tiktoken_rs::CoreBPE {
+    pub(crate) fn get_bpe() -> tiktoken_rs::CoreBPE {
         use once_cell::sync::Lazy;
         static BPE: Lazy<tiktoken_rs::CoreBPE> = Lazy::new(|| tiktoken_rs::cl100k_base().unwrap());
         BPE.clone()
@@ -59,134 +59,8 @@ impl AgentContext {
         self
     }
 
-    /// Single source of truth for system prompt sections.
-    /// Returns (assembled_prompt, per_section_token_counts).
-    fn build_prompt_sections(&self) -> (String, DetailedContextStats) {
-        let bpe = Self::get_bpe();
-        let mut stats = DetailedContextStats::default();
-        let mut sections = Vec::new();
-
-        // 1. Identity
-        let identity = self.system_prompts.join("\n\n");
-        if let Some(section) = Self::build_prompt_section("Identity", identity.clone(), 4_000) {
-            stats.system_static = bpe.encode_with_special_tokens(&section).len();
-            sections.push(section);
-        }
-
-        // 2. Runtime
-        let mut runtime = String::new();
-        runtime.push_str(&format!("OS: {}\n", std::env::consts::OS));
-        runtime.push_str(&format!("Architecture: {}\n", std::env::consts::ARCH));
-        if let Ok(dir) = std::env::current_dir() {
-            runtime.push_str(&format!("Current Directory: {}\n", dir.display()));
-        }
-        if let Some(path) = &self.transcript_path {
-            runtime.push_str(&format!("Session Transcript: {}\n", path.display()));
-        }
-        if let Some(section) = Self::build_prompt_section("Runtime Environment", runtime, 1_000) {
-            stats.system_runtime = bpe.encode_with_special_tokens(&section).len();
-            sections.push(section);
-        }
-
-        // 3. Custom Instructions
-        if let Ok(custom_prompt) = fs::read_to_string(".claw_prompt.md") {
-            if let Some(section) =
-                Self::build_prompt_section("User Custom Instructions", custom_prompt, 4_000)
-            {
-                stats.system_custom = bpe.encode_with_special_tokens(&section).len();
-                sections.push(section);
-            }
-        }
-
-        // 4. Task Plan
-        // Deprecated: the task plan is now loaded via context assembler dynamically from events.
-        // We leave the block stubbed here for structural layout compat in build_prompt_sections if any other code relied on length.
-        // 5. Project Context
-        // [P1-1.4 Fix] Task Planning instruction only injected when NO active plan exists
-        let mut project_context = String::new();
-        if stats.system_task_plan == 0 {
-            project_context.push_str("### Task Planning\n");
-            project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("AGENTS.md") {
-            project_context.push_str("### AGENTS.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 3_000));
-            project_context.push_str("\n\n");
-        }
-        if let Ok(content) = fs::read_to_string("MEMORY.md") {
-            project_context.push_str("### MEMORY.md\n");
-            project_context.push_str(&Self::truncate_chars(&content, 1_500));
-            project_context.push_str("\n\n");
-        }
-        if let Some(section) = Self::build_prompt_section("Project Context", project_context, 7_000)
-        {
-            stats.system_project = bpe.encode_with_special_tokens(&section).len();
-            sections.push(section);
-        }
-
-        // 6. Retrieved Memory (RAG)
-        if let Some(memory) = &self.retrieved_memory {
-            if let Some(section) =
-                Self::build_prompt_section("Retrieved Memory", memory.clone(), 3_000)
-            {
-                stats.memory = bpe.encode_with_special_tokens(&section).len();
-                sections.push(section);
-            }
-        }
-
-        stats.max = self.max_history_tokens;
-        (sections.join("\n"), stats)
-    }
-
     pub fn get_detailed_stats(&self, pending_user_input: Option<&str>) -> DetailedContextStats {
-        let (_, mut stats) = self.build_prompt_sections();
-        let bpe = Self::get_bpe();
-
-        // History (Net Load)
-        let (_, history_tokens, _, truncated_chars) = self.build_history_with_budget();
-        stats.history = history_tokens;
-        stats.truncated_chars = truncated_chars;
-
-        // Current Turn
-        if let Some(turn) = &self.current_turn {
-            for msg in &turn.messages {
-                for part in &msg.parts {
-                    if let Some(text) = &part.text {
-                        stats.current_turn += bpe.encode_with_special_tokens(text).len();
-                    }
-                    if let Some(fc) = &part.function_call {
-                        stats.current_turn += bpe.encode_with_special_tokens(&fc.name).len();
-                        stats.current_turn +=
-                            bpe.encode_with_special_tokens(&fc.args.to_string()).len();
-                    }
-                    if let Some(fr) = &part.function_response {
-                        stats.current_turn += bpe.encode_with_special_tokens(&fr.name).len();
-                        stats.current_turn += bpe
-                            .encode_with_special_tokens(&fr.response.to_string())
-                            .len();
-                    }
-                }
-            }
-        } else if let Some(input) = pending_user_input {
-            stats.current_turn = bpe.encode_with_special_tokens(input).len();
-        }
-
-        // Last Turn
-        if let Some(last) = self.dialogue_history.last() {
-            stats.last_turn = Self::turn_token_estimate(last, &bpe);
-        }
-
-        // Total
-        stats.total = stats.system_static
-            + stats.system_runtime
-            + stats.system_custom
-            + stats.system_project
-            + stats.system_task_plan
-            + stats.memory
-            + stats.history
-            + stats.current_turn;
-
-        stats
+        prompt::get_detailed_stats(self, pending_user_input)
     }
 
     pub fn take_snapshot(&mut self) -> ContextSnapshot {
@@ -304,18 +178,8 @@ impl AgentContext {
         input.chars().take(max_chars).collect()
     }
 
-    fn build_prompt_section(title: &str, content: String, max_chars: usize) -> Option<String> {
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let truncated = Self::truncate_chars(trimmed, max_chars);
-        Some(format!("## {title}\n{truncated}\n"))
-    }
-
     pub(crate) fn build_system_prompt(&self) -> String {
-        let (prompt, _) = self.build_prompt_sections();
-        prompt
+        prompt::build_system_prompt(self)
     }
 
     fn sanitize_message(msg: &Message) -> Option<Message> {
@@ -818,7 +682,7 @@ impl AgentContext {
         )
     }
 
-    fn turn_token_estimate(turn: &Turn, bpe: &CoreBPE) -> usize {
+    pub(crate) fn turn_token_estimate(turn: &Turn, bpe: &CoreBPE) -> usize {
         turn.messages
             .iter()
             .map(|m| Self::estimate_tokens(bpe, m))
@@ -1112,11 +976,6 @@ impl AgentContext {
         } else {
             Self::truncate_chars(&args.to_string(), 60)
         }
-    }
-
-    pub fn set_retrieved_memory(&mut self, retrieved_memory: Option<String>, sources: Vec<String>) {
-        self.retrieved_memory = retrieved_memory;
-        self.retrieved_memory_sources = sources;
     }
 
     pub fn start_turn(&mut self, text: String) {

@@ -491,5 +491,7 @@ Follow-up decomposition completed so far:
 - [x] removed `src/tools/legacy.rs`
 - [x] extracted context model, prompt, history, and transcript data types from `src/context/legacy.rs`
 - [x] extracted context transcript/report helpers from `src/context/legacy.rs`
+- [x] extracted prompt assembly and detailed context stats from `src/context/legacy.rs` into `src/context/prompt.rs`
 - [x] extracted `llm_client` protocol types into `src/llm_client/protocol.rs`
 - [x] extracted Gemini request/declaration types into `src/llm_client/gemini.rs`
+- [x] extracted OpenAI-compatible client implementation into `src/llm_client/openai_compat.rs`

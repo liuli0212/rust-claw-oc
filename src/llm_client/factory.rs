@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use super::legacy::{GeminiClient, OpenAiCompatClient};
+use super::legacy::GeminiClient;
+use super::openai_compat::OpenAiCompatClient;
 use super::policy::estimate_context_window;
 use super::protocol::{GeminiPlatform, LlmClient};
 
