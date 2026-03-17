@@ -1,5 +1,6 @@
 pub mod factory;
 pub mod gemini;
+pub mod gemini_context;
 pub mod legacy;
 pub mod openai_compat;
 pub mod policy;
