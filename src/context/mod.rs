@@ -3,6 +3,7 @@ pub mod legacy;
 pub mod model;
 pub mod prompt;
 pub mod report;
+pub mod sanitize;
 pub mod state;
 pub mod transcript;
 pub mod turns;
