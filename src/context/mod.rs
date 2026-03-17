@@ -5,6 +5,7 @@ pub mod prompt;
 pub mod report;
 pub mod sanitize;
 pub mod state;
+pub mod token;
 pub mod transcript;
 pub mod turns;
 

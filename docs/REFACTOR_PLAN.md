@@ -501,3 +501,4 @@ Follow-up decomposition completed so far:
 - [x] extracted Gemini tool declaration, upload, dehydration, and context cache helpers into `src/llm_client/gemini_context.rs`
 - [x] moved Gemini cached-content resolution and text generation config selection out of `src/llm_client/legacy.rs`
 - [x] extracted response sanitization helpers from `src/context/legacy.rs` into `src/context/sanitize.rs`
+- [x] extracted token and truncation helpers from `src/context/legacy.rs` into `src/context/token.rs`
