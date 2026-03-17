@@ -595,58 +595,14 @@ impl LlmClient for GeminiClient {
 
         let url = gemini_context::request_url(self.platform, &self.model_name, false);
 
-        let mut attempts = 0;
-        let max_attempts = 5;
-        let mut last_error = String::from("initialization");
-
-        let response_json = loop {
-            attempts += 1;
-            let response = gemini_context::send_generate_request(
-                &self.client,
-                &self.api_key,
-                self.platform,
-                &url,
-                &req_body,
-                req_body.cached_content.clone(),
-            )
-            .await;
-
-            match response {
-                Ok(r) if r.status().is_success() => {
-                    break r.json::<Value>().await?;
-                }
-                Ok(r) => {
-                    let status = r.status();
-                    let error_text = r.text().await.unwrap_or_default();
-                    last_error =
-                        format!("status={} body={}", status, truncate_log_error(&error_text));
-                    tracing::warn!(
-                        "Gemini Structured API Error (Attempt {}/{}): {}",
-                        attempts,
-                        max_attempts,
-                        last_error
-                    );
-
-                    let is_transient = status.is_server_error() || status.as_u16() == 429;
-                    if !is_transient || attempts >= max_attempts {
-                        return Err(LlmError::ApiError(last_error));
-                    }
-                }
-                Err(e) => {
-                    last_error = format_full_error(&e);
-                    tracing::warn!(
-                        "Gemini Structured Network Error (Attempt {}/{}): {}",
-                        attempts,
-                        max_attempts,
-                        last_error
-                    );
-                    if attempts >= max_attempts {
-                        return Err(LlmError::NetworkError(e));
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1000 * attempts)).await;
-        };
+        let response_json = gemini_context::generate_with_retry(
+            &self.client,
+            &self.api_key,
+            self.platform,
+            &url,
+            &req_body,
+        )
+        .await?;
 
         let text = response_json["candidates"][0]["content"]["parts"][0]["text"]
             .as_str()

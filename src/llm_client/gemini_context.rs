@@ -5,8 +5,10 @@ use super::gemini::{
 use super::protocol::{GeminiPlatform, LlmError};
 use crate::context::{FileData, Message};
 use crate::tools::Tool;
+use crate::utils::{format_full_error, truncate_log_error};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -345,5 +347,63 @@ pub(crate) async fn send_generate_request(
                 .send()
                 .await
         }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn generate_with_retry(
+    client: &Client,
+    api_key: &str,
+    platform: GeminiPlatform,
+    url: &str,
+    req_body: &GeminiRequest,
+) -> Result<Value, LlmError> {
+    let mut attempts = 0;
+    let max_attempts = 5;
+    loop {
+        attempts += 1;
+        let response =
+            send_generate_request(client, api_key, platform, url, req_body, req_body.cached_content.clone())
+                .await;
+
+        match response {
+            Ok(r) if r.status().is_success() => {
+                return Ok(r.json::<Value>().await?);
+            }
+            Ok(r) => {
+                let status = r.status();
+                let error_text = r.text().await.unwrap_or_default();
+                let last_error = format!(
+                    "status={} body={}",
+                    status,
+                    truncate_log_error(&error_text)
+                );
+                tracing::warn!(
+                    "Gemini Structured API Error (Attempt {}/{}): {}",
+                    attempts,
+                    max_attempts,
+                    last_error
+                );
+
+                let is_transient = status.is_server_error() || status.as_u16() == 429;
+                if !is_transient || attempts >= max_attempts {
+                    return Err(LlmError::ApiError(last_error));
+                }
+            }
+            Err(e) => {
+                let last_error = format_full_error(&e);
+                tracing::warn!(
+                    "Gemini Structured Network Error (Attempt {}/{}): {}",
+                    attempts,
+                    max_attempts,
+                    last_error
+                );
+                if attempts >= max_attempts {
+                    return Err(LlmError::NetworkError(e));
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(1000 * attempts)).await;
     }
 }
