@@ -2,7 +2,6 @@ use crate::context::Message;
 use crate::tools::Tool;
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
@@ -15,7 +14,7 @@ use super::gemini::{
 };
 use super::gemini_context;
 use super::protocol::{GeminiPlatform, LlmClient, LlmError, StreamEvent};
-use crate::utils::{format_full_error, truncate_log, truncate_log_error};
+use crate::utils::{truncate_log, truncate_log_error};
 
 // --- Gemini Implementation ---
 
@@ -309,81 +308,21 @@ impl LlmClient for GeminiClient {
 
             let url = gemini_context::request_url(platform, &model_name, true);
 
-            let mut attempts = 0;
-            let max_attempts = 5;
-            let mut last_error = String::from("initialization");
-
             let body_json_string = gemini_context::request_body_json(platform, &req_body, None);
 
-            let resp = loop {
-                attempts += 1;
-
-                tracing::info!(
-                    "Sending Gemini stream request (Attempt {}/{}, body_size={} bytes)",
-                    attempts,
-                    max_attempts,
-                    body_json_string.len()
-                );
-                tracing::debug!("Gemini stream body: {}", truncate_log(&body_json_string));
-
-                let req_result = client
-                    .post(&url)
-                    .header(CONTENT_TYPE, "application/json")
-                    .header("x-goog-api-key", api_key.clone())
-                    .body(body_json_string.clone())
-                    .send()
-                    .await;
-
-                match req_result {
-                    Ok(r) if r.status().is_success() => break r,
-                    Ok(r) => {
-                        let status = r.status();
-                        let is_transient = status.is_server_error() || status.as_u16() == 429;
-                        let body = r.text().await.unwrap_or_default();
-                        last_error =
-                            format!("status={} body={}", status, truncate_log_error(&body));
-
-                        tracing::warn!(
-                            "Gemini Stream API Error (Attempt {}/{}): {}",
-                            attempts,
-                            max_attempts,
-                            last_error
-                        );
-
-                        if !is_transient || attempts >= max_attempts {
-                            let _ = tx
-                                .send(StreamEvent::Error(format!(
-                                    "Gemini API error after {} attempts: {}",
-                                    attempts, last_error
-                                )))
-                                .await;
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        last_error = format_full_error(&e);
-                        tracing::warn!(
-                            "Gemini Network Error (Attempt {}/{}):\n{}",
-                            attempts,
-                            max_attempts,
-                            last_error
-                        );
-
-                        if attempts >= max_attempts {
-                            let _ = tx
-                                .send(StreamEvent::Error(format!(
-                                    "Gemini network error after {} attempts: {}",
-                                    attempts, last_error
-                                )))
-                                .await;
-                            return;
-                        }
-                    }
+            let resp = match gemini_context::stream_connect_with_retry(
+                &client,
+                &api_key,
+                &url,
+                &body_json_string,
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(message) => {
+                    let _ = tx.send(StreamEvent::Error(message)).await;
+                    return;
                 }
-
-                let backoff = std::time::Duration::from_secs(1 << (attempts - 1));
-                tracing::info!("Transient error detected. Retrying in {:?}...", backoff);
-                tokio::time::sleep(backoff).await;
             };
 
             let mut stream = resp.bytes_stream();

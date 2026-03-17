@@ -507,3 +507,4 @@ Follow-up decomposition completed so far:
 - [x] moved `AgentContext` implementation into `src/context/agent_context.rs` and reduced `src/context/legacy.rs` to a compatibility shim
 - [x] extracted Gemini non-stream request sending from `src/llm_client/legacy.rs` into `src/llm_client/gemini_context.rs`
 - [x] extracted Gemini structured retry handling from `src/llm_client/legacy.rs` into `src/llm_client/gemini_context.rs`
+- [x] extracted Gemini streaming connection retry handling from `src/llm_client/legacy.rs` into `src/llm_client/gemini_context.rs`

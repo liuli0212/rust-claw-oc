@@ -407,3 +407,78 @@ pub(crate) async fn generate_with_retry(
         tokio::time::sleep(std::time::Duration::from_millis(1000 * attempts)).await;
     }
 }
+
+#[allow(dead_code)]
+pub(crate) async fn stream_connect_with_retry(
+    client: &Client,
+    api_key: &str,
+    url: &str,
+    body_json_string: &str,
+) -> Result<reqwest::Response, String> {
+    let mut attempts = 0;
+    let max_attempts = 5;
+
+    loop {
+        attempts += 1;
+
+        tracing::info!(
+            "Sending Gemini stream request (Attempt {}/{}, body_size={} bytes)",
+            attempts,
+            max_attempts,
+            body_json_string.len()
+        );
+        tracing::debug!("Gemini stream body: {}", crate::utils::truncate_log(body_json_string));
+
+        let req_result = client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-goog-api-key", api_key)
+            .body(body_json_string.to_string())
+            .send()
+            .await;
+
+        match req_result {
+            Ok(r) if r.status().is_success() => return Ok(r),
+            Ok(r) => {
+                let status = r.status();
+                let is_transient = status.is_server_error() || status.as_u16() == 429;
+                let body = r.text().await.unwrap_or_default();
+                let last_error = format!("status={} body={}", status, truncate_log_error(&body));
+
+                tracing::warn!(
+                    "Gemini Stream API Error (Attempt {}/{}): {}",
+                    attempts,
+                    max_attempts,
+                    last_error
+                );
+
+                if !is_transient || attempts >= max_attempts {
+                    return Err(format!(
+                        "Gemini API error after {} attempts: {}",
+                        attempts, last_error
+                    ));
+                }
+            }
+            Err(e) => {
+                let last_error = format_full_error(&e);
+                tracing::warn!(
+                    "Gemini Network Error (Attempt {}/{}):\n{}",
+                    attempts,
+                    max_attempts,
+                    last_error
+                );
+
+                if attempts >= max_attempts {
+                    return Err(format!(
+                        "Gemini network error after {} attempts: {}",
+                        attempts, last_error
+                    ));
+                }
+            }
+        }
+
+        let backoff = std::time::Duration::from_secs(1 << (attempts - 1));
+        tracing::info!("Transient error detected. Retrying in {:?}...", backoff);
+        tokio::time::sleep(backoff).await;
+    }
+}
