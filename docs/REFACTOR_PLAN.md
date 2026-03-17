@@ -134,6 +134,7 @@ Completed so far:
 - tool protocol and validation tests
 - `step()` behavior tests for empty input and cancellation during pending stream startup
 - finish-task state transition test
+- `core` helper extraction tests for think-block stripping and transient LLM error detection
 
 Before moving deeper into refactor, keep adding tests only when they directly protect an extraction we are about to do.
 
@@ -193,6 +194,12 @@ Suggested intermediate modules:
 - `core/stream_processor.rs`
 - `core/tool_dispatch.rs`
 - `core/evidence_updates.rs`
+
+Completed notes:
+
+- `AgentLoop::step()` now runs as a short orchestration loop over helper stages instead of one monolithic control-flow block
+- extracted the step/runtime helper group into `src/core/step_helpers.rs`
+- moved `core`-specific tests into `src/core/tests.rs` so production runtime code no longer shares the same file with the test harness
 
 ### Phase 2: Introduce a structured tool runtime
 
@@ -405,6 +412,8 @@ Completed notes:
 - added `src/session/factory.rs` for agent/session construction
 - added `src/session/repository.rs` for session registry persistence
 - narrowed `SessionManager` so it delegates persistence and construction instead of owning both
+- moved headless and interactive CLI orchestration out of `src/main.rs` into `src/app/cli.rs`
+- split Telegram adapter code so `src/telegram.rs` now primarily owns bot startup/dispatcher wiring while output rendering and update handlers live in `src/telegram/output.rs` and `src/telegram/handlers.rs`
 
 ### Phase 6: Remove warning suppression and tighten module APIs
 
@@ -476,36 +485,36 @@ The refactor will be considered successful when:
 
 ## Current Next Step
 
-The structural refactor plan is now complete. Follow-up work should focus on:
+The original structural plan is complete. The best follow-up work now is a second pass on `core` and the remaining oversized adapters:
 
-1. replacing the remaining text- or name-based tool special cases in `src/core.rs` and `src/context/` with structured tool metadata
-2. tightening or removing the text-only `finish_task` fallback now that the tool runtime emits structured finish summaries directly
-3. tightening the remaining warning-heavy surfaces now that `context` and `llm_client` no longer depend on legacy facades
+1. continue splitting `src/core.rs` into focused submodules now that `step()` helpers already live in `src/core/step_helpers.rs`
+2. reduce `src/main.rs`, `src/telegram.rs`, and `src/acp.rs` by separating transport/adapter code from agent-session orchestration
+3. do a second decomposition pass on `src/context/history.rs` and provider-heavy files such as `src/llm_client/gemini_context.rs`
 
-That keeps momentum while staying inside the current safety net.
+That keeps the current momentum, while building on the now-stable runtime and tool boundaries.
 
 ## Current Recommendation
 
-The highest-value next refactor is to finish the structured tool runtime end to end.
+The highest-value next refactor is to keep shrinking the runtime and adapter hot spots that remain oversized after the first pass.
 
 Why this is the best next step:
 
-- `src/core.rs` still carries a text-only `finish_task` fallback outside the structured tool path
-- `src/context/sanitize.rs` and `src/context/history.rs` still contain a small number of tool-name-specific payload trimming and argument summarization rules
-- skills and a few fallback paths still rely on string matching because their outputs do not yet advertise richer metadata
+- `src/core.rs` is much smaller than before, but it still owns runtime types, orchestration entry points, and local test hooks in one top-level module
+- `src/main.rs`, `src/telegram.rs`, and `src/acp.rs` still mix entrypoint or transport wiring with domain behavior
+- `src/context/history.rs` and `src/llm_client/gemini_context.rs` are now the clearest “large concentrated logic” modules left in the system
 
 Concretely, the remaining architectural gap is:
 
-- tools already emit structured envelopes and `core` now consumes them for successful tool effects
-- but some runtime and history code still infer semantic meaning from tool names instead of consuming richer structured result metadata everywhere
+- the runtime/tool/context/provider boundaries are now much cleaner
+- but a few top-level modules are still physically large enough that iteration cost and review cost remain higher than they should be
 
 Recommended implementation order:
 
-1. continue extending the internal tool result model in `src/tools/protocol.rs` where a remaining string branch still exists
-2. finish removing the last non-structured `finish_task` completion fallback from `src/core.rs`
-3. update the remaining `context` sanitization and history paths to rely on structured metadata instead of tool-name pattern matching wherever possible
+1. keep decomposing `core` until the top-level file is mostly runtime types plus the public orchestration entry points
+2. separate adapter and session wiring concerns in `main`/`telegram`/`acp`
+3. revisit `context/history` and provider request-shaping modules for a second size-reduction pass
 
-This path reduces complexity in the runtime hot path, removes duplicated tool semantics across `core` and `context`, and directly addresses the main remaining item from the original plan.
+This path continues the same refactor strategy, but shifts from “remove legacy boundaries and stringly-typed runtime behavior” to “finish physically shrinking the remaining large surfaces.”
 
 ## Post-Plan Progress
 
@@ -518,6 +527,10 @@ Follow-up decomposition completed so far:
 - [x] removed `src/tools/legacy.rs`
 - [x] extracted context model, prompt, history, and transcript data types from `src/context/legacy.rs`
 - [x] extracted context transcript/report helpers from `src/context/legacy.rs`
+- [x] removed `core`'s tool-name-based runtime post-processing in favor of structured tool metadata
+- [x] removed the text-only `finish_task` completion fallback from `core`
+- [x] moved `core` runtime helpers into `src/core/step_helpers.rs`
+- [x] moved `core` tests into `src/core/tests.rs`
 - [x] extracted prompt assembly and detailed context stats from `src/context/legacy.rs` into `src/context/prompt.rs`
 - [x] extracted `llm_client` protocol types into `src/llm_client/protocol.rs`
 - [x] extracted Gemini request/declaration types into `src/llm_client/gemini.rs`

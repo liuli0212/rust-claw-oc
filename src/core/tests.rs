@@ -1,0 +1,234 @@
+use super::*;
+use crate::context::Message;
+use crate::llm_client::{LlmClient, LlmError, StreamEvent};
+use crate::tools::Tool;
+use async_trait::async_trait;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+struct TestLlmClient {
+    stream_calls: AtomicUsize,
+    stream_delay_ms: u64,
+}
+
+impl TestLlmClient {
+    fn new() -> Self {
+        Self {
+            stream_calls: AtomicUsize::new(0),
+            stream_delay_ms: 0,
+        }
+    }
+
+    fn new_with_delay(stream_delay_ms: u64) -> Self {
+        Self {
+            stream_calls: AtomicUsize::new(0),
+            stream_delay_ms,
+        }
+    }
+
+    fn stream_call_count(&self) -> usize {
+        self.stream_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl LlmClient for TestLlmClient {
+    fn model_name(&self) -> &str {
+        "test-model"
+    }
+
+    fn provider_name(&self) -> &str {
+        "test-provider"
+    }
+
+    async fn stream(
+        &self,
+        _messages: Vec<Message>,
+        _system_instruction: Option<Message>,
+        _tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+        if self.stream_delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.stream_delay_ms)).await;
+        }
+        self.stream_calls.fetch_add(1, Ordering::SeqCst);
+        let (_tx, rx) = mpsc::channel(1);
+        Ok(rx)
+    }
+}
+
+#[derive(Default)]
+struct OutputState {
+    text: String,
+    thinking: String,
+}
+
+struct TestOutput {
+    state: Mutex<OutputState>,
+}
+
+impl TestOutput {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(OutputState::default()),
+        }
+    }
+
+    fn snapshot(&self) -> (String, String) {
+        let state = self.state.lock().unwrap();
+        (state.text.clone(), state.thinking.clone())
+    }
+}
+
+#[async_trait]
+impl AgentOutput for TestOutput {
+    async fn on_text(&self, text: &str) {
+        self.state.lock().unwrap().text.push_str(text);
+    }
+
+    async fn on_thinking(&self, text: &str) {
+        self.state.lock().unwrap().thinking.push_str(text);
+    }
+
+    async fn on_tool_start(&self, _name: &str, _args: &str) {}
+
+    async fn on_tool_end(&self, _result: &str) {}
+
+    async fn on_error(&self, _error: &str) {}
+}
+
+fn cleanup_session(session_id: &str) {
+    let session_dir = crate::schema::StoragePaths::session_dir(session_id);
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+fn make_agent_loop(
+    output: Arc<TestOutput>,
+    llm: Arc<TestLlmClient>,
+    session_id: &str,
+) -> AgentLoop {
+    let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+    AgentLoop::new(
+        session_id.to_string(),
+        llm,
+        Vec::new(),
+        AgentContext::new(),
+        output,
+        Arc::new(telemetry),
+        Arc::new(crate::task_state::TaskStateStore::new(session_id)),
+    )
+}
+
+#[test]
+fn test_run_exit_label_matches_public_status_names() {
+    assert_eq!(RunExit::Finished("done".to_string()).label(), "finished");
+    assert_eq!(RunExit::StoppedByUser.label(), "stopped_by_user");
+    assert_eq!(RunExit::AgentTurnLimitReached.label(), "turn_limit_reached");
+    assert_eq!(RunExit::YieldedToUser.label(), "yielded_to_user");
+    assert_eq!(
+        RunExit::RecoverableFailed("retry".to_string()).label(),
+        "recoverable_failed"
+    );
+    assert_eq!(
+        RunExit::CriticallyFailed("boom".to_string()).label(),
+        "critically_failed"
+    );
+}
+
+#[test]
+fn test_strip_think_blocks_removes_closed_and_unclosed_blocks() {
+    assert_eq!(
+        AgentLoop::strip_think_blocks("hello<think>secret</think>world"),
+        "helloworld"
+    );
+    assert_eq!(
+        AgentLoop::strip_think_blocks("visible<think>hidden forever"),
+        "visible"
+    );
+}
+
+#[test]
+fn test_is_transient_llm_error_matches_retryable_signals_only() {
+    assert!(AgentLoop::is_transient_llm_error(&LlmError::ApiError(
+        "HTTP 503 upstream timeout".to_string()
+    )));
+    assert!(AgentLoop::is_transient_llm_error(&LlmError::ApiError(
+        "connection reset by peer".to_string()
+    )));
+    assert!(!AgentLoop::is_transient_llm_error(&LlmError::ApiError(
+        "invalid API key".to_string()
+    )));
+}
+
+#[tokio::test]
+async fn test_process_streaming_text_routes_visible_and_thinking_segments() {
+    let output = Arc::new(TestOutput::new());
+    let llm = Arc::new(TestLlmClient::new());
+    let session_id = "test-streaming-text";
+    cleanup_session(session_id);
+    let agent = make_agent_loop(output.clone(), llm, session_id);
+    let mut processed_idx = 0;
+    let mut in_think_block = false;
+    let mut full_text = "Visible <think>internal".to_string();
+
+    agent
+        .process_streaming_text(&full_text, &mut processed_idx, &mut in_think_block)
+        .await;
+
+    full_text.push_str(" reasoning</think> done <final>answer</final>");
+    agent
+        .process_streaming_text(&full_text, &mut processed_idx, &mut in_think_block)
+        .await;
+
+    let (text, thinking) = output.snapshot();
+    assert_eq!(text, "Visible  done answer");
+    assert_eq!(thinking, "internal reasoning");
+    assert_eq!(processed_idx, full_text.len());
+    assert!(!in_think_block);
+    cleanup_session(session_id);
+}
+
+#[tokio::test]
+async fn test_step_with_empty_goal_yields_without_starting_turn_or_llm() {
+    let output = Arc::new(TestOutput::new());
+    let llm = Arc::new(TestLlmClient::new());
+    let session_id = "test-empty-goal";
+    cleanup_session(session_id);
+    let mut agent = make_agent_loop(output, llm.clone(), session_id);
+
+    let exit = agent.step("   ".to_string()).await.unwrap();
+
+    assert_eq!(exit, RunExit::YieldedToUser);
+    assert!(agent.context.current_turn.is_none());
+    assert_eq!(llm.stream_call_count(), 0);
+    assert!(!crate::schema::StoragePaths::task_state_file(session_id).exists());
+    cleanup_session(session_id);
+}
+
+#[tokio::test]
+async fn test_step_honors_cancel_during_pending_llm_stream_start() {
+    let output = Arc::new(TestOutput::new());
+    let llm = Arc::new(TestLlmClient::new_with_delay(200));
+    let session_id = "test-cancel-before-stream";
+    cleanup_session(session_id);
+    let mut agent = make_agent_loop(output, llm.clone(), session_id);
+    let cancel_token = agent.cancel_token.clone();
+    let cancelled = agent.cancelled.clone();
+
+    let step_handle =
+        tokio::spawn(async move { agent.step("Refactor the core loop".to_string()).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    cancelled.store(true, Ordering::SeqCst);
+    cancel_token.notify_waiters();
+
+    let exit = step_handle.await.unwrap().unwrap();
+    let store = crate::task_state::TaskStateStore::new(session_id);
+    let stored_state = store.load().unwrap();
+
+    assert_eq!(exit, RunExit::StoppedByUser);
+    assert_eq!(llm.stream_call_count(), 0);
+    assert_eq!(stored_state.status, "in_progress");
+    assert_eq!(stored_state.goal.as_deref(), Some("Refactor the core loop"));
+    cleanup_session(session_id);
+}
