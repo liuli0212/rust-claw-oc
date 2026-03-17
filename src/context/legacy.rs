@@ -1,14 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use tiktoken_rs::CoreBPE;
 use super::history::{ContextDiff, ContextSnapshot};
 use super::model::{FileData, FunctionCall, FunctionResponse, Message, Part, Turn};
 use super::prompt::{DetailedContextStats, PromptReport};
-use super::transcript;
+use super::{report, transcript};
 
 pub struct AgentContext {
     pub system_prompts: Vec<String>,
@@ -16,8 +15,8 @@ pub struct AgentContext {
     pub current_turn: Option<Turn>,
     pub max_history_tokens: usize,
     transcript_path: Option<PathBuf>,
-    retrieved_memory: Option<String>,
-    retrieved_memory_sources: Vec<String>,
+    pub(crate) retrieved_memory: Option<String>,
+    pub(crate) retrieved_memory_sources: Vec<String>,
     pub last_snapshot: Option<ContextSnapshot>,
     pub active_evidence: Vec<crate::evidence::Evidence>,
 }
@@ -268,39 +267,14 @@ impl AgentContext {
         let Some(path) = &self.transcript_path else {
             return Ok(0);
         };
-        if !path.exists() {
-            return Ok(0);
-        }
-
-        let file = fs::File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut loaded = 0;
-        for line in reader.lines() {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(turn) = serde_json::from_str::<Turn>(trimmed) {
-                self.dialogue_history.push(turn);
-                loaded += 1;
-            }
-        }
+        let turns = transcript::load_turns(path)?;
+        let loaded = turns.len();
+        self.dialogue_history.extend(turns);
         Ok(loaded)
     }
 
     fn append_turn_to_transcript(&self, turn: &Turn) -> std::io::Result<()> {
-        let Some(path) = &self.transcript_path else {
-            return Ok(());
-        };
-
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        let serialized = serde_json::to_string(turn)?;
-        writeln!(file, "{serialized}")?;
-        Ok(())
+        transcript::append_turn(self.transcript_path.as_deref(), turn)
     }
 
     fn estimate_tokens(bpe: &CoreBPE, msg: &Message) -> usize {
@@ -323,7 +297,7 @@ impl AgentContext {
         count
     }
 
-    fn truncate_chars(input: &str, max_chars: usize) -> String {
+    pub(crate) fn truncate_chars(input: &str, max_chars: usize) -> String {
         if input.chars().count() <= max_chars {
             return input.to_string();
         }
@@ -339,7 +313,7 @@ impl AgentContext {
         Some(format!("## {title}\n{truncated}\n"))
     }
 
-    fn build_system_prompt(&self) -> String {
+    pub(crate) fn build_system_prompt(&self) -> String {
         let (prompt, _) = self.build_prompt_sections();
         prompt
     }
@@ -743,7 +717,7 @@ impl AgentContext {
         )
     }
 
-    fn build_history_with_budget(&self) -> (Vec<Message>, usize, usize, usize) {
+    pub(crate) fn build_history_with_budget(&self) -> (Vec<Message>, usize, usize, usize) {
         let bpe = tiktoken_rs::cl100k_base().unwrap();
         let history_budget = self.max_history_tokens.saturating_mul(85) / 100;
         // Each entry: (distance_index, messages)
@@ -892,90 +866,7 @@ impl AgentContext {
     }
 
     pub fn get_context_details(&self) -> String {
-        let _bpe = Self::get_bpe();
-        let stats = self.get_detailed_stats(None);
-
-        let mut details = String::new();
-        details.push_str("\n\x1b[1;36m=== Context Audit Report ===\x1b[0m\n");
-
-        details.push_str(&format!(
-            "\x1b[1;33m[Token Budget]\x1b[0m  {}/{} tokens ({:.1}% used)\n",
-            stats.total,
-            stats.max,
-            (stats.total as f64 / stats.max as f64) * 100.0
-        ));
-
-        details.push_str("\n\x1b[1;33m[System Components]\x1b[0m\n");
-        details.push_str(&format!(
-            "  - Identity (Static):   {} tokens\n",
-            stats.system_static
-        ));
-        details.push_str(&format!(
-            "  - Runtime Env:        {} tokens\n",
-            stats.system_runtime
-        ));
-
-        if stats.system_custom > 0 {
-            details.push_str(&format!(
-                "  - Custom Prompt:      {} tokens (.claw_prompt.md)\n",
-                stats.system_custom
-            ));
-        }
-
-        if stats.system_task_plan > 0 {
-            details.push_str(&format!(
-                "  - Task Plan:          {} tokens\n",
-                stats.system_task_plan
-            ));
-        }
-
-        details.push_str(&format!(
-            "  - Project Context:    {} tokens\n",
-            stats.system_project
-        ));
-        let project_files = ["AGENTS.md", "README.md", "MEMORY.md"];
-        for file in project_files {
-            if let Ok(meta) = fs::metadata(file) {
-                details.push_str(&format!("    * {} ({} bytes)\n", file, meta.len()));
-            }
-        }
-
-        details.push_str("\n\x1b[1;33m[Conversation History]\x1b[0m\n");
-        let (_, _, turns_included, _) = self.build_history_with_budget();
-        details.push_str(&format!(
-            "  - History Load:       {} tokens ({} turns included)\n",
-            stats.history, turns_included
-        ));
-        details.push_str(&format!(
-            "  - Total History:      {} tokens ({} turns total)\n",
-            self.dialogue_history_token_estimate(),
-            self.dialogue_history.len()
-        ));
-
-        if stats.memory > 0 {
-            details.push_str("\n\x1b[1;33m[RAG Memory]\x1b[0m\n");
-            details.push_str(&format!(
-                "  - Retrieved:          {} tokens\n",
-                stats.memory
-            ));
-            for src in &self.retrieved_memory_sources {
-                details.push_str(&format!("    * {}\n", src));
-            }
-        }
-
-        if let Some(turn) = &self.current_turn {
-            details.push_str("\n\x1b[1;33m[Current Turn]\x1b[0m\n");
-            details.push_str(&format!(
-                "  - Active Payload:     {} tokens\n",
-                stats.current_turn
-            ));
-            details.push_str(&format!(
-                "  - User Message:       {}\n",
-                Self::truncate_chars(&turn.user_message, 80)
-            ));
-        }
-
-        details
+        report::format_context_details(self)
     }
 
     pub fn oldest_turns_for_compaction(&self, target_tokens: usize, min_turns: usize) -> usize {
@@ -1483,107 +1374,11 @@ impl AgentContext {
     }
 
     pub fn format_diff(&self, diff: &ContextDiff) -> String {
-        let mut output = String::new();
-        output.push_str("\n\x1b[1;36m=== Context Diff ===\x1b[0m\n");
-
-        // Token Delta
-        let token_sign = if diff.token_delta >= 0 { "+" } else { "" };
-        let token_color = if diff.token_delta > 0 {
-            "\x1b[31m"
-        } else if diff.token_delta < 0 {
-            "\x1b[32m"
-        } else {
-            "\x1b[0m"
-        };
-        output.push_str(&format!(
-            "  Tokens:       {}{}{}\x1b[0m\n",
-            token_color, token_sign, diff.token_delta
-        ));
-
-        // Truncated Delta
-        let trunc_sign = if diff.truncated_delta >= 0 { "+" } else { "" };
-        let trunc_color = if diff.truncated_delta > 0 {
-            "\x1b[31m"
-        } else if diff.truncated_delta < 0 {
-            "\x1b[32m"
-        } else {
-            "\x1b[0m"
-        };
-        output.push_str(&format!(
-            "  Truncated:    {}{}{}\x1b[0m chars\n",
-            trunc_color, trunc_sign, diff.truncated_delta
-        ));
-
-        // History Turns
-        let turn_sign = if diff.history_turns_delta >= 0 {
-            "+"
-        } else {
-            ""
-        };
-        output.push_str(&format!(
-            "  History:      {}{}\x1b[0m turns\n",
-            turn_sign, diff.history_turns_delta
-        ));
-
-        // System Prompt
-        if diff.system_prompt_changed {
-            output.push_str("  System:       \x1b[33mCHANGED\x1b[0m\n");
-        } else {
-            output.push_str("  System:       Unchanged\n");
-        }
-
-        // Memory
-        if diff.memory_changed {
-            output.push_str("  Memory:       \x1b[33mCHANGED\x1b[0m\n");
-            for src in &diff.new_sources {
-                output.push_str(&format!("    + {}\n", src));
-            }
-            for src in &diff.removed_sources {
-                output.push_str(&format!("    - {}\n", src));
-            }
-        } else {
-            output.push_str("  Memory:       Unchanged\n");
-        }
-
-        output
+        report::format_context_diff(diff)
     }
 
     pub fn inspect_context(&self, section: &str, arg: Option<&str>) -> String {
-        match section {
-            "system" => self.build_system_prompt(),
-            "history" => {
-                let count = arg.and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
-                let start = self.dialogue_history.len().saturating_sub(count);
-                let mut output = String::new();
-                for (i, turn) in self.dialogue_history.iter().enumerate().skip(start) {
-                    output.push_str(&format!(
-                        "\n\x1b[1;33m[Turn {} - {}]\x1b[0m\n",
-                        i + 1,
-                        turn.turn_id
-                    ));
-                    output.push_str(&format!("User: {}\n", turn.user_message));
-                    output.push_str(&format!("Messages: {}\n", turn.messages.len()));
-                }
-                if let Some(current) = &self.current_turn {
-                    output.push_str(&format!(
-                        "\n\x1b[1;32m[Current Turn - {}]\x1b[0m\n",
-                        current.turn_id
-                    ));
-                    output.push_str(&format!("User: {}\n", current.user_message));
-                    output.push_str(&format!("Messages: {}\n", current.messages.len()));
-                }
-                output
-            }
-            "memory" => {
-                if let Some(mem) = &self.retrieved_memory {
-                    format!("Sources: {:?}\n\n{}", self.retrieved_memory_sources, mem)
-                } else {
-                    "No memory retrieved.".to_string()
-                }
-            }
-
-            _ => format!("Unknown section: {}", section),
-        }
+        report::inspect_context_section(self, section, arg)
     }
 }
 

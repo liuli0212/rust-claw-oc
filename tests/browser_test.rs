@@ -1,6 +1,3 @@
-use std::time::Duration;
-use tokio::time::sleep;
-
 #[tokio::test]
 async fn test_browser_workflow() {
     // This is a placeholder test. In a real integration test,
