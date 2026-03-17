@@ -489,3 +489,6 @@ Follow-up decomposition completed so far:
 - [x] moved file-oriented tools into `src/tools/files.rs`
 - [x] moved memory, integration, and LSP tools into dedicated modules
 - [x] removed `src/tools/legacy.rs`
+- [x] extracted context model, prompt, history, and transcript data types from `src/context/legacy.rs`
+- [x] extracted `llm_client` protocol types into `src/llm_client/protocol.rs`
+- [x] extracted Gemini request/declaration types into `src/llm_client/gemini.rs`

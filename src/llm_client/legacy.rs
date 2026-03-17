@@ -4,70 +4,20 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 use crate::utils::{format_full_error, truncate_log, truncate_log_error};
-#[derive(Error, Debug)]
-pub enum LlmError {
-    #[error("Network error: {0}")]
-    NetworkError(#[from] reqwest::Error),
-    #[error("Serialization error: {0}")]
-    SerializationError(#[from] serde_json::Error),
-    #[error("API error: {0}")]
-    #[allow(dead_code)]
-    ApiError(String),
-}
-
-#[derive(Debug)]
-pub enum StreamEvent {
-    Text(String),
-    Thought(String),
-    ToolCall(FunctionCall, Option<String>),
-    Error(String),
-    Done,
-}
-
-#[async_trait]
-pub trait LlmClient: Send + Sync {
-    fn model_name(&self) -> &str;
-    fn provider_name(&self) -> &str;
-    #[allow(dead_code)]
-    fn context_window_size(&self) -> usize;
-    #[allow(dead_code)]
-    async fn generate_text(
-        &self,
-        messages: Vec<Message>,
-        system_instruction: Option<Message>,
-    ) -> Result<String, LlmError>;
-
-    async fn stream(
-        &self,
-        messages: Vec<Message>,
-        system_instruction: Option<Message>,
-        tools: Vec<Arc<dyn Tool>>,
-    ) -> Result<mpsc::Receiver<StreamEvent>, LlmError>;
-
-    async fn generate_structured(
-        &self,
-        messages: Vec<Message>,
-        system_instruction: Option<Message>,
-        response_schema: Value,
-    ) -> Result<Value, LlmError>;
-}
+use super::gemini::{
+    FunctionDeclaration, GeminiRequest, GenerationConfig, ThinkingConfig, ToolDeclarationWrapper,
+};
+use super::protocol::{GeminiPlatform, LlmClient, LlmError, StreamEvent};
 
 // --- Gemini Implementation ---
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GeminiPlatform {
-    Gen,    // generativelanguage.googleapis.com
-    Vertex, // aiplatform.googleapis.com
-}
 
 pub struct GeminiClient {
     api_key: String,
@@ -93,21 +43,6 @@ struct CachedFunctionDeclarations {
     signature: String,
     #[allow(dead_code)]
     declarations: Vec<FunctionDeclaration>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct GeminiRequest {
-    pub contents: Vec<Message>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "systemInstruction")]
-    pub system_instruction: Option<Message>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ToolDeclarationWrapper>>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
-    pub tool_config: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
-    pub generation_config: Option<GenerationConfig>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "cachedContent")]
-    pub cached_content: Option<String>,
 }
 
 // --- Vertex-compatible types (no 'id' field) ---
@@ -183,19 +118,6 @@ fn to_vertex_message(msg: &Message) -> VertexMessage {
             })
             .collect(),
     }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ToolDeclarationWrapper {
-    #[serde(rename = "functionDeclarations")]
-    pub function_declarations: Vec<FunctionDeclaration>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct FunctionDeclaration {
-    pub name: String,
-    pub description: String,
-    pub parameters: Value,
 }
 
 fn create_standard_client(base_url: Option<&str>) -> Client {
@@ -1910,26 +1832,4 @@ mod tests {
         assert_eq!(estimate_context_window("qwen-plus"), 128_000);
         assert_eq!(estimate_context_window("unknown-model"), 128_000);
     }
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct GenerationConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "maxOutputTokens")]
-    pub max_output_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
-    pub thinking_config: Option<ThinkingConfig>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "responseMimeType")]
-    pub response_mime_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "responseSchema")]
-    pub response_schema: Option<Value>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ThinkingConfig {
-    #[serde(rename = "includeThoughts")]
-    pub include_thoughts: bool,
-    #[serde(rename = "thinkingProcessQuotaTokens")]
-    pub quota_tokens: u32,
 }

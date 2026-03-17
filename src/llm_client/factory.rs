@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use super::legacy::{GeminiClient, GeminiPlatform, LlmClient, OpenAiCompatClient};
+use super::legacy::{GeminiClient, OpenAiCompatClient};
 use super::policy::estimate_context_window;
+use super::protocol::{GeminiPlatform, LlmClient};
 
 pub fn create_llm_client(
     provider: &str,
