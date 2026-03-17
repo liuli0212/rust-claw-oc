@@ -58,7 +58,6 @@ pub enum RunExit {
     Finished(String),
     StoppedByUser,
     AgentTurnLimitReached,
-    ContextLimitReached,
     YieldedToUser,
     RecoverableFailed(String),
     CriticallyFailed(String),
@@ -70,7 +69,6 @@ impl RunExit {
             RunExit::Finished(_) => "finished",
             RunExit::StoppedByUser => "stopped_by_user",
             RunExit::AgentTurnLimitReached => "turn_limit_reached",
-            RunExit::ContextLimitReached => "context_limit_reached",
             RunExit::YieldedToUser => "yielded_to_user",
             RunExit::RecoverableFailed(_) => "recoverable_failed",
             RunExit::CriticallyFailed(_) => "critically_failed",
@@ -260,13 +258,6 @@ impl AgentLoop {
         self.context.build_llm_payload(&state, &assembler)
     }
 
-    pub async fn force_compact(
-        &mut self,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.maybe_compact_history(true).await?;
-        Ok("Compaction triggered.".to_string())
-    }
-
     pub async fn maybe_compact_history(
         &mut self,
         force: bool,
@@ -303,6 +294,7 @@ impl AgentLoop {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn process_streaming_text(
         &self,
         full_text: &str,
@@ -1037,7 +1029,6 @@ mod tests {
     use super::*;
     use crate::context::Message;
     use crate::llm_client::LlmError;
-    use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::mpsc;
@@ -1077,18 +1068,6 @@ mod tests {
             "test-provider"
         }
 
-        fn context_window_size(&self) -> usize {
-            1024
-        }
-
-        async fn generate_text(
-            &self,
-            _messages: Vec<Message>,
-            _system_instruction: Option<Message>,
-        ) -> Result<String, LlmError> {
-            Err(LlmError::ApiError("unused".to_string()))
-        }
-
         async fn stream(
             &self,
             _messages: Vec<Message>,
@@ -1101,15 +1080,6 @@ mod tests {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
             let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
-        }
-
-        async fn generate_structured(
-            &self,
-            _messages: Vec<Message>,
-            _system_instruction: Option<Message>,
-            _response_schema: Value,
-        ) -> Result<Value, LlmError> {
-            Err(LlmError::ApiError("unused".to_string()))
         }
     }
 
@@ -1180,10 +1150,6 @@ mod tests {
         assert_eq!(RunExit::Finished("done".to_string()).label(), "finished");
         assert_eq!(RunExit::StoppedByUser.label(), "stopped_by_user");
         assert_eq!(RunExit::AgentTurnLimitReached.label(), "turn_limit_reached");
-        assert_eq!(
-            RunExit::ContextLimitReached.label(),
-            "context_limit_reached"
-        );
         assert_eq!(RunExit::YieldedToUser.label(), "yielded_to_user");
         assert_eq!(
             RunExit::RecoverableFailed("retry".to_string()).label(),

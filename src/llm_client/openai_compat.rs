@@ -142,129 +142,6 @@ impl LlmClient for OpenAiCompatClient {
     fn provider_name(&self) -> &str {
         &self.provider_name
     }
-    fn context_window_size(&self) -> usize {
-        self.context_window
-    }
-    async fn generate_text(
-        &self,
-        messages: Vec<Message>,
-        system_instruction: Option<Message>,
-    ) -> Result<String, LlmError> {
-        let mut openai_messages = Vec::new();
-        if let Some(sys) = system_instruction {
-            openai_messages.push(serde_json::json!({
-                "role": "system",
-                "content": sys.parts[0].text.as_deref().unwrap_or("")
-            }));
-        }
-        for msg in messages {
-            if msg.role == "user" {
-                openai_messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": msg.parts[0].text.as_deref().unwrap_or("")
-                }));
-            } else if msg.role == "model" {
-                let text = msg
-                    .parts
-                    .iter()
-                    .find_map(|p| p.text.as_deref())
-                    .unwrap_or("");
-                let mut tool_calls = Vec::new();
-                for part in &msg.parts {
-                    if let Some(fc) = &part.function_call {
-                        let call_id = fc
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
-                        tool_calls.push(serde_json::json!({
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": fc.name,
-                                "arguments": fc.args.to_string()
-                            }
-                        }));
-                    }
-                }
-
-                let mut message_json = serde_json::json!({
-                    "role": "assistant"
-                });
-
-                if !text.is_empty() {
-                    message_json["content"] = serde_json::Value::String(text.to_string());
-                }
-
-                if !tool_calls.is_empty() {
-                    message_json["tool_calls"] = serde_json::Value::Array(tool_calls);
-                }
-                openai_messages.push(message_json);
-            } else if msg.role == "function" {
-                for part in &msg.parts {
-                    if let Some(fr) = &part.function_response {
-                        openai_messages.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": fr.id.clone().unwrap_or_else(|| "unknown".to_string()),
-                            "content": fr.response.to_string()
-                        }));
-                    }
-                }
-            }
-        }
-
-        let mut body = serde_json::json!({
-            "model": self.model_name,
-            "messages": openai_messages,
-        });
-
-        if let Some(effort) = &self.reasoning_effort {
-            body["reasoning_effort"] = serde_json::Value::String(effort.clone());
-        }
-
-        let body_json = serde_json::to_string(&body).unwrap_or_default();
-        tracing::info!(
-            "OpenAI generate_text request: url={}, body_size={} bytes",
-            self.base_url,
-            body_json.len()
-        );
-        tracing::debug!("OpenAI generate_text body: {}", truncate_log(&body_json));
-        let response = self
-            .client
-            .post(&self.base_url)
-            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Could not read error body".to_string());
-            let truncated_error = truncate_log_error(&error_text);
-            tracing::error!(
-                "OpenAI API Error: status={}, url={}, body={}",
-                status,
-                self.base_url,
-                truncated_error
-            );
-            return Err(LlmError::ApiError(format!(
-                "OpenAI API status={}: {}",
-                status, truncated_error
-            )));
-        }
-
-        let resp_json: Value = response.json().await?;
-        let text = resp_json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        tracing::info!("OpenAI Response: {}", truncate_log(&text));
-        Ok(text)
-    }
-
     async fn stream(
         &self,
         messages: Vec<Message>,
@@ -537,16 +414,128 @@ impl LlmClient for OpenAiCompatClient {
         });
         Ok(rx)
     }
+}
 
-    async fn generate_structured(
+#[cfg(test)]
+impl OpenAiCompatClient {
+    async fn generate_text(
         &self,
-        _messages: Vec<Message>,
-        _system_instruction: Option<Message>,
-        _response_schema: Value,
-    ) -> Result<Value, LlmError> {
-        Err(LlmError::ApiError(
-            "Structured output not yet implemented for OpenAI Compat".to_string(),
-        ))
+        messages: Vec<Message>,
+        system_instruction: Option<Message>,
+    ) -> Result<String, LlmError> {
+        let mut openai_messages = Vec::new();
+        if let Some(sys) = system_instruction {
+            openai_messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys.parts[0].text.as_deref().unwrap_or("")
+            }));
+        }
+        for msg in messages {
+            if msg.role == "user" {
+                openai_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": msg.parts[0].text.as_deref().unwrap_or("")
+                }));
+            } else if msg.role == "model" {
+                let text = msg
+                    .parts
+                    .iter()
+                    .find_map(|p| p.text.as_deref())
+                    .unwrap_or("");
+                let mut tool_calls = Vec::new();
+                for part in &msg.parts {
+                    if let Some(fc) = &part.function_call {
+                        let call_id = fc
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4().simple()));
+                        tool_calls.push(serde_json::json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": fc.name,
+                                "arguments": fc.args.to_string()
+                            }
+                        }));
+                    }
+                }
+
+                let mut message_json = serde_json::json!({
+                    "role": "assistant"
+                });
+
+                if !text.is_empty() {
+                    message_json["content"] = serde_json::Value::String(text.to_string());
+                }
+
+                if !tool_calls.is_empty() {
+                    message_json["tool_calls"] = serde_json::Value::Array(tool_calls);
+                }
+                openai_messages.push(message_json);
+            } else if msg.role == "function" {
+                for part in &msg.parts {
+                    if let Some(fr) = &part.function_response {
+                        openai_messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": fr.id.clone().unwrap_or_else(|| "unknown".to_string()),
+                            "content": fr.response.to_string()
+                        }));
+                    }
+                }
+            }
+        }
+
+        let mut body = serde_json::json!({
+            "model": self.model_name,
+            "messages": openai_messages,
+        });
+
+        if let Some(effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = serde_json::Value::String(effort.clone());
+        }
+
+        let body_json = serde_json::to_string(&body).unwrap_or_default();
+        tracing::info!(
+            "OpenAI generate_text request: url={}, body_size={} bytes",
+            self.base_url,
+            body_json.len()
+        );
+        tracing::debug!("OpenAI generate_text body: {}", truncate_log(&body_json));
+        let response = self
+            .client
+            .post(&self.base_url)
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Could not read error body".to_string());
+            let truncated_error = truncate_log_error(&error_text);
+            tracing::error!(
+                "OpenAI API Error: status={}, url={}, body={}",
+                status,
+                self.base_url,
+                truncated_error
+            );
+            return Err(LlmError::ApiError(format!(
+                "OpenAI API error ({}): {}",
+                status, truncated_error
+            )));
+        }
+
+        let response_text = response.text().await?;
+        let response_json: Value = serde_json::from_str(&response_text)?;
+        let text = response_json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        Ok(text)
     }
 }
 

@@ -1,4 +1,3 @@
-use serde_json::Value;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
 use tracing::{info, span, Level};
@@ -15,8 +14,6 @@ pub struct TelemetryExporter {
 enum TelemetryMessage {
     SpanStart(String, CorrelationIds, u64),
     SpanEnd(String, u64),
-    MetricIncr(String, u64),
-    Log(String, CorrelationIds, Value),
 }
 
 impl TelemetryExporter {
@@ -44,15 +41,6 @@ impl TelemetryExporter {
                     TelemetryMessage::SpanEnd(name, ts) => {
                         info!("SpanEnded: {} at {}", name, ts);
                     }
-                    TelemetryMessage::MetricIncr(name, val) => {
-                        info!("Metric: {} += {}", name, val);
-                    }
-                    TelemetryMessage::Log(msg, ids, payload) => {
-                        info!(
-                            session_id = %ids.session_id,
-                            "Log: {} - Payload: {}", msg, payload
-                        );
-                    }
                 }
             }
         });
@@ -79,17 +67,5 @@ impl TelemetryExporter {
         let _ = self
             .sender
             .try_send(TelemetryMessage::SpanEnd(name.to_string(), Self::now()));
-    }
-
-    pub fn increment_metric(&self, name: &str, value: u64) {
-        let _ = self
-            .sender
-            .try_send(TelemetryMessage::MetricIncr(name.to_string(), value));
-    }
-
-    pub fn record_log(&self, message: &str, ids: CorrelationIds, payload: Value) {
-        let _ = self
-            .sender
-            .try_send(TelemetryMessage::Log(message.to_string(), ids, payload));
     }
 }

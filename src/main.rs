@@ -1,8 +1,10 @@
 #[cfg(feature = "acp")]
 mod acp;
 mod app;
+#[cfg(test)]
 mod browser;
 mod context_assembler;
+#[cfg(test)]
 mod event_log;
 mod evidence;
 mod lsp;
@@ -536,14 +538,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("\n  {}", style("Turn Limit Reached").yellow());
                     println!("  The agent reached the maximum allowed consecutive actions.");
                     println!("  👉 Action required: Review recent actions. If on track, type {} to proceed.", style("continue").green());
-                }
-                RunExit::ContextLimitReached => {
-                    println!("\n  {}", style("Context Limit Reached").red());
-                    println!("  The context window size is exceeding the model's limit.");
-                    println!(
-                        "  👉 Action required: Wait for compaction or use {} to start fresh.",
-                        style("/new").green()
-                    );
                 }
                 RunExit::RecoverableFailed(ref msg) => {
                     println!("\n  {} Recoverable Failure: {}", style("⚠").yellow(), msg);

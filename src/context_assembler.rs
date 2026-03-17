@@ -21,12 +21,10 @@ pub enum CandidateKind {
     TaskStateSummary,
     Evidence(String),    // Evidence ID
     VolatileTurn(usize), // Turn Index
-    RunContext,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct AssemblyReport {
-    pub max_tokens: usize,
     pub used_tokens: usize,
     pub stable_tokens: usize,
     pub volatile_tokens: usize,
@@ -54,10 +52,7 @@ impl ContextAssembler {
         mut active_evidence: Vec<Evidence>,
         transcript_tail: Vec<String>,
     ) -> (String, AssemblyReport) {
-        let mut report = AssemblyReport {
-            max_tokens: self.budget,
-            ..Default::default()
-        };
+        let mut report = AssemblyReport::default();
         let mut candidates = Vec::new();
 
         // Layer 0: System and Rules (Most Stable, High Priority)

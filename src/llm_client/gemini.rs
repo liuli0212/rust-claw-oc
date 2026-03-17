@@ -11,7 +11,6 @@ use tokio::sync::Mutex;
 
 use super::gemini_context;
 use super::protocol::{create_standard_client, GeminiPlatform, LlmClient, LlmError, StreamEvent};
-use crate::utils::{truncate_log, truncate_log_error};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GeminiRequest {
@@ -156,95 +155,6 @@ impl LlmClient for GeminiClient {
     fn provider_name(&self) -> &str {
         &self.provider_name
     }
-
-    fn context_window_size(&self) -> usize {
-        self.context_window
-    }
-
-    async fn generate_text(
-        &self,
-        messages: Vec<Message>,
-        system_instruction: Option<Message>,
-    ) -> Result<String, LlmError> {
-        let mut messages = messages;
-        let mut system_instruction = system_instruction;
-        self.dehydrate_messages(&mut messages).await?;
-        if let Some(ref mut sys_msg) = system_instruction {
-            self.dehydrate_message(sys_msg).await?;
-        }
-
-        let cached_content_id = gemini_context::resolve_cached_content(
-            &self.client,
-            &self.api_key,
-            &self.model_name,
-            &self.cached_content,
-            &system_instruction,
-            "system instruction",
-        )
-        .await;
-        let final_system_instruction =
-            gemini_context::final_system_instruction(&system_instruction, &cached_content_id);
-        let generation_config = gemini_context::text_generation_config(&self.model_name);
-
-        let req_body = GeminiRequest {
-            contents: messages,
-            system_instruction: final_system_instruction,
-            tools: None,
-            tool_config: None,
-            generation_config: generation_config.clone(),
-            cached_content: cached_content_id,
-        };
-
-        let req_body_json = serde_json::to_string(&req_body).unwrap_or_default();
-        let url = gemini_context::request_url(self.platform, &self.model_name, false);
-
-        tracing::info!(
-            "Gemini generate_text request: url={}, body_size={} bytes",
-            url,
-            req_body_json.len()
-        );
-        tracing::debug!(
-            "Gemini generate_text body: {}",
-            truncate_log(&req_body_json)
-        );
-
-        let response = gemini_context::send_generate_request(
-            &self.client,
-            &self.api_key,
-            self.platform,
-            &url,
-            &req_body,
-            None,
-        )
-        .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Could not read error body".to_string());
-            let truncated_error = truncate_log_error(&error_text);
-            tracing::error!(
-                "Gemini API Error: status={}, body={}",
-                status,
-                truncated_error
-            );
-            return Err(LlmError::ApiError(format!(
-                "Gemini API status={}: {}",
-                status, truncated_error
-            )));
-        }
-
-        let resp_json: Value = response.json().await?;
-        let text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        tracing::info!("Gemini Response: {}", truncate_log(&text));
-        Ok(text)
-    }
-
     async fn stream(
         &self,
         messages: Vec<Message>,
@@ -361,67 +271,6 @@ impl LlmClient for GeminiClient {
         });
 
         Ok(rx)
-    }
-
-    async fn generate_structured(
-        &self,
-        messages: Vec<Message>,
-        system_instruction: Option<Message>,
-        response_schema: Value,
-    ) -> Result<Value, LlmError> {
-        let mut messages = messages;
-        let mut system_instruction = system_instruction;
-        self.dehydrate_messages(&mut messages).await?;
-        if let Some(ref mut sys_msg) = system_instruction {
-            self.dehydrate_message(sys_msg).await?;
-        }
-
-        let cached_content_id = gemini_context::resolve_cached_content(
-            &self.client,
-            &self.api_key,
-            &self.model_name,
-            &self.cached_content,
-            &system_instruction,
-            "structured output",
-        )
-        .await;
-        let final_system_instruction =
-            gemini_context::final_system_instruction(&system_instruction, &cached_content_id);
-
-        let generation_config = GenerationConfig {
-            temperature: Some(0.0),
-            max_output_tokens: Some(8192),
-            thinking_config: None,
-            response_mime_type: Some("application/json".to_string()),
-            response_schema: Some(response_schema),
-        };
-
-        let req_body = GeminiRequest {
-            contents: messages,
-            system_instruction: final_system_instruction,
-            tools: None,
-            tool_config: None,
-            generation_config: Some(generation_config),
-            cached_content: cached_content_id,
-        };
-
-        let url = gemini_context::request_url(self.platform, &self.model_name, false);
-
-        let response_json = gemini_context::generate_with_retry(
-            &self.client,
-            &self.api_key,
-            self.platform,
-            &url,
-            &req_body,
-        )
-        .await?;
-
-        let text = response_json["candidates"][0]["content"]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("{}");
-
-        let parsed: Value = serde_json::from_str(text)?;
-        Ok(parsed)
     }
 }
 

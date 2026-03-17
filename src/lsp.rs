@@ -173,7 +173,6 @@ impl LspClient {
         let root_uri = Url::from_directory_path(&root_dir).map_err(|_| "Invalid root path")?;
         let params = InitializeParams {
             process_id: Some(std::process::id()),
-            root_uri: None, // Deprecated
             capabilities: ClientCapabilities {
                 text_document: Some(lsp_types::TextDocumentClientCapabilities {
                     document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {

@@ -2,7 +2,6 @@ use crate::context::{FunctionCall, Message};
 use crate::tools::Tool;
 use async_trait::async_trait;
 use reqwest::Client;
-use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -30,13 +29,6 @@ pub enum StreamEvent {
 pub trait LlmClient: Send + Sync {
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
-    fn context_window_size(&self) -> usize;
-
-    async fn generate_text(
-        &self,
-        messages: Vec<Message>,
-        system_instruction: Option<Message>,
-    ) -> Result<String, LlmError>;
 
     async fn stream(
         &self,
@@ -44,13 +36,6 @@ pub trait LlmClient: Send + Sync {
         system_instruction: Option<Message>,
         tools: Vec<Arc<dyn Tool>>,
     ) -> Result<mpsc::Receiver<StreamEvent>, LlmError>;
-
-    async fn generate_structured(
-        &self,
-        messages: Vec<Message>,
-        system_instruction: Option<Message>,
-        response_schema: Value,
-    ) -> Result<Value, LlmError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

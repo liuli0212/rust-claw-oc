@@ -21,6 +21,7 @@ impl StoragePaths {
             .join(session_id)
     }
 
+    #[cfg(test)]
     pub fn events_file(session_id: &str) -> PathBuf {
         Self::session_dir(session_id).join("events.jsonl")
     }
@@ -29,6 +30,7 @@ impl StoragePaths {
         Self::session_dir(session_id).join("task_state.json")
     }
 
+    #[cfg(test)]
     pub fn artifacts_dir(session_id: &str, run_id: &str) -> PathBuf {
         PathBuf::from("rusty_claw")
             .join("artifacts")
@@ -36,6 +38,7 @@ impl StoragePaths {
             .join(run_id)
     }
 
+    #[cfg(test)]
     pub fn session_transcript_file(session_id: &str) -> PathBuf {
         Self::session_dir(session_id).join("transcript.json")
     }
