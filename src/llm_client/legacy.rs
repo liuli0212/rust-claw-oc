@@ -1,10 +1,9 @@
-use crate::context::{FunctionCall, Message};
+use crate::context::Message;
 use crate::tools::Tool;
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
-use serde::Serialize;
 use serde_json::Value;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -12,7 +11,9 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 use super::gemini::{
-    FunctionDeclaration, GeminiRequest, GenerationConfig, ThinkingConfig, ToolDeclarationWrapper,
+    capture_thought_signature, inline_schema_refs, normalize_schema_for_gemini,
+    parse_function_call_basic, to_vertex_message, FunctionDeclaration, GeminiRequest,
+    GenerationConfig, ThinkingConfig, ToolDeclarationWrapper, VertexGeminiRequest,
 };
 use super::protocol::{GeminiPlatform, LlmClient, LlmError, StreamEvent};
 use crate::utils::{format_full_error, truncate_log, truncate_log_error};
@@ -43,81 +44,6 @@ struct CachedFunctionDeclarations {
     signature: String,
     #[allow(dead_code)]
     declarations: Vec<FunctionDeclaration>,
-}
-
-// --- Vertex-compatible types (no 'id' field) ---
-
-#[derive(Debug, Serialize)]
-struct VertexFunctionCall {
-    name: String,
-    args: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct VertexFunctionResponse {
-    name: String,
-    response: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct VertexPart {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "functionCall")]
-    function_call: Option<VertexFunctionCall>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "functionResponse")]
-    function_response: Option<VertexFunctionResponse>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
-    pub thought_signature: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "fileData")]
-    pub file_data: Option<crate::context::FileData>,
-}
-
-#[derive(Debug, Serialize)]
-struct VertexMessage {
-    role: String,
-    parts: Vec<VertexPart>,
-}
-
-#[derive(Debug, Serialize)]
-struct VertexGeminiRequest {
-    contents: Vec<VertexMessage>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "systemInstruction")]
-    system_instruction: Option<VertexMessage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ToolDeclarationWrapper>>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
-    pub tool_config: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
-    pub generation_config: Option<GenerationConfig>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "cachedContent")]
-    pub cached_content: Option<String>,
-}
-
-fn to_vertex_message(msg: &Message) -> VertexMessage {
-    VertexMessage {
-        role: msg.role.clone(),
-        parts: msg
-            .parts
-            .iter()
-            .map(|p| VertexPart {
-                text: p.text.clone(),
-                function_call: p.function_call.as_ref().map(|fc| VertexFunctionCall {
-                    name: fc.name.clone(),
-                    args: fc.args.clone(),
-                }),
-                function_response: p
-                    .function_response
-                    .as_ref()
-                    .map(|fr| VertexFunctionResponse {
-                        name: fr.name.clone(),
-                        response: fr.response.clone(),
-                    }),
-                thought_signature: p.thought_signature.clone(),
-                file_data: p.file_data.clone(),
-            })
-            .collect(),
-    }
 }
 
 pub(super) fn create_standard_client(base_url: Option<&str>) -> Client {
@@ -1094,134 +1020,6 @@ impl LlmClient for GeminiClient {
 
         let parsed: Value = serde_json::from_str(text)?;
         Ok(parsed)
-    }
-}
-
-fn parse_function_call_basic(part: &Value) -> Option<FunctionCall> {
-    let func_call = part.get("functionCall")?;
-    let name = func_call.get("name")?.as_str()?.to_string();
-    let args = func_call.get("args")?.clone();
-    let id = func_call
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    Some(FunctionCall { name, args, id })
-}
-
-fn capture_thought_signature(part: &Value) -> Option<String> {
-    part.get("thoughtSignature")
-        .or_else(|| part.get("thought_signature"))
-        .and_then(|ts| ts.as_str())
-        .map(|s| s.to_string())
-}
-
-fn inline_schema_refs(value: &mut Value, root: &Value, depth: usize) {
-    if depth > 20 {
-        return; // safeguard against infinite recursion
-    }
-    match value {
-        Value::Object(map) => {
-            if let Some(Value::String(ref_path)) = map.get("$ref") {
-                let prefix1 = "#/$defs/";
-                let prefix2 = "#/definitions/";
-                let def_name = if ref_path.starts_with(prefix1) {
-                    Some(&ref_path[prefix1.len()..])
-                } else if ref_path.starts_with(prefix2) {
-                    Some(&ref_path[prefix2.len()..])
-                } else {
-                    None
-                };
-
-                if let Some(name) = def_name {
-                    let mut resolved = None;
-                    if let Some(defs) = root.get("$defs").and_then(|v| v.as_object()) {
-                        if let Some(def_val) = defs.get(name) {
-                            resolved = Some(def_val.clone());
-                        }
-                    }
-                    if resolved.is_none() {
-                        if let Some(defs) = root.get("definitions").and_then(|v| v.as_object()) {
-                            if let Some(def_val) = defs.get(name) {
-                                resolved = Some(def_val.clone());
-                            }
-                        }
-                    }
-
-                    if let Some(mut resolved_val) = resolved {
-                        inline_schema_refs(&mut resolved_val, root, depth + 1);
-                        if let Value::Object(resolved_map) = resolved_val {
-                            map.clear();
-                            for (k, v) in resolved_map {
-                                map.insert(k, v);
-                            }
-                        }
-                    }
-                }
-            } else {
-                for nested_val in map.values_mut() {
-                    inline_schema_refs(nested_val, root, depth + 1);
-                }
-            }
-        }
-        Value::Array(arr) => {
-            for nested_val in arr {
-                inline_schema_refs(nested_val, root, depth + 1);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn normalize_schema_for_gemini(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            map.remove("$schema");
-            map.remove("definitions");
-            map.remove("$defs");
-            map.remove("title");
-
-            if let Some(type_val) = map.get_mut("type") {
-                if let Value::Array(type_arr) = type_val {
-                    let chosen = type_arr
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .find(|t| *t != "null")
-                        .unwrap_or("string")
-                        .to_string();
-                    *type_val = Value::String(chosen);
-                }
-            }
-
-            for combiner in ["anyOf", "oneOf", "allOf"] {
-                if let Some(Value::Array(options)) = map.remove(combiner) {
-                    let mut replacement = options
-                        .into_iter()
-                        .find(|candidate| candidate.get("$ref").is_none())
-                        .unwrap_or(Value::Null);
-                    normalize_schema_for_gemini(&mut replacement);
-                    if let Value::Object(repl_map) = replacement {
-                        for (k, v) in repl_map {
-                            map.insert(k, v);
-                        }
-                    }
-                }
-            }
-
-            if map.remove("$ref").is_some() {
-                map.clear();
-                map.insert("type".to_string(), Value::String("string".to_string()));
-            }
-
-            for nested in map.values_mut() {
-                normalize_schema_for_gemini(nested);
-            }
-        }
-        Value::Array(arr) => {
-            for nested in arr {
-                normalize_schema_for_gemini(nested);
-            }
-        }
-        _ => {}
     }
 }
 
