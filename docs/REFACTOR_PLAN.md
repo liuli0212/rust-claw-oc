@@ -496,3 +496,4 @@ Follow-up decomposition completed so far:
 - [x] extracted Gemini request/declaration types into `src/llm_client/gemini.rs`
 - [x] extracted OpenAI-compatible client implementation into `src/llm_client/openai_compat.rs`
 - [x] extracted Gemini vertex request/schema helpers into `src/llm_client/gemini.rs`
+- [x] narrowed `src/context/mod.rs` to selective facade re-exports and removed stale bridge imports from `src/context/legacy.rs`

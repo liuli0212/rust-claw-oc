@@ -1,12 +1,10 @@
 use super::history::{ContextDiff, ContextSnapshot};
-use super::model::{FileData, FunctionCall, FunctionResponse, Message, Part, Turn};
+use super::model::{FunctionResponse, Message, Part, Turn};
 use super::prompt::{self, DetailedContextStats, PromptReport};
 use super::{report, transcript};
-use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::fs;
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tiktoken_rs::CoreBPE;
 
 pub struct AgentContext {
