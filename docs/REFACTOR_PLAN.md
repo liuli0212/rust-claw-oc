@@ -504,3 +504,4 @@ Follow-up decomposition completed so far:
 - [x] extracted token and truncation helpers from `src/context/legacy.rs` into `src/context/token.rs`
 - [x] extracted Gemini request URL selection and Vertex request serialization from `src/llm_client/legacy.rs`
 - [x] moved transcript context loading/appending and shared BPE access out of `src/context/legacy.rs`
+- [x] moved `AgentContext` implementation into `src/context/agent_context.rs` and reduced `src/context/legacy.rs` to a compatibility shim
