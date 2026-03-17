@@ -160,3 +160,150 @@ fn build_prompt_section(title: &str, content: String, max_chars: usize) -> Optio
     let truncated = AgentContext::truncate_chars(trimmed, max_chars);
     Some(format!("## {title}\n{truncated}\n"))
 }
+
+pub(crate) fn build_llm_payload(
+    ctx: &AgentContext,
+    task_state: &crate::task_state::TaskStateSnapshot,
+    assembler: &crate::context_assembler::ContextAssembler,
+) -> (
+    Vec<super::model::Message>,
+    Option<super::model::Message>,
+    PromptReport,
+) {
+    let bpe = tiktoken_rs::cl100k_base().unwrap();
+    let (mut messages, history_tokens_used, history_turns_included, _) =
+        ctx.build_history_with_budget();
+    let mut current_turn_tokens = 0;
+    if let Some(turn) = &ctx.current_turn {
+        if let Some(sanitized_turn) = super::history::sanitize_turn(turn) {
+            let separator = super::model::Message {
+                role: "user".to_string(),
+                parts: vec![super::model::Part {
+                    text: Some("--- [CURRENT TASK] ---".to_string()),
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None,
+                    file_data: None,
+                }],
+            };
+            current_turn_tokens += AgentContext::estimate_tokens(&bpe, &separator);
+            messages.push(separator);
+
+            current_turn_tokens += sanitized_turn
+                .messages
+                .iter()
+                .map(|m| AgentContext::estimate_tokens(&bpe, m))
+                .sum::<usize>();
+            messages.extend(sanitized_turn.messages);
+        }
+    }
+
+    let mut system_static = Vec::new();
+    system_static.push(ctx.system_prompts.join(
+        "
+
+",
+    ));
+
+    let mut runtime = format!(
+        "OS: {}
+Architecture: {}
+",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    if let Ok(dir) = std::env::current_dir() {
+        runtime.push_str(&format!(
+            "Current Directory: {}
+",
+            dir.display()
+        ));
+    }
+    system_static.push(format!(
+        "## Runtime Environment
+{}",
+        runtime
+    ));
+
+    if let Ok(custom) = fs::read_to_string(".claw_prompt.md") {
+        system_static.push(format!(
+            "## Custom Instructions
+{}",
+            custom
+        ));
+    }
+
+    let mut project_context = String::new();
+    if let Ok(content) = fs::read_to_string("AGENTS.md") {
+        project_context.push_str(
+            "### AGENTS.md
+",
+        );
+        project_context.push_str(&AgentContext::truncate_chars(&content, 3_000));
+        project_context.push_str(
+            "
+
+",
+        );
+    }
+    system_static.push(format!(
+        "## Project Context
+{}",
+        project_context
+    ));
+
+    let durable_memory = fs::read_to_string("MEMORY.md").ok();
+
+    let mut active_evidence = ctx.active_evidence.clone();
+    if let Some(mem) = &ctx.retrieved_memory {
+        active_evidence.push(crate::evidence::Evidence::new(
+            "legacy_rag".into(),
+            "memory".into(),
+            "retrieved".into(),
+            1.0,
+            "Retrieved memory snippets".into(),
+            mem.clone(),
+        ));
+    }
+
+    let (assembled_system_text, report_data) = assembler.assemble_prompt(
+        &system_static.join(
+            "
+
+",
+        ),
+        "",
+        durable_memory.as_deref(),
+        task_state,
+        active_evidence,
+        Vec::new(),
+    );
+
+    let system_msg = super::model::Message {
+        role: "system".to_string(),
+        parts: vec![super::model::Part {
+            thought_signature: None,
+            text: Some(assembled_system_text),
+            function_call: None,
+            function_response: None,
+            file_data: None,
+        }],
+    };
+
+    let system_prompt_tokens = report_data.used_tokens;
+    let retrieved_memory_snippets = ctx.retrieved_memory_sources.len();
+
+    let report = PromptReport {
+        max_history_tokens: ctx.max_history_tokens,
+        history_tokens_used,
+        history_turns_included,
+        current_turn_tokens,
+        system_prompt_tokens,
+        total_prompt_tokens: history_tokens_used + current_turn_tokens + system_prompt_tokens,
+        retrieved_memory_snippets,
+        retrieved_memory_sources: ctx.retrieved_memory_sources.clone(),
+        detailed_stats: ctx.get_detailed_stats(None),
+    };
+
+    (messages, Some(system_msg), report)
+}
