@@ -151,7 +151,7 @@ impl AgentContext {
         transcript::append_turn(self.transcript_path.as_deref(), turn)
     }
 
-    fn estimate_tokens(bpe: &CoreBPE, msg: &Message) -> usize {
+    pub(crate) fn estimate_tokens(bpe: &CoreBPE, msg: &Message) -> usize {
         let mut count = 0;
         for part in &msg.parts {
             if let Some(text) = &part.text {
@@ -182,504 +182,8 @@ impl AgentContext {
         prompt::build_system_prompt(self)
     }
 
-    fn sanitize_message(msg: &Message) -> Option<Message> {
-        let role = msg.role.as_str();
-        if role != "user" && role != "model" && role != "function" {
-            return None;
-        }
-
-        let mut cleaned_parts = Vec::new();
-        for part in &msg.parts {
-            let mut cleaned = part.clone();
-
-            if role == "function" {
-                cleaned.text = None;
-                cleaned.function_call = None;
-            }
-
-            let has_content = cleaned
-                .text
-                .as_ref()
-                .map(|t| !t.trim().is_empty())
-                .unwrap_or(false)
-                || cleaned.function_call.is_some()
-                || cleaned.function_response.is_some();
-            if !has_content {
-                continue;
-            }
-
-            cleaned_parts.push(cleaned);
-        }
-
-        if cleaned_parts.is_empty() {
-            return None;
-        }
-
-        Some(Message {
-            role: msg.role.clone(),
-            parts: cleaned_parts,
-        })
-    }
-
-    fn sanitize_turn(turn: &Turn) -> Option<Turn> {
-        let mut messages = Vec::new();
-        for msg in &turn.messages {
-            if let Some(cleaned) = Self::sanitize_message(msg) {
-                messages.push(cleaned);
-            }
-        }
-        if messages.is_empty() {
-            return None;
-        }
-        Some(Turn {
-            turn_id: turn.turn_id.clone(),
-            user_message: turn.user_message.clone(),
-            messages,
-        })
-    }
-
-    fn truncate_old_tool_results(turn: &Turn) -> (Turn, usize) {
-        let mut cloned = turn.clone();
-        for msg in &mut cloned.messages {
-            for part in &mut msg.parts {
-                part.thought_signature = None; // Strip for history items to save tokens
-                if let Some(fr) = &mut part.function_response {
-                    // Smart truncation: Try to truncate the "result" field inside the JSON first
-                    let mut truncated_in_place = false;
-
-                    // We need to work with the value as a mutable object if possible
-                    if let Some(obj) = fr.response.as_object_mut() {
-                        if let Some(val) = obj.get_mut("result") {
-                            // Case 1: result is a String (common for read_file, execute_bash)
-                            if let Some(s) = val.as_str() {
-                                // TIERED CONTEXT STRATEGY:
-                                // History items are compressed to 12,000 chars (Head 6k + Tail 6k).
-                                // This retains context & errors while saving tokens.
-                                if s.len() > 12_000 {
-                                    let char_count = s.chars().count();
-                                    if char_count > 12_000 {
-                                        let keep = 6_000;
-                                        let head: String = s.chars().take(keep).collect();
-                                        let tail: String =
-                                            s.chars().skip(char_count - keep).collect();
-
-                                        *val = serde_json::Value::String(format!(
-                                            "{}\n... [History Compressed: {} chars hidden] ...\n{}",
-                                            head,
-                                            char_count - 12_000,
-                                            tail
-                                        ));
-                                        truncated_in_place = true;
-                                    }
-                                }
-                            }
-                            // Case 2: result is a large object
-                            else if val.to_string().len() > 12_000 {
-                                let s = val.to_string();
-                                let char_count = s.chars().count();
-                                if char_count > 12_000 {
-                                    let head: String = s.chars().take(4_000).collect();
-                                    *val = serde_json::Value::String(format!(
-                                        "{}\n... [History Object Compressed] ...",
-                                        head
-                                    ));
-                                    truncated_in_place = true;
-                                }
-                            }
-                        }
-                    }
-
-                    // Fallback safety cap
-                    if !truncated_in_place {
-                        let response_str = fr.response.to_string();
-                        if response_str.len() > 20_000 {
-                            let head: String = response_str.chars().take(2_000).collect();
-                            fr.response = serde_json::json!({
-                                "result": format!("{}\n... [Truncated massive object] ...", head),
-                                "original_chars": response_str.len()
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        (cloned, 0)
-    }
-
-    fn is_user_referencing_history(msg: &str) -> bool {
-        let lower = msg.to_lowercase();
-        let keywords = [
-            // English
-            "previous command",
-            "last command",
-            "previous output",
-            "last output",
-            "what did it say",
-            "fix the error",
-            "look above",
-            "check the error",
-            "what was the error",
-            "show me the output",
-            "full output",
-            // Chinese (P1-1.5 fix)
-            "上次",
-            "之前",
-            "刚才",
-            "前面",
-            "上面",
-            "修复错误",
-            "看看输出",
-            "检查错误",
-            "什么错误",
-            "历史",
-            "回顾",
-            "重新看",
-        ];
-        keywords.iter().any(|k| lower.contains(k))
-    }
-
-    pub(crate) fn strip_thinking_tags(text: &str) -> String {
-        let mut result = text.to_string();
-        while let Some(start) = result.find("<think>") {
-            if let Some(end_offset) = result[start..].find("</think>") {
-                let end = start + end_offset;
-                let before = &result[..start];
-                let after = &result[end + 8..]; // 8 is len of </think>
-                result = format!("{}{}", before, after);
-            } else {
-                // If there's an unclosed <think> tag, just strip from <think> to the end of the string
-                // and break, otherwise we have an infinite loop!
-                result = result[..start].to_string();
-                break;
-            }
-        }
-        result.trim().to_string()
-    }
-
-    pub fn strip_response_payload(fr: &mut FunctionResponse) {
-        // All tool results from core.rs are wrapped as: { "result": "{...serialized ToolExecutionEnvelope...}" }
-        // We unwrap the envelope, strip per-tool, remove noise fields, and re-serialize.
-        let obj = match fr.response.as_object_mut() {
-            Some(o) => o,
-            None => return,
-        };
-        let result_val = match obj.get_mut("result") {
-            Some(v) => v,
-            None => return,
-        };
-        let result_str = match result_val.as_str() {
-            Some(s) => s.to_string(),
-            None => return,
-        };
-
-        // Try to parse the inner envelope JSON
-        let mut envelope: serde_json::Value = match serde_json::from_str(&result_str) {
-            Ok(v) => v,
-            Err(_) => {
-                // Not valid JSON — just truncate the raw string
-                if result_str.len() > 500 {
-                    let head: String = result_str.chars().take(200).collect();
-                    *result_val = serde_json::Value::String(format!(
-                        "{}\n... [stripped {} chars]",
-                        head,
-                        result_str.len()
-                    ));
-                }
-                return;
-            }
-        };
-
-        let env_obj = match envelope.as_object_mut() {
-            Some(o) => o,
-            None => return,
-        };
-
-        match fr.name.as_str() {
-            "task_plan" => {
-                // Plan is always in system prompt; replace entire result
-                *result_val = serde_json::Value::String("[plan updated]".to_string());
-                return;
-            }
-            "read_file" => {
-                if let Some(output) = env_obj.get_mut("output") {
-                    if let Some(s) = output.as_str() {
-                        let line_count = s.lines().count();
-                        if line_count > 10 {
-                            let head: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
-                            let tail: String = s
-                                .lines()
-                                .rev()
-                                .take(5)
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .rev()
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            *output = serde_json::Value::String(format!(
-                                "{}\n... [stripped {} lines] ...\n{}",
-                                head, line_count, tail
-                            ));
-                        }
-                    }
-                }
-            }
-            "execute_bash" => {
-                if let Some(output) = env_obj.get_mut("output") {
-                    if let Some(s) = output.as_str() {
-                        let char_count = s.chars().count();
-                        if char_count > 500 {
-                            let head: String = s.chars().take(200).collect();
-                            let tail: String = s.chars().skip(char_count - 200).collect();
-                            *output = serde_json::Value::String(format!(
-                                "{}\n... [stripped {} chars] ...\n{}",
-                                head, char_count, tail
-                            ));
-                        }
-                    }
-                }
-            }
-            "web_fetch" | "web_search_tavily" => {
-                if let Some(output) = env_obj.get_mut("output") {
-                    if let Some(s) = output.as_str() {
-                        *output = serde_json::Value::String(format!(
-                            "[web content stripped - {} chars]",
-                            s.len()
-                        ));
-                    }
-                }
-            }
-            "skill" | "use_skill" => {
-                if let Some(output) = env_obj.get_mut("output") {
-                    *output = serde_json::Value::String("Skill loaded.".to_string());
-                }
-            }
-            "write_file" | "patch_file" => {
-                // Already small, keep as-is
-            }
-            _ => {
-                // Generic: truncate output if large
-                if let Some(output) = env_obj.get_mut("output") {
-                    if let Some(s) = output.as_str() {
-                        if s.len() > 500 {
-                            let head: String = s.chars().take(200).collect();
-                            let tail: String = s.chars().skip(s.chars().count() - 100).collect();
-                            *output = serde_json::Value::String(format!(
-                                "{}\n... [stripped {} chars] ...\n{}",
-                                head,
-                                s.len(),
-                                tail
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Strip noise fields from envelope to save tokens
-        env_obj.remove("duration_ms");
-        env_obj.remove("truncated");
-        env_obj.remove("recovery_attempted");
-        env_obj.remove("recovery_output");
-        env_obj.remove("recovery_rule");
-
-        // Re-serialize the stripped envelope back
-        if let Ok(stripped_str) = serde_json::to_string(env_obj) {
-            *result_val = serde_json::Value::String(stripped_str);
-        }
-    }
-
-    fn reconstruct_turn_for_history(turn: &Turn) -> (Turn, usize) {
-        let mut new_messages = Vec::new();
-
-        for msg in &turn.messages {
-            let mut new_parts = Vec::new();
-
-            for part in &msg.parts {
-                let mut new_part = Part {
-                    text: None,
-                    function_call: None,
-                    function_response: None,
-                    thought_signature: None, // Strip for history — Gemini only validates current turn
-                    file_data: None,
-                };
-
-                // 1. Function Call (Action) - KEEP (but strip task_plan args)
-                if let Some(fc) = &part.function_call {
-                    if fc.name == "task_plan" {
-                        // For task_plan, only keep the action to save tokens
-                        let action = fc
-                            .args
-                            .get("action")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let mut stripped_fc = fc.clone();
-                        stripped_fc.args = serde_json::json!({ "action": action });
-                        new_part.function_call = Some(stripped_fc);
-                    } else {
-                        new_part.function_call = Some(fc.clone());
-                    }
-                }
-
-                // 2. Function Response (Result) - KEEP (Stripped)
-                if let Some(fr) = &part.function_response {
-                    let mut stripped_fr = fr.clone();
-                    Self::strip_response_payload(&mut stripped_fr);
-                    new_part.function_response = Some(stripped_fr);
-                }
-
-                // 3. Text (Intent/Reply) - SELECTIVE KEEP
-                if let Some(text) = &part.text {
-                    if msg.role == "user" {
-                        // User text: Keep, but clean system tags
-                        let mut cleaned_text = text.clone();
-                        let markers = [
-                            "[CURRENT TASK]",
-                            "--- [RECENT CONTEXT] ---",
-                            "--- [EARLIER HISTORY] ---",
-                        ];
-                        for marker in markers {
-                            if cleaned_text.contains(marker) {
-                                cleaned_text = cleaned_text.replace(marker, "").trim().to_string();
-                            }
-                        }
-                        new_part.text = Some(cleaned_text);
-                    } else if msg.role == "model" {
-                        // Model text: Only keep if NO function call, and strip <think>
-                        if new_part.function_call.is_none() {
-                            let cleaned = Self::strip_thinking_tags(text);
-                            if !cleaned.is_empty() {
-                                new_part.text = Some(cleaned);
-                            }
-                        }
-                    }
-                }
-
-                // Only add part if it has content
-                if new_part.text.is_some()
-                    || new_part.function_call.is_some()
-                    || new_part.function_response.is_some()
-                {
-                    new_parts.push(new_part);
-                }
-            }
-
-            if !new_parts.is_empty() {
-                new_messages.push(Message {
-                    role: msg.role.clone(),
-                    parts: new_parts,
-                });
-            }
-        }
-
-        (
-            Turn {
-                turn_id: turn.turn_id.clone(),
-                user_message: turn.user_message.clone(),
-                messages: new_messages,
-            },
-            0,
-        )
-    }
-
     pub(crate) fn build_history_with_budget(&self) -> (Vec<Message>, usize, usize, usize) {
-        let bpe = tiktoken_rs::cl100k_base().unwrap();
-        let history_budget = self.max_history_tokens.saturating_mul(85) / 100;
-        // Each entry: (distance_index, messages)
-        let mut history_blocks: Vec<(usize, Vec<Message>)> = Vec::new();
-        let mut current_tokens = 0;
-        let mut turns_included = 0;
-        let mut total_truncated_chars = 0;
-
-        let mut protect_next_turn = false;
-
-        for (i, turn) in self.dialogue_history.iter().rev().enumerate() {
-            let sanitized = match Self::sanitize_turn(turn) {
-                Some(v) => v,
-                None => continue,
-            };
-
-            // Heuristic: If this turn asks about history, protect the *next* turn we process (which is the older one)
-            // Limit heuristic protection to recent 10 turns to avoid noise in deep history
-            let user_asks_for_context =
-                i < 10 && Self::is_user_referencing_history(&turn.user_message);
-
-            // Context Optimization:
-            // 1. Safety Buffer (Hot State): Keep last 3 turns in Full Fidelity.
-            // 2. Heuristic Protection: If user asked "what did it say?", keep the older turn full.
-            // 3. History (Cool State): Otherwise, apply Smart Stripping.
-            let should_strip = i >= 3 && !protect_next_turn;
-
-            let (turn, truncated) = if should_strip {
-                Self::reconstruct_turn_for_history(&sanitized)
-            } else {
-                Self::truncate_old_tool_results(&sanitized)
-            };
-            total_truncated_chars += truncated;
-
-            protect_next_turn = user_asks_for_context;
-
-            let turn_tokens: usize = turn
-                .messages
-                .iter()
-                .map(|m| Self::estimate_tokens(&bpe, m))
-                .sum();
-
-            if current_tokens + turn_tokens > history_budget {
-                break;
-            }
-            current_tokens += turn_tokens;
-            history_blocks.push((i, turn.messages));
-            turns_included += 1;
-        }
-
-        history_blocks.reverse();
-
-        // Inject zone separator labels based on turn distance.
-        // Hot Zone (distance < 3): no label
-        // Warm Zone (3 <= distance < 10): "--- [RECENT CONTEXT] ---"
-        // Cold Zone (distance >= 10): "--- [EARLIER HISTORY] ---"
-        let mut flattened = Vec::new();
-        let mut prev_zone: Option<u8> = None; // 0=cold, 1=warm, 2=hot
-
-        for (distance, block) in &history_blocks {
-            let zone = if *distance >= 10 {
-                0u8 // cold
-            } else if *distance >= 3 {
-                1u8 // warm
-            } else {
-                2u8 // hot
-            };
-
-            // Insert a zone separator when transitioning between zones
-            if prev_zone.is_none() || prev_zone != Some(zone) {
-                let label = match zone {
-                    0 => Some("--- [EARLIER HISTORY] ---"),
-                    1 => Some("--- [RECENT CONTEXT] ---"),
-                    _ => None, // Hot zone: no label
-                };
-                if let Some(label_text) = label {
-                    flattened.push(Message {
-                        role: "user".to_string(),
-                        parts: vec![Part {
-                            text: Some(label_text.to_string()),
-                            function_call: None,
-                            function_response: None,
-                            thought_signature: None,
-                            file_data: None,
-                        }],
-                    });
-                }
-            }
-            prev_zone = Some(zone);
-            flattened.extend(block.clone());
-        }
-
-        (
-            flattened,
-            current_tokens,
-            turns_included,
-            total_truncated_chars,
-        )
+        super::history::build_history_with_budget(self)
     }
 
     pub(crate) fn turn_token_estimate(turn: &Turn, bpe: &CoreBPE) -> usize {
@@ -739,44 +243,7 @@ impl AgentContext {
     }
 
     pub fn truncate_current_turn_tool_results(&mut self, max_chars: usize) -> usize {
-        let mut truncated_parts = 0usize;
-        let Some(turn) = &mut self.current_turn else {
-            return 0;
-        };
-
-        for msg in &mut turn.messages {
-            if msg.role != "function" {
-                continue;
-            }
-            for part in &mut msg.parts {
-                let Some(fr) = &mut part.function_response else {
-                    continue;
-                };
-                let response_str = fr.response.to_string();
-                let char_count = response_str.chars().count();
-
-                if char_count <= max_chars {
-                    continue;
-                }
-
-                let keep_half = max_chars / 2;
-                let head: String = response_str.chars().take(keep_half).collect();
-                let tail: String = response_str.chars().skip(char_count - keep_half).collect();
-
-                fr.response = serde_json::json!({
-                    "result": format!(
-                        "{}\n... [Truncated by context recovery: {} chars hidden] ...\n{}",
-                        head,
-                        char_count - max_chars,
-                        tail
-                    ),
-                    "original_chars": char_count
-                });
-                truncated_parts += 1;
-            }
-        }
-
-        truncated_parts
+        super::history::truncate_current_turn_tool_results(self, max_chars)
     }
 
     pub fn end_turn(&mut self) {
@@ -798,7 +265,7 @@ impl AgentContext {
             self.build_history_with_budget();
         let mut current_turn_tokens = 0;
         if let Some(turn) = &self.current_turn {
-            if let Some(sanitized_turn) = Self::sanitize_turn(turn) {
+            if let Some(sanitized_turn) = super::history::sanitize_turn(turn) {
                 // Self-Adaptive Context (SAC): Inject [CURRENT TASK] separator
                 // so the LLM can clearly distinguish the active goal from historical background.
                 let separator = Message {
@@ -908,6 +375,144 @@ impl AgentContext {
 
     pub fn inspect_context(&self, section: &str, arg: Option<&str>) -> String {
         report::inspect_context_section(self, section, arg)
+    }
+
+    pub(crate) fn strip_thinking_tags(text: &str) -> String {
+        let mut result = text.to_string();
+        while let Some(start) = result.find("<think>") {
+            if let Some(end_offset) = result[start..].find("</think>") {
+                let end = start + end_offset;
+                let before = &result[..start];
+                let after = &result[end + 8..];
+                result = format!("{}{}", before, after);
+            } else {
+                result = result[..start].to_string();
+                break;
+            }
+        }
+        result.trim().to_string()
+    }
+
+    pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
+        let obj = match fr.response.as_object_mut() {
+            Some(o) => o,
+            None => return,
+        };
+        let result_val = match obj.get_mut("result") {
+            Some(v) => v,
+            None => return,
+        };
+        let result_str = match result_val.as_str() {
+            Some(s) => s.to_string(),
+            None => return,
+        };
+
+        let mut envelope: serde_json::Value = match serde_json::from_str(&result_str) {
+            Ok(v) => v,
+            Err(_) => {
+                if result_str.len() > 500 {
+                    let head: String = result_str.chars().take(200).collect();
+                    *result_val = serde_json::Value::String(format!(
+                        "{}\n... [stripped {} chars]",
+                        head,
+                        result_str.len()
+                    ));
+                }
+                return;
+            }
+        };
+
+        let env_obj = match envelope.as_object_mut() {
+            Some(o) => o,
+            None => return,
+        };
+
+        match fr.name.as_str() {
+            "task_plan" => {
+                *result_val = serde_json::Value::String("[plan updated]".to_string());
+                return;
+            }
+            "read_file" => {
+                if let Some(output) = env_obj.get_mut("output") {
+                    if let Some(s) = output.as_str() {
+                        let line_count = s.lines().count();
+                        if line_count > 10 {
+                            let head: String = s.lines().take(5).collect::<Vec<_>>().join("\n");
+                            let tail: String = s
+                                .lines()
+                                .rev()
+                                .take(5)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            *output = serde_json::Value::String(format!(
+                                "{}\n... [stripped {} lines] ...\n{}",
+                                head, line_count, tail
+                            ));
+                        }
+                    }
+                }
+            }
+            "execute_bash" => {
+                if let Some(output) = env_obj.get_mut("output") {
+                    if let Some(s) = output.as_str() {
+                        let char_count = s.chars().count();
+                        if char_count > 500 {
+                            let head: String = s.chars().take(200).collect();
+                            let tail: String = s.chars().skip(char_count - 200).collect();
+                            *output = serde_json::Value::String(format!(
+                                "{}\n... [stripped {} chars] ...\n{}",
+                                head, char_count, tail
+                            ));
+                        }
+                    }
+                }
+            }
+            "web_fetch" | "web_search_tavily" => {
+                if let Some(output) = env_obj.get_mut("output") {
+                    if let Some(s) = output.as_str() {
+                        *output = serde_json::Value::String(format!(
+                            "[web content stripped - {} chars]",
+                            s.len()
+                        ));
+                    }
+                }
+            }
+            "skill" | "use_skill" => {
+                if let Some(output) = env_obj.get_mut("output") {
+                    *output = serde_json::Value::String("Skill loaded.".to_string());
+                }
+            }
+            "write_file" | "patch_file" => {}
+            _ => {
+                if let Some(output) = env_obj.get_mut("output") {
+                    if let Some(s) = output.as_str() {
+                        if s.len() > 500 {
+                            let head: String = s.chars().take(200).collect();
+                            let tail: String = s.chars().skip(s.chars().count() - 100).collect();
+                            *output = serde_json::Value::String(format!(
+                                "{}\n... [stripped {} chars] ...\n{}",
+                                head,
+                                s.len(),
+                                tail
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        env_obj.remove("duration_ms");
+        env_obj.remove("truncated");
+        env_obj.remove("recovery_attempted");
+        env_obj.remove("recovery_output");
+        env_obj.remove("recovery_rule");
+
+        if let Ok(stripped_str) = serde_json::to_string(env_obj) {
+            *result_val = serde_json::Value::String(stripped_str);
+        }
     }
 }
 

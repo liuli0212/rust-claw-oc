@@ -392,3 +392,306 @@ fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
         AgentContext::truncate_chars(&args.to_string(), 60)
     }
 }
+
+pub(crate) fn sanitize_turn(turn: &Turn) -> Option<Turn> {
+    let mut messages = Vec::new();
+    for msg in &turn.messages {
+        if let Some(cleaned) = sanitize_message(msg) {
+            messages.push(cleaned);
+        }
+    }
+    if messages.is_empty() {
+        return None;
+    }
+    Some(Turn {
+        turn_id: turn.turn_id.clone(),
+        user_message: turn.user_message.clone(),
+        messages,
+    })
+}
+
+pub(crate) fn build_history_with_budget(
+    ctx: &AgentContext,
+) -> (Vec<super::model::Message>, usize, usize, usize) {
+    let bpe = tiktoken_rs::cl100k_base().unwrap();
+    let history_budget = ctx.max_history_tokens.saturating_mul(85) / 100;
+    let mut history_blocks: Vec<(usize, Vec<super::model::Message>)> = Vec::new();
+    let mut current_tokens = 0;
+    let mut turns_included = 0;
+    let mut total_truncated_chars = 0;
+    let mut protect_next_turn = false;
+
+    for (i, turn) in ctx.dialogue_history.iter().rev().enumerate() {
+        let sanitized = match sanitize_turn(turn) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        let user_asks_for_context = i < 10 && is_user_referencing_history(&turn.user_message);
+        let should_strip = i >= 3 && !protect_next_turn;
+
+        let (turn, truncated) = if should_strip {
+            reconstruct_turn_for_history(&sanitized)
+        } else {
+            truncate_old_tool_results(&sanitized)
+        };
+        total_truncated_chars += truncated;
+        protect_next_turn = user_asks_for_context;
+
+        let turn_tokens: usize = turn
+            .messages
+            .iter()
+            .map(|m| AgentContext::estimate_tokens(&bpe, m))
+            .sum();
+
+        if current_tokens + turn_tokens > history_budget {
+            break;
+        }
+        current_tokens += turn_tokens;
+        history_blocks.push((i, turn.messages));
+        turns_included += 1;
+    }
+
+    history_blocks.reverse();
+    let mut flattened = Vec::new();
+    let mut prev_zone: Option<u8> = None;
+
+    for (distance, block) in &history_blocks {
+        let zone = if *distance >= 10 {
+            0u8
+        } else if *distance >= 3 {
+            1u8
+        } else {
+            2u8
+        };
+        if prev_zone.is_none() || prev_zone != Some(zone) {
+            let label = match zone {
+                0 => Some("--- [EARLIER HISTORY] ---"),
+                1 => Some("--- [RECENT CONTEXT] ---"),
+                _ => None,
+            };
+            if let Some(label_text) = label {
+                flattened.push(super::model::Message {
+                    role: "user".to_string(),
+                    parts: vec![super::model::Part {
+                        text: Some(label_text.to_string()),
+                        function_call: None,
+                        function_response: None,
+                        thought_signature: None,
+                        file_data: None,
+                    }],
+                });
+            }
+        }
+        prev_zone = Some(zone);
+        flattened.extend(block.clone());
+    }
+
+    (
+        flattened,
+        current_tokens,
+        turns_included,
+        total_truncated_chars,
+    )
+}
+
+fn sanitize_message(msg: &super::model::Message) -> Option<super::model::Message> {
+    let role = msg.role.as_str();
+    if role != "user" && role != "model" && role != "function" {
+        return None;
+    }
+
+    let mut cleaned_parts = Vec::new();
+    for part in &msg.parts {
+        let mut cleaned = part.clone();
+        if role == "function" {
+            cleaned.text = None;
+            cleaned.function_call = None;
+        }
+
+        let has_content = cleaned
+            .text
+            .as_ref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false)
+            || cleaned.function_call.is_some()
+            || cleaned.function_response.is_some();
+        if !has_content {
+            continue;
+        }
+        cleaned_parts.push(cleaned);
+    }
+
+    if cleaned_parts.is_empty() {
+        return None;
+    }
+
+    Some(super::model::Message {
+        role: msg.role.clone(),
+        parts: cleaned_parts,
+    })
+}
+
+fn truncate_old_tool_results(turn: &Turn) -> (Turn, usize) {
+    let mut cloned = turn.clone();
+    for msg in &mut cloned.messages {
+        for part in &mut msg.parts {
+            part.thought_signature = None;
+            if let Some(fr) = &mut part.function_response {
+                let mut truncated_in_place = false;
+                if let Some(obj) = fr.response.as_object_mut() {
+                    if let Some(val) = obj.get_mut("result") {
+                        if let Some(s) = val.as_str() {
+                            if s.len() > 12_000 {
+                                let char_count = s.chars().count();
+                                if char_count > 12_000 {
+                                    let keep = 6_000;
+                                    let head: String = s.chars().take(keep).collect();
+                                    let tail: String = s.chars().skip(char_count - keep).collect();
+                                    *val = serde_json::Value::String(format!(
+                                        "{}
+... [History Compressed: {} chars hidden] ...
+{}",
+                                        head,
+                                        char_count - 12_000,
+                                        tail
+                                    ));
+                                    truncated_in_place = true;
+                                }
+                            }
+                        } else if val.to_string().len() > 12_000 {
+                            let s = val.to_string();
+                            let char_count = s.chars().count();
+                            if char_count > 12_000 {
+                                let head: String = s.chars().take(4_000).collect();
+                                *val = serde_json::Value::String(format!(
+                                    "{}
+... [History Object Compressed] ...",
+                                    head
+                                ));
+                                truncated_in_place = true;
+                            }
+                        }
+                    }
+                }
+                if !truncated_in_place {
+                    let response_str = fr.response.to_string();
+                    if response_str.len() > 20_000 {
+                        let head: String = response_str.chars().take(2_000).collect();
+                        fr.response = serde_json::json!({
+                            "result": format!("{}
+                        ... [Truncated massive object] ...", head),
+                            "original_chars": response_str.len()
+                        });
+                    }
+                }
+            }
+        }
+    }
+    (cloned, 0)
+}
+
+fn is_user_referencing_history(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    let keywords = [
+        "previous command",
+        "last command",
+        "previous output",
+        "last output",
+        "what did it say",
+        "fix the error",
+        "look above",
+        "check the error",
+        "what was the error",
+        "show me the output",
+        "full output",
+        "上次",
+        "之前",
+        "刚才",
+        "前面",
+        "上面",
+        "修复错误",
+        "看看输出",
+        "检查错误",
+        "什么错误",
+        "历史",
+        "回顾",
+        "重新看",
+    ];
+    keywords.iter().any(|k| lower.contains(k))
+}
+
+fn reconstruct_turn_for_history(turn: &Turn) -> (Turn, usize) {
+    let mut new_messages = Vec::new();
+    for msg in &turn.messages {
+        let mut new_parts = Vec::new();
+        for part in &msg.parts {
+            let mut new_part = super::model::Part {
+                text: None,
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+                file_data: None,
+            };
+            if let Some(fc) = &part.function_call {
+                if fc.name == "task_plan" {
+                    let action = fc
+                        .args
+                        .get("action")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let mut stripped_fc = fc.clone();
+                    stripped_fc.args = serde_json::json!({ "action": action });
+                    new_part.function_call = Some(stripped_fc);
+                } else {
+                    new_part.function_call = Some(fc.clone());
+                }
+            }
+            if let Some(fr) = &part.function_response {
+                let mut stripped_fr = fr.clone();
+                AgentContext::strip_response_payload(&mut stripped_fr);
+                new_part.function_response = Some(stripped_fr);
+            }
+            if let Some(text) = &part.text {
+                if msg.role == "user" {
+                    let mut cleaned_text = text.clone();
+                    for marker in [
+                        "[CURRENT TASK]",
+                        "--- [RECENT CONTEXT] ---",
+                        "--- [EARLIER HISTORY] ---",
+                    ] {
+                        if cleaned_text.contains(marker) {
+                            cleaned_text = cleaned_text.replace(marker, "").trim().to_string();
+                        }
+                    }
+                    new_part.text = Some(cleaned_text);
+                } else if msg.role == "model" && new_part.function_call.is_none() {
+                    let cleaned = AgentContext::strip_thinking_tags(text);
+                    if !cleaned.is_empty() {
+                        new_part.text = Some(cleaned);
+                    }
+                }
+            }
+            if new_part.text.is_some()
+                || new_part.function_call.is_some()
+                || new_part.function_response.is_some()
+            {
+                new_parts.push(new_part);
+            }
+        }
+        if !new_parts.is_empty() {
+            new_messages.push(super::model::Message {
+                role: msg.role.clone(),
+                parts: new_parts,
+            });
+        }
+    }
+    (
+        Turn {
+            turn_id: turn.turn_id.clone(),
+            user_message: turn.user_message.clone(),
+            messages: new_messages,
+        },
+        0,
+    )
+}
