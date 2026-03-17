@@ -43,13 +43,13 @@ pub fn build_app_bootstrap() -> Result<AppBootstrap, Box<dyn std::error::Error>>
     tools.push(Arc::new(crate::tools::LspGetDiagnosticsTool {
         lsp_client: lazy_lsp.clone(),
     }));
-    tools.push(Arc::new(crate::tools::LspGetSymbolsTool { lsp_client: lazy_lsp }));
+    tools.push(Arc::new(crate::tools::LspGetSymbolsTool {
+        lsp_client: lazy_lsp,
+    }));
 
     if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
         tools.push(Arc::new(crate::tools::SendTelegramMessageTool::new(token)));
     }
 
-    Ok(AppBootstrap {
-        tools,
-    })
+    Ok(AppBootstrap { tools })
 }

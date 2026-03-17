@@ -42,7 +42,11 @@ impl Tool for SendTelegramMessageTool {
         let parsed: SendTelegramMessageArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
-        if !parsed.chat_id.chars().all(|c| c.is_ascii_digit() || c == '-') {
+        if !parsed
+            .chat_id
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '-')
+        {
             return Err(ToolError::InvalidArguments(
                 "chat_id must be a numeric Telegram chat ID".to_string(),
             ));

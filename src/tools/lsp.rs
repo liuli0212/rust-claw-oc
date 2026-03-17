@@ -199,8 +199,7 @@ impl Tool for LspGetSymbolsTool {
     }
 
     fn description(&self) -> String {
-        "Get all symbols (structs, enums, functions) in a file using rust-analyzer."
-            .to_string()
+        "Get all symbols (structs, enums, functions) in a file using rust-analyzer.".to_string()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

@@ -126,7 +126,9 @@ pub struct EmptyArgs {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{BashTool, PatchFileTool, ReadFileTool, ReadMemoryTool, WriteFileTool, WriteMemoryTool};
+    use crate::tools::{
+        BashTool, PatchFileTool, ReadFileTool, ReadMemoryTool, WriteFileTool, WriteMemoryTool,
+    };
 
     #[test]
     fn test_tool_schema_validation() {
@@ -144,8 +146,16 @@ mod tests {
             let schema = tool.parameters_schema();
             let obj = schema.as_object().expect("Schema must be an object");
 
-            assert!(!obj.contains_key("$schema"), "Schema for {} should not contain $schema", tool.name());
-            assert!(!obj.contains_key("title"), "Schema for {} should not contain title", tool.name());
+            assert!(
+                !obj.contains_key("$schema"),
+                "Schema for {} should not contain $schema",
+                tool.name()
+            );
+            assert!(
+                !obj.contains_key("title"),
+                "Schema for {} should not contain title",
+                tool.name()
+            );
 
             if obj.get("type").and_then(|t| t.as_str()) == Some("object") {
                 assert!(

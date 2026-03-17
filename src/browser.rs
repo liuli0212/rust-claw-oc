@@ -377,7 +377,10 @@ mod tests {
         {
             Ok(res) => res,
             Err(err) => {
-                eprintln!("Skipping browser flow test due to navigation failure: {}", err);
+                eprintln!(
+                    "Skipping browser flow test due to navigation failure: {}",
+                    err
+                );
                 let _ = tool.execute(json!({"action": "stop"})).await;
                 return;
             }

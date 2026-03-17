@@ -60,7 +60,12 @@ impl SessionRegistryStore {
         self.persist_async();
     }
 
-    pub fn touch_session(&self, session_id: &str, transcript_path: Option<&Path>, loaded_turns: Option<usize>) {
+    pub fn touch_session(
+        &self,
+        session_id: &str,
+        transcript_path: Option<&Path>,
+        loaded_turns: Option<usize>,
+    ) {
         let mut cache = self.cache.write().unwrap();
         let entry = cache
             .sessions

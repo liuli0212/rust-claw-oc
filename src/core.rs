@@ -515,7 +515,10 @@ impl AgentLoop {
     fn initialize_task_state(
         &self,
         goal: &str,
-    ) -> (crate::task_state::TaskStateSnapshot, crate::schema::CorrelationIds) {
+    ) -> (
+        crate::task_state::TaskStateSnapshot,
+        crate::schema::CorrelationIds,
+    ) {
         let mut state = self
             .task_state_store
             .load()
@@ -1033,7 +1036,6 @@ impl AgentLoop {
             }
 
             state = self.reconcile_after_tool_calls(&state_before_tools).await;
-
         }
     }
 }

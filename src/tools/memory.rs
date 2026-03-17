@@ -71,8 +71,7 @@ impl Tool for WriteMemoryTool {
     }
 
     fn description(&self) -> String {
-        "Overwrites the entire workspace long-term memory (MEMORY.md) with new content."
-            .to_string()
+        "Overwrites the entire workspace long-term memory (MEMORY.md) with new content.".to_string()
     }
 
     fn parameters_schema(&self) -> Value {
