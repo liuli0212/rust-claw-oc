@@ -74,7 +74,7 @@ impl AgentLoop {
                 Ok(mut rx) => {
                     let mut current_turn_text = String::new();
 
-                    let stream_loop_res = loop {
+                    let stream_loop_res: Result<(), crate::llm_client::LlmError> = loop {
                         tokio::select! {
                             event = rx.recv() => {
                                 match event {
@@ -94,29 +94,36 @@ impl AgentLoop {
                                     }
                                     Some(StreamEvent::Done) | None => break Ok(()),
                                     Some(StreamEvent::Error(e)) => {
-                                        self.output.on_error(&format!("Stream error: {}", e)).await;
+                                        break Err(crate::llm_client::LlmError::ApiError(format!("Stream error: {}", e)));
                                     }
                                 }
                             }
                             _ = self.cancel_token.notified() => {
-                                break Err(RunExit::StoppedByUser);
+                                self.output.flush().await;
+                                self.context.end_turn();
+                                return Ok(StreamCollectionOutcome::Exit(RunExit::StoppedByUser));
                             }
                         }
                     };
 
-                    if let Err(exit) = stream_loop_res {
-                        self.output.flush().await;
-                        self.context.end_turn();
-                        return Ok(StreamCollectionOutcome::Exit(exit));
-                    }
+                    match stream_loop_res {
+                        Ok(()) => {
+                            if current_turn_text.contains("<think>")
+                                && !current_turn_text.contains("</think>")
+                            {
+                                current_turn_text.push_str("</think>");
+                            }
 
-                    if current_turn_text.contains("<think>")
-                        && !current_turn_text.contains("</think>")
-                    {
-                        current_turn_text.push_str("</think>");
+                            break current_turn_text;
+                        }
+                        Err(e) => {
+                            tool_calls_accumulated.clear(); // 清理避免重试时带有历史 tool_call
+                            if !self.handle_llm_error(&e, llm_attempts).await {
+                                self.output.flush().await;
+                                return Err(Box::new(e));
+                            }
+                        }
                     }
-
-                    break current_turn_text;
                 }
                 Err(e) => {
                     if !self.handle_llm_error(&e, llm_attempts).await {

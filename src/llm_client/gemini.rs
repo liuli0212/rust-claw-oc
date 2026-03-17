@@ -232,32 +232,39 @@ impl LlmClient for GeminiClient {
             tracing::debug!("Gemini stream connected, starting to receive chunks");
 
             while let Some(chunk_res) = stream.next().await {
-                if let Ok(chunk) = chunk_res {
-                    let chunk_str = String::from_utf8_lossy(&chunk);
-                    tracing::trace!("Received streaming chunk: {}", chunk_str);
-                    buffer.push_str(&chunk_str);
-                    while let Some(idx) = buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n")) {
-                        let sep_len = if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
-                            4
-                        } else {
-                            2
-                        };
-                        let line = buffer[..idx].trim().to_string();
-                        buffer = buffer[idx + sep_len..].to_string();
-                        if line.starts_with("data: ") {
-                            let data = &line[6..];
-                            if gemini_context::emit_sse_data_block(
-                                &tx,
-                                data,
-                                &mut total_text_len,
-                                &mut total_tool_calls,
-                                &mut chunk_count,
-                            )
-                            .await
-                            {
-                                return;
+                match chunk_res {
+                    Ok(chunk) => {
+                        let chunk_str = String::from_utf8_lossy(&chunk);
+                        tracing::trace!("Received streaming chunk: {}", chunk_str);
+                        buffer.push_str(&chunk_str);
+                        while let Some(idx) = buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n")) {
+                            let sep_len = if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
+                                4
+                            } else {
+                                2
+                            };
+                            let line = buffer[..idx].trim().to_string();
+                            buffer = buffer[idx + sep_len..].to_string();
+                            if line.starts_with("data: ") {
+                                let data = &line[6..];
+                                if gemini_context::emit_sse_data_block(
+                                    &tx,
+                                    data,
+                                    &mut total_text_len,
+                                    &mut total_tool_calls,
+                                    &mut chunk_count,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
                             }
                         }
+                    }
+                    Err(e) => {
+                        tracing::error!("Gemini stream read error: {}", e);
+                        let _ = tx.send(StreamEvent::Error(format!("Stream read error: {}", e))).await;
+                        return;
                     }
                 }
             }

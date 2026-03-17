@@ -337,31 +337,38 @@ impl LlmClient for OpenAiCompatClient {
                 std::collections::HashMap::new();
 
             while let Some(chunk_res) = stream.next().await {
-                if let Ok(chunk) = chunk_res {
-                    let chunk_str = String::from_utf8_lossy(&chunk);
-                    tracing::debug!("Received OpenAI streaming chunk: {}", chunk_str);
-                    buffer.push_str(&chunk_str);
+                match chunk_res {
+                    Ok(chunk) => {
+                        let chunk_str = String::from_utf8_lossy(&chunk);
+                        tracing::debug!("Received OpenAI streaming chunk: {}", chunk_str);
+                        buffer.push_str(&chunk_str);
 
-                    while let Some(idx) = buffer.find('\n') {
-                        let line = buffer[..idx].trim().to_string();
-                        buffer = buffer[idx + 1..].to_string();
+                        while let Some(idx) = buffer.find('\n') {
+                            let line = buffer[..idx].trim().to_string();
+                            buffer = buffer[idx + 1..].to_string();
 
-                        if line.starts_with("data: ") {
-                            let data = &line[6..];
-                            if data == "[DONE]" {
-                                tracing::debug!("OpenAI stream received [DONE]");
-                                continue;
-                            }
-                            if let Ok(json) = serde_json::from_str::<Value>(data) {
-                                OpenAiCompatClient::process_delta_json(
-                                    json,
-                                    &tx,
-                                    &mut active_tools,
-                                    &mut index_map,
-                                )
-                                .await;
+                            if line.starts_with("data: ") {
+                                let data = &line[6..];
+                                if data == "[DONE]" {
+                                    tracing::debug!("OpenAI stream received [DONE]");
+                                    continue;
+                                }
+                                if let Ok(json) = serde_json::from_str::<Value>(data) {
+                                    OpenAiCompatClient::process_delta_json(
+                                        json,
+                                        &tx,
+                                        &mut active_tools,
+                                        &mut index_map,
+                                    )
+                                    .await;
+                                }
                             }
                         }
+                    }
+                    Err(e) => {
+                        tracing::error!("OpenAI stream read error: {}", e);
+                        let _ = tx.send(StreamEvent::Error(format!("Stream read error: {}", e))).await;
+                        return;
                     }
                 }
             }
