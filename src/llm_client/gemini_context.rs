@@ -5,6 +5,7 @@ use super::gemini::{
 use super::protocol::{GeminiPlatform, LlmError};
 use crate::context::{FileData, Message};
 use crate::tools::Tool;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -311,6 +312,38 @@ pub(crate) fn request_body_json(
         GeminiPlatform::Vertex => {
             let vertex_req = to_vertex_request(req_body, vertex_cached_content);
             serde_json::to_string(&vertex_req).unwrap_or_default()
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) async fn send_generate_request(
+    client: &Client,
+    api_key: &str,
+    platform: GeminiPlatform,
+    url: &str,
+    req_body: &GeminiRequest,
+    vertex_cached_content: Option<String>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    match platform {
+        GeminiPlatform::Gen => {
+            client
+                .post(url)
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-goog-api-key", api_key)
+                .json(req_body)
+                .send()
+                .await
+        }
+        GeminiPlatform::Vertex => {
+            let vertex_req = to_vertex_request(req_body, vertex_cached_content);
+            client
+                .post(url)
+                .header(CONTENT_TYPE, "application/json")
+                .header("x-goog-api-key", api_key)
+                .json(&vertex_req)
+                .send()
+                .await
         }
     }
 }

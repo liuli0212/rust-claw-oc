@@ -219,27 +219,15 @@ impl LlmClient for GeminiClient {
             truncate_log(&req_body_json)
         );
 
-        let response = match self.platform {
-            GeminiPlatform::Gen => {
-                self.client
-                    .post(&url)
-                    .header(CONTENT_TYPE, "application/json")
-                    .header("x-goog-api-key", self.api_key.clone())
-                    .json(&req_body)
-                    .send()
-                    .await?
-            }
-            GeminiPlatform::Vertex => {
-                let vertex_req = gemini_context::to_vertex_request(&req_body, None);
-                self.client
-                    .post(&url)
-                    .header(CONTENT_TYPE, "application/json")
-                    .header("x-goog-api-key", self.api_key.clone())
-                    .json(&vertex_req)
-                    .send()
-                    .await?
-            }
-        };
+        let response = gemini_context::send_generate_request(
+            &self.client,
+            &self.api_key,
+            self.platform,
+            &url,
+            &req_body,
+            None,
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -613,28 +601,15 @@ impl LlmClient for GeminiClient {
 
         let response_json = loop {
             attempts += 1;
-            let response = match self.platform {
-                GeminiPlatform::Gen => {
-                    self.client
-                        .post(&url)
-                        .header(CONTENT_TYPE, "application/json")
-                        .header("x-goog-api-key", self.api_key.clone())
-                        .json(&req_body)
-                        .send()
-                        .await
-                }
-                GeminiPlatform::Vertex => {
-                    let vertex_req =
-                        gemini_context::to_vertex_request(&req_body, req_body.cached_content.clone());
-                    self.client
-                        .post(&url)
-                        .header(CONTENT_TYPE, "application/json")
-                        .header("x-goog-api-key", self.api_key.clone())
-                        .json(&vertex_req)
-                        .send()
-                        .await
-                }
-            };
+            let response = gemini_context::send_generate_request(
+                &self.client,
+                &self.api_key,
+                self.platform,
+                &url,
+                &req_body,
+                req_body.cached_content.clone(),
+            )
+            .await;
 
             match response {
                 Ok(r) if r.status().is_success() => {
