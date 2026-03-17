@@ -3,7 +3,9 @@ pub mod legacy;
 pub mod model;
 pub mod prompt;
 pub mod report;
+pub mod state;
 pub mod transcript;
+pub mod turns;
 
 pub use history::ContextDiff;
 pub use legacy::AgentContext;

@@ -1,9 +1,7 @@
 use super::history::{ContextDiff, ContextSnapshot};
-use super::model::{FunctionResponse, Message, Part, Turn};
+use super::model::{FunctionResponse, Message, Turn};
 use super::prompt::{self, DetailedContextStats, PromptReport};
-use super::{report, transcript};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use super::{report, state, transcript, turns};
 use std::path::PathBuf;
 use tiktoken_rs::CoreBPE;
 
@@ -62,77 +60,11 @@ impl AgentContext {
     }
 
     pub fn take_snapshot(&mut self) -> ContextSnapshot {
-        let stats = self.get_detailed_stats(None);
-        let system_prompt = self.build_system_prompt();
-        let mut hasher = DefaultHasher::new();
-        system_prompt.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let snapshot = ContextSnapshot {
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-            turn_id: self
-                .current_turn
-                .as_ref()
-                .map(|t| t.turn_id.clone())
-                .unwrap_or_default(),
-            stats,
-            messages_count: self
-                .dialogue_history
-                .iter()
-                .map(|t| t.messages.len())
-                .sum::<usize>()
-                + self
-                    .current_turn
-                    .as_ref()
-                    .map(|t| t.messages.len())
-                    .unwrap_or(0),
-            system_prompt_hash: hash,
-            retrieved_memory_sources: self.retrieved_memory_sources.clone(),
-            history_turns_count: self.dialogue_history.len(),
-        };
-        self.last_snapshot = Some(snapshot.clone());
-        snapshot
+        state::take_snapshot(self)
     }
 
     pub fn diff_snapshot(&self, old: &ContextSnapshot) -> ContextDiff {
-        let current_stats = self.get_detailed_stats(None);
-        let system_prompt = self.build_system_prompt();
-        let mut hasher = DefaultHasher::new();
-        system_prompt.hash(&mut hasher);
-        let current_hash = hasher.finish();
-
-        let old_sources: std::collections::HashSet<_> =
-            old.retrieved_memory_sources.iter().cloned().collect();
-        let new_sources_set: std::collections::HashSet<_> =
-            self.retrieved_memory_sources.iter().cloned().collect();
-
-        let new_sources = self
-            .retrieved_memory_sources
-            .iter()
-            .filter(|s| !old_sources.contains(*s))
-            .cloned()
-            .collect();
-        let removed_sources = old
-            .retrieved_memory_sources
-            .iter()
-            .filter(|s| !new_sources_set.contains(*s))
-            .cloned()
-            .collect();
-
-        ContextDiff {
-            token_delta: current_stats.total as i64 - old.stats.total as i64,
-            history_turns_delta: self.dialogue_history.len() as i32
-                - old.history_turns_count as i32,
-            system_prompt_changed: current_hash != old.system_prompt_hash,
-            new_sources,
-            removed_sources,
-            memory_changed: self.retrieved_memory_sources != old.retrieved_memory_sources,
-            truncated_delta: current_stats.truncated_chars as i64
-                - old.stats.truncated_chars as i64,
-        }
+        state::diff_snapshot(self, old)
     }
 
     pub fn load_transcript(&mut self) -> std::io::Result<usize> {
@@ -214,26 +146,11 @@ impl AgentContext {
     }
 
     pub fn start_turn(&mut self, text: String) {
-        self.current_turn = Some(Turn {
-            turn_id: uuid::Uuid::new_v4().to_string(),
-            user_message: text.clone(),
-            messages: vec![Message {
-                role: "user".to_string(),
-                parts: vec![Part {
-                    text: Some(text),
-                    function_call: None,
-                    function_response: None,
-                    thought_signature: None,
-                    file_data: None,
-                }],
-            }],
-        });
+        turns::start_turn(self, text);
     }
 
     pub fn add_message_to_current_turn(&mut self, msg: Message) {
-        if let Some(turn) = &mut self.current_turn {
-            turn.messages.push(msg);
-        }
+        turns::add_message_to_current_turn(self, msg);
     }
 
     pub fn compress_current_turn(&mut self, max_bytes: usize) -> usize {
@@ -245,12 +162,7 @@ impl AgentContext {
     }
 
     pub fn end_turn(&mut self) {
-        if let Some(turn) = self.current_turn.take() {
-            if let Err(e) = self.append_turn_to_transcript(&turn) {
-                tracing::warn!("Failed to append turn to transcript: {}", e);
-            }
-            self.dialogue_history.push(turn);
-        }
+        turns::end_turn(self);
     }
 
     pub fn build_llm_payload(
@@ -411,6 +323,7 @@ impl AgentContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::model::Part;
     use tempfile::tempdir;
 
     #[test]
