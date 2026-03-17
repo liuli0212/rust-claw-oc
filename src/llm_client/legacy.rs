@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 use super::gemini::{
-    capture_thought_signature, parse_function_call_basic, to_vertex_message, FunctionDeclaration,
-    GeminiRequest, ToolDeclarationWrapper, VertexGeminiRequest,
+    capture_thought_signature, parse_function_call_basic, FunctionDeclaration, GeminiRequest,
+    ToolDeclarationWrapper,
 };
 use super::gemini_context;
 use super::protocol::{GeminiPlatform, LlmClient, LlmError, StreamEvent};
@@ -207,14 +207,7 @@ impl LlmClient for GeminiClient {
         };
 
         let req_body_json = serde_json::to_string(&req_body).unwrap_or_default();
-        let url = match self.platform {
-            GeminiPlatform::Gen => format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", self.model_name
-            ),
-            GeminiPlatform::Vertex => format!(
-                "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:generateContent", self.model_name
-            ),
-        };
+        let url = gemini_context::request_url(self.platform, &self.model_name, false);
 
         tracing::info!(
             "Gemini generate_text request: url={}, body_size={} bytes",
@@ -237,14 +230,7 @@ impl LlmClient for GeminiClient {
                     .await?
             }
             GeminiPlatform::Vertex => {
-                let vertex_req = VertexGeminiRequest {
-                    contents: req_body.contents.iter().map(to_vertex_message).collect(),
-                    system_instruction: req_body.system_instruction.as_ref().map(to_vertex_message),
-                    tools: req_body.tools.clone(),
-                    tool_config: req_body.tool_config.clone(),
-                    generation_config: req_body.generation_config.clone(),
-                    cached_content: None,
-                };
+                let vertex_req = gemini_context::to_vertex_request(&req_body, None);
                 self.client
                     .post(&url)
                     .header(CONTENT_TYPE, "application/json")
@@ -333,36 +319,13 @@ impl LlmClient for GeminiClient {
                 cached_content: cached_content_id,
             };
 
-            let url = match platform {
-                GeminiPlatform::Gen => format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse", model_name
-                ),
-                GeminiPlatform::Vertex => format!(
-                    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:streamGenerateContent?alt=sse", model_name
-                ),
-            };
+            let url = gemini_context::request_url(platform, &model_name, true);
 
             let mut attempts = 0;
             let max_attempts = 5;
             let mut last_error = String::from("initialization");
 
-            let body_json_string = match platform {
-                GeminiPlatform::Gen => serde_json::to_string(&req_body).unwrap_or_default(),
-                GeminiPlatform::Vertex => {
-                    let vertex_req = VertexGeminiRequest {
-                        contents: req_body.contents.iter().map(to_vertex_message).collect(),
-                        system_instruction: req_body
-                            .system_instruction
-                            .as_ref()
-                            .map(to_vertex_message),
-                        tools: req_body.tools.clone(),
-                        tool_config: req_body.tool_config.clone(),
-                        generation_config: req_body.generation_config.clone(),
-                        cached_content: None,
-                    };
-                    serde_json::to_string(&vertex_req).unwrap_or_default()
-                }
-            };
+            let body_json_string = gemini_context::request_body_json(platform, &req_body, None);
 
             let resp = loop {
                 attempts += 1;
@@ -642,14 +605,7 @@ impl LlmClient for GeminiClient {
             cached_content: cached_content_id,
         };
 
-        let url = match self.platform {
-            GeminiPlatform::Gen => format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", self.model_name
-            ),
-            GeminiPlatform::Vertex => format!(
-                "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:generateContent", self.model_name
-            ),
-        };
+        let url = gemini_context::request_url(self.platform, &self.model_name, false);
 
         let mut attempts = 0;
         let max_attempts = 5;
@@ -668,17 +624,8 @@ impl LlmClient for GeminiClient {
                         .await
                 }
                 GeminiPlatform::Vertex => {
-                    let vertex_req = VertexGeminiRequest {
-                        contents: req_body.contents.iter().map(to_vertex_message).collect(),
-                        system_instruction: req_body
-                            .system_instruction
-                            .as_ref()
-                            .map(to_vertex_message),
-                        tools: req_body.tools.clone(),
-                        tool_config: req_body.tool_config.clone(),
-                        generation_config: req_body.generation_config.clone(),
-                        cached_content: req_body.cached_content.clone(),
-                    };
+                    let vertex_req =
+                        gemini_context::to_vertex_request(&req_body, req_body.cached_content.clone());
                     self.client
                         .post(&url)
                         .header(CONTENT_TYPE, "application/json")

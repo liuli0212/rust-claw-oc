@@ -1,8 +1,8 @@
 use super::gemini::{
-    inline_schema_refs, normalize_schema_for_gemini, FunctionDeclaration, GenerationConfig,
-    ThinkingConfig,
+    inline_schema_refs, normalize_schema_for_gemini, to_vertex_message, FunctionDeclaration,
+    GeminiRequest, GenerationConfig, ThinkingConfig, VertexGeminiRequest,
 };
-use super::protocol::LlmError;
+use super::protocol::{GeminiPlatform, LlmError};
 use crate::context::{FileData, Message};
 use crate::tools::Tool;
 use reqwest::Client;
@@ -259,5 +259,58 @@ pub(crate) fn text_generation_config(model_name: &str) -> Option<GenerationConfi
             response_mime_type: None,
             response_schema: None,
         })
+    }
+}
+
+pub(crate) fn request_url(
+    platform: GeminiPlatform,
+    model_name: &str,
+    streaming: bool,
+) -> String {
+    match (platform, streaming) {
+        (GeminiPlatform::Gen, false) => format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+            model_name
+        ),
+        (GeminiPlatform::Vertex, false) => format!(
+            "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:generateContent",
+            model_name
+        ),
+        (GeminiPlatform::Gen, true) => format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse",
+            model_name
+        ),
+        (GeminiPlatform::Vertex, true) => format!(
+            "https://aiplatform.googleapis.com/v1beta1/publishers/google/models/{}:streamGenerateContent?alt=sse",
+            model_name
+        ),
+    }
+}
+
+pub(crate) fn to_vertex_request(
+    req_body: &GeminiRequest,
+    cached_content: Option<String>,
+) -> VertexGeminiRequest {
+    VertexGeminiRequest {
+        contents: req_body.contents.iter().map(to_vertex_message).collect(),
+        system_instruction: req_body.system_instruction.as_ref().map(to_vertex_message),
+        tools: req_body.tools.clone(),
+        tool_config: req_body.tool_config.clone(),
+        generation_config: req_body.generation_config.clone(),
+        cached_content,
+    }
+}
+
+pub(crate) fn request_body_json(
+    platform: GeminiPlatform,
+    req_body: &GeminiRequest,
+    vertex_cached_content: Option<String>,
+) -> String {
+    match platform {
+        GeminiPlatform::Gen => serde_json::to_string(req_body).unwrap_or_default(),
+        GeminiPlatform::Vertex => {
+            let vertex_req = to_vertex_request(req_body, vertex_cached_content);
+            serde_json::to_string(&vertex_req).unwrap_or_default()
+        }
     }
 }

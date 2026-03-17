@@ -502,3 +502,4 @@ Follow-up decomposition completed so far:
 - [x] moved Gemini cached-content resolution and text generation config selection out of `src/llm_client/legacy.rs`
 - [x] extracted response sanitization helpers from `src/context/legacy.rs` into `src/context/sanitize.rs`
 - [x] extracted token and truncation helpers from `src/context/legacy.rs` into `src/context/token.rs`
+- [x] extracted Gemini request URL selection and Vertex request serialization from `src/llm_client/legacy.rs`
