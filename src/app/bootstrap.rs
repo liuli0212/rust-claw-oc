@@ -30,7 +30,9 @@ pub fn build_app_bootstrap() -> Result<AppBootstrap, Box<dyn std::error::Error>>
         Arc::new(SendFileTool),
     ];
 
-    let lazy_lsp = Arc::new(crate::lsp::LazyLspClient::new(std::env::current_dir()?));
+    let lazy_lsp = Arc::new(crate::lsp_client::LazyLspClient::new(
+        std::env::current_dir()?,
+    ));
     tools.push(Arc::new(crate::tools::LspGotoDefinitionTool {
         lsp_client: lazy_lsp.clone(),
     }));

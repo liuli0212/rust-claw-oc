@@ -414,6 +414,7 @@ Completed notes:
 - narrowed `SessionManager` so it delegates persistence and construction instead of owning both
 - moved headless and interactive CLI orchestration out of `src/main.rs` into `src/app/cli.rs`
 - split Telegram adapter code so `src/telegram.rs` now primarily owns bot startup/dispatcher wiring while output rendering and update handlers live in `src/telegram/output.rs` and `src/telegram/handlers.rs`
+- split ACP server code so `src/acp/mod.rs` now focuses on server wiring while route handlers, SSE output, and the console page asset live under `src/acp/`
 
 ### Phase 6: Remove warning suppression and tighten module APIs
 
@@ -531,6 +532,8 @@ Follow-up decomposition completed so far:
 - [x] removed the text-only `finish_task` completion fallback from `core`
 - [x] moved `core` runtime helpers into `src/core/step_helpers.rs`
 - [x] moved `core` tests into `src/core/tests.rs`
+- [x] moved ACP route and SSE output logic into `src/acp/handlers.rs` and `src/acp/output.rs`
+- [x] renamed the root LSP integration module from `src/lsp.rs` to `src/lsp_client.rs` to distinguish it from `src/tools/lsp.rs`
 - [x] extracted prompt assembly and detailed context stats from `src/context/legacy.rs` into `src/context/prompt.rs`
 - [x] extracted `llm_client` protocol types into `src/llm_client/protocol.rs`
 - [x] extracted Gemini request/declaration types into `src/llm_client/gemini.rs`

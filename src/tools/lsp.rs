@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub struct LspGotoDefinitionTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp_client::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -48,7 +48,7 @@ impl Tool for LspGotoDefinitionTool {
 }
 
 pub struct LspFindReferencesTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp_client::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -98,7 +98,7 @@ impl Tool for LspFindReferencesTool {
 }
 
 pub struct LspHoverTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp_client::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -142,7 +142,7 @@ impl Tool for LspHoverTool {
 }
 
 pub struct LspGetDiagnosticsTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp_client::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -184,7 +184,7 @@ impl Tool for LspGetDiagnosticsTool {
 }
 
 pub struct LspGetSymbolsTool {
-    pub lsp_client: std::sync::Arc<crate::lsp::LazyLspClient>,
+    pub lsp_client: std::sync::Arc<crate::lsp_client::LazyLspClient>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

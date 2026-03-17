@@ -7,7 +7,7 @@ mod context_assembler;
 #[cfg(test)]
 mod event_log;
 mod evidence;
-mod lsp;
+mod lsp_client;
 mod rag;
 mod schema;
 mod task_state;
