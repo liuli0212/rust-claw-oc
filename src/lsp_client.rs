@@ -116,7 +116,7 @@ impl LspClient {
 
                     // Read the empty line after Content-Length
                     let mut empty_line = String::new();
-                    if let Err(_) = reader.read_line(&mut empty_line).await {
+                    if reader.read_line(&mut empty_line).await.is_err() {
                         break;
                     }
 

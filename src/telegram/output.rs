@@ -445,3 +445,24 @@ impl AgentOutput for TelegramOutput {
         *active_msg_id = None;
     }
 }
+
+pub(super) struct SilentTelegramOutput(pub Arc<TelegramOutput>);
+
+#[async_trait]
+impl AgentOutput for SilentTelegramOutput {
+    async fn on_text(&self, _text: &str) {}
+    async fn on_tool_start(&self, _name: &str, _args: &str) {}
+    async fn on_tool_end(&self, _result: &str) {}
+
+    async fn on_error(&self, error: &str) {
+        self.0.on_error(error).await;
+    }
+
+    async fn on_task_finish(&self, summary: &str) {
+        self.0.on_task_finish(summary).await;
+    }
+
+    async fn on_file(&self, path: &str) {
+        self.0.on_file(path).await;
+    }
+}

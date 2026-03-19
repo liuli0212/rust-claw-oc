@@ -163,7 +163,11 @@ impl Tool for BrowserTool {
         clean_schema(serde_json::to_value(&schema).unwrap())
     }
 
-    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, ToolError> {
         let params: BrowserToolParams =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
@@ -334,28 +338,52 @@ mod tests {
 
         // 1. Status - Should be stopped
         let status_res = browser_tool
-            .execute(json!({"action": "status"}))
+            .execute(
+                json!({"action": "status"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap();
         assert!(status_res.contains("stopped"));
 
         // 2. Start
         let start_res = browser_tool
-            .execute(json!({"action": "start"}))
+            .execute(
+                json!({"action": "start"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap();
         assert!(start_res.contains("ready"));
 
         // 3. Status - Should be running
         let status_res2 = browser_tool
-            .execute(json!({"action": "status"}))
+            .execute(
+                json!({"action": "status"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap();
         assert!(status_res2.contains("running"));
 
         // 4. Stop
         let stop_res = browser_tool
-            .execute(json!({"action": "stop"}))
+            .execute(
+                json!({"action": "stop"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap();
         assert!(stop_res.contains("stopped"));
@@ -367,12 +395,27 @@ mod tests {
         let tool = BrowserTool::new();
 
         println!("--- Starting Browser ---");
-        let res = tool.execute(json!({"action": "start"})).await.unwrap();
+        let res = tool
+            .execute(
+                json!({"action": "start"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
         println!("{}", res);
 
         println!("--- Navigating ---");
         let res = match tool
-            .execute(json!({"action": "navigate", "target_url": "https://example.com"}))
+            .execute(
+                json!({"action": "navigate", "target_url": "https://example.com"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
         {
             Ok(res) => res,
@@ -381,7 +424,15 @@ mod tests {
                     "Skipping browser flow test due to navigation failure: {}",
                     err
                 );
-                let _ = tool.execute(json!({"action": "stop"})).await;
+                let _ = tool
+                    .execute(
+                        json!({"action": "stop"}),
+                        &crate::tools::ToolContext {
+                            session_id: "test".into(),
+                            reply_to: "test".into(),
+                        },
+                    )
+                    .await;
                 return;
             }
         };
@@ -391,11 +442,29 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         println!("--- Taking Snapshot ---");
-        let res = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        let res = tool
+            .execute(
+                json!({"action": "snapshot"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
         println!("Snapshot Result:\n{}", res);
 
         println!("--- Stopping Browser ---");
-        let res = tool.execute(json!({"action": "stop"})).await.unwrap();
+        let res = tool
+            .execute(
+                json!({"action": "stop"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
         println!("{}", res);
     }
 
@@ -404,16 +473,47 @@ mod tests {
     async fn test_google_access() {
         let tool = BrowserTool::new();
         println!("--- Starting Browser for Google ---");
-        tool.execute(json!({"action": "start"})).await.unwrap();
+        tool.execute(
+            json!({"action": "start"}),
+            &crate::tools::ToolContext {
+                session_id: "test".into(),
+                reply_to: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
         println!("--- Navigating to Google ---");
-        tool.execute(json!({"action": "navigate", "target_url": "https://www.google.com"}))
-            .await
-            .unwrap();
+        tool.execute(
+            json!({"action": "navigate", "target_url": "https://www.google.com"}),
+            &crate::tools::ToolContext {
+                session_id: "test".into(),
+                reply_to: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         println!("--- Taking Google Snapshot ---");
-        let snapshot = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        let snapshot = tool
+            .execute(
+                json!({"action": "snapshot"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
         println!("GOOGLE SNAPSHOT:\n{}", snapshot);
-        tool.execute(json!({"action": "stop"})).await.unwrap();
+        tool.execute(
+            json!({"action": "stop"}),
+            &crate::tools::ToolContext {
+                session_id: "test".into(),
+                reply_to: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -421,14 +521,37 @@ mod tests {
     async fn test_google_search_flow() {
         let tool = BrowserTool::new();
         println!("--- Phase 1: Start & Navigate ---");
-        tool.execute(json!({"action": "start"})).await.unwrap();
-        tool.execute(json!({"action": "navigate", "target_url": "https://www.google.com"}))
-            .await
-            .unwrap();
+        tool.execute(
+            json!({"action": "start"}),
+            &crate::tools::ToolContext {
+                session_id: "test".into(),
+                reply_to: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        tool.execute(
+            json!({"action": "navigate", "target_url": "https://www.google.com"}),
+            &crate::tools::ToolContext {
+                session_id: "test".into(),
+                reply_to: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         println!("--- Phase 2: Identify Search Box ---");
-        let snapshot = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        let snapshot = tool
+            .execute(
+                json!({"action": "snapshot"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
         // Look for the input. On Google it's usually an input.
         // Based on previous test, it was [5] or similar.
         println!("Snapshot:\n{}", snapshot);
@@ -443,14 +566,20 @@ mod tests {
 
         println!("--- Phase 3: Typing Search Query ---");
         let res = tool
-            .execute(json!({
-                "action": "act",
-                "request": {
-                    "kind": "type",
-                    "target_id": search_id,
-                    "text": "OpenClaw github"
-                }
-            }))
+            .execute(
+                json!({
+                    "action": "act",
+                    "request": {
+                        "kind": "type",
+                        "target_id": search_id,
+                        "text": "OpenClaw github"
+                    }
+                }),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap();
         println!("{}", res);
@@ -466,13 +595,19 @@ mod tests {
             .map(|s| s.trim_start_matches('['))
             .unwrap_or("6");
 
-        tool.execute(json!({
-            "action": "act",
-            "request": {
-                "kind": "click",
-                "target_id": button_id
-            }
-        }))
+        tool.execute(
+            json!({
+                "action": "act",
+                "request": {
+                    "kind": "click",
+                    "target_id": button_id
+                }
+            }),
+            &crate::tools::ToolContext {
+                session_id: "test".into(),
+                reply_to: "test".into(),
+            },
+        )
         .await
         .unwrap();
 
@@ -480,9 +615,26 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         println!("--- Phase 6: Result Snapshot ---");
-        let results = tool.execute(json!({"action": "snapshot"})).await.unwrap();
+        let results = tool
+            .execute(
+                json!({"action": "snapshot"}),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
         println!("SEARCH RESULTS:\n{}", results);
 
-        tool.execute(json!({"action": "stop"})).await.unwrap();
+        tool.execute(
+            json!({"action": "stop"}),
+            &crate::tools::ToolContext {
+                session_id: "test".into(),
+                reply_to: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
     }
 }

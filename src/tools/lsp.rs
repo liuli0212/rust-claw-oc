@@ -28,7 +28,11 @@ impl Tool for LspGotoDefinitionTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspGotoDefinitionArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let parsed: LspGotoDefinitionArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
@@ -73,7 +77,11 @@ impl Tool for LspFindReferencesTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspFindReferencesArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let parsed: LspFindReferencesArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
@@ -122,7 +130,11 @@ impl Tool for LspHoverTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspHoverArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let parsed: LspHoverArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
@@ -164,7 +176,11 @@ impl Tool for LspGetDiagnosticsTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspGetDiagnosticsArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let parsed: LspGetDiagnosticsArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
@@ -206,7 +222,11 @@ impl Tool for LspGetSymbolsTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspGetSymbolsArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let parsed: LspGetSymbolsArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 

@@ -4,6 +4,7 @@ pub mod integrations;
 pub mod lsp;
 pub mod memory;
 pub mod protocol;
+pub mod scheduler;
 pub mod web;
 
 pub use bash::BashTool;
@@ -16,5 +17,6 @@ pub use lsp::{
     LspHoverTool,
 };
 pub use memory::{RagInsertTool, RagSearchTool, ReadMemoryTool, WriteMemoryTool};
-pub use protocol::{clean_schema, Tool, ToolError};
+pub use protocol::{clean_schema, Tool, ToolContext, ToolError};
+pub use scheduler::ManageScheduleTool;
 pub use web::{TavilySearchTool, WebFetchTool};

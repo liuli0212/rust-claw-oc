@@ -237,7 +237,9 @@ impl LlmClient for GeminiClient {
                         let chunk_str = String::from_utf8_lossy(&chunk);
                         tracing::trace!("Received streaming chunk: {}", chunk_str);
                         buffer.push_str(&chunk_str);
-                        while let Some(idx) = buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n")) {
+                        while let Some(idx) =
+                            buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n"))
+                        {
                             let sep_len = if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
                                 4
                             } else {
@@ -245,8 +247,7 @@ impl LlmClient for GeminiClient {
                             };
                             let line = buffer[..idx].trim().to_string();
                             buffer = buffer[idx + sep_len..].to_string();
-                            if line.starts_with("data: ") {
-                                let data = &line[6..];
+                            if let Some(data) = line.strip_prefix("data: ") {
                                 if gemini_context::emit_sse_data_block(
                                     &tx,
                                     data,
@@ -263,7 +264,9 @@ impl LlmClient for GeminiClient {
                     }
                     Err(e) => {
                         tracing::error!("Gemini stream read error: {}", e);
-                        let _ = tx.send(StreamEvent::Error(format!("Stream read error: {}", e))).await;
+                        let _ = tx
+                            .send(StreamEvent::Error(format!("Stream read error: {}", e)))
+                            .await;
                         return;
                     }
                 }

@@ -105,7 +105,11 @@ impl Tool for BashTool {
         val
     }
 
-    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &crate::tools::protocol::ToolContext,
+    ) -> Result<String, ToolError> {
         let parsed_args: ExecuteCmdArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 

@@ -34,7 +34,11 @@ impl Tool for PatchFileTool {
         clean_schema(serde_json::to_value(schema_for!(PatchFileArgs)).unwrap())
     }
 
-    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &crate::tools::protocol::ToolContext,
+    ) -> Result<String, ToolError> {
         let start = Instant::now();
         let parsed: PatchFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
@@ -98,7 +102,11 @@ impl Tool for WriteFileTool {
         clean_schema(serde_json::to_value(schema_for!(WriteFileArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let start = Instant::now();
         let parsed: WriteFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
@@ -157,7 +165,11 @@ impl Tool for ReadFileTool {
         clean_schema(serde_json::to_value(schema_for!(ReadFileArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let start = Instant::now();
         let parsed: ReadFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
@@ -251,7 +263,11 @@ impl Tool for TaskPlanTool {
         clean_schema(serde_json::to_value(schema_for!(TaskPlanArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let start = Instant::now();
         let parsed: TaskPlanArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
@@ -403,7 +419,11 @@ impl Tool for SendFileTool {
         clean_schema(serde_json::to_value(schema_for!(SendFileArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let parsed: SendFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
@@ -441,7 +461,11 @@ impl Tool for FinishTaskTool {
         clean_schema(serde_json::to_value(schema_for!(FinishTaskArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let parsed: FinishTaskArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
@@ -489,7 +513,16 @@ mod tests {
             "patch": patch
         });
 
-        let result = tool.execute(args).await.unwrap();
+        let result = tool
+            .execute(
+                args,
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
+            .await
+            .unwrap();
         assert!(result.contains("true"));
 
         let content = std::fs::read_to_string(test_file).unwrap();
@@ -510,10 +543,16 @@ mod tests {
 
         let tool = ReadFileTool;
         let result = tool
-            .execute(serde_json::json!({
-                "path": file_path,
-                "thought": "inspect large file"
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": file_path,
+                    "thought": "inspect large file"
+                }),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap();
 
@@ -542,9 +581,15 @@ mod tests {
         };
 
         let result = tool
-            .execute(serde_json::json!({
-                "summary": "Refactor complete"
-            }))
+            .execute(
+                serde_json::json!({
+                    "summary": "Refactor complete"
+                }),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap();
         let updated = store.load().unwrap();

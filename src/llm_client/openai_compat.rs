@@ -347,8 +347,7 @@ impl LlmClient for OpenAiCompatClient {
                             let line = buffer[..idx].trim().to_string();
                             buffer = buffer[idx + 1..].to_string();
 
-                            if line.starts_with("data: ") {
-                                let data = &line[6..];
+                            if let Some(data) = line.strip_prefix("data: ") {
                                 if data == "[DONE]" {
                                     tracing::debug!("OpenAI stream received [DONE]");
                                     continue;
@@ -367,7 +366,9 @@ impl LlmClient for OpenAiCompatClient {
                     }
                     Err(e) => {
                         tracing::error!("OpenAI stream read error: {}", e);
-                        let _ = tx.send(StreamEvent::Error(format!("Stream read error: {}", e))).await;
+                        let _ = tx
+                            .send(StreamEvent::Error(format!("Stream read error: {}", e)))
+                            .await;
                         return;
                     }
                 }
@@ -375,8 +376,7 @@ impl LlmClient for OpenAiCompatClient {
 
             if !buffer.trim().is_empty() {
                 let line = buffer.trim();
-                if line.starts_with("data: ") {
-                    let data = &line[6..];
+                if let Some(data) = line.strip_prefix("data: ") {
                     if data != "[DONE]" {
                         if let Ok(json) = serde_json::from_str::<Value>(data) {
                             OpenAiCompatClient::process_delta_json(

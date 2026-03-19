@@ -9,6 +9,7 @@ mod event_log;
 mod evidence;
 mod lsp_client;
 mod rag;
+mod scheduler;
 mod schema;
 mod task_state;
 mod telemetry;
@@ -35,8 +36,31 @@ use console::style;
 use dotenvy::dotenv;
 use std::sync::Arc;
 
+const LOGO: &str = r#"
+  ██████╗ ██╗   ██╗███████╗████████╗██╗   ██╗      ██████╗██╗      █████╗ ██╗    ██╗
+  ██╔══██╗██║   ██║██╔════╝╚══██╔══╝╚██╗ ██╔╝     ██╔════╝██║     ██╔══██╗██║    ██║
+  ██████╔╝██║   ██║███████╗   ██║    ╚████╔╝  ████╗██║     ██║     ███████║██║ █╗ ██║
+  ██╔══██╗██║   ██║╚════██║   ██║     ╚██╔╝   ╚═══╝██║     ██║     ██╔══██║██║███╗██║
+  ██║  ██║╚██████╔╝███████║   ██║      ██║          ╚██████╗███████╗██║  ██║╚███╔███╔╝
+  ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝      ╚═╝           ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝
+"#;
+
+fn styles() -> clap::builder::styling::Styles {
+    use clap::builder::styling::{AnsiColor, Effects, Styles};
+    Styles::styled()
+        .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Blue.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Green.on_default())
+}
+
 #[derive(Debug, Parser)]
-#[command(name = "rusty-claw", about = "Rusty-Claw CLI agent")]
+#[command(
+    name = "rusty-claw",
+    about = "Rusty-Claw CLI agent",
+    before_help = LOGO,
+    styles = styles()
+)]
 struct CliArgs {
     /// LLM Provider (gemini, aliyun)
     #[arg(long, default_value = "gemini")]
@@ -82,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !is_headless {
         println!();
+        println!("{}", style(LOGO).cyan());
         println!("  {}", style("Rusty-Claw AGENT-OS v0.1.0").bold().cyan());
         println!("  {}", style("---------------------------").dim());
     }
@@ -117,7 +142,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
 
     let session_manager = Arc::new(SessionManager::new(llm_opt, bootstrap.tools.clone()));
+    session_manager.add_output_router(Arc::new(ui::TuiOutputRouter));
     let output = Arc::new(TuiOutput::new());
+
+    // Initialize and start the scheduler
+    let scheduler = Arc::new(scheduler::Scheduler::new(session_manager.clone()));
+    let scheduler_clone = scheduler.clone();
+    tokio::spawn(async move {
+        scheduler_clone.run_loop().await;
+    });
+    // Note: Registering the tool here is safe because no sessions have been created yet.
+    // Sessions snapshot the tool list upon creation.
+    session_manager.add_tool(Arc::new(tools::ManageScheduleTool { scheduler }));
 
     if !is_headless {
         if let Some(token) = telegram_token {

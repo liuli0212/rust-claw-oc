@@ -1,17 +1,44 @@
-use crate::core::AgentOutput;
+use crate::core::{AgentOutput, OutputRouter};
 use async_trait::async_trait;
 use console::{style, Emoji};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::ThemeSet;
+use syntect::parsing::SyntaxSet;
+use syntect::util::as_24_bit_terminal_escaped;
 use termimad::{crossterm::style::Color::*, MadSkin};
+
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style as RatatuiStyle},
+    widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Wrap},
+    Terminal,
+};
+use std::io;
+
+pub struct DashboardStats {
+    pub tokens: usize,
+    pub max_tokens: usize,
+    pub energy: usize,
+    pub provider: String,
+    pub model: String,
+}
 
 pub struct TuiOutput {
     skin: MadSkin,
     spinner: Arc<Mutex<Option<ProgressBar>>>,
     in_thinking: Arc<Mutex<bool>>,
     line_buffer: Arc<Mutex<String>>,
-    in_code_block: Arc<Mutex<bool>>,
+    in_code_block: Arc<Mutex<Option<String>>>,
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
+
+    // Dashboard state
+    task_state: Arc<Mutex<Option<crate::task_state::TaskStateSnapshot>>>,
+    stats: Arc<Mutex<DashboardStats>>,
 }
 
 impl TuiOutput {
@@ -30,7 +57,17 @@ impl TuiOutput {
             spinner: Arc::new(Mutex::new(None)),
             in_thinking: Arc::new(Mutex::new(false)),
             line_buffer: Arc::new(Mutex::new(String::new())),
-            in_code_block: Arc::new(Mutex::new(false)),
+            in_code_block: Arc::new(Mutex::new(None)),
+            syntax_set: SyntaxSet::load_defaults_newlines(),
+            theme_set: ThemeSet::load_defaults(),
+            task_state: Arc::new(Mutex::new(None)),
+            stats: Arc::new(Mutex::new(DashboardStats {
+                tokens: 0,
+                max_tokens: 1,
+                energy: 100,
+                provider: "Unknown".to_string(),
+                model: "Unknown".to_string(),
+            })),
         }
     }
 
@@ -73,13 +110,148 @@ impl TuiOutput {
                 println!("{}", style(line.trim()).cyan());
             } else if line.starts_with("[Error]") {
                 println!("{}", style(line.trim()).red());
-            } else if *in_code_guard {
-                println!("{}", style(line).color256(250));
+            } else if let Some(lang) = in_code_guard.as_ref() {
+                let syntax = self
+                    .syntax_set
+                    .find_syntax_by_token(lang)
+                    .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+                let mut h =
+                    HighlightLines::new(syntax, &self.theme_set.themes["base16-ocean.dark"]);
+                let ranges: Vec<(syntect::highlighting::Style, &str)> =
+                    h.highlight_line(&line, &self.syntax_set).unwrap();
+                let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
+                print!("{}", escaped);
+                if !line.ends_with('\n') {
+                    println!();
+                }
             } else {
                 self.skin.print_inline(&line);
                 println!();
             }
         }
+    }
+
+    fn render_dashboard(&self) {
+        let task_state = self.task_state.lock().unwrap().clone();
+        if task_state.is_none() {
+            return;
+        }
+
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = match Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(10),
+            },
+        ) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        let stats = self.stats.lock().unwrap();
+
+        let _ = terminal.draw(|f| {
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
+                .split(f.area());
+
+            // Left side: Task Plan
+            let plan_block = Block::default()
+                .title(" 🎯 Active Plan ")
+                .borders(Borders::ALL)
+                .border_style(RatatuiStyle::default().fg(Color::Cyan));
+            if let Some(state) = &task_state {
+                let items: Vec<ListItem> = state
+                    .plan_steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, step)| {
+                        let icon = match step.status.as_str() {
+                            "completed" => "✅",
+                            "in_progress" => "🔄",
+                            _ => "⏳",
+                        };
+                        let content = format!("{} {}. {}", icon, i + 1, step.step);
+                        let style = if step.status == "in_progress" {
+                            RatatuiStyle::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else if step.status == "completed" {
+                            RatatuiStyle::default()
+                                .fg(Color::Green)
+                                .add_modifier(Modifier::DIM)
+                        } else {
+                            RatatuiStyle::default().fg(Color::Gray)
+                        };
+                        ListItem::new(content).style(style)
+                    })
+                    .collect();
+                let list = List::new(items).block(plan_block);
+                f.render_widget(list, chunks[0]);
+            } else {
+                f.render_widget(
+                    Paragraph::new("No active task").block(plan_block),
+                    chunks[0],
+                );
+            }
+
+            // Right side: Stats
+            let stats_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(
+                    [
+                        Constraint::Length(3), // Token Gauge
+                        Constraint::Length(3), // Energy Gauge
+                        Constraint::Min(2),    // Model Info
+                    ]
+                    .as_ref(),
+                )
+                .split(chunks[1]);
+
+            // Token Usage
+            let token_pct = (stats.tokens as f64 / stats.max_tokens as f64).min(1.0);
+            let token_gauge = Gauge::default()
+                .block(
+                    Block::default()
+                        .title(format!(
+                            " 📊 Context: {}/{} ",
+                            stats.tokens, stats.max_tokens
+                        ))
+                        .borders(Borders::ALL),
+                )
+                .gauge_style(RatatuiStyle::default().fg(if token_pct > 0.8 {
+                    Color::Red
+                } else {
+                    Color::Green
+                }))
+                .ratio(token_pct);
+            f.render_widget(token_gauge, stats_chunks[0]);
+
+            // Energy
+            let energy_pct = (stats.energy as f64 / 100.0).min(1.0);
+            let energy_gauge = Gauge::default()
+                .block(
+                    Block::default()
+                        .title(format!(" ⚡ Energy: {}% ", stats.energy))
+                        .borders(Borders::ALL),
+                )
+                .gauge_style(RatatuiStyle::default().fg(if energy_pct < 0.2 {
+                    Color::Red
+                } else {
+                    Color::Yellow
+                }))
+                .ratio(energy_pct);
+            f.render_widget(energy_gauge, stats_chunks[1]);
+
+            // Model Info
+            let info = format!("Provider: {}\nModel: {}", stats.provider, stats.model);
+            let info_p = Paragraph::new(info)
+                .block(Block::default().title(" 🤖 System ").borders(Borders::ALL))
+                .style(RatatuiStyle::default().fg(Color::Blue))
+                .wrap(Wrap { trim: true });
+            f.render_widget(info_p, stats_chunks[2]);
+        });
     }
 }
 
@@ -129,16 +301,42 @@ impl AgentOutput for TuiOutput {
             let line = buffer_guard[..pos].to_string();
             *buffer_guard = buffer_guard[pos + 1..].to_string();
 
-            let mut in_code_guard = self.in_code_block.lock().unwrap();
+            let in_code_guard = self.in_code_block.lock().unwrap();
             if line.trim_start().starts_with("```") {
-                *in_code_guard = !*in_code_guard;
+                let mut in_code_guard = self.in_code_block.lock().unwrap();
+                if in_code_guard.is_none() {
+                    let lang = line
+                        .trim_start()
+                        .trim_start_matches("```")
+                        .trim()
+                        .to_string();
+                    *in_code_guard = Some(if lang.is_empty() {
+                        "text".to_string()
+                    } else {
+                        lang
+                    });
+                } else {
+                    *in_code_guard = None;
+                }
                 println!("{}", style(&line).dim());
             } else if line.starts_with("[System]") {
                 println!("{}", style(line.trim()).cyan());
             } else if line.starts_with("[Error]") {
                 println!("{}", style(line.trim()).red());
-            } else if *in_code_guard {
-                println!("{}", style(&line).color256(250));
+            } else if let Some(lang) = in_code_guard.as_ref() {
+                let syntax = self
+                    .syntax_set
+                    .find_syntax_by_token(lang)
+                    .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+                let mut h =
+                    HighlightLines::new(syntax, &self.theme_set.themes["base16-ocean.dark"]);
+                let ranges: Vec<(syntect::highlighting::Style, &str)> =
+                    h.highlight_line(&line, &self.syntax_set).unwrap();
+                let escaped = as_24_bit_terminal_escaped(&ranges[..], false);
+                print!("{}", escaped);
+                if !line.ends_with('\n') {
+                    println!();
+                }
             } else {
                 self.skin.print_inline(&line);
                 println!();
@@ -241,6 +439,10 @@ impl AgentOutput for TuiOutput {
 
     async fn on_error(&self, error: &str) {
         self.stop_spinner();
+        {
+            let mut guard = self.task_state.lock().unwrap();
+            *guard = None;
+        }
         println!("{} {}", style("✖").red().bold(), style(error).red());
     }
 
@@ -259,49 +461,41 @@ impl AgentOutput for TuiOutput {
         }
         self.stop_spinner();
 
-        println!(
-            "  ╭─ {} {}",
-            style("Plan").bold().cyan(),
-            style("─".repeat(45)).cyan()
-        );
-        if let Some(goal) = &state.goal {
-            println!("  │ {}: {}", style("Goal").bold(), style(goal).italic());
-            println!("  │");
+        // Update internal state
+        {
+            let mut guard = self.task_state.lock().unwrap();
+            *guard = Some(state.clone());
         }
 
-        let mut completed = 0;
-        for (i, step) in state.plan_steps.iter().enumerate() {
-            let (icon, color_step) = match step.status.as_str() {
-                "completed" => {
-                    completed += 1;
-                    ("✅", style(&step.step).green().dim())
-                }
-                "in_progress" => ("🔄", style(&step.step).blue().bold()),
-                _ => ("⏳", style(&step.step).dim()),
-            };
+        // Trigger dashboard render
+        self.render_dashboard();
+    }
 
-            let mut line = format!("  │  {} {}. {}", icon, i + 1, color_step);
-            if let Some(note) = &step.note {
-                if !note.is_empty() {
-                    line.push_str(&format!(" - {}", style(note).dim().italic()));
-                }
-            }
-            println!("{}", line);
+    async fn on_status_update(
+        &self,
+        tokens: usize,
+        max_tokens: usize,
+        energy: usize,
+        provider: &str,
+        model: &str,
+    ) {
+        {
+            let mut guard = self.stats.lock().unwrap();
+            guard.tokens = tokens;
+            guard.max_tokens = max_tokens;
+            guard.energy = energy;
+            guard.provider = provider.to_string();
+            guard.model = model.to_string();
         }
-        let total = state.plan_steps.len();
-        println!("  │");
-        println!(
-            "  │ {}: {}/{} completed",
-            style("Progress").dim(),
-            completed,
-            total
-        );
-        println!("  ╰{}", style("─".repeat(50)).cyan());
-        println!();
+        self.render_dashboard();
     }
 
     async fn on_task_finish(&self, summary: &str) {
         self.stop_spinner();
+        {
+            let mut guard = self.task_state.lock().unwrap();
+            *guard = None;
+        }
         self.flush_line_buffer();
         println!(
             "\n{} {}\n",
@@ -310,5 +504,40 @@ impl AgentOutput for TuiOutput {
         );
         self.print_markdown(summary);
         println!();
+    }
+}
+
+pub struct SilentTuiOutput(pub Arc<TuiOutput>);
+
+#[async_trait]
+impl AgentOutput for SilentTuiOutput {
+    async fn on_text(&self, _text: &str) {}
+    async fn on_tool_start(&self, _name: &str, _args: &str) {}
+    async fn on_tool_end(&self, _result: &str) {}
+
+    async fn on_error(&self, error: &str) {
+        println!("\n[🔔 Scheduled Task Error]");
+        self.0.on_error(error).await;
+    }
+
+    async fn on_task_finish(&self, summary: &str) {
+        println!("\n[🔔 Scheduled Task Finished]");
+        self.0.on_task_finish(summary).await;
+    }
+
+    async fn on_file(&self, path: &str) {
+        self.0.on_file(path).await;
+    }
+}
+
+pub struct TuiOutputRouter;
+
+impl OutputRouter for TuiOutputRouter {
+    fn try_route(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>> {
+        if reply_to == "cli_default" {
+            let base_output = Arc::new(TuiOutput::new());
+            return Some(Arc::new(SilentTuiOutput(base_output)));
+        }
+        None
     }
 }

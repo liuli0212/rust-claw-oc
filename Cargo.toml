@@ -43,6 +43,9 @@ axum = { version = "0.7", optional = true }
 tower-http = { version = "0.5", features = ["cors"], optional = true }
 once_cell = "1.21.3"
 lsp-types = "0.95"
+cron = "0.12"
+syntect = "5.2"
+ratatui = "0.29"
 
 [features]
 default = ["acp"]

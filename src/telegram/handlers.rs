@@ -87,48 +87,72 @@ pub(super) async fn handle_command(
                 agent_guard.flush_output().await;
                 agent_guard.update_output(output);
 
-                let ts = crate::task_state::TaskStateStore::new(&session_id);
-                if ts.has_active_plan() {
-                    if let Ok(state) = ts.load() {
-                        let mut task_msg = format!(
-                            "🎯 *Active Task*: {}\n",
-                            TelegramOutput::escape_markdown_v2(
-                                &state.goal.unwrap_or_else(|| "Unknown".to_string())
-                            )
-                        );
-                        for (step_idx, step) in state.plan_steps.iter().enumerate() {
-                            let icon = match step.status.as_str() {
-                                "completed" => "✅",
-                                "in_progress" => "⏳",
-                                _ => "⬜",
-                            };
-                            task_msg.push_str(&format!(
-                                "    \\[{}\\] {} {}\n",
-                                step_idx,
-                                icon,
-                                TelegramOutput::escape_markdown_v2(&step.step)
-                            ));
-                        }
-                        task_msg.push_str(
-                            "\n💡 You can say \"continue\" to proceed, or use /cancel to abort\\.",
-                        );
-                        let _ = bot_clone
-                            .send_message(chat_id, task_msg)
-                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                            .await;
-                    }
-                }
-
                 let (provider, model, tokens, max_tokens) = agent_guard.get_status();
-                let status = format!(
-                    "🤖 *Status*\n*Provider*: {}\n*Model*: {}\n*Context*: {} / {} tokens",
+                let usage_pc = if max_tokens > 0 {
+                    (tokens as f64 / max_tokens as f64 * 100.0) as usize
+                } else {
+                    0
+                };
+                let bar_len = 10;
+                let filled = (usage_pc * bar_len) / 100;
+                let bar = format!("{}{}", "▓".repeat(filled), "░".repeat(bar_len - filled));
+
+                let mut status_msg = format!(
+                    "🤖 *System Status*\n\
+                    ━━━━━━━━━━━━━━━━━━━━━\n\
+                    *LLM*: {} / {}\n\
+                    *Context*: {} / {} tokens\n\
+                    `[{}]` {}%\n\n",
                     TelegramOutput::escape_markdown_v2(&provider),
                     TelegramOutput::escape_markdown_v2(&model),
                     tokens,
-                    max_tokens
+                    max_tokens,
+                    bar,
+                    usage_pc
                 );
+
+                let ts = crate::task_state::TaskStateStore::new(&session_id);
+                if ts.has_active_plan() {
+                    if let Ok(state) = ts.load() {
+                        let total_steps = state.plan_steps.len();
+                        let completed_steps = state
+                            .plan_steps
+                            .iter()
+                            .filter(|s| s.status == "completed")
+                            .count();
+                        let current_step =
+                            state.plan_steps.iter().find(|s| s.status == "in_progress");
+
+                        status_msg.push_str(&format!(
+                            "🎯 *Active Plan*: {}%\n\
+                            *Goal*: {}\nProgress: {} / {} steps\n",
+                            if total_steps > 0 {
+                                completed_steps * 100 / total_steps
+                            } else {
+                                0
+                            },
+                            TelegramOutput::escape_markdown_v2(
+                                &state.goal.unwrap_or_else(|| "Unknown".to_string())
+                            ),
+                            completed_steps,
+                            total_steps
+                        ));
+
+                        if let Some(step) = current_step {
+                            status_msg.push_str(&format!(
+                                "👉 *Now*: {}\n",
+                                TelegramOutput::escape_markdown_v2(&step.step)
+                            ));
+                        }
+
+                        status_msg.push_str("\n💡 Say \"continue\" or use /cancel\\.");
+                    }
+                } else {
+                    status_msg.push_str("⚪ *No active plan*\\. Ready for new tasks\\.");
+                }
+
                 let _ = bot_clone
-                    .send_message(chat_id, status)
+                    .send_message(chat_id, status_msg)
                     .parse_mode(ParseMode::MarkdownV2)
                     .await;
             });

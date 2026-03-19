@@ -30,7 +30,11 @@ impl Tool for ReadMemoryTool {
         clean_schema(serde_json::to_value(schema_for!(EmptyArgs)).unwrap())
     }
 
-    async fn execute(&self, _args: Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let start = Instant::now();
         let mem = self.workspace.read_memory().await?;
         let output = if mem.is_empty() {
@@ -78,7 +82,11 @@ impl Tool for WriteMemoryTool {
         clean_schema(serde_json::to_value(schema_for!(WriteMemoryArgs)).unwrap())
     }
 
-    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &crate::tools::protocol::ToolContext,
+    ) -> Result<String, ToolError> {
         let start = Instant::now();
         let parsed: WriteMemoryArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
@@ -125,7 +133,11 @@ impl Tool for RagSearchTool {
         clean_schema(serde_json::to_value(schema_for!(RagSearchArgs)).unwrap())
     }
 
-    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &crate::tools::protocol::ToolContext,
+    ) -> Result<String, ToolError> {
         let parsed: RagSearchArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
@@ -177,7 +189,11 @@ impl Tool for RagInsertTool {
         clean_schema(serde_json::to_value(schema_for!(RagInsertArgs)).unwrap())
     }
 
-    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &crate::tools::protocol::ToolContext,
+    ) -> Result<String, ToolError> {
         let parsed: RagInsertArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 

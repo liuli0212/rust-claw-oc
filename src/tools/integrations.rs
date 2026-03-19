@@ -38,7 +38,11 @@ impl Tool for SendTelegramMessageTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(SendTelegramMessageArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let parsed: SendTelegramMessageArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
@@ -92,10 +96,16 @@ mod tests {
         let tool = SendTelegramMessageTool::new("fake-token".to_string());
 
         let invalid_chat = tool
-            .execute(serde_json::json!({
-                "chat_id": "abc123",
-                "text": "hello"
-            }))
+            .execute(
+                serde_json::json!({
+                    "chat_id": "abc123",
+                    "text": "hello"
+                }),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap_err();
         assert!(invalid_chat
@@ -103,10 +113,16 @@ mod tests {
             .contains("chat_id must be a numeric Telegram chat ID"));
 
         let long_text = tool
-            .execute(serde_json::json!({
-                "chat_id": "12345",
-                "text": "x".repeat(4097)
-            }))
+            .execute(
+                serde_json::json!({
+                    "chat_id": "12345",
+                    "text": "x".repeat(4097)
+                }),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap_err();
         assert!(long_text

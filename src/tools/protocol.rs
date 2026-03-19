@@ -29,12 +29,18 @@ pub enum ToolError {
     IoError(#[from] std::io::Error),
 }
 
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    pub session_id: String,
+    pub reply_to: String,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> String;
     fn description(&self) -> String;
     fn parameters_schema(&self) -> serde_json::Value;
-    async fn execute(&self, args: Value) -> Result<String, ToolError>;
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

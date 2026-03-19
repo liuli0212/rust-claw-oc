@@ -27,7 +27,11 @@ impl Tool for SkillTool {
         crate::tools::clean_schema(self.schema.clone())
     }
 
-    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: Value,
+        ctx: &crate::tools::ToolContext,
+    ) -> Result<String, ToolError> {
         let start = Instant::now();
         let mut script = self.script_template.clone();
 
@@ -247,8 +251,12 @@ echo "{{n}}"
             script_template: "echo \"{{message}}\"".to_string(),
         };
 
+        let ctx = crate::tools::ToolContext {
+            session_id: "test".to_string(),
+            reply_to: "test".to_string(),
+        };
         let result = skill
-            .execute(serde_json::json!({ "message": "hello" }))
+            .execute(serde_json::json!({ "message": "hello" }), &ctx)
             .await
             .unwrap();
         let envelope: crate::tools::protocol::ToolExecutionEnvelope =

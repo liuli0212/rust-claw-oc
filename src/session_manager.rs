@@ -1,4 +1,4 @@
-use crate::core::{AgentLoop, AgentOutput};
+use crate::core::{AgentLoop, AgentOutput, OutputRouter};
 use crate::llm_client::LlmClient;
 use crate::tools::Tool;
 use std::collections::HashMap;
@@ -18,7 +18,8 @@ type SessionEntryMap = AsyncMutex<
 
 pub struct SessionManager {
     llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
-    tools: Vec<Arc<dyn Tool>>,
+    tools: RwLock<Vec<Arc<dyn Tool>>>,
+    routers: RwLock<Vec<Arc<dyn OutputRouter>>>,
     sessions: SessionEntryMap,
     registry: crate::session::repository::SessionRegistryStore,
 }
@@ -27,12 +28,33 @@ impl SessionManager {
     pub fn new(llm: Option<Arc<dyn LlmClient>>, tools: Vec<Arc<dyn Tool>>) -> Self {
         Self {
             llm: Arc::new(RwLock::new(llm)),
-            tools,
+            tools: RwLock::new(tools),
+            routers: RwLock::new(Vec::new()),
             sessions: AsyncMutex::new(HashMap::new()),
             registry: crate::session::repository::SessionRegistryStore::new(
                 std::path::PathBuf::from("rusty_claw"),
             ),
         }
+    }
+
+    pub fn add_output_router(&self, router: Arc<dyn OutputRouter>) {
+        let mut routers = self.routers.write().unwrap();
+        routers.push(router);
+    }
+
+    pub fn route_output(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>> {
+        let routers = self.routers.read().unwrap();
+        for router in routers.iter() {
+            if let Some(output) = router.try_route(reply_to) {
+                return Some(output);
+            }
+        }
+        None
+    }
+
+    pub fn add_tool(&self, tool: Arc<dyn Tool>) {
+        let mut tools = self.tools.write().unwrap();
+        tools.push(tool);
     }
 
     pub async fn reset_session(&self, session_id: &str) {
@@ -79,10 +101,11 @@ impl SessionManager {
                 })?
                 .clone()
         };
+        let tools = self.tools.read().unwrap().clone();
         let agent = crate::session::factory::build_agent_session(
             session_id,
             llm,
-            self.tools.clone(),
+            tools,
             transcript_path.clone(),
             output,
         )?;
@@ -134,8 +157,8 @@ impl SessionManager {
     }
 
     #[cfg(feature = "acp")]
-    pub fn tools(&self) -> &[Arc<dyn Tool>] {
-        &self.tools
+    pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
+        self.tools.read().unwrap().clone()
     }
 
     pub fn list_sessions(&self) -> Vec<(String, u64, usize)> {

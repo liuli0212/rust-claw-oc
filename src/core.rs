@@ -50,9 +50,23 @@ pub trait AgentOutput: Send + Sync {
     async fn on_plan_update(&self, _state: &crate::task_state::TaskStateSnapshot) {
         // Default: no-op
     }
+    async fn on_status_update(
+        &self,
+        _tokens: usize,
+        _max_tokens: usize,
+        _energy: usize,
+        _provider: &str,
+        _model: &str,
+    ) {
+        // Default: no-op
+    }
     async fn on_task_finish(&self, _summary: &str) {
         // Default: no-op
     }
+}
+
+pub trait OutputRouter: Send + Sync {
+    fn try_route(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -420,6 +434,18 @@ impl AgentLoop {
                 let _ = self.maybe_compact_history(false).await;
                 compaction_checked = true;
             }
+
+            // Update status dashboard
+            let (tokens, max_tokens, _, _, _) = self.context.get_context_status();
+            self.output
+                .on_status_update(
+                    tokens,
+                    max_tokens,
+                    task_state.energy_points,
+                    self.llm.provider_name(),
+                    self.llm.model_name(),
+                )
+                .await;
 
             let current_tools = self.load_current_tools();
 

@@ -69,7 +69,11 @@ impl Tool for WebFetchTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(WebFetchArgs)).unwrap())
     }
 
-    async fn execute(&self, args: serde_json::Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
         let start = Instant::now();
         let parsed: WebFetchArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
@@ -146,7 +150,11 @@ impl Tool for TavilySearchTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(TavilySearchArgs)).unwrap())
     }
 
-    async fn execute(&self, args: Value) -> Result<String, ToolError> {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: &crate::tools::protocol::ToolContext,
+    ) -> Result<String, ToolError> {
         let start = Instant::now();
         let parsed: TavilySearchArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
@@ -231,9 +239,15 @@ mod tests {
     async fn test_web_fetch_tool_rejects_non_http_url() {
         let tool = WebFetchTool::new();
         let err = tool
-            .execute(serde_json::json!({
-                "url": "ftp://example.com/file.txt"
-            }))
+            .execute(
+                serde_json::json!({
+                    "url": "ftp://example.com/file.txt"
+                }),
+                &crate::tools::ToolContext {
+                    session_id: "test".into(),
+                    reply_to: "test".into(),
+                },
+            )
             .await
             .unwrap_err();
 

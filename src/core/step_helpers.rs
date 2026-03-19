@@ -380,10 +380,15 @@ impl AgentLoop {
                 .on_tool_start(&call.name, &call.args.to_string())
                 .await;
 
+            let ctx = crate::tools::ToolContext {
+                session_id: self.session_id.clone(),
+                reply_to: self.session_id.clone(),
+            };
+
             let (result, is_error, stopped) = tokio::select! {
                 exec_res = tokio::time::timeout(
                     Duration::from_secs(120),
-                    tool.execute(call.args.clone())
+                    tool.execute(call.args.clone(), &ctx)
                 ) => {
                     match exec_res {
                         Ok(Ok(res)) => (res, false, false),
