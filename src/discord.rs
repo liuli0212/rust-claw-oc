@@ -178,7 +178,7 @@ impl EventHandler for Handler {
 
         let agent = match self
             .session_manager
-            .get_or_create_session(&session_id, output.clone())
+            .get_or_create_session(&session_id, &session_id, output.clone())
             .await
         {
             Ok(a) => a,
@@ -238,6 +238,71 @@ impl EventHandler for Handler {
                 status_msg.push_str("✅ No active task.");
             }
             let _ = channel_id.say(&http, status_msg).await;
+            return;
+        }
+
+        if cmd.starts_with("/cron") {
+            let parts: Vec<&str> = content.split_whitespace().collect();
+            let action = parts.get(1).copied().unwrap_or("list");
+            let scheduler = crate::scheduler::Scheduler::new(self.session_manager.clone());
+
+            match action {
+                "list" => {
+                    let tasks = scheduler.list_tasks().await;
+                    if tasks.is_empty() {
+                        let _ = channel_id.say(&http, "⚪ No scheduled tasks found.").await;
+                    } else {
+                        let mut msg = "📅 **Scheduled Tasks**\n━━━━━━━━━━━━━━━━━━━━━\n".to_string();
+                        for task in tasks {
+                            let status = if task.enabled { "✅" } else { "❌" };
+                            msg.push_str(&format!(
+                                "*ID*: `{}` {}\n*Cron*: `{}`\n*Goal*: {}\n\n",
+                                task.id, status, task.cron, task.goal
+                            ));
+                        }
+                        let _ = channel_id.say(&http, msg).await;
+                    }
+                }
+                "remove" => {
+                    if let Some(id) = parts.get(2) {
+                        match scheduler.remove_task(id).await {
+                            Ok(_) => {
+                                let _ = channel_id.say(&http, format!("✅ Task `{}` removed.", id)).await;
+                            }
+                            Err(e) => {
+                                let _ = channel_id.say(&http, format!("❌ Error: {}", e)).await;
+                            }
+                        }
+                    } else {
+                        let _ = channel_id.say(&http, "Usage: /cron remove <id>").await;
+                    }
+                }
+                "toggle" => {
+                    if let (Some(id), Some(state)) = (parts.get(2), parts.get(3)) {
+                        let enabled = match *state {
+                            "on" | "true" | "enable" => true,
+                            "off" | "false" | "disable" => false,
+                            _ => {
+                                let _ = channel_id.say(&http, "Usage: /cron toggle <id> <on|off>").await;
+                                return;
+                            }
+                        };
+                        match scheduler.toggle_task(id, enabled).await {
+                            Ok(_) => {
+                                let _ = channel_id.say(&http, format!("✅ Task `{}` is now {}.", id, if enabled { "enabled" } else { "disabled" })).await;
+                            }
+                            Err(e) => {
+                                let _ = channel_id.say(&http, format!("❌ Error: {}", e)).await;
+                            }
+                        }
+                    } else {
+                        let _ = channel_id.say(&http, "Usage: /cron toggle <id> <on|off>").await;
+                    }
+                }
+                _ => {
+                    let _ = channel_id.say(&http, "Unknown action. Use: list, remove, toggle").await;
+                }
+            }
             return;
         }
 

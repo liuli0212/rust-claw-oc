@@ -11,7 +11,7 @@ pub async fn run_headless_command(
     command: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let agent = session_manager
-        .get_or_create_session("headless", output.clone())
+        .get_or_create_session("headless", "cli", output.clone())
         .await?;
 
     let mut agent_guard = agent.lock().await;
@@ -167,6 +167,10 @@ pub async fn run_cli_repl(
             print_sessions(session_manager.clone());
             continue;
         }
+        if line.starts_with("/cron") {
+            handle_cron_command(session_manager.clone(), &line).await;
+            continue;
+        }
         if line.starts_with("/context") {
             handle_context_command(session_manager.clone(), output.clone(), &line).await;
             continue;
@@ -200,13 +204,14 @@ fn print_help() {
     println!("  {} - Show model usage", style("/status").cyan());
     println!("  {} - Switch models", style("/model").magenta());
     println!("  {} - List all sessions", style("/session").white());
+    println!("  {} - Manage scheduled tasks", style("/cron").yellow());
     println!("  {} - Inspect context", style("/context").blue());
     println!();
 }
 
 async fn print_status(session_manager: Arc<SessionManager>, output: Arc<dyn AgentOutput>) {
     let agent = session_manager
-        .get_or_create_session("cli", output)
+        .get_or_create_session("cli", "cli", output)
         .await
         .unwrap();
     let agent_guard = agent.lock().await;
@@ -241,6 +246,72 @@ async fn print_status(session_manager: Arc<SessionManager>, output: Arc<dyn Agen
     }
 }
 
+async fn handle_cron_command(session_manager: Arc<SessionManager>, line: &str) {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let action = parts.get(1).copied().unwrap_or("list");
+    let scheduler = crate::scheduler::Scheduler::new(session_manager.clone());
+
+    match action {
+        "list" => {
+            let tasks = scheduler.list_tasks().await;
+            if tasks.is_empty() {
+                println!("  {} No scheduled tasks found.", style("⚪").dim());
+            } else {
+                println!("\n  {}", style("Scheduled Tasks:").bold());
+                for task in tasks {
+                    let status = if task.enabled {
+                        style("enabled").green()
+                    } else {
+                        style("disabled").red()
+                    };
+                    println!(
+                        "  • {} [{}] - {} ({})",
+                        style(&task.id).bold().cyan(),
+                        status,
+                        task.goal,
+                        style(&task.cron).dim()
+                    );
+                }
+                println!();
+            }
+        }
+        "remove" => {
+            if let Some(id) = parts.get(2) {
+                match scheduler.remove_task(id).await {
+                    Ok(_) => println!("  {} Task '{}' removed.", style("✔").green(), id),
+                    Err(e) => println!("  {} Error: {}", style("❌").red(), e),
+                }
+            } else {
+                println!("  {} Usage: /cron remove <id>", style("ℹ").blue());
+            }
+        }
+        "toggle" => {
+            if let (Some(id), Some(state)) = (parts.get(2), parts.get(3)) {
+                let enabled = match *state {
+                    "on" | "true" | "enable" => true,
+                    "off" | "false" | "disable" => false,
+                    _ => {
+                        println!(
+                            "  {} Usage: /cron toggle <id> <on|off>",
+                            style("ℹ").blue()
+                        );
+                        return;
+                    }
+                };
+                match scheduler.toggle_task(id, enabled).await {
+                    Ok(_) => println!("  {} Task '{}' is now {}.", style("✔").green(), id, if enabled { "enabled" } else { "disabled" }),
+                    Err(e) => println!("  {} Error: {}", style("❌").red(), e),
+                }
+            } else {
+                println!("  {} Usage: /cron toggle <id> <on|off>", style("ℹ").blue());
+            }
+        }
+        _ => {
+            println!("  {} Unknown action. Use: list, remove, toggle", style("❌").red());
+        }
+    }
+}
+
 fn print_sessions(session_manager: Arc<SessionManager>) {
     let sessions = session_manager.list_sessions();
     println!();
@@ -269,7 +340,7 @@ async fn handle_context_command(
     line: &str,
 ) {
     let agent = session_manager
-        .get_or_create_session("cli", output)
+        .get_or_create_session("cli", "cli", output)
         .await
         .unwrap();
     let mut agent_guard = agent.lock().await;
@@ -405,7 +476,7 @@ async fn run_cli_agent_step(
     line: String,
 ) {
     let agent = match session_manager
-        .get_or_create_session("cli", output.clone())
+        .get_or_create_session("cli", "cli", output.clone())
         .await
     {
         Ok(a) => a,

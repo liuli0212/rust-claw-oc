@@ -1,4 +1,4 @@
-use crate::core::{AgentOutput, OutputRouter};
+use crate::core::{AgentOutput, OutputRouter, SilentOutputWrapper};
 use crate::session_manager::SessionManager;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +29,8 @@ enum Command {
     Session,
     #[command(description = "switch LLM model: /model <provider> [model_name]")]
     Model(String),
+    #[command(description = "manage scheduled tasks: /cron <list|remove|toggle> [id] [on|off]")]
+    Cron(String),
 }
 
 struct TelegramOutputRouter {
@@ -37,13 +39,15 @@ struct TelegramOutputRouter {
 
 impl OutputRouter for TelegramOutputRouter {
     fn try_route(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>> {
-        if let Some(chat_id_str) = reply_to.strip_prefix("tg_") {
+        tracing::debug!("TelegramOutputRouter checking reply_to: '{}'", reply_to);
+        let chat_id_str = reply_to.strip_prefix("tg_").or_else(|| reply_to.strip_prefix("telegram:"));
+        if let Some(chat_id_str) = chat_id_str {
             if let Ok(id) = chat_id_str.parse::<i64>() {
                 let base_output = Arc::new(output::TelegramOutput::new(
                     self.bot.clone(),
                     teloxide::types::ChatId(id),
                 ));
-                return Some(Arc::new(output::SilentTelegramOutput(base_output)));
+                return Some(Arc::new(SilentOutputWrapper { inner: base_output }));
             }
         }
         None

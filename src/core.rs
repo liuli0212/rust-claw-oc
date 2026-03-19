@@ -65,6 +65,41 @@ pub trait AgentOutput: Send + Sync {
     }
 }
 
+pub struct SilentOutputWrapper {
+    pub inner: Arc<dyn AgentOutput>,
+}
+
+#[async_trait]
+impl AgentOutput for SilentOutputWrapper {
+    async fn on_waiting(&self, message: &str) { self.inner.on_waiting(message).await; }
+    fn clear_waiting(&self) { self.inner.clear_waiting(); }
+    async fn on_text(&self, text: &str) { self.inner.on_text(text).await; }
+    async fn on_thinking(&self, _text: &str) {}
+    async fn on_tool_start(&self, _name: &str, _args: &str) {}
+    async fn on_tool_end(&self, _result: &str) {}
+    async fn on_error(&self, error: &str) { self.inner.on_error(error).await; }
+    async fn flush(&self) { self.inner.flush().await; }
+    async fn on_file(&self, path: &str) { self.inner.on_file(path).await; }
+    async fn on_plan_update(&self, state: &crate::task_state::TaskStateSnapshot) {
+        self.inner.on_plan_update(state).await;
+    }
+    async fn on_status_update(
+        &self,
+        tokens: usize,
+        max_tokens: usize,
+        energy: usize,
+        provider: &str,
+        model: &str,
+    ) {
+        self.inner
+            .on_status_update(tokens, max_tokens, energy, provider, model)
+            .await;
+    }
+    async fn on_task_finish(&self, summary: &str) {
+        self.inner.on_task_finish(summary).await;
+    }
+}
+
 pub trait OutputRouter: Send + Sync {
     fn try_route(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>>;
 }
@@ -115,6 +150,7 @@ struct ToolDispatchOutcome {
 
 pub struct AgentLoop {
     session_id: String,
+    pub reply_to: String,
     llm: Arc<dyn LlmClient>,
     tools: Vec<Arc<dyn Tool>>,
     pub context: AgentContext,
@@ -134,6 +170,7 @@ impl AgentLoop {
     pub fn new(
         session_id: String,
         llm: Arc<dyn LlmClient>,
+        reply_to: String,
         tools: Vec<Arc<dyn Tool>>,
         context: AgentContext,
         output: Arc<dyn AgentOutput>,
@@ -143,6 +180,7 @@ impl AgentLoop {
         Self {
             session_id,
             llm,
+            reply_to,
             tools,
             context,
             output,

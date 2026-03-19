@@ -61,7 +61,7 @@ pub(super) async fn handle_run(
 
     let agent_res = server
         .session_manager
-        .get_or_create_session(&session_id, output.clone())
+        .get_or_create_session(&session_id, &session_id, output.clone())
         .await;
 
     let _guard = match agent_res {

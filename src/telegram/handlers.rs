@@ -58,7 +58,7 @@ pub(super) async fn handle_command(
         Command::Status => {
             let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
             let agent = match session_manager
-                .get_or_create_session(&session_id, output.clone())
+                .get_or_create_session(&session_id, &session_id, output.clone())
                 .await
             {
                 Ok(a) => a,
@@ -160,7 +160,7 @@ pub(super) async fn handle_command(
         Command::Session => {
             let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
             let agent = match session_manager
-                .get_or_create_session(&session_id, output.clone())
+                .get_or_create_session(&session_id, &session_id, output.clone())
                 .await
             {
                 Ok(a) => a,
@@ -250,6 +250,74 @@ pub(super) async fn handle_command(
                 }
             }
         }
+        Command::Cron(args) => {
+            let parts: Vec<&str> = args.split_whitespace().collect();
+            let action = parts.get(0).copied().unwrap_or("list");
+            let scheduler = Arc::new(crate::scheduler::Scheduler::new(session_manager.clone()));
+
+            match action {
+                "list" => {
+                    let tasks = scheduler.list_tasks().await;
+                    if tasks.is_empty() {
+                        bot.send_message(chat_id, "⚪ No scheduled tasks found.").await?;
+                    } else {
+                        let mut msg = "📅 *Scheduled Tasks*\n━━━━━━━━━━━━━━━━━━━━━\n".to_string();
+                        for task in tasks {
+                            let status = if task.enabled { "✅" } else { "❌" };
+                            msg.push_str(&format!(
+                                "*ID*: `{}` {}\n*Cron*: `{}`\n*Goal*: {}\n\n",
+                                TelegramOutput::escape_markdown_v2(&task.id),
+                                status,
+                                TelegramOutput::escape_markdown_v2(&task.cron),
+                                TelegramOutput::escape_markdown_v2(&task.goal)
+                            ));
+                        }
+                        bot.send_message(chat_id, msg)
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .await?;
+                    }
+                }
+                "remove" => {
+                    if let Some(id) = parts.get(1) {
+                        match scheduler.remove_task(id).await {
+                            Ok(_) => {
+                                bot.send_message(chat_id, format!("✅ Task `{}` removed.", id)).await?;
+                            }
+                            Err(e) => {
+                                bot.send_message(chat_id, format!("❌ Error: {}", e)).await?;
+                            }
+                        }
+                    } else {
+                        bot.send_message(chat_id, "Usage: /cron remove <id>").await?;
+                    }
+                }
+                "toggle" => {
+                    if let (Some(id), Some(state)) = (parts.get(1), parts.get(2)) {
+                        let enabled = match *state {
+                            "on" | "true" | "enable" => true,
+                            "off" | "false" | "disable" => false,
+                            _ => {
+                                bot.send_message(chat_id, "Usage: /cron toggle <id> <on|off>").await?;
+                                return Ok(());
+                            }
+                        };
+                        match scheduler.toggle_task(id, enabled).await {
+                            Ok(_) => {
+                                bot.send_message(chat_id, format!("✅ Task `{}` is now {}.", id, if enabled { "enabled" } else { "disabled" })).await?;
+                            }
+                            Err(e) => {
+                                bot.send_message(chat_id, format!("❌ Error: {}", e)).await?;
+                            }
+                        }
+                    } else {
+                        bot.send_message(chat_id, "Usage: /cron toggle <id> <on|off>").await?;
+                    }
+                }
+                _ => {
+                    bot.send_message(chat_id, "Unknown action. Use: list, remove, toggle").await?;
+                }
+            }
+        }
     }
 
     Ok(())
@@ -305,7 +373,7 @@ pub(super) async fn handle_message(
         let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
 
         let agent = match session_manager
-            .get_or_create_session(&session_id, output.clone())
+            .get_or_create_session(&session_id, &session_id, output.clone())
             .await
         {
             Ok(a) => a,

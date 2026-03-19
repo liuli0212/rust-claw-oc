@@ -10,6 +10,7 @@ use crate::tools::Tool;
 
 pub fn build_agent_session(
     session_id: &str,
+    reply_to: &str,
     llm: Arc<dyn LlmClient>,
     tools: Vec<Arc<dyn Tool>>,
     transcript_path: PathBuf,
@@ -34,6 +35,7 @@ pub fn build_agent_session(
     Ok(Arc::new(AsyncMutex::new(AgentLoop::new(
         session_id.to_string(),
         llm,
+        reply_to.to_string(),
         session_tools,
         context,
         output,

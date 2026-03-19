@@ -382,7 +382,7 @@ impl AgentLoop {
 
             let ctx = crate::tools::ToolContext {
                 session_id: self.session_id.clone(),
-                reply_to: self.session_id.clone(),
+                reply_to: self.reply_to.clone(),
             };
 
             let (result, is_error, stopped) = tokio::select! {

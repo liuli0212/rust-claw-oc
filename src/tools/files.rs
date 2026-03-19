@@ -304,6 +304,10 @@ impl Tool for TaskPlanTool {
                 let status = parsed.status.ok_or_else(|| {
                     ToolError::InvalidArguments("update_status requires 'status'".to_string())
                 })?;
+                if state.plan_steps.len() == 0 {
+                    return Err(ToolError::ExecutionFailed(
+                        "No tasks planed yet.".to_string()));
+                }
                 let normalized_status = Self::normalize_status(&status)?;
 
                 if index < state.plan_steps.len() {
@@ -323,6 +327,10 @@ impl Tool for TaskPlanTool {
                     ToolError::InvalidArguments("update_text requires 'index'".to_string())
                 })?;
 
+                if state.plan_steps.len() == 0 {
+                    return Err(ToolError::ExecutionFailed(
+                        "No tasks planed yet.".to_string()));
+                }
                 if index < state.plan_steps.len() {
                     if let Some(step) = parsed.step {
                         state.plan_steps[index].step = step;

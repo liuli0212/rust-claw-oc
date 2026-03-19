@@ -1,4 +1,4 @@
-use crate::core::{AgentOutput, OutputRouter};
+use crate::core::{AgentOutput, OutputRouter, SilentOutputWrapper};
 use async_trait::async_trait;
 use console::{style, Emoji};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -39,6 +39,7 @@ pub struct TuiOutput {
     // Dashboard state
     task_state: Arc<Mutex<Option<crate::task_state::TaskStateSnapshot>>>,
     stats: Arc<Mutex<DashboardStats>>,
+    last_plan_fingerprint: Arc<Mutex<String>>,
 }
 
 impl TuiOutput {
@@ -68,6 +69,7 @@ impl TuiOutput {
                 provider: "Unknown".to_string(),
                 model: "Unknown".to_string(),
             })),
+            last_plan_fingerprint: Arc::new(Mutex::new(String::new())),
         }
     }
 
@@ -459,13 +461,25 @@ impl AgentOutput for TuiOutput {
         if state.plan_steps.is_empty() {
             return;
         }
-        self.stop_spinner();
+
+        // Calculate fingerprint to avoid redundant renders
+        let fingerprint = format!(
+            "{}:{}",
+            state.goal.as_deref().unwrap_or(""),
+            state.plan_steps.iter().map(|s| format!("{}{}", s.step, s.status)).collect::<String>()
+        );
 
         // Update internal state
         {
+            let mut fp_guard = self.last_plan_fingerprint.lock().unwrap();
+            if *fp_guard == fingerprint {
+                return; // No meaningful change
+            }
+            *fp_guard = fingerprint;
             let mut guard = self.task_state.lock().unwrap();
             *guard = Some(state.clone());
         }
+        self.stop_spinner();
 
         // Trigger dashboard render
         self.render_dashboard();
@@ -507,36 +521,13 @@ impl AgentOutput for TuiOutput {
     }
 }
 
-pub struct SilentTuiOutput(pub Arc<TuiOutput>);
-
-#[async_trait]
-impl AgentOutput for SilentTuiOutput {
-    async fn on_text(&self, _text: &str) {}
-    async fn on_tool_start(&self, _name: &str, _args: &str) {}
-    async fn on_tool_end(&self, _result: &str) {}
-
-    async fn on_error(&self, error: &str) {
-        println!("\n[🔔 Scheduled Task Error]");
-        self.0.on_error(error).await;
-    }
-
-    async fn on_task_finish(&self, summary: &str) {
-        println!("\n[🔔 Scheduled Task Finished]");
-        self.0.on_task_finish(summary).await;
-    }
-
-    async fn on_file(&self, path: &str) {
-        self.0.on_file(path).await;
-    }
-}
-
 pub struct TuiOutputRouter;
 
 impl OutputRouter for TuiOutputRouter {
     fn try_route(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>> {
-        if reply_to == "cli_default" {
+        if reply_to == "cli" {
             let base_output = Arc::new(TuiOutput::new());
-            return Some(Arc::new(SilentTuiOutput(base_output)));
+            return Some(Arc::new(SilentOutputWrapper { inner: base_output }));
         }
         None
     }

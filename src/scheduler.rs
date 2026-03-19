@@ -102,9 +102,23 @@ impl Scheduler {
         }
     }
 
+    pub async fn toggle_task(&self, id: &str, enabled: bool) -> Result<(), String> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.get_mut(id) {
+            task.enabled = enabled;
+            drop(tasks);
+            self.save().await.map_err(|e| e.to_string())?;
+            Ok(())
+        } else {
+            Err("Task not found".to_string())
+        }
+    }
+
     pub async fn list_tasks(&self) -> Vec<ScheduledTask> {
         let tasks = self.tasks.read().await;
-        tasks.values().cloned().collect()
+        let mut list: Vec<ScheduledTask> = tasks.values().cloned().collect();
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        list
     }
 
     pub async fn run_loop(self: Arc<Self>) {
@@ -157,10 +171,19 @@ impl Scheduler {
                     let output = sm
                         .route_output(&task.reply_to)
                         .unwrap_or_else(|| Arc::new(CronOutput));
-                    match sm.get_or_create_session(&task.session_id, output).await {
+                    match sm.get_or_create_session(&task.session_id, &task.reply_to, output.clone()).await {
                         Ok(agent_mutex) => {
+                            {
+                                let mut agent = agent_mutex.lock().await;
+                                agent.update_output(output);
+                            }
                             let mut agent = agent_mutex.lock().await;
-                            if let Err(e) = agent.step(task.goal).await {
+                            let injected_goal = format!(
+                                "[SYSTEM: SCHEDULED EVENT TRIGGERED]\nThis is a scheduled task that has just been triggered. Execute the goal immediately and output the result. DO NOT create new scheduled tasks or reminders for this.\n\nTask Goal: {}",
+                                task.goal
+                            );
+                            
+                            if let Err(e) = agent.step(injected_goal).await {
                                 tracing::error!("Scheduled task {} failed: {}", task.id, e);
                             }
                         }

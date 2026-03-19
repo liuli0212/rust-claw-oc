@@ -44,11 +44,14 @@ impl SessionManager {
 
     pub fn route_output(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>> {
         let routers = self.routers.read().unwrap();
+        tracing::debug!("Routing output for reply_to: {}, routers count: {}", reply_to, routers.len());
         for router in routers.iter() {
             if let Some(output) = router.try_route(reply_to) {
+                tracing::debug!("Found router for reply_to: {}", reply_to);
                 return Some(output);
             }
         }
+        tracing::debug!("No router found for reply_to: {}", reply_to);
         None
     }
 
@@ -78,6 +81,7 @@ impl SessionManager {
     pub async fn get_or_create_session(
         &self,
         session_id: &str,
+        reply_to: &str,
         output: Arc<dyn AgentOutput>,
     ) -> Result<Arc<AsyncMutex<AgentLoop>>, String> {
         let existing = {
@@ -104,6 +108,7 @@ impl SessionManager {
         let tools = self.tools.read().unwrap().clone();
         let agent = crate::session::factory::build_agent_session(
             session_id,
+            reply_to,
             llm,
             tools,
             transcript_path.clone(),

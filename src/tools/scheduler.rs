@@ -12,9 +12,9 @@ pub struct ManageScheduleTool {
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct ManageScheduleArgs {
-    /// Action to perform: "add", "remove", "list"
+    /// Action to perform: "add", "remove", "list", "toggle"
     pub action: String,
-    /// Unique ID for the task (required for "add" and "remove")
+    /// Unique ID for the task (required for "add", "remove", "toggle")
     pub id: Option<String>,
     /// Cron expression (e.g., "0 23 * * *") (required for "add")
     pub cron: Option<String>,
@@ -24,6 +24,8 @@ pub struct ManageScheduleArgs {
     pub session_id: Option<String>,
     /// Delay from now (e.g., "5m", "1h", "10s"). If used, task is run once.
     pub delay: Option<String>,
+    /// For "toggle": true to enable, false to disable
+    pub enabled: Option<bool>,
 }
 
 #[async_trait]
@@ -33,7 +35,7 @@ impl Tool for ManageScheduleTool {
     }
 
     fn description(&self) -> String {
-        "Manage scheduled tasks and reminders. Actions: add, remove, list. Supports relative delays like '5m' or '1h' for one-time reminders.".to_string()
+        "Manage scheduled tasks and reminders. Actions: add, remove, list, toggle. Supports relative delays like '5m' or '1h' for one-time reminders.".to_string()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -95,12 +97,21 @@ impl Tool for ManageScheduleTool {
                     })?
                 };
 
+                // If the task is created from CLI, try to forward notifications to Telegram
+                // if TELEGRAM_CHAT_ID is configured in the environment.
+                let mut reply_to = _ctx.reply_to.clone();
+                if reply_to == "cli" {
+                    if let Ok(chat_id) = std::env::var("TELEGRAM_CHAT_ID") {
+                        reply_to = format!("telegram:{}", chat_id);
+                    }
+                }
+
                 let task = ScheduledTask {
                     id: id.clone(),
                     cron,
                     goal,
                     session_id,
-                    reply_to: _ctx.reply_to.clone(),
+                    reply_to,
                     enabled: true,
                     run_once,
                     last_run: None,
@@ -125,6 +136,23 @@ impl Tool for ManageScheduleTool {
                     .await
                     .map_err(ToolError::ExecutionFailed)?;
                 Ok(format!("Task '{}' removed successfully.", id))
+            }
+            "toggle" => {
+                let id = parsed.id.ok_or_else(|| {
+                    ToolError::InvalidArguments("id is required for toggle".to_string())
+                })?;
+                let enabled = parsed.enabled.ok_or_else(|| {
+                    ToolError::InvalidArguments("enabled is required for toggle".to_string())
+                })?;
+                self.scheduler
+                    .toggle_task(&id, enabled)
+                    .await
+                    .map_err(ToolError::ExecutionFailed)?;
+                Ok(format!(
+                    "Task '{}' is now {}.",
+                    id,
+                    if enabled { "enabled" } else { "disabled" }
+                ))
             }
             "list" => {
                 let tasks = self.scheduler.list_tasks().await;

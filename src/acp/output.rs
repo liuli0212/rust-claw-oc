@@ -30,9 +30,7 @@ impl AgentOutput for AcpOutput {
     async fn on_text(&self, text: &str) {
         let _ = self.tx.send(AcpEvent::Text(text.to_string()));
     }
-    async fn on_thinking(&self, text: &str) {
-        let _ = self.tx.send(AcpEvent::Thinking(text.to_string()));
-    }
+    async fn on_thinking(&self, _text: &str) {}
     async fn on_tool_start(&self, _name: &str, _args: &str) {}
     async fn on_tool_end(&self, _result: &str) {}
     async fn on_error(&self, error: &str) {
