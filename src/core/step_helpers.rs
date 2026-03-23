@@ -329,7 +329,10 @@ impl AgentLoop {
                     let summary = format!("Autopilot completed {} tasks in the last 25 iterations.", current_completed - self.autopilot_todos_completed_count);
                     
                     self.context.rolling_summary = Some(summary);
-                    self.context.dialogue_history.clear(); // Amnesia reset
+                    // Keep the last 3 turns instead of complete amnesia
+                    if self.context.dialogue_history.len() > 3 {
+                        self.context.dialogue_history.drain(0..self.context.dialogue_history.len() - 3);
+                    }
                     task_state.energy_points = Self::INITIAL_ENERGY;
                     self.autopilot_todos_completed_count = current_completed;
                     return None; // Continue loop
@@ -493,7 +496,7 @@ impl AgentLoop {
         let mut skip_remaining = false;
         let mut response_parts = Vec::new();
         
-        let todos_before = if self.is_autopilot { std::fs::read_to_string("TODOS.md").unwrap_or_default() } else { String::new() };
+        let todos_before = if self.is_autopilot { self.count_todos_status() } else { (0, 0) };
 
         for (mut call, thought_sig) in tool_calls_accumulated {
             if skip_remaining {
@@ -523,13 +526,27 @@ impl AgentLoop {
             if self.is_autopilot {
                 if call.name == "execute_bash" || call.name == "write_file" || call.name == "patch_file" {
                     if !std::path::Path::new("TODOS.md").exists() {
-                        response_parts.push(Self::build_function_response_part(
-                            call.name.clone(),
-                            call.id.clone(),
-                            serde_json::json!({ "result": "[System Error] Action Denied. Autopilot 模式下必须先创建并规划 TODOS.md。" }),
-                            thought_sig.clone(),
-                        ));
-                        continue;
+
+                        let is_creating_todos = (call.name == "write_file" || call.name == "execute_bash") && call.args.to_string().contains("TODOS.md");
+
+                        if !is_creating_todos {
+
+                            response_parts.push(Self::build_function_response_part(
+
+                                call.name.clone(),
+
+                                call.id.clone(),
+
+                                serde_json::json!({ "result": "[System Error] Action Denied. Autopilot 模式下必须先创建并规划 TODOS.md。" }),
+
+                                thought_sig.clone(),
+
+                            ));
+
+                            continue;
+
+                        }
+
                     }
                 }
             }
@@ -622,9 +639,9 @@ impl AgentLoop {
         }
 
         if self.is_autopilot {
-            let todos_after = std::fs::read_to_string("TODOS.md").unwrap_or_default();
+            let todos_after = self.count_todos_status();
             if todos_before != todos_after {
-                self.output.on_text("[Autopilot] 检测到 TODOS.md 发生变化，任务进度已更新。").await;
+                self.output.on_text(&format!("[Autopilot] 任务进度已更新: {} 已完成, {} 待办", todos_after.0, todos_after.1)).await;
             }
         }
 

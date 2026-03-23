@@ -222,7 +222,23 @@ impl AgentLoop {
     }
 
     fn count_completed_todos(&self) -> usize {
-        std::fs::read_to_string("TODOS.md").unwrap_or_default().matches("- [x]").count()
+
+        self.count_todos_status().0
+
+    }
+
+
+
+    pub(crate) fn count_todos_status(&self) -> (usize, usize) {
+
+        let content = std::fs::read_to_string("TODOS.md").unwrap_or_default();
+
+        let re_completed = regex::Regex::new(r"(?i)[-*]\s*\[x\]").unwrap();
+
+        let re_uncompleted = regex::Regex::new(r"(?i)[-*]\s*\[\s\]").unwrap();
+
+        (re_completed.find_iter(&content).count(), re_uncompleted.find_iter(&content).count())
+
     }
 
     pub async fn flush_output(&self) {
