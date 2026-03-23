@@ -166,7 +166,7 @@ pub async fn run_cli_repl(
                 .await
                 .unwrap();
             let mut agent_guard = agent.lock().await;
-            agent_guard.is_autopilot = true;
+            agent_guard.enable_autopilot();
             println!("  {} Autopilot mode enabled.", style("🚀").green());
             if !goal.is_empty() {
                 drop(agent_guard);
@@ -536,6 +536,10 @@ async fn run_cli_agent_step(
             RunExit::StoppedByUser => {
                 println!("\n  {}", style("Execution Stopped by User").yellow());
                 println!("  The current operation was manually cancelled.");
+                if agent_guard.is_autopilot {
+                    println!("  {} {}", style("Autopilot Paused").yellow().bold(), style("任务已安全暂停。").yellow());
+                    println!("  👉 您可以直接输入指导意见来纠偏并自动继续，或者输入 /manual 彻底退出自动驾驶。");
+                }
             }
             RunExit::AgentTurnLimitReached => {
                 println!("\n  {}", style("Turn Limit Reached").yellow());

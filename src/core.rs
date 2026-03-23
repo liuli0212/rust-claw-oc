@@ -458,6 +458,10 @@ impl AgentLoop {
         // Reset cancel flag at start of each step
         self.cancelled
             .store(false, std::sync::atomic::Ordering::SeqCst);
+            
+        if self.is_autopilot {
+            self.autopilot_todos_completed_count = self.count_completed_todos();
+        }
         self.context.take_snapshot();
 
         let mut task_state = TaskState {
