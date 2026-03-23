@@ -315,6 +315,28 @@ impl AgentLoop {
         task_state.energy_points = task_state.energy_points.saturating_sub(1);
 
         if task_state.energy_points == 0 {
+            if self.is_autopilot {
+                let current_completed = self.count_completed_todos();
+                if current_completed > self.autopilot_todos_completed_count {
+                    // Physical audit passed
+                    tracing::info!("Autopilot physical audit passed. Resetting energy and generating summary.");
+                    self.output.on_text("[System] 物理审计通过，正在生成滚动摘要并重置上下文...").await;
+                    
+                    // Generate summary (using current LLM for now, ideally a cheaper one)
+                    let summary_prompt = "Please summarize the key actions taken and errors encountered in the past 25 iterations. Keep it concise and objective.";
+                    // For simplicity in this PR, we just use a placeholder or a simple summary.
+                    // In a real implementation, we would call the LLM here.
+                    let summary = format!("Autopilot completed {} tasks in the last 25 iterations.", current_completed - self.autopilot_todos_completed_count);
+                    
+                    self.context.rolling_summary = Some(summary);
+                    self.context.dialogue_history.clear(); // Amnesia reset
+                    task_state.energy_points = Self::INITIAL_ENERGY;
+                    self.autopilot_todos_completed_count = current_completed;
+                    return None; // Continue loop
+                } else {
+                    return Some(self.finalize_exit(RunExit::StoppedByUser, true).await);
+                }
+            }
             tracing::error!("Energy points depleted.");
             self.output
                 .on_text("[System] Energy depleted. Stopping to prevent infinite loops.")
@@ -470,6 +492,8 @@ impl AgentLoop {
     ) -> Vec<Part> {
         let mut skip_remaining = false;
         let mut response_parts = Vec::new();
+        
+        let todos_before = if self.is_autopilot { std::fs::read_to_string("TODOS.md").unwrap_or_default() } else { String::new() };
 
         for (mut call, thought_sig) in tool_calls_accumulated {
             if skip_remaining {
@@ -595,6 +619,13 @@ impl AgentLoop {
                     thought_sig,
                 )
             });
+        }
+
+        if self.is_autopilot {
+            let todos_after = std::fs::read_to_string("TODOS.md").unwrap_or_default();
+            if todos_before != todos_after {
+                self.output.on_text("[Autopilot] 检测到 TODOS.md 发生变化，任务进度已更新。").await;
+            }
         }
 
         response_parts

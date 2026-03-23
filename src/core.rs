@@ -162,6 +162,7 @@ pub struct AgentLoop {
     pub is_autopilot: bool,
     action_history: std::collections::VecDeque<u64>,
     reflection_strike: u8,
+    autopilot_todos_completed_count: usize,
 }
 
 impl AgentLoop {
@@ -194,6 +195,7 @@ impl AgentLoop {
             is_autopilot: false,
             action_history: std::collections::VecDeque::new(),
             reflection_strike: 0,
+            autopilot_todos_completed_count: 0,
         }
     }
 
@@ -212,6 +214,15 @@ impl AgentLoop {
     }
     pub fn update_output(&mut self, output: Arc<dyn AgentOutput>) {
         self.output = output;
+    }
+
+    pub fn enable_autopilot(&mut self) {
+        self.is_autopilot = true;
+        self.autopilot_todos_completed_count = self.count_completed_todos();
+    }
+
+    fn count_completed_todos(&self) -> usize {
+        std::fs::read_to_string("TODOS.md").unwrap_or_default().matches("- [x]").count()
     }
 
     pub async fn flush_output(&self) {
