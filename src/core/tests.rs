@@ -112,6 +112,7 @@ fn make_agent_loop(
     AgentLoop::new(
         session_id.to_string(),
         llm,
+        "test_cli".to_string(), // Add reply_to
         Vec::new(),
         AgentContext::new(),
         output,

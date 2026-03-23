@@ -278,12 +278,19 @@ Architecture: {}
         active_evidence,
         Vec::new(),
     );
+    let mut final_system_text = assembled_system_text;
+
+    if let Some(summary) = &ctx.rolling_summary {
+
+        final_system_text.push_str(&format!("\n\n--- [PREVIOUS AUTOPILOT SUMMARY] ---\n{}\n------------------------------------\n", summary));
+
+    }
 
     let system_msg = super::model::Message {
         role: "system".to_string(),
         parts: vec![super::model::Part {
             thought_signature: None,
-            text: Some(assembled_system_text),
+            text: Some(final_system_text),
             function_call: None,
             function_response: None,
             file_data: None,

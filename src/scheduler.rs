@@ -69,6 +69,16 @@ impl Scheduler {
         }
     }
 
+    pub async fn reload(&self) {
+        if self.file_path.exists() {
+            if let Ok(content) = fs::read_to_string(&self.file_path) {
+                if let Ok(parsed) = serde_json::from_str(&content) {
+                    *self.tasks.write().await = parsed;
+                }
+            }
+        }
+    }
+
     pub async fn save(&self) -> Result<(), std::io::Error> {
         if let Some(parent) = self.file_path.parent() {
             fs::create_dir_all(parent)?;
@@ -83,6 +93,7 @@ impl Scheduler {
         // Validate cron
         Schedule::from_str(&task.cron).map_err(|e| format!("Invalid cron expression: {}", e))?;
 
+        self.reload().await;
         let mut tasks = self.tasks.write().await;
         tasks.insert(task.id.clone(), task);
         drop(tasks);
@@ -92,6 +103,7 @@ impl Scheduler {
     }
 
     pub async fn remove_task(&self, id: &str) -> Result<(), String> {
+        self.reload().await;
         let mut tasks = self.tasks.write().await;
         if tasks.remove(id).is_some() {
             drop(tasks);
@@ -103,6 +115,7 @@ impl Scheduler {
     }
 
     pub async fn toggle_task(&self, id: &str, enabled: bool) -> Result<(), String> {
+        self.reload().await;
         let mut tasks = self.tasks.write().await;
         if let Some(task) = tasks.get_mut(id) {
             task.enabled = enabled;
@@ -115,6 +128,7 @@ impl Scheduler {
     }
 
     pub async fn list_tasks(&self) -> Vec<ScheduledTask> {
+        self.reload().await;
         let tasks = self.tasks.read().await;
         let mut list: Vec<ScheduledTask> = tasks.values().cloned().collect();
         list.sort_by(|a, b| a.id.cmp(&b.id));
@@ -124,6 +138,7 @@ impl Scheduler {
     pub async fn run_loop(self: Arc<Self>) {
         tracing::info!("Starting scheduler loop...");
         loop {
+            self.reload().await;
             let now = Local::now();
             let mut tasks_to_run = Vec::new();
 
@@ -135,11 +150,14 @@ impl Scheduler {
                     }
 
                     if let Ok(schedule) = Schedule::from_str(&task.cron) {
-                        let window_start = now - chrono::Duration::seconds(30);
+                        let window_start = now - chrono::Duration::seconds(60);
                         if let Some(next) = schedule.after(&window_start).next() {
                             // Check if it's time to run (within the last minute and not run yet)
                             let last_run_ts = task.last_run.unwrap_or(0);
                             let now_ts = now.timestamp() as u64;
+
+                            tracing::debug!("[Scheduler] Task {}: next={}, now={}, last_run={}", 
+                                task.id, next, now, last_run_ts);
 
                             // If next run is in the past or now, and we haven't run in this minute
                             if next <= now && (now_ts / 60 > last_run_ts / 60) {
@@ -261,5 +279,24 @@ mod tests {
             let tasks = scheduler.tasks.read().await;
             assert!(!tasks.contains_key(&task_id));
         }
+    }
+
+    #[tokio::test]
+    async fn test_delay_cron_parsing() {
+        use chrono::{TimeZone, Timelike};
+        // Simulate a delay-generated cron
+        // 27 40 8 21 3 ? 2026
+        let cron_str = "27 40 8 21 3 ? 2026";
+        let schedule = Schedule::from_str(cron_str).expect("Failed to parse cron");
+        
+        let now = Local.with_ymd_and_hms(2026, 3, 21, 8, 40, 30).unwrap();
+        let window_start = now - chrono::Duration::seconds(60);
+        
+        let next = schedule.after(&window_start).next().expect("No next occurrence");
+        println!("Now: {}", now);
+        println!("Next: {}", next);
+        
+        assert!(next <= now);
+        assert_eq!(next.second(), 27);
     }
 }

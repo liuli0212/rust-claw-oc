@@ -15,6 +15,7 @@ pub struct AgentContext {
     pub(crate) retrieved_memory_sources: Vec<String>,
     pub last_snapshot: Option<ContextSnapshot>,
     pub active_evidence: Vec<crate::evidence::Evidence>,
+    pub rolling_summary: Option<String>,
 }
 
 impl AgentContext {
@@ -41,6 +42,7 @@ impl AgentContext {
             retrieved_memory_sources: Vec::new(),
             last_snapshot: None,
             active_evidence: Vec::new(),
+            rolling_summary: None,
         }
     }
 

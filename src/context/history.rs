@@ -590,56 +590,74 @@ fn truncate_old_tool_results(turn: &Turn) -> (Turn, usize) {
 }
 
 fn truncate_function_response(fr: &mut super::model::FunctionResponse) -> usize {
-    let mut truncated_chars = 0;
-    let mut truncated_in_place = false;
+    const MAX_RESULT_LEN: usize = 12_000;
+    const MAX_TOTAL_LEN: usize = 20_000;
 
-    // First, try to truncate the "result" field if it exists in the response object
-    if let Some(val) = fr.response.as_object_mut().and_then(|obj| obj.get_mut("result")) {
-        if let Some(s) = val.as_str() {
-            let char_count = s.chars().count();
-            if char_count > 12_000 {
-                let keep = 6_000;
-                let head: String = s.chars().take(keep).collect();
-                let tail: String = s.chars().skip(char_count - keep).collect();
-                *val = serde_json::Value::String(format!(
-                    "{}\n... [History Compressed: {} chars hidden] ...\n{}",
-                    head,
-                    char_count - 12_000,
-                    tail
-                ));
-                truncated_chars = char_count - 12_000;
-                truncated_in_place = true;
-            }
-        } else {
-            let s = val.to_string();
-            let char_count = s.chars().count();
-            if char_count > 12_000 {
-                let head: String = s.chars().take(4_000).collect();
-                *val = serde_json::Value::String(format!(
-                    "{}\n... [History Object Compressed] ...",
-                    head
-                ));
-                truncated_chars = char_count - 4_000;
-                truncated_in_place = true;
+    // 1. Try to truncate "result" field if it's an object response
+    if let Some(obj) = fr.response.as_object_mut() {
+        if let Some(val) = obj.get_mut("result") {
+            if let Some(truncated) = truncate_large_json_value(val, MAX_RESULT_LEN) {
+                return truncated;
             }
         }
     }
 
-    // If "result" wasn't truncated, or didn't exist, check the whole response
-    if !truncated_in_place {
-        let response_str = fr.response.to_string();
-        if response_str.len() > 20_000 {
-            let char_count = response_str.chars().count();
-            let head: String = response_str.chars().take(2_000).collect();
-            fr.response = serde_json::json!({
-                "result": format!("{}\n... [Truncated massive object] ...", head),
-                "original_chars": response_str.len()
-            });
-            truncated_chars = char_count - 2_000;
-        }
+    // 2. Fallback: truncate the entire response if it's still too large
+    let response_str = fr.response.to_string();
+    if response_str.len() > MAX_TOTAL_LEN {
+        let original_len = response_str.len();
+        let char_count = response_str.chars().count();
+        let head: String = response_str.chars().take(2_000).collect();
+        fr.response = serde_json::json!({
+            "result": format!("{}\n... [Truncated massive object] ...", head),
+            "original_chars": original_len
+        });
+        return char_count.saturating_sub(2000); // Approximate hidden count
     }
 
-    truncated_chars
+    0
+}
+
+fn truncate_large_json_value(val: &mut serde_json::Value, max_len: usize) -> Option<usize> {
+    let s = if let Some(s) = val.as_str() {
+        s.to_string()
+    } else {
+        let serialized = val.to_string();
+        if serialized.len() <= max_len {
+            return None;
+        }
+        serialized
+    };
+
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        return None;
+    }
+
+    let is_string = val.is_string();
+    let (truncated_text, truncated_count) = if is_string {
+        let keep = max_len / 2;
+        let head: String = s.chars().take(keep).collect();
+        let tail: String = s.chars().skip(char_count - keep).collect();
+        (
+            format!(
+                "{}\n... [History Compressed: {} chars hidden] ...\n{}",
+                head,
+                char_count.saturating_sub(max_len),
+                tail
+            ),
+            char_count.saturating_sub(max_len),
+        )
+    } else {
+        let head: String = s.chars().take(4_000).collect();
+        (
+            format!("{}\n... [History Object Compressed] ...", head),
+            char_count.saturating_sub(4_000),
+        )
+    };
+
+    *val = serde_json::Value::String(truncated_text);
+    Some(truncated_count)
 }
 
 fn is_user_referencing_history(msg: &str) -> bool {
@@ -799,5 +817,38 @@ mod tests {
             parts[1].function_call.as_ref().unwrap().args,
             serde_json::json!({ "path": "/tmp/demo.txt" })
         );
+    }
+
+    #[test]
+    fn test_truncate_function_response_string() {
+        use crate::context::model::FunctionResponse;
+        let mut fr = FunctionResponse {
+            id: None,
+            name: "test_tool".to_string(),
+            response: serde_json::json!({
+                "result": "A".repeat(15_000)
+            }),
+        };
+        let truncated = truncate_function_response(&mut fr);
+        assert!(truncated > 0);
+        let result_str = fr.response["result"].as_str().unwrap();
+        assert!(result_str.contains("History Compressed"));
+        assert!(result_str.len() < 15_000);
+    }
+
+    #[test]
+    fn test_truncate_function_response_obj() {
+        use crate::context::model::FunctionResponse;
+        let mut fr = FunctionResponse {
+            id: None,
+            name: "test_tool".to_string(),
+            response: serde_json::json!({
+                "result": { "large_data": "A".repeat(15_000) }
+            }),
+        };
+        let truncated = truncate_function_response(&mut fr);
+        assert!(truncated > 0);
+        let result_str = fr.response["result"].as_str().unwrap();
+        assert!(result_str.contains("History Object Compressed"));
     }
 }

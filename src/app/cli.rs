@@ -159,6 +159,31 @@ pub async fn run_cli_repl(
             println!("  {} Task cancelled and plan cleared.", style("✔").yellow());
             continue;
         }
+        if line.starts_with("/autopilot") {
+            let goal = line.trim_start_matches("/autopilot").trim().to_string();
+            let agent = session_manager
+                .get_or_create_session("cli", "cli", output.clone())
+                .await
+                .unwrap();
+            let mut agent_guard = agent.lock().await;
+            agent_guard.is_autopilot = true;
+            println!("  {} Autopilot mode enabled.", style("🚀").green());
+            if !goal.is_empty() {
+                drop(agent_guard);
+                run_cli_agent_step(session_manager.clone(), output.clone(), goal).await;
+            }
+            continue;
+        }
+        if line == "/manual" {
+            let agent = session_manager
+                .get_or_create_session("cli", "cli", output.clone())
+                .await
+                .unwrap();
+            let mut agent_guard = agent.lock().await;
+            agent_guard.is_autopilot = false;
+            println!("  {} Autopilot mode disabled. Switched to manual mode.", style("✔").green());
+            continue;
+        }
         if line == "/status" {
             print_status(session_manager.clone(), output.clone()).await;
             continue;

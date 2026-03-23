@@ -494,6 +494,19 @@ impl AgentLoop {
                 continue;
             }
 
+            if self.is_autopilot {
+                if call.name == "execute_bash" || call.name == "write_file" || call.name == "patch_file" {
+                    if !std::path::Path::new("TODOS.md").exists() {
+                        response_parts.push(Self::build_function_response_part(
+                            call.name.clone(),
+                            call.id.clone(),
+                            serde_json::json!({ "result": "[System Error] Action Denied. Autopilot 模式下必须先创建并规划 TODOS.md。" }),
+                            thought_sig.clone(),
+                        ));
+                        continue;
+                    }
+                }
+            }
             let ToolDispatchOutcome {
                 result,
                 is_error,
@@ -518,8 +531,21 @@ impl AgentLoop {
                 self.output.on_tool_end(&result).await;
                 self.handle_successful_tool_effects(&result).await;
                 if let Some(summary) = Self::extract_finish_task_summary_from_result(&result) {
-                    state.status = "finished".to_string();
+                    if self.is_autopilot {
+                        if let Ok(content) = std::fs::read_to_string("TODOS.md") {
+                            if content.contains("- [ ]") {
+                                response_parts.push(Self::build_function_response_part(
+                                    call.name.clone(),
+                                    call.id.clone(),
+                                    serde_json::json!({ "result": "[System Error] Action Denied. Autopilot 模式下必须完成 TODOS.md 中的所有任务才能结束。" }),
+                                    thought_sig.clone(),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
                     let _ = self.task_state_store.save(state);
+                    state.status = "finished".to_string();
                     self.output.on_task_finish(&summary).await;
                 }
             }

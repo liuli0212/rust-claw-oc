@@ -159,6 +159,7 @@ pub struct AgentLoop {
     task_state_store: Arc<crate::task_state::TaskStateStore>,
     pub cancel_token: Arc<Notify>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
+    pub is_autopilot: bool,
 }
 
 impl AgentLoop {
@@ -188,6 +189,7 @@ impl AgentLoop {
             task_state_store,
             cancel_token: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            is_autopilot: false,
         }
     }
 
