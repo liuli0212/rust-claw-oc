@@ -1,4 +1,6 @@
 use super::*;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 impl AgentLoop {
     /// Strip `<think>...</think>` blocks from a string, returning only visible text.
@@ -512,6 +514,41 @@ impl AgentLoop {
                 is_error,
                 stopped,
             } = self.dispatch_tool_call(&call, current_tools).await;
+            if self.is_autopilot {
+                let mut hasher = DefaultHasher::new();
+                call.name.hash(&mut hasher);
+                call.args.to_string().hash(&mut hasher);
+                is_error.hash(&mut hasher);
+                let action_hash = hasher.finish();
+
+                self.action_history.push_back(action_hash);
+                if self.action_history.len() > 3 {
+                    self.action_history.pop_front();
+                }
+
+                if self.action_history.len() == 3 && self.action_history.iter().all(|&h| h == action_hash) {
+                    self.reflection_strike += 1;
+                    self.action_history.clear();
+                    
+                    if self.reflection_strike >= 2 {
+                        response_parts.push(Self::build_function_response_part(
+                            call.name.clone(),
+                            call.id.clone(),
+                            serde_json::json!({ "result": "[System Error] AUTOPILOT_MELTDOWN" }),
+                            thought_sig.clone(),
+                        ));
+                        continue;
+                    } else {
+                        response_parts.push(Self::build_function_response_part(
+                            call.name.clone(),
+                            call.id.clone(),
+                            serde_json::json!({ "result": "[System Warning] 检测到你正在重复执行相同的错误动作。请立即停止当前尝试，反思失败原因，并提出全新的解决路径。" }),
+                            thought_sig.clone(),
+                        ));
+                        continue;
+                    }
+                }
+            }
 
             if stopped {
                 self.output.on_error(&result).await;

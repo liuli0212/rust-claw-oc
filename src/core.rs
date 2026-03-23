@@ -160,6 +160,8 @@ pub struct AgentLoop {
     pub cancel_token: Arc<Notify>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     pub is_autopilot: bool,
+    action_history: std::collections::VecDeque<u64>,
+    reflection_strike: u8,
 }
 
 impl AgentLoop {
@@ -190,6 +192,8 @@ impl AgentLoop {
             cancel_token: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_autopilot: false,
+            action_history: std::collections::VecDeque::new(),
+            reflection_strike: 0,
         }
     }
 
@@ -527,6 +531,14 @@ impl AgentLoop {
                 .await;
 
             if !response_parts.is_empty() {
+                for part in &response_parts {
+                    if let Some(res) = &part.function_response {
+                        if res.response.to_string().contains("AUTOPILOT_MELTDOWN") {
+                            return Ok(RunExit::RecoverableFailed("检测到深度死循环，反思无效，交还控制权".to_string()));
+                        }
+                    }
+                }
+
                 self.context.add_message_to_current_turn(Message {
                     role: "function".to_string(),
                     parts: response_parts,

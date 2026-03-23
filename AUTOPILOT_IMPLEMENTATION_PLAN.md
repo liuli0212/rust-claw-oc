@@ -19,7 +19,7 @@
     *   **探索宽限期**：允许 Agent 使用只读工具（如 `read_file`, `ls`, `grep`）进行项目探索，不强制拦截。
     *   **拦截**：如果试图修改代码但 `TODOS.md` 不存在，阻断工具执行，并向 LLM 返回错误：`[System Error] Action Denied. Autopilot 模式下必须先创建并规划 TODOS.md。`
 
-### [ ] Phase 2: 防卡死引擎与反思机制 (Action Hash Wall & Reflection)
+### [x] Phase 2: 防卡死引擎与反思机制 (Action Hash Wall & Reflection)
 **目标**：在常规执行中，实现死循环的“警告-反思-熔断”三级机制。
 
 *   **2.1 状态结构扩展 (`src/core.rs`)**：
@@ -84,7 +84,7 @@
 建议分四个 PR (Pull Request) 逐步落地，以保证系统稳定性：
 
 *   **[x] PR 1: 基础改造** - 实现 `/autopilot` 指令入口，引入 `TODOS.md` 专属拦截器和清晰的进度播报。
-*   **[ ] PR 2: 防御机制** - 实现 Action Hash Wall 以及“警告-反思-熔断”三级机制。
+*   **[x] PR 2: 防御机制** - 实现 Action Hash Wall 以及“警告-反思-熔断”三级机制。
 *   **[ ] PR 3: 自动驾驶核心** - 实现物理审计逻辑和基于结构化 Context Block 的滚动续航机制。
 *   **[ ] PR 4: 人在回路** - 实现优雅中断（SIGINT -> SIGKILL）、友好提示、纠偏注入、无缝恢复以及 `/manual` 降级逻辑。
 
