@@ -298,17 +298,6 @@ impl AgentLoop {
             return Some(self.finalize_exit(RunExit::StoppedByUser, true).await);
         }
 
-        if task_state.iterations >= Self::MAX_ITERATIONS {
-            tracing::warn!(
-                "Agent loop reached MAX_ITERATIONS ({}). Exiting to prevent runaway loops.",
-                Self::MAX_ITERATIONS
-            );
-            return Some(
-                self.finalize_exit(RunExit::AgentTurnLimitReached, false)
-                    .await,
-            );
-        }
-
         task_state.iterations += 1;
         task_state.energy_points = task_state.energy_points.saturating_sub(1);
 

@@ -109,7 +109,6 @@ pub trait OutputRouter: Send + Sync {
 pub enum RunExit {
     Finished(String),
     StoppedByUser,
-    AgentTurnLimitReached,
     YieldedToUser,
     RecoverableFailed(String),
     CriticallyFailed(String),
@@ -121,7 +120,6 @@ impl RunExit {
         match self {
             RunExit::Finished(_) => "finished",
             RunExit::StoppedByUser => "stopped_by_user",
-            RunExit::AgentTurnLimitReached => "turn_limit_reached",
             RunExit::YieldedToUser => "yielded_to_user",
             RunExit::RecoverableFailed(_) => "recoverable_failed",
             RunExit::CriticallyFailed(_) => "critically_failed",
@@ -172,8 +170,7 @@ pub struct AgentLoop {
 impl AgentLoop {
     const MAX_LLM_RECOVERY_ATTEMPTS: usize = 3;
     const MAX_CONSECUTIVE_EMPTY_RESPONSES: usize = 3;
-    const MAX_ITERATIONS: usize = 25;
-    const INITIAL_ENERGY: usize = 100;
+    const INITIAL_ENERGY: usize = 25; // 每轮最大生存时间（步数），AutoPilot中由物理审计自动续期
 
     pub fn new(
         session_id: String,

@@ -125,7 +125,6 @@ fn make_agent_loop(
 fn test_run_exit_label_matches_public_status_names() {
     assert_eq!(RunExit::Finished("done".to_string()).label(), "finished");
     assert_eq!(RunExit::StoppedByUser.label(), "stopped_by_user");
-    assert_eq!(RunExit::AgentTurnLimitReached.label(), "turn_limit_reached");
     assert_eq!(RunExit::YieldedToUser.label(), "yielded_to_user");
     assert_eq!(
         RunExit::RecoverableFailed("retry".to_string()).label(),

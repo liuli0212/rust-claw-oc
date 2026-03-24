@@ -470,9 +470,6 @@ pub(super) async fn handle_message(
 
             match result {
                 Ok(exit) => match exit {
-                    RunExit::AgentTurnLimitReached => {
-                        let _ = bot_clone.send_message(chat_id, "⚠️ [Turn Limit Reached] The agent reached the maximum allowed consecutive actions. Please type 'continue' if you want it to proceed.").await;
-                    }
                     RunExit::RecoverableFailed(ref msg)
                     | RunExit::CriticallyFailed(ref msg)
                     | RunExit::AutopilotStalled(ref msg) => {

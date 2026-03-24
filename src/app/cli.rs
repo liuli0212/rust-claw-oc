@@ -541,14 +541,6 @@ async fn run_cli_agent_step(
                     println!("  👉 您可以直接输入指导意见来纠偏并自动继续，或者输入 /manual 彻底退出自动驾驶。");
                 }
             }
-            RunExit::AgentTurnLimitReached => {
-                println!("\n  {}", style("Turn Limit Reached").yellow());
-                println!("  The agent reached the maximum allowed consecutive actions.");
-                println!(
-                    "  👉 Action required: Review recent actions. If on track, type {} to proceed.",
-                    style("continue").green()
-                );
-            }
             RunExit::RecoverableFailed(ref msg) => {
                 println!("\n  {} Recoverable Failure: {}", style("⚠").yellow(), msg);
             }
