@@ -20,6 +20,7 @@ pub struct TaskStateSnapshot {
     pub status: String,
     pub goal: Option<String>,
     pub current_step: Option<String>,
+    pub finish_summary: Option<String>,
     pub plan_steps: Vec<PlanStep>,
 }
 
@@ -35,7 +36,15 @@ impl TaskStateSnapshot {
     pub fn summary(&self) -> String {
         use std::fmt::Write;
         let mut s = String::new();
-        let _ = writeln!(s, "Current task ({})", self.status);
+        
+        if self.status != "finished" {
+            let _ = writeln!(s, "Current task ({})", self.status);
+        }
+
+        if let Some(finish_summary) = &self.finish_summary {
+            let _ = writeln!(s, "{}", finish_summary);
+        }
+
         if let Some(goal) = &self.goal {
             let _ = writeln!(s, "- Goal: {}", goal);
         }
@@ -49,7 +58,7 @@ impl TaskStateSnapshot {
             }
         }
 
-        if !self.plan_steps.is_empty() {
+        if !self.plan_steps.is_empty() && self.status != "finished" {
             let _ = writeln!(s, "\nPlan steps:");
             for (i, p) in self.plan_steps.iter().enumerate() {
                 let note = p.note.clone().unwrap_or_default();

@@ -305,6 +305,20 @@ impl AgentOutput for TelegramOutput {
             Self::escape_markdown_v2(&display_name)
         );
 
+        if ok {
+            let summary = if output_text.len() > 100 {
+                format!(
+                    "{}...",
+                    &output_text.chars().take(80).collect::<String>().replace('\n', " ")
+                )
+            } else {
+                output_text.replace('\n', " ")
+            };
+            if !summary.is_empty() {
+                msg.push_str(&format!(": _{}_", Self::escape_markdown_v2(&summary)));
+            }
+        }
+
         if !ok {
             let snippet: String = output_text.chars().take(200).collect();
             let snippet = snippet.lines().take(3).collect::<Vec<_>>().join("\n");

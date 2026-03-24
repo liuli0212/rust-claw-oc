@@ -1,9 +1,220 @@
 use super::output::TelegramOutput;
-use super::Command;
+use super::Command as TgCommand;
+use crate::app::commands::{Command, CommandExecutor, CommandOutput, StatusData};
 use crate::core::{AgentOutput, RunExit};
 use crate::session_manager::SessionManager;
 use std::sync::Arc;
-use teloxide::{net::Download, prelude::*, types::ParseMode, utils::command::BotCommands};
+use teloxide::{prelude::*, types::ParseMode, utils::command::BotCommands, net::Download};
+
+pub struct TelegramCommandOutput {
+    bot: Bot,
+    chat_id: ChatId,
+}
+
+impl TelegramCommandOutput {
+    pub fn new(bot: Bot, chat_id: ChatId) -> Self {
+        Self { bot, chat_id }
+    }
+
+    fn escape(text: &str) -> String {
+        TelegramOutput::escape_markdown_v2(text)
+    }
+}
+
+impl CommandOutput for TelegramCommandOutput {
+    fn send_text(&self, text: &str) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        let text = text.to_string();
+        tokio::spawn(async move {
+            let _ = bot.send_message(chat_id, text).await;
+        });
+    }
+
+    fn send_error(&self, error: &str) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        let msg = format!("❌ Error: {}", error);
+        tokio::spawn(async move {
+            let _ = bot.send_message(chat_id, msg).await;
+        });
+    }
+
+    fn send_success(&self, message: &str) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        let msg = format!("✅ {}", message);
+        tokio::spawn(async move {
+            let _ = bot.send_message(chat_id, msg).await;
+        });
+    }
+
+    fn send_status(&self, data: StatusData) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        tokio::spawn(async move {
+            let usage_pc = if data.max_tokens > 0 {
+                (data.tokens as f64 / data.max_tokens as f64 * 100.0) as usize
+            } else {
+                0
+            };
+            let bar_len = 10;
+            let filled = (usage_pc * bar_len) / 100;
+            let bar = format!("{}{}", "▓".repeat(filled), "░".repeat(bar_len - filled));
+
+            let mut status_msg = format!(
+                "🤖 *System Status*\n\
+                ━━━━━━━━━━━━━━━━━━━━━\n\
+                *LLM*: {} / {}\n\
+                *Context*: {} / {} tokens\n\
+                `[{}]` {}%\n\n",
+                Self::escape(&data.provider),
+                Self::escape(&data.model),
+                data.tokens,
+                data.max_tokens,
+                bar,
+                usage_pc
+            );
+
+            if let Some(state) = data.active_plan {
+                let total_steps = state.plan_steps.len();
+                let completed_steps = state
+                    .plan_steps
+                    .iter()
+                    .filter(|s| s.status == "completed")
+                    .count();
+                let current_step =
+                    state.plan_steps.iter().find(|s| s.status == "in_progress");
+
+                status_msg.push_str(&format!(
+                    "🎯 *Active Plan*: {}%\n\
+                    *Goal*: {}\nProgress: {} / {} steps\n",
+                    if total_steps > 0 {
+                        completed_steps * 100 / total_steps
+                    } else {
+                        0
+                    },
+                    Self::escape(
+                        &state.goal.unwrap_or_else(|| "Unknown".to_string())
+                    ),
+                    completed_steps,
+                    total_steps
+                ));
+
+                if let Some(step) = current_step {
+                    status_msg.push_str(&format!(
+                        "👉 *Now*: {}\n",
+                        Self::escape(&step.step)
+                    ));
+                }
+
+                status_msg.push_str("\n💡 Say \"continue\" or use /cancel\\.");
+            } else {
+                status_msg.push_str("⚪ *No active plan*\\. Ready for new tasks\\.");
+            }
+
+            let _ = bot
+                .send_message(chat_id, status_msg)
+                .parse_mode(ParseMode::MarkdownV2)
+                .await;
+        });
+    }
+
+    fn send_session_list(&self, sessions: Vec<(String, u64, usize)>) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        tokio::spawn(async move {
+            let mut msg = "📝 *Active/Recent Sessions*\n━━━━━━━━━━━━━━━━━━━━━\n".to_string();
+            if sessions.is_empty() {
+                msg.push_str("(No sessions found)");
+            } else {
+                for (id, updated, turns) in sessions {
+                    let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(updated);
+                    let datetime: chrono::DateTime<chrono::Local> = chrono::DateTime::from(time);
+                    msg.push_str(&format!(
+                        "• `{}` (Turns: {}, Updated: {})\n",
+                        Self::escape(&id),
+                        turns,
+                        Self::escape(&datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+                    ));
+                }
+            }
+            let _ = bot.send_message(chat_id, msg).parse_mode(ParseMode::MarkdownV2).await;
+        });
+    }
+
+    fn send_cron_list(&self, tasks: Vec<crate::scheduler::ScheduledTask>) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        tokio::spawn(async move {
+            if tasks.is_empty() {
+                let _ = bot.send_message(chat_id, "⚪ No scheduled tasks found.").await;
+            } else {
+                let mut msg = "📅 *Scheduled Tasks*\n━━━━━━━━━━━━━━━━━━━━━\n".to_string();
+                for task in tasks {
+                    let status = if task.enabled { "✅" } else { "❌" };
+                    msg.push_str(&format!(
+                        "*ID*: `{}` {}\n*Cron*: `{}`\n*Goal*: {}\n\n",
+                        Self::escape(&task.id),
+                        status,
+                        Self::escape(&task.cron),
+                        Self::escape(&task.goal)
+                    ));
+                }
+                let _ = bot.send_message(chat_id, msg)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await;
+            }
+        });
+    }
+
+    fn send_context_audit(&self, details: String) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        tokio::spawn(async move {
+            let _ = bot.send_message(chat_id, details).await;
+        });
+    }
+
+    fn send_context_diff(&self, diff: Option<String>) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        tokio::spawn(async move {
+            if let Some(diff) = diff {
+                let _ = bot.send_message(chat_id, diff).await;
+            } else {
+                let _ = bot.send_message(chat_id, "ℹ️ No changes since last snapshot.").await;
+            }
+        });
+    }
+
+    fn send_context_inspect(&self, result: String) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        tokio::spawn(async move {
+            let _ = bot.send_message(chat_id, result).await;
+        });
+    }
+
+    fn send_context_dump(&self, path: String) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        tokio::spawn(async move {
+            let _ = bot.send_message(chat_id, format!("✅ Context dumped locally to {}", path)).await;
+        });
+    }
+
+    fn send_context_compact(&self, result: Result<(), String>) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        tokio::spawn(async move {
+            match result {
+                Ok(_) => { let _ = bot.send_message(chat_id, "✅ Compaction finished.").await; }
+                Err(e) => { let _ = bot.send_message(chat_id, format!("❌ Compaction failed: {}", e)).await; }
+            }
+        });
+    }
+}
 
 pub(super) async fn handle_callback_query(
     bot: Bot,
@@ -32,292 +243,35 @@ pub(super) async fn handle_callback_query(
 pub(super) async fn handle_command(
     bot: Bot,
     msg: Message,
-    cmd: Command,
+    tg_cmd: TgCommand,
     session_manager: Arc<SessionManager>,
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
     let session_id = format!("telegram:{}", chat_id);
+    let executor = CommandExecutor::new(session_manager.clone());
+    let cmd_output = Arc::new(TelegramCommandOutput::new(bot.clone(), chat_id));
+    let agent_output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
 
-    match cmd {
-        Command::Help => {
-            bot.send_message(chat_id, Command::descriptions().to_string())
-                .await?;
+    let cmd = match tg_cmd {
+        TgCommand::Help => {
+            bot.send_message(chat_id, TgCommand::descriptions().to_string()).await?;
+            return Ok(());
         }
-        Command::Reset => {
-            session_manager.reset_session(&session_id).await;
-            bot.send_message(chat_id, "♻️ Session reset.").await?;
-        }
-        Command::Ping => {
+        TgCommand::New => Command::New,
+        TgCommand::Ping => {
             bot.send_message(chat_id, "🏓 Pong!").await?;
+            return Ok(());
         }
-        Command::Cancel => {
-            session_manager.cancel_session(&session_id).await;
-            bot.send_message(chat_id, "🛑 Task cancellation requested.")
-                .await?;
-        }
-        Command::Status => {
-            let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
-            let agent = match session_manager
-                .get_or_create_session(&session_id, &session_id, output.clone())
-                .await
-            {
-                Ok(a) => a,
-                Err(e) => {
-                    bot.send_message(chat_id, format!("❌ Error: {}", e))
-                        .await?;
-                    return Ok(());
-                }
-            };
+        TgCommand::Cancel => Command::Cancel,
+        TgCommand::Status => Command::Status,
+        TgCommand::Session => Command::Session,
+        TgCommand::Model(args) => Command::Model(args),
+        TgCommand::Cron(args) => Command::Cron(args),
+        TgCommand::Context(args) => Command::Context(args),
+    };
 
-            let bot_clone = bot.clone();
-            tokio::spawn(async move {
-                let mut agent_guard =
-                    match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock())
-                        .await
-                    {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            let _ = bot_clone
-                                .send_message(chat_id, "⏳ 状态获取超时 (Agnet 繁忙)")
-                                .await;
-                            return;
-                        }
-                    };
-
-                agent_guard.flush_output().await;
-                agent_guard.update_output(output);
-
-                let (provider, model, tokens, max_tokens) = agent_guard.get_status();
-                let usage_pc = if max_tokens > 0 {
-                    (tokens as f64 / max_tokens as f64 * 100.0) as usize
-                } else {
-                    0
-                };
-                let bar_len = 10;
-                let filled = (usage_pc * bar_len) / 100;
-                let bar = format!("{}{}", "▓".repeat(filled), "░".repeat(bar_len - filled));
-
-                let mut status_msg = format!(
-                    "🤖 *System Status*\n\
-                    ━━━━━━━━━━━━━━━━━━━━━\n\
-                    *LLM*: {} / {}\n\
-                    *Context*: {} / {} tokens\n\
-                    `[{}]` {}%\n\n",
-                    TelegramOutput::escape_markdown_v2(&provider),
-                    TelegramOutput::escape_markdown_v2(&model),
-                    tokens,
-                    max_tokens,
-                    bar,
-                    usage_pc
-                );
-
-                let ts = crate::task_state::TaskStateStore::new(&session_id);
-                if ts.has_active_plan() {
-                    if let Ok(state) = ts.load() {
-                        let total_steps = state.plan_steps.len();
-                        let completed_steps = state
-                            .plan_steps
-                            .iter()
-                            .filter(|s| s.status == "completed")
-                            .count();
-                        let current_step =
-                            state.plan_steps.iter().find(|s| s.status == "in_progress");
-
-                        status_msg.push_str(&format!(
-                            "🎯 *Active Plan*: {}%\n\
-                            *Goal*: {}\nProgress: {} / {} steps\n",
-                            if total_steps > 0 {
-                                completed_steps * 100 / total_steps
-                            } else {
-                                0
-                            },
-                            TelegramOutput::escape_markdown_v2(
-                                &state.goal.unwrap_or_else(|| "Unknown".to_string())
-                            ),
-                            completed_steps,
-                            total_steps
-                        ));
-
-                        if let Some(step) = current_step {
-                            status_msg.push_str(&format!(
-                                "👉 *Now*: {}\n",
-                                TelegramOutput::escape_markdown_v2(&step.step)
-                            ));
-                        }
-
-                        status_msg.push_str("\n💡 Say \"continue\" or use /cancel\\.");
-                    }
-                } else {
-                    status_msg.push_str("⚪ *No active plan*\\. Ready for new tasks\\.");
-                }
-
-                let _ = bot_clone
-                    .send_message(chat_id, status_msg)
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await;
-            });
-        }
-        Command::Session => {
-            let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
-            let agent = match session_manager
-                .get_or_create_session(&session_id, &session_id, output.clone())
-                .await
-            {
-                Ok(a) => a,
-                Err(e) => {
-                    bot.send_message(chat_id, format!("❌ Error: {}", e))
-                        .await?;
-                    return Ok(());
-                }
-            };
-
-            let bot_clone = bot.clone();
-            tokio::spawn(async move {
-                let mut agent_guard =
-                    match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock())
-                        .await
-                    {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            let _ = bot_clone
-                                .send_message(chat_id, "⏳ 会话状态获取超时 (Agnet 繁忙)")
-                                .await;
-                            return;
-                        }
-                    };
-
-                agent_guard.flush_output().await;
-                agent_guard.update_output(output);
-
-                let details = agent_guard.get_session_details();
-
-                let formatted = format!(
-                    "📝 *Detailed Session Diagnostics*\n\
-                    ━━━━━━━━━━━━━━━━━━━━━\n\
-                    *ID*: `{}`\n\
-                    *LLM*: `{}` / `{}`\n\
-                    *Task*: `{}` ({})\n\
-                    *Context*: {} / {} tokens\n\
-                    *Turns*: `{}`\n\
-                    *System Prompts*: `{}`\n\
-                    *Active Evidence*: `{}`\n\
-                    *Cancelled*: `{}`",
-                    TelegramOutput::escape_markdown_v2(
-                        details["session_id"].as_str().unwrap_or("")
-                    ),
-                    TelegramOutput::escape_markdown_v2(details["provider"].as_str().unwrap_or("")),
-                    TelegramOutput::escape_markdown_v2(
-                        details["model"].as_str().unwrap_or("unknown")
-                    ),
-                    TelegramOutput::escape_markdown_v2(
-                        details["task_id"].as_str().unwrap_or("none")
-                    ),
-                    details["task_status"].as_str().unwrap_or("idle"),
-                    details["context"]["tokens"],
-                    details["context"]["max_tokens"],
-                    details["context"]["turns"],
-                    details["context"]["system_tokens"],
-                    details["context"]["active_evidence"],
-                    details["cancelled"]
-                );
-                let _ = bot_clone
-                    .send_message(chat_id, formatted)
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await;
-            });
-        }
-        Command::Model(args) => {
-            let parts: Vec<&str> = args.split_whitespace().collect();
-            if parts.is_empty() {
-                bot.send_message(chat_id, "Usage: /model <provider> [model_name]")
-                    .await?;
-                return Ok(());
-            }
-
-            let provider = parts[0];
-            let model = parts.get(1).map(|s| s.to_string());
-
-            match session_manager
-                .update_session_llm(&session_id, provider, model)
-                .await
-            {
-                Ok(msg) => {
-                    bot.send_message(chat_id, format!("✅ {}", msg)).await?;
-                }
-                Err(e) => {
-                    bot.send_message(chat_id, format!("❌ Error: {}", e))
-                        .await?;
-                }
-            }
-        }
-        Command::Cron(args) => {
-            let parts: Vec<&str> = args.split_whitespace().collect();
-            let action = parts.get(0).copied().unwrap_or("list");
-            let scheduler = Arc::new(crate::scheduler::Scheduler::new(session_manager.clone()));
-
-            match action {
-                "list" => {
-                    let tasks = scheduler.list_tasks().await;
-                    if tasks.is_empty() {
-                        bot.send_message(chat_id, "⚪ No scheduled tasks found.").await?;
-                    } else {
-                        let mut msg = "📅 *Scheduled Tasks*\n━━━━━━━━━━━━━━━━━━━━━\n".to_string();
-                        for task in tasks {
-                            let status = if task.enabled { "✅" } else { "❌" };
-                            msg.push_str(&format!(
-                                "*ID*: `{}` {}\n*Cron*: `{}`\n*Goal*: {}\n\n",
-                                TelegramOutput::escape_markdown_v2(&task.id),
-                                status,
-                                TelegramOutput::escape_markdown_v2(&task.cron),
-                                TelegramOutput::escape_markdown_v2(&task.goal)
-                            ));
-                        }
-                        bot.send_message(chat_id, msg)
-                            .parse_mode(ParseMode::MarkdownV2)
-                            .await?;
-                    }
-                }
-                "remove" => {
-                    if let Some(id) = parts.get(1) {
-                        match scheduler.remove_task(id).await {
-                            Ok(_) => {
-                                bot.send_message(chat_id, format!("✅ Task `{}` removed.", id)).await?;
-                            }
-                            Err(e) => {
-                                bot.send_message(chat_id, format!("❌ Error: {}", e)).await?;
-                            }
-                        }
-                    } else {
-                        bot.send_message(chat_id, "Usage: /cron remove <id>").await?;
-                    }
-                }
-                "toggle" => {
-                    if let (Some(id), Some(state)) = (parts.get(1), parts.get(2)) {
-                        let enabled = match *state {
-                            "on" | "true" | "enable" => true,
-                            "off" | "false" | "disable" => false,
-                            _ => {
-                                bot.send_message(chat_id, "Usage: /cron toggle <id> <on|off>").await?;
-                                return Ok(());
-                            }
-                        };
-                        match scheduler.toggle_task(id, enabled).await {
-                            Ok(_) => {
-                                bot.send_message(chat_id, format!("✅ Task `{}` is now {}.", id, if enabled { "enabled" } else { "disabled" })).await?;
-                            }
-                            Err(e) => {
-                                bot.send_message(chat_id, format!("❌ Error: {}", e)).await?;
-                            }
-                        }
-                    } else {
-                        bot.send_message(chat_id, "Usage: /cron toggle <id> <on|off>").await?;
-                    }
-                }
-                _ => {
-                    bot.send_message(chat_id, "Unknown action. Use: list, remove, toggle").await?;
-                }
-            }
-        }
+    if let Err(e) = executor.execute(&session_id, &session_id, agent_output, cmd_output.clone(), cmd).await {
+        cmd_output.send_error(&e);
     }
 
     Ok(())

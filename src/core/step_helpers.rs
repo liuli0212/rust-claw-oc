@@ -619,8 +619,14 @@ impl AgentLoop {
                         ));
                         continue;
                     }
-                    let _ = self.task_state_store.save(state);
                     state.status = "finished".to_string();
+                    state.finish_summary = Some(summary.clone());
+                    // Mark all steps as completed when finishing
+                    for step in &mut state.plan_steps {
+                        step.status = "completed".to_string();
+                    }
+                    state.current_step = None;
+                    let _ = self.task_state_store.save(state);
                     self.output.on_task_finish(&summary).await;
                 }
             }

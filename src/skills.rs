@@ -30,7 +30,7 @@ impl Tool for SkillTool {
     async fn execute(
         &self,
         args: Value,
-        ctx: &crate::tools::ToolContext,
+        _ctx: &crate::tools::ToolContext,
     ) -> Result<String, ToolError> {
         let start = Instant::now();
         let mut script = self.script_template.clone();

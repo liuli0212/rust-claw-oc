@@ -19,7 +19,7 @@ pub struct DetailedContextStats {
     pub truncated_chars: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptReport {
     pub max_history_tokens: usize,
     pub history_tokens_used: usize,

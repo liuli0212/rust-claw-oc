@@ -422,21 +422,35 @@ impl AgentOutput for TuiOutput {
 
     async fn on_tool_end(&self, result: &str) {
         self.stop_spinner();
+
+        let mut ok = true;
+        let mut output_text = result.to_string();
+
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(result) {
+            if let Some(b) = val.get("ok").and_then(|v| v.as_bool()) {
+                ok = b;
+            }
+            if let Some(o) = val.get("output").and_then(|v| v.as_str()) {
+                output_text = o.to_string();
+            }
+        }
+
         // Don't print full result if it's huge, just a success indicator
-        let summary = if result.len() > 100 {
+        let summary = if output_text.len() > 100 {
             format!(
                 "{}...",
-                &result
+                &output_text
                     .chars()
                     .take(80)
                     .collect::<String>()
                     .replace('\n', " ")
             )
         } else {
-            result.replace('\n', " ")
+            output_text.replace('\n', " ")
         };
 
-        println!("  {} {}", style("✔").green(), style(summary).dim());
+        let icon = if ok { style("✔").green() } else { style("✖").red() };
+        println!("  {} {}", icon, style(summary).dim());
     }
 
     async fn on_error(&self, error: &str) {

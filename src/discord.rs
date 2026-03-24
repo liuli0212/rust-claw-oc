@@ -1,3 +1,4 @@
+use crate::app::commands::{Command, CommandExecutor, CommandOutput, StatusData};
 use crate::core::AgentOutput;
 use crate::session_manager::SessionManager;
 use serenity::async_trait;
@@ -141,12 +142,25 @@ impl AgentOutput for DiscordOutput {
     }
 
     async fn on_tool_end(&self, result: &str) {
-        let display_result = if result.len() > 1800 {
-            format!("{}... (truncated)", &result[..1800])
+        let mut ok = true;
+        let mut output_text = result.to_string();
+
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(result) {
+            if let Some(b) = val.get("ok").and_then(|v| v.as_bool()) {
+                ok = b;
+            }
+            if let Some(o) = val.get("output").and_then(|v| v.as_str()) {
+                output_text = o.to_string();
+            }
+        }
+
+        let display_result = if output_text.len() > 1800 {
+            format!("{}... (truncated)", &output_text[..1800])
         } else {
-            result.to_string()
+            output_text
         };
-        let msg = format!("✅ **Tool Result**:\n```\n{}\n```", display_result);
+        let status_emoji = if ok { "✅" } else { "❌" };
+        let msg = format!("{} **Tool Result**:\n```\n{}\n```", status_emoji, display_result);
         let _ = self.channel_id.say(&self.ctx.http, msg).await;
     }
 
@@ -159,6 +173,136 @@ impl AgentOutput for DiscordOutput {
     async fn flush(&self) {
         let mut streaming_id_guard = self.streaming_message_id.lock().await;
         self.flush_internal(&mut streaming_id_guard).await;
+    }
+}
+
+struct DiscordCommandOutput {
+    ctx: Context,
+    channel_id: serenity::model::id::ChannelId,
+}
+
+impl CommandOutput for DiscordCommandOutput {
+    fn send_text(&self, text: &str) {
+        let http = self.ctx.http.clone();
+        let channel_id = self.channel_id;
+        let text = text.to_string();
+        tokio::spawn(async move {
+            let _ = channel_id.say(&http, text).await;
+        });
+    }
+
+    fn send_error(&self, error: &str) {
+        let http = self.ctx.http.clone();
+        let channel_id = self.channel_id;
+        let msg = format!("❌ **Error**: {}", error);
+        tokio::spawn(async move {
+            let _ = channel_id.say(&http, msg).await;
+        });
+    }
+
+    fn send_success(&self, message: &str) {
+        let http = self.ctx.http.clone();
+        let channel_id = self.channel_id;
+        let msg = format!("✅ {}", message);
+        tokio::spawn(async move {
+            let _ = channel_id.say(&http, msg).await;
+        });
+    }
+
+    fn send_status(&self, data: StatusData) {
+        let http = self.ctx.http.clone();
+        let channel_id = self.channel_id;
+        tokio::spawn(async move {
+            let mut status_msg = "📊 **Bot Status**\n".to_string();
+            status_msg.push_str(&format!("*Provider*: {}\n*Model*: {}\n*Context*: {}/{} tokens\n", data.provider, data.model, data.tokens, data.max_tokens));
+
+            if let Some(state) = data.active_plan {
+                status_msg.push_str(&format!(
+                    "🎯 **Active Task**: {}\n",
+                    state.goal.unwrap_or_else(|| "Unknown".to_string())
+                ));
+                for (i, step) in state.plan_steps.iter().enumerate() {
+                    let icon = match step.status.as_str() {
+                        "completed" => "✅",
+                        "in_progress" => "⏳",
+                        _ => "⬜",
+                    };
+                    status_msg.push_str(&format!(
+                        "  [{}] {} {}\n",
+                        i, icon, step.step
+                    ));
+                }
+                status_msg.push_str(
+                    "\n💡 You can say \"continue\" to proceed, or use `/cancel_task` to abort.",
+                );
+            } else {
+                status_msg.push_str("✅ No active task.");
+            }
+            let _ = channel_id.say(&http, status_msg).await;
+        });
+    }
+
+    fn send_session_list(&self, sessions: Vec<(String, u64, usize)>) {
+        let http = self.ctx.http.clone();
+        let channel_id = self.channel_id;
+        tokio::spawn(async move {
+            let mut msg = "📝 **Active/Recent Sessions**\n━━━━━━━━━━━━━━━━━━━━━\n".to_string();
+            if sessions.is_empty() {
+                msg.push_str("(No sessions found)");
+            } else {
+                for (id, updated, turns) in sessions {
+                    msg.push_str(&format!("• `{}` (Turns: {}, Updated: {})\n", id, turns, updated));
+                }
+            }
+            let _ = channel_id.say(&http, msg).await;
+        });
+    }
+
+    fn send_cron_list(&self, tasks: Vec<crate::scheduler::ScheduledTask>) {
+        let http = self.ctx.http.clone();
+        let channel_id = self.channel_id;
+        tokio::spawn(async move {
+            if tasks.is_empty() {
+                let _ = channel_id.say(&http, "⚪ No scheduled tasks found.").await;
+            } else {
+                let mut msg = "📅 **Scheduled Tasks**\\n━━━━━━━━━━━━━━━━━━━━━\\n".to_string();
+                for task in tasks {
+                    let status = if task.enabled { "✅" } else { "❌" };
+                    msg.push_str(&format!(
+                        "*ID*: `{}` {}\\n*Cron*: `{}`\\n*Goal*: {}\\n\\n",
+                        task.id, status, task.cron, task.goal
+                    ));
+                }
+                let _ = channel_id.say(&http, msg).await;
+            }
+        });
+    }
+
+    fn send_context_audit(&self, details: String) {
+        self.send_text(&details);
+    }
+
+    fn send_context_diff(&self, diff: Option<String>) {
+        if let Some(diff) = diff {
+            self.send_text(&diff);
+        } else {
+            self.send_text("ℹ️ No changes since last snapshot.");
+        }
+    }
+
+    fn send_context_inspect(&self, result: String) {
+        self.send_text(&result);
+    }
+
+    fn send_context_dump(&self, path: String) {
+        self.send_success(&format!("Context dumped locally to {}", path));
+    }
+
+    fn send_context_compact(&self, result: Result<(), String>) {
+        match result {
+            Ok(_) => self.send_success("Compaction finished."),
+            Err(e) => self.send_error(&format!("Compaction failed: {}", e)),
+        }
     }
 }
 
@@ -175,6 +319,19 @@ impl EventHandler for Handler {
 
         let session_id = format!("discord:{}", msg.channel_id);
         let output = Arc::new(DiscordOutput::new(ctx.clone(), msg.channel_id));
+        let executor = CommandExecutor::new(self.session_manager.clone());
+        let cmd_output = Arc::new(DiscordCommandOutput { ctx: ctx.clone(), channel_id: msg.channel_id });
+
+        let content = msg.content.clone();
+        let channel_id = msg.channel_id;
+        let http = ctx.http.clone();
+
+        if let Some(cmd) = Command::parse(&content) {
+            if let Err(e) = executor.execute(&session_id, &session_id, output.clone(), cmd_output.clone(), cmd).await {
+                cmd_output.send_error(&e);
+            }
+            return;
+        }
 
         let agent = match self
             .session_manager
@@ -190,121 +347,6 @@ impl EventHandler for Handler {
                 return;
             }
         };
-
-        let content = msg.content.clone();
-        let channel_id = msg.channel_id;
-        let http = ctx.http.clone();
-        let cmd = content.trim().to_lowercase();
-
-        if cmd == "/cancel_task" {
-            self.session_manager.cancel_session(&session_id).await;
-            let _ = channel_id
-                .say(&http, "🛑 Task cancellation requested.")
-                .await;
-            return;
-        }
-
-        if cmd == "/status" {
-            let ts = crate::task_state::TaskStateStore::new(&session_id);
-            let mut status_msg = "📊 **Bot Status**
-"
-            .to_string();
-
-            if ts.has_active_plan() {
-                if let Ok(state) = ts.load() {
-                    status_msg.push_str(&format!(
-                        "🎯 **Active Task**: {}
-",
-                        state.goal.unwrap_or_else(|| "Unknown".to_string())
-                    ));
-                    for (i, step) in state.plan_steps.iter().enumerate() {
-                        let icon = match step.status.as_str() {
-                            "completed" => "✅",
-                            "in_progress" => "⏳",
-                            _ => "⬜",
-                        };
-                        status_msg.push_str(&format!(
-                            "  [{}] {} {}
-",
-                            i, icon, step.step
-                        ));
-                    }
-                    status_msg.push_str(
-                        "
-💡 You can say \"continue\" to proceed, or use `/cancel_task` to abort.",
-                    );
-                }
-            } else {
-                status_msg.push_str("✅ No active task.");
-            }
-            let _ = channel_id.say(&http, status_msg).await;
-            return;
-        }
-
-        if cmd.starts_with("/cron") {
-            let parts: Vec<&str> = content.split_whitespace().collect();
-            let action = parts.get(1).copied().unwrap_or("list");
-            let scheduler = crate::scheduler::Scheduler::new(self.session_manager.clone());
-
-            match action {
-                "list" => {
-                    let tasks = scheduler.list_tasks().await;
-                    if tasks.is_empty() {
-                        let _ = channel_id.say(&http, "⚪ No scheduled tasks found.").await;
-                    } else {
-                        let mut msg = "📅 **Scheduled Tasks**\n━━━━━━━━━━━━━━━━━━━━━\n".to_string();
-                        for task in tasks {
-                            let status = if task.enabled { "✅" } else { "❌" };
-                            msg.push_str(&format!(
-                                "*ID*: `{}` {}\n*Cron*: `{}`\n*Goal*: {}\n\n",
-                                task.id, status, task.cron, task.goal
-                            ));
-                        }
-                        let _ = channel_id.say(&http, msg).await;
-                    }
-                }
-                "remove" => {
-                    if let Some(id) = parts.get(2) {
-                        match scheduler.remove_task(id).await {
-                            Ok(_) => {
-                                let _ = channel_id.say(&http, format!("✅ Task `{}` removed.", id)).await;
-                            }
-                            Err(e) => {
-                                let _ = channel_id.say(&http, format!("❌ Error: {}", e)).await;
-                            }
-                        }
-                    } else {
-                        let _ = channel_id.say(&http, "Usage: /cron remove <id>").await;
-                    }
-                }
-                "toggle" => {
-                    if let (Some(id), Some(state)) = (parts.get(2), parts.get(3)) {
-                        let enabled = match *state {
-                            "on" | "true" | "enable" => true,
-                            "off" | "false" | "disable" => false,
-                            _ => {
-                                let _ = channel_id.say(&http, "Usage: /cron toggle <id> <on|off>").await;
-                                return;
-                            }
-                        };
-                        match scheduler.toggle_task(id, enabled).await {
-                            Ok(_) => {
-                                let _ = channel_id.say(&http, format!("✅ Task `{}` is now {}.", id, if enabled { "enabled" } else { "disabled" })).await;
-                            }
-                            Err(e) => {
-                                let _ = channel_id.say(&http, format!("❌ Error: {}", e)).await;
-                            }
-                        }
-                    } else {
-                        let _ = channel_id.say(&http, "Usage: /cron toggle <id> <on|off>").await;
-                    }
-                }
-                _ => {
-                    let _ = channel_id.say(&http, "Unknown action. Use: list, remove, toggle").await;
-                }
-            }
-            return;
-        }
 
         // Spawn agent execution in background so EventHandler returns immediately
         tokio::spawn(async move {
@@ -341,7 +383,7 @@ impl EventHandler for Handler {
                         let _ = channel_id
                             .say(
                                 &http,
-                                format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), e),
+                                format!("⚠️ Run stopped: {}\\nReason: {}", exit.label(), e),
                             )
                             .await;
                     }

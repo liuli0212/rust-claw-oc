@@ -17,8 +17,8 @@ use handlers::{handle_callback_query, handle_command, handle_message};
 enum Command {
     #[command(description = "display this text.")]
     Help,
-    #[command(description = "reset the current session.")]
-    Reset,
+    #[command(description = "start a fresh session.")]
+    New,
     #[command(description = "check if bot is alive.")]
     Ping,
     #[command(description = "cancel the current running task.")]
@@ -31,6 +31,8 @@ enum Command {
     Model(String),
     #[command(description = "manage scheduled tasks: /cron <list|remove|toggle> [id] [on|off]")]
     Cron(String),
+    #[command(description = "inspect context: /context <audit|diff|inspect|dump|compact>")]
+    Context(String),
 }
 
 struct TelegramOutputRouter {

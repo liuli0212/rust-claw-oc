@@ -36,7 +36,7 @@ impl Tool for ReadMemoryTool {
 
     async fn execute(
         &self,
-        args: serde_json::Value,
+        _args: serde_json::Value,
         _ctx: &crate::tools::ToolContext,
     ) -> Result<String, crate::tools::ToolError> {
         let start = Instant::now();
