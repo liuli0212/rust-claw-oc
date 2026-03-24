@@ -30,6 +30,10 @@ impl Tool for ReadMemoryTool {
         clean_schema(serde_json::to_value(schema_for!(EmptyArgs)).unwrap())
     }
 
+    fn has_side_effects(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,
@@ -131,6 +135,10 @@ impl Tool for RagSearchTool {
 
     fn parameters_schema(&self) -> Value {
         clean_schema(serde_json::to_value(schema_for!(RagSearchArgs)).unwrap())
+    }
+
+    fn has_side_effects(&self) -> bool {
+        false
     }
 
     async fn execute(

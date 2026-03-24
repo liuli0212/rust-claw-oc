@@ -1,6 +1,4 @@
 use super::*;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 impl AgentLoop {
     /// Strip `<think>...</think>` blocks from a string, returning only visible text.
@@ -318,31 +316,43 @@ impl AgentLoop {
             if self.is_autopilot {
                 let current_completed = self.count_completed_todos();
                 if current_completed > self.autopilot_todos_completed_count {
-                    // Physical audit passed
+                    // Physical audit passed — generate rolling summary via LLM
                     tracing::info!("Autopilot physical audit passed. Resetting energy and generating summary.");
-                    self.output.on_text("[System] 物理审计通过，正在生成滚动摘要并重置上下文...").await;
-                    
-                    // Generate summary (using current LLM for now, ideally a cheaper one)
-                    let summary_prompt = "Please summarize the key actions taken and errors encountered in the past 25 iterations. Keep it concise and objective.";
-                    // For simplicity in this PR, we just use a placeholder or a simple summary.
-                    // In a real implementation, we would call the LLM here.
-                    let summary = format!("Autopilot completed {} tasks in the last 25 iterations.", current_completed - self.autopilot_todos_completed_count);
-                    
+                    self.output.on_text("[System] 物理审计通过，正在生成滚动摘要并重置上下文...\n").await;
+
+                    let summary = self.generate_rolling_summary().await;
                     self.context.rolling_summary = Some(summary);
-                    // Keep the last 3 turns instead of complete amnesia
-                    if self.context.dialogue_history.len() > 3 {
-                        self.context.dialogue_history.drain(0..self.context.dialogue_history.len() - 3);
+
+                    // Use rule_based_compact to safely compress history (preserves message pairing)
+                    let keep_turns = 3;
+                    let to_compact = self.context.dialogue_history.len().saturating_sub(keep_turns);
+                    if to_compact > 0 {
+                        if let Some(reason) = self.context.rule_based_compact(to_compact) {
+                            tracing::info!("Autopilot compaction: {}", reason);
+                        }
                     }
+
                     task_state.energy_points = Self::INITIAL_ENERGY;
                     self.autopilot_todos_completed_count = current_completed;
                     return None; // Continue loop
                 } else {
-                    return Some(self.finalize_exit(RunExit::StoppedByUser, true).await);
+                    self.output
+                        .on_text("[System] Autopilot 能量耗尽且未检测到任务进展，停止执行。\n")
+                        .await;
+                    return Some(
+                        self.finalize_exit(
+                            RunExit::AutopilotStalled(
+                                "能量耗尽且物理审计未通过：未检测到 TODOS.md 进展".to_string(),
+                            ),
+                            true,
+                        )
+                        .await,
+                    );
                 }
             }
             tracing::error!("Energy points depleted.");
             self.output
-                .on_text("[System] Energy depleted. Stopping to prevent infinite loops.")
+                .on_text("[System] 能量耗尽，停止执行以防止无限循环。\n")
                 .await;
             return Some(
                 self.finalize_exit(
@@ -524,29 +534,26 @@ impl AgentLoop {
             }
 
             if self.is_autopilot {
-                if call.name == "execute_bash" || call.name == "write_file" || call.name == "patch_file" {
-                    if !std::path::Path::new("TODOS.md").exists() {
-
-                        let is_creating_todos = (call.name == "write_file" || call.name == "execute_bash") && call.args.to_string().contains("TODOS.md");
-
+                let tool_has_effects = current_tools
+                    .iter()
+                    .find(|t| t.name() == call.name)
+                    .map(|t| t.has_side_effects())
+                    .unwrap_or(true);
+                if tool_has_effects {
+                    let todos_path = self.todos_path();
+                    if !todos_path.exists() {
+                        let is_creating_todos = (call.name == "write_file"
+                            || call.name == "execute_bash")
+                            && call.args.to_string().contains("TODOS.md");
                         if !is_creating_todos {
-
                             response_parts.push(Self::build_function_response_part(
-
                                 call.name.clone(),
-
                                 call.id.clone(),
-
                                 serde_json::json!({ "result": "[System Error] Action Denied. Autopilot 模式下必须先创建并规划 TODOS.md。" }),
-
                                 thought_sig.clone(),
-
                             ));
-
                             continue;
-
                         }
-
                     }
                 }
             }
@@ -556,26 +563,28 @@ impl AgentLoop {
                 stopped,
             } = self.dispatch_tool_call(&call, current_tools).await;
             if self.is_autopilot {
-                let mut hasher = DefaultHasher::new();
-                call.name.hash(&mut hasher);
-                call.args.to_string().hash(&mut hasher);
-                is_error.hash(&mut hasher);
-                let action_hash = hasher.finish();
+                // Use full string key for action dedup (avoids hash collisions)
+                let action_key = format!("{}:{}:{}", call.name, call.args, is_error);
 
-                self.action_history.push_back(action_hash);
+                self.action_history.push_back(action_key.clone());
                 if self.action_history.len() > 3 {
                     self.action_history.pop_front();
                 }
 
-                if self.action_history.len() == 3 && self.action_history.iter().all(|&h| h == action_hash) {
+                if self.action_history.len() == 3
+                    && self.action_history.iter().all(|k| k == &action_key)
+                {
                     self.reflection_strike += 1;
                     self.action_history.clear();
-                    
+
                     if self.reflection_strike >= 2 {
                         response_parts.push(Self::build_function_response_part(
                             call.name.clone(),
                             call.id.clone(),
-                            serde_json::json!({ "result": "[System Error] AUTOPILOT_MELTDOWN" }),
+                            serde_json::json!({
+                                "result": "[System Error] 检测到深度死循环，反思无效。",
+                                "signal": "autopilot_meltdown"
+                            }),
                             thought_sig.clone(),
                         ));
                         continue;
@@ -583,7 +592,10 @@ impl AgentLoop {
                         response_parts.push(Self::build_function_response_part(
                             call.name.clone(),
                             call.id.clone(),
-                            serde_json::json!({ "result": "[System Warning] 检测到你正在重复执行相同的错误动作。请立即停止当前尝试，反思失败原因，并提出全新的解决路径。" }),
+                            serde_json::json!({
+                                "result": "[System Warning] 检测到你正在重复执行相同的错误动作。请立即停止当前尝试，反思失败原因，并提出全新的解决路径。",
+                                "signal": "reflection_warning"
+                            }),
                             thought_sig.clone(),
                         ));
                         continue;
@@ -609,18 +621,14 @@ impl AgentLoop {
                 self.output.on_tool_end(&result).await;
                 self.handle_successful_tool_effects(&result).await;
                 if let Some(summary) = Self::extract_finish_task_summary_from_result(&result) {
-                    if self.is_autopilot {
-                        if let Ok(content) = std::fs::read_to_string("TODOS.md") {
-                            if content.contains("- [ ]") {
-                                response_parts.push(Self::build_function_response_part(
-                                    call.name.clone(),
-                                    call.id.clone(),
-                                    serde_json::json!({ "result": "[System Error] Action Denied. Autopilot 模式下必须完成 TODOS.md 中的所有任务才能结束。" }),
-                                    thought_sig.clone(),
-                                ));
-                                continue;
-                            }
-                        }
+                    if self.is_autopilot && self.has_uncompleted_todos() {
+                        response_parts.push(Self::build_function_response_part(
+                            call.name.clone(),
+                            call.id.clone(),
+                            serde_json::json!({ "result": "[System Error] Action Denied. Autopilot 模式下必须完成 TODOS.md 中的所有任务才能结束。" }),
+                            thought_sig.clone(),
+                        ));
+                        continue;
                     }
                     let _ = self.task_state_store.save(state);
                     state.status = "finished".to_string();
@@ -641,11 +649,120 @@ impl AgentLoop {
         if self.is_autopilot {
             let todos_after = self.count_todos_status();
             if todos_before != todos_after {
-                self.output.on_text(&format!("[Autopilot] 任务进度已更新: {} 已完成, {} 待办", todos_after.0, todos_after.1)).await;
+                self.output
+                    .on_text(&format!(
+                        "[System] Autopilot 任务进度已更新: {} 已完成, {} 待办\n",
+                        todos_after.0, todos_after.1
+                    ))
+                    .await;
             }
         }
 
         response_parts
+    }
+
+    /// Generate a rolling summary of recent history via the LLM.
+    /// Falls back to a structural summary if the LLM call fails.
+    pub(super) async fn generate_rolling_summary(&self) -> String {
+        // Build a concise text representation of recent history for summarization
+        let mut history_text = String::new();
+        let max_history_chars = 8_000;
+
+        for turn in self.context.dialogue_history.iter().rev().take(10) {
+            let mut turn_desc = format!("[User] {}\n", turn.user_message);
+            for msg in &turn.messages {
+                for part in &msg.parts {
+                    if let Some(fc) = &part.function_call {
+                        turn_desc.push_str(&format!("  → {}({})\n", fc.name,
+                            crate::context::AgentContext::truncate_chars(&fc.args.to_string(), 100)));
+                    }
+                    if let Some(fr) = &part.function_response {
+                        let ok = fr.response.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+                        let label = if ok { "✓" } else { "✗" };
+                        turn_desc.push_str(&format!("  {} {} -> {}\n", label, fr.name,
+                            crate::context::AgentContext::truncate_chars(&fr.response.to_string(), 80)));
+                    }
+                }
+            }
+            if history_text.len() + turn_desc.len() > max_history_chars {
+                break;
+            }
+            history_text.push_str(&turn_desc);
+            history_text.push('\n');
+        }
+
+        let summary_prompt = format!(
+            "Summarize the following agent execution history into a concise rolling summary. \
+             Focus on: (1) What tasks were attempted (2) What succeeded/failed (3) Current state of TODOS. \
+             Be objective and concise (max 500 words).\n\n---\n{}\n---",
+            history_text
+        );
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            parts: vec![Part {
+                text: Some(summary_prompt),
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+                file_data: None,
+            }],
+        }];
+
+        // Try LLM-based summary with a timeout
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.llm.stream(messages, None, vec![]),
+        )
+        .await
+        {
+            Ok(Ok(mut rx)) => {
+                let mut summary = String::new();
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        StreamEvent::Text(t) => summary.push_str(&t),
+                        StreamEvent::Thought(t) => summary.push_str(&t),
+                        StreamEvent::Done | StreamEvent::Error(_) => break,
+                        _ => {}
+                    }
+                }
+                let summary = summary.trim().to_string();
+                if !summary.is_empty() {
+                    return summary;
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("LLM summary generation failed: {}", e);
+            }
+            Err(_) => {
+                tracing::warn!("LLM summary generation timed out");
+            }
+        }
+
+        // Fallback: structural summary from history
+        let mut fallback = String::from("Structural summary of recent autopilot activity:\n");
+        for turn in self.context.dialogue_history.iter().rev().take(5) {
+            fallback.push_str(&format!("- User: {}\n", 
+                crate::context::AgentContext::truncate_chars(&turn.user_message, 100)));
+            let mut tool_count = 0;
+            let mut error_count = 0;
+            for msg in &turn.messages {
+                for part in &msg.parts {
+                    if part.function_call.is_some() {
+                        tool_count += 1;
+                    }
+                    if let Some(fr) = &part.function_response {
+                        if fr.response.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+                            error_count += 1;
+                        }
+                    }
+                }
+            }
+            fallback.push_str(&format!("  ({} tool calls, {} errors)\n", tool_count, error_count));
+        }
+        let (completed, uncompleted) = self.count_todos_status();
+        fallback.push_str(&format!("Current TODOS: {} completed, {} remaining\n", completed, uncompleted));
+        fallback
     }
 
     pub(super) async fn reconcile_after_tool_calls(

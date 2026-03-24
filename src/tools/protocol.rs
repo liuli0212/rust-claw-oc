@@ -41,6 +41,11 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> String;
     fn parameters_schema(&self) -> serde_json::Value;
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError>;
+    /// Whether this tool can modify files, state, or the outside world.
+    /// Read-only tools should return false. Default is true (conservative).
+    fn has_side_effects(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

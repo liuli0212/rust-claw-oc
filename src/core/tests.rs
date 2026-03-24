@@ -135,6 +135,10 @@ fn test_run_exit_label_matches_public_status_names() {
         RunExit::CriticallyFailed("boom".to_string()).label(),
         "critically_failed"
     );
+    assert_eq!(
+        RunExit::AutopilotStalled("stuck".to_string()).label(),
+        "autopilot_stalled"
+    );
 }
 
 #[test]

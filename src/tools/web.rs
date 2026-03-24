@@ -69,6 +69,10 @@ impl Tool for WebFetchTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(WebFetchArgs)).unwrap())
     }
 
+    fn has_side_effects(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,
@@ -148,6 +152,10 @@ impl Tool for TavilySearchTool {
 
     fn parameters_schema(&self) -> Value {
         clean_schema(serde_json::to_value(schemars::schema_for!(TavilySearchArgs)).unwrap())
+    }
+
+    fn has_side_effects(&self) -> bool {
+        false
     }
 
     async fn execute(

@@ -339,7 +339,8 @@ impl EventHandler for Handler {
                         let _ = channel_id.say(&http, "⚠️ [Turn Limit Reached]").await;
                     }
                     crate::core::RunExit::RecoverableFailed(ref e)
-                    | crate::core::RunExit::CriticallyFailed(ref e) => {
+                    | crate::core::RunExit::CriticallyFailed(ref e)
+                    | crate::core::RunExit::AutopilotStalled(ref e) => {
                         let _ = channel_id
                             .say(
                                 &http,

@@ -556,6 +556,10 @@ async fn run_cli_agent_step(
                 println!("\n  {} Critical Failure: {}", style("✖").red(), msg);
                 println!("  The system encountered an unrecoverable error.");
             }
+            RunExit::AutopilotStalled(ref msg) => {
+                println!("\n  {} Autopilot 停滞: {}", style("⚠").yellow(), msg);
+                println!("  👉 Autopilot 未检测到有效进展，已暂停。您可以输入指导意见并继续，或输入 /manual 退出自动驾驶。");
+            }
         },
         Err(e) => eprintln!("  {} Agent error: {}", style("✖").red(), e),
     }

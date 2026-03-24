@@ -28,6 +28,10 @@ impl Tool for LspGotoDefinitionTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspGotoDefinitionArgs)).unwrap())
     }
 
+    fn has_side_effects(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,
@@ -75,6 +79,10 @@ impl Tool for LspFindReferencesTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspFindReferencesArgs)).unwrap())
+    }
+
+    fn has_side_effects(&self) -> bool {
+        false
     }
 
     async fn execute(
@@ -130,6 +138,10 @@ impl Tool for LspHoverTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspHoverArgs)).unwrap())
     }
 
+    fn has_side_effects(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,
@@ -176,6 +188,10 @@ impl Tool for LspGetDiagnosticsTool {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspGetDiagnosticsArgs)).unwrap())
     }
 
+    fn has_side_effects(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,
@@ -220,6 +236,10 @@ impl Tool for LspGetSymbolsTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         clean_schema(serde_json::to_value(schemars::schema_for!(LspGetSymbolsArgs)).unwrap())
+    }
+
+    fn has_side_effects(&self) -> bool {
+        false
     }
 
     async fn execute(

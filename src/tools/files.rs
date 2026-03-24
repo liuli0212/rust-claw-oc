@@ -165,6 +165,10 @@ impl Tool for ReadFileTool {
         clean_schema(serde_json::to_value(schema_for!(ReadFileArgs)).unwrap())
     }
 
+    fn has_side_effects(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         args: serde_json::Value,
@@ -261,6 +265,10 @@ impl Tool for TaskPlanTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         clean_schema(serde_json::to_value(schema_for!(TaskPlanArgs)).unwrap())
+    }
+
+    fn has_side_effects(&self) -> bool {
+        false
     }
 
     async fn execute(
@@ -467,6 +475,10 @@ impl Tool for FinishTaskTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         clean_schema(serde_json::to_value(schema_for!(FinishTaskArgs)).unwrap())
+    }
+
+    fn has_side_effects(&self) -> bool {
+        false
     }
 
     async fn execute(

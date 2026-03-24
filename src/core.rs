@@ -2,6 +2,7 @@ use crate::context::{AgentContext, ContextDiff, FunctionResponse, Message, Part}
 use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;
 use async_trait::async_trait;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -112,6 +113,7 @@ pub enum RunExit {
     YieldedToUser,
     RecoverableFailed(String),
     CriticallyFailed(String),
+    AutopilotStalled(String),
 }
 
 impl RunExit {
@@ -123,6 +125,7 @@ impl RunExit {
             RunExit::YieldedToUser => "yielded_to_user",
             RunExit::RecoverableFailed(_) => "recoverable_failed",
             RunExit::CriticallyFailed(_) => "critically_failed",
+            RunExit::AutopilotStalled(_) => "autopilot_stalled",
         }
     }
 }
@@ -160,9 +163,10 @@ pub struct AgentLoop {
     pub cancel_token: Arc<Notify>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     pub is_autopilot: bool,
-    action_history: std::collections::VecDeque<u64>,
+    action_history: std::collections::VecDeque<String>,
     reflection_strike: u8,
     autopilot_todos_completed_count: usize,
+    autopilot_work_dir: Option<PathBuf>,
 }
 
 impl AgentLoop {
@@ -196,6 +200,7 @@ impl AgentLoop {
             action_history: std::collections::VecDeque::new(),
             reflection_strike: 0,
             autopilot_todos_completed_count: 0,
+            autopilot_work_dir: None,
         }
     }
 
@@ -216,29 +221,47 @@ impl AgentLoop {
         self.output = output;
     }
 
+    /// Enable autopilot mode. MUST be called BEFORE the first `step()` call,
+    /// as it captures the current working directory and initial TODOS.md baseline.
     pub fn enable_autopilot(&mut self) {
         self.is_autopilot = true;
+        self.autopilot_work_dir = std::env::current_dir().ok();
         self.autopilot_todos_completed_count = self.count_completed_todos();
     }
 
     fn count_completed_todos(&self) -> usize {
-
         self.count_todos_status().0
-
     }
 
-
-
+    /// Returns (completed_count, uncompleted_count) from TODOS.md.
+    /// Uses the locked autopilot_work_dir if set, otherwise falls back to CWD.
     pub(crate) fn count_todos_status(&self) -> (usize, usize) {
+        use std::sync::LazyLock;
+        static RE_COMPLETED: LazyLock<regex::Regex> =
+            LazyLock::new(|| regex::Regex::new(r"(?i)[-*]\s*\[x\]").unwrap());
+        static RE_UNCOMPLETED: LazyLock<regex::Regex> =
+            LazyLock::new(|| regex::Regex::new(r"(?i)[-*]\s*\[\s\]").unwrap());
 
-        let content = std::fs::read_to_string("TODOS.md").unwrap_or_default();
+        let todos_path = self.todos_path();
+        let content = std::fs::read_to_string(todos_path).unwrap_or_default();
+        (
+            RE_COMPLETED.find_iter(&content).count(),
+            RE_UNCOMPLETED.find_iter(&content).count(),
+        )
+    }
 
-        let re_completed = regex::Regex::new(r"(?i)[-*]\s*\[x\]").unwrap();
+    /// Returns the absolute path to TODOS.md, using the locked work directory if available.
+    pub(crate) fn todos_path(&self) -> PathBuf {
+        if let Some(dir) = &self.autopilot_work_dir {
+            dir.join("TODOS.md")
+        } else {
+            PathBuf::from("TODOS.md")
+        }
+    }
 
-        let re_uncompleted = regex::Regex::new(r"(?i)[-*]\s*\[\s\]").unwrap();
-
-        (re_completed.find_iter(&content).count(), re_uncompleted.find_iter(&content).count())
-
+    /// Check if TODOS.md has any uncompleted items. Uses the same regex as count_todos_status.
+    pub(crate) fn has_uncompleted_todos(&self) -> bool {
+        self.count_todos_status().1 > 0
     }
 
     pub async fn flush_output(&self) {
@@ -564,8 +587,15 @@ impl AgentLoop {
             if !response_parts.is_empty() {
                 for part in &response_parts {
                     if let Some(res) = &part.function_response {
-                        if res.response.to_string().contains("AUTOPILOT_MELTDOWN") {
-                            return Ok(RunExit::RecoverableFailed("检测到深度死循环，反思无效，交还控制权".to_string()));
+                        if res
+                            .response
+                            .get("signal")
+                            .and_then(|s| s.as_str())
+                            == Some("autopilot_meltdown")
+                        {
+                            return Ok(RunExit::AutopilotStalled(
+                                "检测到深度死循环，反思无效，交还控制权".to_string(),
+                            ));
                         }
                     }
                 }
