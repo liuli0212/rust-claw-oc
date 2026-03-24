@@ -228,6 +228,8 @@ fn print_help() {
     println!("  {} - Abort active task plan", style("/cancel_task").red());
     println!("  {} - Show model usage", style("/status").cyan());
     println!("  {} - Switch models", style("/model").magenta());
+    println!("  {} - Enable autopilot mode", style("/autopilot").green());
+    println!("  {} - Switch to manual mode", style("/manual").yellow());
     println!("  {} - List all sessions", style("/session").white());
     println!("  {} - Manage scheduled tasks", style("/cron").yellow());
     println!("  {} - Inspect context", style("/context").blue());
