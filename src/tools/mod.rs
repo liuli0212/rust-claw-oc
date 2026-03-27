@@ -1,3 +1,4 @@
+pub mod ask_user;
 pub mod bash;
 pub mod files;
 pub mod integrations;

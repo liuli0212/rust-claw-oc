@@ -48,6 +48,15 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Structured question to present to the user during skill execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserPromptRequest {
+    pub question: String,
+    pub context_key: String,
+    pub options: Vec<String>,
+    pub recommendation: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StructuredToolOutput {
     pub ok: bool,
@@ -66,6 +75,9 @@ pub struct StructuredToolOutput {
     pub payload_kind: Option<String>,
     pub invalidate_diagnostic_evidence: bool,
     pub finish_task_summary: Option<String>,
+    /// If set, the tool is requesting that execution pause for user input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub await_user: Option<UserPromptRequest>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -96,6 +108,8 @@ pub struct ToolExecutionEnvelope {
     pub invalidate_diagnostic_evidence: bool,
     #[serde(default)]
     pub finish_task_summary: Option<String>,
+    #[serde(default)]
+    pub await_user: Option<UserPromptRequest>,
 }
 
 impl StructuredToolOutput {
@@ -124,6 +138,7 @@ impl StructuredToolOutput {
             payload_kind: None,
             invalidate_diagnostic_evidence: false,
             finish_task_summary: None,
+            await_user: None,
         }
     }
 
@@ -159,6 +174,11 @@ impl StructuredToolOutput {
         self
     }
 
+    pub fn with_await_user(mut self, request: UserPromptRequest) -> Self {
+        self.await_user = Some(request);
+        self
+    }
+
     pub fn into_envelope(self) -> ToolExecutionEnvelope {
         ToolExecutionEnvelope {
             ok: self.ok,
@@ -177,6 +197,7 @@ impl StructuredToolOutput {
             payload_kind: self.payload_kind,
             invalidate_diagnostic_evidence: self.invalidate_diagnostic_evidence,
             finish_task_summary: self.finish_task_summary,
+            await_user: self.await_user,
         }
     }
 
