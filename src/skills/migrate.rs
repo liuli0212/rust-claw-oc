@@ -71,6 +71,10 @@ pub fn migrate_legacy_skill(content: &str) -> Option<SkillDef> {
         name, param_docs, script_body
     );
 
+    let parameters_json: Option<serde_json::Value> = yaml_val
+        .get("parameters")
+        .and_then(|p| serde_json::to_value(p).ok());
+
     Some(SkillDef {
         meta: SkillMeta {
             name,
@@ -80,12 +84,14 @@ pub fn migrate_legacy_skill(content: &str) -> Option<SkillDef> {
             // Legacy skills typically need execute_bash
             allowed_tools: vec!["execute_bash".to_string()],
             output_mode: None,
+            parameters: parameters_json.clone(),
         },
         instructions,
         preamble: Some(SkillPreamble {
             shell: script_body,
             tier: None,
         }),
+        parameters: parameters_json,
         constraints: SkillConstraints::default(),
     })
 }

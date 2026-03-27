@@ -5,6 +5,7 @@
 //! prompt injection) is driven by these structures.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Top-level unified skill definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +15,8 @@ pub struct SkillDef {
     pub instructions: String,
     /// Optional preamble to execute before skill activation.
     pub preamble: Option<SkillPreamble>,
+    /// Optional parameter definitions (schema).
+    pub parameters: Option<Value>,
     /// Runtime constraints and policies.
     pub constraints: SkillConstraints,
 }
@@ -31,6 +34,8 @@ pub struct SkillMeta {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub output_mode: Option<OutputMode>,
+    /// Formal parameter definitions (as seen in YAML).
+    pub parameters: Option<Value>,
 }
 
 /// How a skill can be triggered.

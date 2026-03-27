@@ -38,11 +38,16 @@ impl SkillRuntime {
     }
 
     /// Activate a skill, executing its preamble if present.
-    pub async fn activate_skill(&self, def: &SkillDef) -> Result<(), String> {
+    pub async fn activate_skill(
+        &self,
+        def: &SkillDef,
+        initial_args: Option<String>,
+    ) -> Result<(), String> {
         let mut state = ActiveSkillState::new(
             def.meta.name.clone(),
             def.constraints.clone(),
         );
+        state.initial_args = initial_args;
 
         // Execute preamble if present
         if let Some(preamble) = &def.preamble {
@@ -288,7 +293,7 @@ mod tests {
         assert!(!rt.is_active().await);
 
         let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill).await.unwrap();
+        rt.activate_skill(&skill, None).await.unwrap();
         assert!(rt.is_active().await);
 
         rt.deactivate_skill().await;
@@ -296,10 +301,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_activate_with_args_injects_into_prompt() {
+        let rt = SkillRuntime::new();
+        let skill = make_test_skill(false, None);
+        rt.activate_skill(&skill, Some("a space cat".to_string()))
+            .await
+            .unwrap();
+
+        let draft = rt.before_prompt_build(PromptDraft::default()).await;
+        let summary = draft.skill_state_summary.unwrap();
+        assert!(summary.contains("USER INPUT AT ACTIVATION: a space cat"));
+    }
+
+    #[tokio::test]
     async fn test_prompt_build_injects_contract() {
         let rt = SkillRuntime::new();
         let skill = make_test_skill(true, None);
-        rt.activate_skill(&skill).await.unwrap();
+        rt.activate_skill(&skill, None).await.unwrap();
 
         let draft = rt.before_prompt_build(PromptDraft::default()).await;
         assert!(draft.skill_contract.is_some());
@@ -320,7 +338,7 @@ mod tests {
     async fn test_forbid_code_write_filters_tools() {
         let rt = SkillRuntime::new();
         let skill = make_test_skill(true, None);
-        rt.activate_skill(&skill).await.unwrap();
+        rt.activate_skill(&skill, None).await.unwrap();
 
         // Create mock tools
         struct MockTool(String);
@@ -357,7 +375,7 @@ mod tests {
     async fn test_resume_with_pending_interaction() {
         let rt = SkillRuntime::new();
         let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill).await.unwrap();
+        rt.activate_skill(&skill, None).await.unwrap();
 
         // Set pending interaction
         {
@@ -394,7 +412,7 @@ mod tests {
     async fn test_resume_without_pending_passes_through() {
         let rt = SkillRuntime::new();
         let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill).await.unwrap();
+        rt.activate_skill(&skill, None).await.unwrap();
 
         let decision = rt.on_user_resume("hello").await;
         assert!(matches!(decision, ResumeDecision::PassThrough));
@@ -404,7 +422,7 @@ mod tests {
     async fn test_artifact_contract_denies_finish() {
         let rt = SkillRuntime::new();
         let skill = make_test_skill(false, Some(ArtifactKind::DesignDoc));
-        rt.activate_skill(&skill).await.unwrap();
+        rt.activate_skill(&skill, None).await.unwrap();
 
         let decision = rt.before_finish().await;
         match decision {
@@ -419,7 +437,7 @@ mod tests {
     async fn test_artifact_contract_allows_finish_with_artifact() {
         let rt = SkillRuntime::new();
         let skill = make_test_skill(false, Some(ArtifactKind::DesignDoc));
-        rt.activate_skill(&skill).await.unwrap();
+        rt.activate_skill(&skill, None).await.unwrap();
 
         // Add an artifact
         {

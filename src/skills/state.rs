@@ -19,6 +19,8 @@ pub struct ActiveSkillState {
     pub preamble_result: Option<PreambleState>,
     /// Artifacts produced during skill execution.
     pub artifacts: Vec<SkillArtifact>,
+    /// Arguments provided at activation (e.g. from slash command).
+    pub initial_args: Option<String>,
     /// Constraints inherited from the SkillDef.
     pub constraints: SkillConstraints,
 }
@@ -79,6 +81,7 @@ impl ActiveSkillState {
             pending_interaction: None,
             preamble_result: None,
             artifacts: Vec::new(),
+            initial_args: None,
             constraints,
         }
     }
@@ -108,6 +111,10 @@ impl ActiveSkillState {
 
         if !self.artifacts.is_empty() {
             parts.push(format!("Artifacts: {}", self.artifacts.len()));
+        }
+
+        if let Some(args) = &self.initial_args {
+            parts.push(format!("USER INPUT AT ACTIVATION: {}", args));
         }
 
         parts.join("\n")

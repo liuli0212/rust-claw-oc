@@ -60,7 +60,11 @@ pub fn parse_skill_md(content: &str) -> Option<SkillDef> {
     let yaml_str = parts[1].trim();
     let body = parts[2].trim().to_string();
 
-    let raw: RawFrontmatter = serde_yaml::from_str(yaml_str).ok()?;
+    let yaml_val: serde_yaml::Value = serde_yaml::from_str(yaml_str).ok()?;
+    let raw: RawFrontmatter = serde_yaml::from_value(yaml_val.clone()).ok()?;
+    let parameters_json: Option<serde_json::Value> = yaml_val
+        .get("parameters")
+        .and_then(|p| serde_json::to_value(p).ok());
 
     let trigger = match raw.trigger.as_deref() {
         Some("suggest_only") => super::definition::SkillTrigger::SuggestOnly,
@@ -88,9 +92,13 @@ pub fn parse_skill_md(content: &str) -> Option<SkillDef> {
             trigger,
             allowed_tools: raw.allowed_tools.unwrap_or_default(),
             output_mode,
+            parameters: parameters_json,
         },
         instructions: body,
         preamble,
+        parameters: raw
+            .parameters
+            .and_then(|p| serde_json::to_value(p).ok()),
         constraints: raw.constraints.unwrap_or_default(),
     })
 }
