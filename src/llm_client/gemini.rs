@@ -288,12 +288,16 @@ impl LlmClient for GeminiClient {
 struct VertexFunctionCall {
     name: String,
     args: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct VertexFunctionResponse {
     name: String,
     response: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -342,6 +346,7 @@ pub(crate) fn to_vertex_message(msg: &Message) -> VertexMessage {
                 function_call: p.function_call.as_ref().map(|fc| VertexFunctionCall {
                     name: fc.name.clone(),
                     args: fc.args.clone(),
+                    id: fc.id.clone(),
                 }),
                 function_response: p
                     .function_response
@@ -349,6 +354,7 @@ pub(crate) fn to_vertex_message(msg: &Message) -> VertexMessage {
                     .map(|fr| VertexFunctionResponse {
                         name: fr.name.clone(),
                         response: fr.response.clone(),
+                        id: fr.id.clone(),
                     }),
                 thought_signature: p.thought_signature.clone(),
                 file_data: p.file_data.clone(),

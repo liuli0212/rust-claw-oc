@@ -2,6 +2,8 @@
 
 ## 1. 背景
 
+<!-- REVIEW (Strict): 背景分析准确。引入 General Skill Runtime 是必要的。重点在于如何确保这套运行时不仅能跑通 office-hours，还能通过通用的钩子机制（ExecutionExtension）适配未来不可预见的 SOP 类型。 -->
+
 当前 `rusty-claw` 的 skill 机制本质上是"把 Markdown 解析成动态 Tool，再把正文当作脚本模板执行"。
 
 这套模型适合：
@@ -28,10 +30,12 @@
 
 ### 2.1 必须达成
 
+<!-- REVIEW (Strict): 目标 7 的“持久化与恢复”需明确是否包含 Workspace 状态。如果 Skill 执行中途 crash，恢复时如何确保文件系统状态与 ActiveSkillState 一致？建议增加“Workspace 状态一致性校验”作为进阶目标。 -->
+
 1. 支持统一的 SKILL 定义模型，而不是长期维持双轨系统
 2. 支持递归发现 `skills/**/SKILL.md`
 3. 支持 skill 级 prompt 注入，但不破坏现有 system / project / memory / task-plan 约束
-4. 支持 skill 级工具白名单与能力策略
+4. 支持 skill 级工具 white-list 与能力策略
 5. 支持技能内提问、暂停、恢复
 6. 支持受限子会话执行
 7. 支持技能状态持久化与恢复
