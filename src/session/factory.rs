@@ -31,6 +31,11 @@ pub fn build_agent_session(
     session_tools.push(Arc::new(crate::tools::FinishTaskTool {
         task_state_store: task_state_store.clone(),
     }));
+    // DispatchSubagent: inject LLM and a snapshot of the base tool set
+    session_tools.push(Arc::new(crate::tools::subagent::DispatchSubagentTool::new(
+        llm.clone(),
+        session_tools.clone(),
+    )));
 
     Ok(Arc::new(AsyncMutex::new(AgentLoop::new(
         session_id.to_string(),
