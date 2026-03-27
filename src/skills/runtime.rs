@@ -275,9 +275,11 @@ mod tests {
                 trigger: SkillTrigger::ManualOnly,
                 allowed_tools: vec!["read_file".to_string(), "execute_bash".to_string()],
                 output_mode: None,
+                parameters: None,
             },
             instructions: "Do the thing.".to_string(),
             preamble: None,
+            parameters: None,
             constraints: SkillConstraints {
                 forbid_code_write: forbid_code,
                 allow_subagents: false,

@@ -110,9 +110,11 @@ mod tests {
                 trigger: SkillTrigger::ManualOnly,
                 allowed_tools: allowed.into_iter().map(|s| s.to_string()).collect(),
                 output_mode: None,
+                parameters: None,
             },
             instructions: String::new(),
             preamble: None,
+            parameters: None,
             constraints: SkillConstraints::default(),
         }
     }

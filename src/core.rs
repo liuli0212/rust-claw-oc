@@ -518,6 +518,12 @@ impl AgentLoop {
 
         self.context.start_turn(goal.clone());
 
+        // Extension hook: before_turn_start
+        for ext in &self.extensions {
+            let _decision = ext.before_turn_start(&goal).await;
+            // Future: handle ExtensionDecision::Halt
+        }
+
         let (mut state, c_ids) = self.initialize_task_state(&goal);
 
         let _run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
@@ -550,7 +556,7 @@ impl AgentLoop {
                 )
                 .await;
 
-            let current_tools = self.load_current_tools();
+            let current_tools = self.load_current_tools().await;
 
             let (full_text, tool_calls_accumulated) = match self
                 .collect_iteration_response(&state, &current_tools)
@@ -612,8 +618,26 @@ impl AgentLoop {
             }
 
             if state.status == "finished" {
-                let summary = state.summary();
-                return Ok(self.finalize_finished_run(summary).await);
+                // Extension hook: before_finish — let extensions validate completion
+                let mut allow_finish = true;
+                for ext in &self.extensions {
+                    if let crate::core::extensions::FinishDecision::Deny { reason } =
+                        ext.before_finish().await
+                    {
+                        tracing::warn!("Extension denied finish: {}", reason);
+                        self.output
+                            .on_text(&format!("[System] {}", reason))
+                            .await;
+                        allow_finish = false;
+                        state.status = "in_progress".to_string();
+                        let _ = self.task_state_store.save(&state);
+                        break;
+                    }
+                }
+                if allow_finish {
+                    let summary = state.summary();
+                    return Ok(self.finalize_finished_run(summary).await);
+                }
             }
 
             state = self.reconcile_after_tool_calls(&state_before_tools).await;

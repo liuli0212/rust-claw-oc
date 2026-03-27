@@ -292,6 +292,16 @@ Architecture: {}
         ));
     }
 
+    // Skill contract injection (from ExecutionExtension hooks)
+    if let Some(contract) = &ctx.skill_contract {
+        final_system_text.push_str(&format!(
+            "\n\n--- [ACTIVE SKILL CONTRACT] ---\n\
+             {}\n\
+             ------------------------------------\n",
+            contract
+        ));
+    }
+
     let system_msg = super::model::Message {
         role: "system".to_string(),
         parts: vec![super::model::Part {

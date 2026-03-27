@@ -16,6 +16,8 @@ pub struct AgentContext {
     pub last_snapshot: Option<ContextSnapshot>,
     pub active_evidence: Vec<crate::evidence::Evidence>,
     pub rolling_summary: Option<String>,
+    /// Injected by SkillRuntime via before_prompt_build hook.
+    pub skill_contract: Option<String>,
 }
 
 impl AgentContext {
@@ -44,6 +46,7 @@ impl AgentContext {
             last_snapshot: None,
             active_evidence: Vec::new(),
             rolling_summary: None,
+            skill_contract: None,
         }
     }
 

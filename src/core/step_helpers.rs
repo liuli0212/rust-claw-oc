@@ -219,11 +219,17 @@ impl AgentLoop {
             .filter(|thought| !thought.is_empty())
     }
 
-    pub(super) fn load_current_tools(&self) -> Vec<Arc<dyn Tool>> {
+    pub(super) async fn load_current_tools(&self) -> Vec<Arc<dyn Tool>> {
         let mut current_tools = self.tools.clone();
         for skill in crate::skills::load_skills("skills") {
             current_tools.push(Arc::new(skill));
         }
+
+        // Extension hook: before_tool_resolution — let extensions filter the tool set
+        for ext in &self.extensions {
+            current_tools = ext.before_tool_resolution(current_tools).await;
+        }
+
         current_tools
     }
 
@@ -360,6 +366,19 @@ impl AgentLoop {
         state: &crate::task_state::TaskStateSnapshot,
         current_tools: &[Arc<dyn Tool>],
     ) -> Result<StreamCollectionOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        // Extension hook: before_prompt_build — let extensions inject skill contract/instructions
+        let mut draft = crate::core::extensions::PromptDraft::default();
+        for ext in &self.extensions {
+            draft = ext.before_prompt_build(draft).await;
+        }
+
+        // If an extension injected a skill contract, attach it to context for prompt assembly
+        if let Some(contract) = &draft.skill_contract {
+            self.context.skill_contract = Some(contract.clone());
+        } else {
+            self.context.skill_contract = None;
+        }
+
         let max_tokens = self.context.max_history_tokens;
         let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
         let (messages, system, _) = self.context.build_llm_payload(state, &assembler);
@@ -445,6 +464,11 @@ impl AgentLoop {
         let Some(envelope) = Self::parse_tool_envelope(result) else {
             return;
         };
+
+        // Extension hook: after_tool_result — let extensions react to tool outputs
+        for ext in &self.extensions {
+            ext.after_tool_result(&envelope).await;
+        }
 
         if let Some(path) = envelope.file_path.as_deref() {
             self.output.on_file(path).await;

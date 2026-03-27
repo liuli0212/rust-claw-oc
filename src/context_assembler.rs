@@ -21,6 +21,7 @@ pub enum CandidateKind {
     TaskStateSummary,
     Evidence(String),    // Evidence ID
     VolatileTurn(usize), // Turn Index
+    SkillContract,       // Active skill contract
 }
 
 #[derive(Debug, Default, Clone)]
