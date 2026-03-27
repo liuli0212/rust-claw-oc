@@ -7,7 +7,11 @@
 pub mod definition;
 pub mod migrate;
 pub mod parser;
+pub mod preamble;
+pub mod policy;
 pub mod registry;
+pub mod runtime;
+pub mod state;
 
 // Re-export the legacy module so existing `crate::skills::load_skills()` calls
 // continue to work during the migration period.
