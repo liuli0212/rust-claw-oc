@@ -7,6 +7,7 @@ pub mod memory;
 pub mod protocol;
 pub mod scheduler;
 pub mod shell;
+pub mod subagent;
 pub mod web;
 
 pub use bash::BashTool;
