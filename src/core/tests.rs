@@ -33,6 +33,24 @@ impl TestLlmClient {
     }
 }
 
+struct PromptCapturingLlm {
+    last_system: Mutex<Option<String>>,
+    events: Mutex<Vec<StreamEvent>>,
+}
+
+impl PromptCapturingLlm {
+    fn new(events: Vec<StreamEvent>) -> Self {
+        Self {
+            last_system: Mutex::new(None),
+            events: Mutex::new(events),
+        }
+    }
+
+    fn last_system_text(&self) -> Option<String> {
+        self.last_system.lock().unwrap().clone()
+    }
+}
+
 #[async_trait]
 impl LlmClient for TestLlmClient {
     fn model_name(&self) -> &str {
@@ -54,6 +72,39 @@ impl LlmClient for TestLlmClient {
         }
         self.stream_calls.fetch_add(1, Ordering::SeqCst);
         let (_tx, rx) = mpsc::channel(1);
+        Ok(rx)
+    }
+}
+
+#[async_trait]
+impl LlmClient for PromptCapturingLlm {
+    fn model_name(&self) -> &str {
+        "prompt-capturing"
+    }
+
+    fn provider_name(&self) -> &str {
+        "test-provider"
+    }
+
+    async fn stream(
+        &self,
+        _messages: Vec<Message>,
+        system_instruction: Option<Message>,
+        _tools: Vec<Arc<dyn Tool>>,
+    ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+        let text = system_instruction
+            .and_then(|message| message.parts.into_iter().find_map(|part| part.text))
+            .unwrap_or_default();
+        *self.last_system.lock().unwrap() = Some(text);
+
+        let (tx, rx) = mpsc::channel(8);
+        let events = std::mem::take(&mut *self.events.lock().unwrap());
+        tokio::spawn(async move {
+            for event in events {
+                let _ = tx.send(event).await;
+            }
+            let _ = tx.send(StreamEvent::Done).await;
+        });
         Ok(rx)
     }
 }
@@ -234,5 +285,87 @@ async fn test_step_honors_cancel_during_pending_llm_stream_start() {
     assert_eq!(llm.stream_call_count(), 0);
     assert_eq!(stored_state.status, "in_progress");
     assert_eq!(stored_state.goal.as_deref(), Some("Refactor the core loop"));
+    cleanup_session(session_id);
+}
+
+#[tokio::test]
+async fn test_step_yields_after_ask_user_tool_result() {
+    struct AskUserTool;
+
+    #[async_trait]
+    impl Tool for AskUserTool {
+        fn name(&self) -> String {
+            "ask_user_question".to_string()
+        }
+
+        fn description(&self) -> String {
+            "ask".to_string()
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        fn has_side_effects(&self) -> bool {
+            false
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &crate::tools::ToolContext,
+        ) -> Result<String, crate::tools::ToolError> {
+            crate::tools::protocol::StructuredToolOutput::new(
+                "ask_user_question",
+                true,
+                "waiting".to_string(),
+                None,
+                None,
+                false,
+            )
+            .with_await_user(crate::tools::protocol::UserPromptRequest {
+                question: "What is your goal?".to_string(),
+                context_key: "goal".to_string(),
+                options: vec!["A".to_string(), "B".to_string()],
+                recommendation: Some("A".to_string()),
+            })
+            .to_json_string()
+        }
+    }
+
+    let llm = Arc::new(PromptCapturingLlm::new(vec![StreamEvent::ToolCall(
+        crate::context::FunctionCall {
+            name: "ask_user_question".to_string(),
+            args: serde_json::json!({
+                "question": "What is your goal?",
+                "context_key": "goal",
+                "options": ["A", "B"],
+                "recommendation": "A"
+            }),
+            id: Some("call_1".to_string()),
+        },
+        None,
+    )]));
+    let output = Arc::new(TestOutput::new());
+    let session_id = "test-ask-user-yield";
+    cleanup_session(session_id);
+
+    let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+    let mut agent = AgentLoop::new(
+        session_id.to_string(),
+        llm,
+        "test_cli".to_string(),
+        vec![Arc::new(AskUserTool)],
+        AgentContext::new(),
+        output.clone(),
+        Arc::new(telemetry),
+        Arc::new(crate::task_state::TaskStateStore::new(session_id)),
+    );
+
+    let exit = agent.step("Help me choose a goal".to_string()).await.unwrap();
+    let (text, _) = output.snapshot();
+
+    assert_eq!(exit, RunExit::YieldedToUser);
+    assert!(text.contains("What is your goal?"));
     cleanup_session(session_id);
 }

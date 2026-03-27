@@ -60,18 +60,27 @@ impl Tool for PatchFileTool {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let ok = output.status.success();
 
-        serialize_tool_envelope(
-            "patch_file",
-            ok,
-            if ok {
-                stdout
-            } else {
-                format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr)
-            },
-            output.status.code(),
-            Some(start.elapsed().as_millis()),
-            false,
-        )
+        if ok {
+            StructuredToolOutput::new(
+                "patch_file",
+                true,
+                stdout,
+                output.status.code(),
+                Some(start.elapsed().as_millis()),
+                false,
+            )
+            .with_file_path(parsed.path)
+            .to_json_string()
+        } else {
+            serialize_tool_envelope(
+                "patch_file",
+                false,
+                format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr),
+                output.status.code(),
+                Some(start.elapsed().as_millis()),
+                false,
+            )
+        }
     }
 }
 
@@ -128,6 +137,7 @@ impl Tool for WriteFileTool {
                 false,
             )
             .with_invalidated_diagnostics()
+            .with_file_path(parsed.path)
             .to_json_string(),
             Err(e) => serialize_tool_envelope(
                 "write_file",
@@ -577,10 +587,10 @@ mod tests {
             .unwrap();
 
         let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
-        assert!(envelope.ok);
-        assert!(envelope.truncated);
-        assert!(envelope.output.contains("line-0000"));
-        assert!(envelope.output.contains("Truncated"));
+        assert!(envelope.result.ok);
+        assert!(envelope.result.truncated);
+        assert!(envelope.result.output.contains("line-0000"));
+        assert!(envelope.result.output.contains("Truncated"));
     }
 
     #[tokio::test]
@@ -615,9 +625,9 @@ mod tests {
         let updated = store.load().unwrap();
 
         let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
-        assert!(envelope.ok);
+        assert!(envelope.result.ok);
         assert_eq!(
-            envelope.finish_task_summary.as_deref(),
+            envelope.effects.finish_task_summary.as_deref(),
             Some("Refactor complete")
         );
         assert_eq!(updated.status, "completed");

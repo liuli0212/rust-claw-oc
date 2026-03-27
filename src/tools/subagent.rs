@@ -3,34 +3,35 @@
 //! The sub-agent executes with:
 //! - A subset of tools (configurable)
 //! - A timeout (default 60 seconds)
-//! - A maximum step count (default 5)
+//! - A maximum step count enforced via AgentLoop energy budget
 //! - Summary-only context (no full parent history)
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::protocol::{clean_schema, StructuredToolOutput, Tool, ToolError};
 
-pub struct DispatchSubagentTool;
+pub struct DispatchSubagentTool {
+    llm: Arc<dyn crate::llm_client::LlmClient>,
+    base_tools: Vec<Arc<dyn Tool>>,
+}
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct DispatchSubagentArgs {
-    /// The goal for the sub-agent to accomplish.
     pub goal: String,
-    /// Summary of the context the sub-agent should work with.
     pub input_summary: String,
-    /// Tools the sub-agent is allowed to use.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
-    /// Timeout in seconds (default: 60).
     pub timeout_sec: Option<u64>,
-    /// Maximum number of execution steps (default: 5).
     pub max_steps: Option<usize>,
 }
 
-/// Structured result returned by a sub-agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentResult {
     pub ok: bool,
@@ -40,14 +41,34 @@ pub struct SubagentResult {
 }
 
 impl DispatchSubagentTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(
+        llm: Arc<dyn crate::llm_client::LlmClient>,
+        base_tools: Vec<Arc<dyn Tool>>,
+    ) -> Self {
+        Self { llm, base_tools }
     }
-}
 
-impl Default for DispatchSubagentTool {
-    fn default() -> Self {
-        Self::new()
+    fn filter_tools(&self, allowed: &[String]) -> Vec<Arc<dyn Tool>> {
+        let effective_allowed: Vec<String> = if allowed.is_empty() {
+            vec![
+                "read_file".to_string(),
+                "execute_bash".to_string(),
+                "web_fetch".to_string(),
+            ]
+        } else {
+            allowed.to_vec()
+        };
+
+        let runtime_tools = ["finish_task", "task_plan"];
+
+        self.base_tools
+            .iter()
+            .filter(|tool| {
+                let name = tool.name();
+                runtime_tools.contains(&name.as_str()) || effective_allowed.contains(&name)
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -59,7 +80,7 @@ impl Tool for DispatchSubagentTool {
 
     fn description(&self) -> String {
         "Dispatch a restricted sub-agent to perform an isolated task. \
-         The sub-agent runs with limited tools, timeout, and step count."
+         The sub-agent runs with limited tools, timeout, and enforced step count."
             .to_string()
     }
 
@@ -74,45 +95,111 @@ impl Tool for DispatchSubagentTool {
     async fn execute(
         &self,
         args: Value,
-        _ctx: &super::protocol::ToolContext,
+        ctx: &super::protocol::ToolContext,
     ) -> Result<String, ToolError> {
         let parsed: DispatchSubagentArgs = serde_json::from_value(args)
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
-        let _timeout_sec = parsed.timeout_sec.unwrap_or(60);
-        let _max_steps = parsed.max_steps.unwrap_or(5);
+        let timeout_sec = parsed.timeout_sec.unwrap_or(60);
+        let max_steps = parsed.max_steps.unwrap_or(5).max(1);
 
-        // Phase 4 implementation stub:
-        // In production, this would call SessionManager::create_ephemeral_session()
-        // to spawn a restricted AgentLoop with the given constraints.
-        //
-        // For now, return a structured placeholder indicating the sub-agent
-        // received the request but the execution engine is not yet wired.
-        let result = SubagentResult {
-            ok: true,
-            summary: format!(
-                "Sub-agent dispatched for goal: '{}'. \
-                 Context: '{}'. Allowed tools: {:?}. \
-                 Timeout: {}s, Max steps: {}.",
-                parsed.goal,
-                parsed.input_summary,
-                parsed.allowed_tools,
-                _timeout_sec,
-                _max_steps
-            ),
-            findings: vec![
-                "Sub-agent execution engine not yet wired (Phase 4 stub)".to_string(),
-            ],
-            artifacts: vec![],
+        let collector = Arc::new(CollectorOutput::new());
+        let mut context = crate::context::AgentContext::new();
+        context.system_prompts.push(format!(
+            "You are a restricted sub-agent. Complete the assigned goal with the available tools, \
+             then call `finish_task`.\nParent context summary:\n{}\n\nBe concise.",
+            parsed.input_summary
+        ));
+        context.max_history_tokens = 100_000;
+
+        let sub_session_id = format!("sub_{}_{}", ctx.session_id, uuid::Uuid::new_v4().simple());
+        let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+        let telemetry = Arc::new(telemetry);
+        let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(&sub_session_id));
+
+        let mut tools = self.filter_tools(&parsed.allowed_tools);
+        if !tools.iter().any(|tool| tool.name() == "task_plan") {
+            tools.push(Arc::new(crate::tools::TaskPlanTool::new(
+                sub_session_id.clone(),
+                task_state_store.clone(),
+            )));
+        }
+        if !tools.iter().any(|tool| tool.name() == "finish_task") {
+            tools.push(Arc::new(crate::tools::FinishTaskTool {
+                task_state_store: task_state_store.clone(),
+            }));
+        }
+
+        let mut sub_loop = crate::core::AgentLoop::new(
+            sub_session_id,
+            self.llm.clone(),
+            ctx.reply_to.clone(),
+            tools,
+            context,
+            collector.clone() as Arc<dyn crate::core::AgentOutput>,
+            telemetry,
+            task_state_store,
+        );
+        sub_loop.set_initial_energy_budget(max_steps);
+
+        let run_result = tokio::time::timeout(
+            Duration::from_secs(timeout_sec),
+            sub_loop.step(parsed.goal.clone()),
+        )
+        .await;
+
+        let collected_text = collector.take_text().await;
+        let tool_outputs = collector.take_tool_outputs().await;
+
+        let result = match run_result {
+            Ok(Ok(exit)) => {
+                let ok = matches!(exit, crate::core::RunExit::Finished(_));
+                let summary = match exit {
+                    crate::core::RunExit::Finished(summary) => summary,
+                    crate::core::RunExit::YieldedToUser => {
+                        if collected_text.trim().is_empty() {
+                            "Sub-agent yielded without visible output.".to_string()
+                        } else {
+                            format!("Sub-agent yielded with output: {}", collected_text.trim())
+                        }
+                    }
+                    crate::core::RunExit::RecoverableFailed(message)
+                    | crate::core::RunExit::CriticallyFailed(message)
+                    | crate::core::RunExit::AutopilotStalled(message) => message,
+                    crate::core::RunExit::StoppedByUser => {
+                        "Sub-agent execution was interrupted.".to_string()
+                    }
+                };
+
+                SubagentResult {
+                    ok,
+                    summary,
+                    findings: tool_outputs,
+                    artifacts: Vec::new(),
+                }
+            }
+            Ok(Err(error)) => SubagentResult {
+                ok: false,
+                summary: format!("Sub-agent error: {}", error),
+                findings: tool_outputs,
+                artifacts: Vec::new(),
+            },
+            Err(_) => SubagentResult {
+                ok: false,
+                summary: format!(
+                    "Sub-agent timed out after {}s while working on '{}'.",
+                    timeout_sec, parsed.goal
+                ),
+                findings: tool_outputs,
+                artifacts: Vec::new(),
+            },
         };
-
-        let output = serde_json::to_string_pretty(&result)
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         StructuredToolOutput::new(
             "dispatch_subagent",
-            true,
-            output,
+            result.ok,
+            serde_json::to_string_pretty(&result)
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
             None,
             None,
             false,
@@ -121,10 +208,58 @@ impl Tool for DispatchSubagentTool {
     }
 }
 
+struct CollectorOutput {
+    text: AsyncMutex<String>,
+    tool_outputs: AsyncMutex<Vec<String>>,
+}
+
+impl CollectorOutput {
+    fn new() -> Self {
+        Self {
+            text: AsyncMutex::new(String::new()),
+            tool_outputs: AsyncMutex::new(Vec::new()),
+        }
+    }
+
+    async fn take_text(&self) -> String {
+        let mut text = self.text.lock().await;
+        std::mem::take(&mut *text)
+    }
+
+    async fn take_tool_outputs(&self) -> Vec<String> {
+        let mut outputs = self.tool_outputs.lock().await;
+        std::mem::take(&mut *outputs)
+    }
+}
+
+#[async_trait]
+impl crate::core::AgentOutput for CollectorOutput {
+    async fn on_text(&self, text: &str) {
+        self.text.lock().await.push_str(text);
+    }
+
+    async fn on_thinking(&self, _text: &str) {}
+
+    async fn on_tool_start(&self, _name: &str, _args: &str) {}
+
+    async fn on_tool_end(&self, result: &str) {
+        let truncated = if result.len() > 500 {
+            format!("{}...(truncated)", &result[..500])
+        } else {
+            result.to_string()
+        };
+        self.tool_outputs.lock().await.push(truncated);
+    }
+
+    async fn on_error(&self, error: &str) {
+        self.text.lock().await.push_str(&format!("[ERROR] {}\n", error));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::protocol::{ToolContext, ToolExecutionEnvelope};
+    use crate::tools::protocol::ToolContext;
 
     fn make_ctx() -> ToolContext {
         ToolContext {
@@ -133,48 +268,118 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_dispatch_subagent_basic() {
-        let tool = DispatchSubagentTool::new();
-        let args = serde_json::json!({
-            "goal": "Review database schema",
-            "input_summary": "Current schema has 5 tables"
-        });
+    struct MockTool(String);
 
-        let result = tool.execute(args, &make_ctx()).await.unwrap();
-        let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> String {
+            self.0.clone()
+        }
 
-        assert!(envelope.ok);
-        assert!(envelope.output.contains("Review database schema"));
+        fn description(&self) -> String {
+            String::new()
+        }
+
+        fn parameters_schema(&self) -> Value {
+            serde_json::json!({})
+        }
+
+        async fn execute(
+            &self,
+            _: Value,
+            _: &crate::tools::protocol::ToolContext,
+        ) -> Result<String, ToolError> {
+            Ok(String::new())
+        }
     }
 
-    #[tokio::test]
-    async fn test_dispatch_subagent_with_constraints() {
-        let tool = DispatchSubagentTool::new();
-        let args = serde_json::json!({
-            "goal": "Analyze code",
-            "input_summary": "Check main.rs",
-            "allowed_tools": ["read_file"],
-            "timeout_sec": 30,
-            "max_steps": 3
-        });
+    struct DummyLlm;
 
-        let result = tool.execute(args, &make_ctx()).await.unwrap();
-        let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
+    #[async_trait]
+    impl crate::llm_client::LlmClient for DummyLlm {
+        fn model_name(&self) -> &str {
+            "dummy"
+        }
 
-        assert!(envelope.ok);
-        assert!(envelope.output.contains("read_file"));
-        assert!(envelope.output.contains("30s"));
+        fn provider_name(&self) -> &str {
+            "dummy"
+        }
+
+        async fn stream(
+            &self,
+            _: Vec<crate::context::Message>,
+            _: Option<crate::context::Message>,
+            _: Vec<Arc<dyn Tool>>,
+        ) -> Result<
+            tokio::sync::mpsc::Receiver<crate::llm_client::StreamEvent>,
+            crate::llm_client::LlmError,
+        > {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+    }
+
+    #[test]
+    fn test_filter_tools_default() {
+        let base_tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool("read_file".to_string())),
+            Arc::new(MockTool("write_file".to_string())),
+            Arc::new(MockTool("execute_bash".to_string())),
+            Arc::new(MockTool("finish_task".to_string())),
+            Arc::new(MockTool("web_fetch".to_string())),
+        ];
+        let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), base_tools);
+
+        let filtered = tool.filter_tools(&[]);
+        let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"execute_bash".to_string()));
+        assert!(names.contains(&"web_fetch".to_string()));
+        assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
+    }
+
+    #[test]
+    fn test_filter_tools_explicit() {
+        let base_tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool("read_file".to_string())),
+            Arc::new(MockTool("write_file".to_string())),
+            Arc::new(MockTool("execute_bash".to_string())),
+            Arc::new(MockTool("finish_task".to_string())),
+        ];
+        let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), base_tools);
+
+        let filtered = tool.filter_tools(&["read_file".to_string()]);
+        let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"execute_bash".to_string()));
     }
 
     #[tokio::test]
     async fn test_dispatch_subagent_invalid_args() {
-        let tool = DispatchSubagentTool::new();
-        let args = serde_json::json!({
-            "wrong_field": "value"
-        });
+        let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), vec![]);
+        let args = serde_json::json!({ "wrong_field": "value" });
 
         let result = tool.execute(args, &make_ctx()).await;
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_subagent_reports_energy_exhaustion_when_max_steps_is_one() {
+        let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), vec![]);
+        let args = serde_json::json!({
+            "goal": "Investigate repository",
+            "input_summary": "repo context",
+            "max_steps": 1,
+            "timeout_sec": 5
+        });
+
+        let result = tool.execute(args, &make_ctx()).await.unwrap();
+        let envelope: crate::tools::protocol::ToolExecutionEnvelope =
+            serde_json::from_str(&result).unwrap();
+        assert!(!envelope.result.ok);
+        assert!(envelope.result.output.contains("Energy depleted"));
     }
 }

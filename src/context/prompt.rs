@@ -274,6 +274,9 @@ Architecture: {}
         ),
         "",
         durable_memory.as_deref(),
+        ctx.skill_contract.as_deref(),
+        ctx.skill_instructions.as_deref(),
+        ctx.skill_state_summary.as_deref(),
         task_state,
         active_evidence,
         Vec::new(),
@@ -289,16 +292,6 @@ Architecture: {}
              {}\n\
              ------------------------------------\n",
             summary
-        ));
-    }
-
-    // Skill contract injection (from ExecutionExtension hooks)
-    if let Some(contract) = &ctx.skill_contract {
-        final_system_text.push_str(&format!(
-            "\n\n--- [ACTIVE SKILL CONTRACT] ---\n\
-             {}\n\
-             ------------------------------------\n",
-            contract
         ));
     }
 

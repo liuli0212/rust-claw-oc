@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Map;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -57,14 +58,24 @@ pub struct UserPromptRequest {
     pub recommendation: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StructuredToolOutput {
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolResultData {
+    #[serde(default)]
     pub ok: bool,
+    #[serde(default)]
     pub tool_name: String,
+    #[serde(default)]
     pub output: String,
+    #[serde(default)]
     pub exit_code: Option<i32>,
-    pub duration_ms: Option<u128>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolEffects {
     pub recovery_attempted: bool,
     pub recovery_output: Option<String>,
     pub recovery_rule: Option<String>,
@@ -80,36 +91,78 @@ pub struct StructuredToolOutput {
     pub await_user: Option<UserPromptRequest>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredToolOutput {
+    #[serde(default, flatten)]
+    pub result: ToolResultData,
+    #[serde(default, flatten)]
+    pub effects: ToolEffects,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionEnvelope {
-    pub ok: bool,
-    pub tool_name: String,
-    pub output: String,
-    pub exit_code: Option<i32>,
-    pub duration_ms: Option<u128>,
-    pub truncated: bool,
-    #[serde(default)]
-    pub recovery_attempted: bool,
-    #[serde(default)]
-    pub recovery_output: Option<String>,
-    #[serde(default)]
-    pub recovery_rule: Option<String>,
-    #[serde(default)]
-    pub file_path: Option<String>,
-    #[serde(default)]
-    pub evidence_kind: Option<String>,
-    #[serde(default)]
-    pub evidence_source_path: Option<String>,
-    #[serde(default)]
-    pub evidence_summary: Option<String>,
-    #[serde(default)]
-    pub payload_kind: Option<String>,
-    #[serde(default)]
-    pub invalidate_diagnostic_evidence: bool,
-    #[serde(default)]
-    pub finish_task_summary: Option<String>,
-    #[serde(default)]
-    pub await_user: Option<UserPromptRequest>,
+    #[serde(default, flatten)]
+    pub result: ToolResultData,
+    #[serde(default, flatten)]
+    pub effects: ToolEffects,
+}
+
+impl ToolExecutionEnvelope {
+    pub fn from_json_str(input: &str) -> Option<Self> {
+        serde_json::from_str(input)
+            .ok()
+            .or_else(|| Self::from_legacy_value(serde_json::from_str(input).ok()?))
+    }
+
+    fn from_legacy_value(value: Value) -> Option<Self> {
+        let obj = value.as_object()?;
+
+        Some(Self {
+            result: ToolResultData {
+                ok: get_bool(obj, "ok").unwrap_or(false),
+                tool_name: get_string(obj, "tool_name").unwrap_or_default(),
+                output: get_string(obj, "output").unwrap_or_default(),
+                exit_code: get_i32(obj, "exit_code"),
+                duration_ms: get_u64(obj, "duration_ms"),
+                truncated: get_bool(obj, "truncated").unwrap_or(false),
+            },
+            effects: ToolEffects {
+                recovery_attempted: get_bool(obj, "recovery_attempted").unwrap_or(false),
+                recovery_output: get_string(obj, "recovery_output"),
+                recovery_rule: get_string(obj, "recovery_rule"),
+                file_path: get_string(obj, "file_path"),
+                evidence_kind: get_string(obj, "evidence_kind"),
+                evidence_source_path: get_string(obj, "evidence_source_path"),
+                evidence_summary: get_string(obj, "evidence_summary"),
+                payload_kind: get_string(obj, "payload_kind"),
+                invalidate_diagnostic_evidence: get_bool(obj, "invalidate_diagnostic_evidence")
+                    .unwrap_or(false),
+                finish_task_summary: get_string(obj, "finish_task_summary"),
+                await_user: obj
+                    .get("await_user")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok()),
+            },
+        })
+    }
+}
+
+fn get_string(obj: &Map<String, Value>, key: &str) -> Option<String> {
+    obj.get(key).and_then(|value| value.as_str()).map(str::to_string)
+}
+
+fn get_bool(obj: &Map<String, Value>, key: &str) -> Option<bool> {
+    obj.get(key).and_then(|value| value.as_bool())
+}
+
+fn get_u64(obj: &Map<String, Value>, key: &str) -> Option<u64> {
+    obj.get(key).and_then(|value| value.as_u64())
+}
+
+fn get_i32(obj: &Map<String, Value>, key: &str) -> Option<i32> {
+    obj.get(key)
+        .and_then(|value| value.as_i64())
+        .and_then(|value| i32::try_from(value).ok())
 }
 
 impl StructuredToolOutput {
@@ -122,28 +175,20 @@ impl StructuredToolOutput {
         truncated: bool,
     ) -> Self {
         Self {
-            ok,
-            tool_name: tool_name.into(),
-            output,
-            exit_code,
-            duration_ms,
-            truncated,
-            recovery_attempted: false,
-            recovery_output: None,
-            recovery_rule: None,
-            file_path: None,
-            evidence_kind: None,
-            evidence_source_path: None,
-            evidence_summary: None,
-            payload_kind: None,
-            invalidate_diagnostic_evidence: false,
-            finish_task_summary: None,
-            await_user: None,
+            result: ToolResultData {
+                ok,
+                tool_name: tool_name.into(),
+                output,
+                exit_code,
+                duration_ms: duration_ms.map(|value| value.min(u64::MAX as u128) as u64),
+                truncated,
+            },
+            effects: ToolEffects::default(),
         }
     }
 
     pub fn with_file_path(mut self, path: impl Into<String>) -> Self {
-        self.file_path = Some(path.into());
+        self.effects.file_path = Some(path.into());
         self
     }
 
@@ -153,51 +198,36 @@ impl StructuredToolOutput {
         source_path: impl Into<String>,
         summary: impl Into<String>,
     ) -> Self {
-        self.evidence_kind = Some(kind.into());
-        self.evidence_source_path = Some(source_path.into());
-        self.evidence_summary = Some(summary.into());
+        self.effects.evidence_kind = Some(kind.into());
+        self.effects.evidence_source_path = Some(source_path.into());
+        self.effects.evidence_summary = Some(summary.into());
         self
     }
 
     pub fn with_invalidated_diagnostics(mut self) -> Self {
-        self.invalidate_diagnostic_evidence = true;
+        self.effects.invalidate_diagnostic_evidence = true;
         self
     }
 
     pub fn with_payload_kind(mut self, kind: impl Into<String>) -> Self {
-        self.payload_kind = Some(kind.into());
+        self.effects.payload_kind = Some(kind.into());
         self
     }
 
     pub fn with_finish_task_summary(mut self, summary: impl Into<String>) -> Self {
-        self.finish_task_summary = Some(summary.into());
+        self.effects.finish_task_summary = Some(summary.into());
         self
     }
 
     pub fn with_await_user(mut self, request: UserPromptRequest) -> Self {
-        self.await_user = Some(request);
+        self.effects.await_user = Some(request);
         self
     }
 
     pub fn into_envelope(self) -> ToolExecutionEnvelope {
         ToolExecutionEnvelope {
-            ok: self.ok,
-            tool_name: self.tool_name,
-            output: self.output,
-            exit_code: self.exit_code,
-            duration_ms: self.duration_ms,
-            truncated: self.truncated,
-            recovery_attempted: self.recovery_attempted,
-            recovery_output: self.recovery_output,
-            recovery_rule: self.recovery_rule,
-            file_path: self.file_path,
-            evidence_kind: self.evidence_kind,
-            evidence_source_path: self.evidence_source_path,
-            evidence_summary: self.evidence_summary,
-            payload_kind: self.payload_kind,
-            invalidate_diagnostic_evidence: self.invalidate_diagnostic_evidence,
-            finish_task_summary: self.finish_task_summary,
-            await_user: self.await_user,
+            result: self.result,
+            effects: self.effects,
         }
     }
 
@@ -294,20 +324,20 @@ mod tests {
         .unwrap();
         let envelope: ToolExecutionEnvelope = serde_json::from_str(&serialized).unwrap();
 
-        assert!(envelope.ok);
-        assert_eq!(envelope.tool_name, "write_file");
-        assert_eq!(envelope.output, "ok");
-        assert_eq!(envelope.exit_code, Some(0));
-        assert_eq!(envelope.duration_ms, Some(42));
-        assert!(!envelope.truncated);
-        assert!(!envelope.recovery_attempted);
-        assert_eq!(envelope.recovery_output, None);
-        assert_eq!(envelope.recovery_rule, None);
-        assert_eq!(envelope.file_path, None);
-        assert_eq!(envelope.evidence_kind, None);
-        assert_eq!(envelope.evidence_source_path, None);
-        assert_eq!(envelope.evidence_summary, None);
-        assert!(!envelope.invalidate_diagnostic_evidence);
-        assert_eq!(envelope.finish_task_summary, None);
+        assert!(envelope.result.ok);
+        assert_eq!(envelope.result.tool_name, "write_file");
+        assert_eq!(envelope.result.output, "ok");
+        assert_eq!(envelope.result.exit_code, Some(0));
+        assert_eq!(envelope.result.duration_ms, Some(42));
+        assert!(!envelope.result.truncated);
+        assert!(!envelope.effects.recovery_attempted);
+        assert_eq!(envelope.effects.recovery_output, None);
+        assert_eq!(envelope.effects.recovery_rule, None);
+        assert_eq!(envelope.effects.file_path, None);
+        assert_eq!(envelope.effects.evidence_kind, None);
+        assert_eq!(envelope.effects.evidence_source_path, None);
+        assert_eq!(envelope.effects.evidence_summary, None);
+        assert!(!envelope.effects.invalidate_diagnostic_evidence);
+        assert_eq!(envelope.effects.finish_task_summary, None);
     }
 }

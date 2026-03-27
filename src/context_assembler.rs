@@ -8,7 +8,7 @@ pub struct PromptCandidate {
     pub kind: CandidateKind,
     pub priority_score: f32, // Higher is better
     pub token_cost: usize,
-    pub layer: u8, // L0..L4 (0 is RunContext/System, 4 is Transcript tail)
+    pub layer: u8, // L0..L7 (0 is RunContext/System, 7 is Transcript tail)
     pub required: bool,
     pub content: String,
 }
@@ -22,6 +22,8 @@ pub enum CandidateKind {
     Evidence(String),    // Evidence ID
     VolatileTurn(usize), // Turn Index
     SkillContract,       // Active skill contract
+    SkillInstructions,   // Active skill instructions
+    SkillStateSummary,   // Active skill state summary
 }
 
 #[derive(Debug, Default, Clone)]
@@ -49,6 +51,9 @@ impl ContextAssembler {
         system_static: &str,
         tool_schemas: &str,
         durable_memory: Option<&str>,
+        skill_contract: Option<&str>,
+        skill_instructions: Option<&str>,
+        skill_state_summary: Option<&str>,
         task_state: &TaskStateSnapshot,
         mut active_evidence: Vec<Evidence>,
         transcript_tail: Vec<String>,
@@ -123,6 +128,51 @@ impl ContextAssembler {
             }
         }
 
+        // Layer 2.5: Active skill contract
+        if let Some(contract) = skill_contract {
+            if !contract.trim().is_empty() {
+                candidates.push(PromptCandidate {
+                    id: "skill_contract".to_string(),
+                    kind: CandidateKind::SkillContract,
+                    priority_score: 650.0,
+                    token_cost: Self::est_tokens(contract),
+                    layer: 3,
+                    required: false,
+                    content: format!("--- [ACTIVE SKILL CONTRACT] ---\n{contract}"),
+                });
+            }
+        }
+
+        // Layer 2.6: Active skill instructions
+        if let Some(instructions) = skill_instructions {
+            if !instructions.trim().is_empty() {
+                candidates.push(PromptCandidate {
+                    id: "skill_instructions".to_string(),
+                    kind: CandidateKind::SkillInstructions,
+                    priority_score: 625.0,
+                    token_cost: Self::est_tokens(instructions),
+                    layer: 4,
+                    required: false,
+                    content: format!("--- [ACTIVE SKILL INSTRUCTIONS] ---\n{instructions}"),
+                });
+            }
+        }
+
+        // Layer 2.7: Active skill state summary
+        if let Some(skill_state_summary) = skill_state_summary {
+            if !skill_state_summary.trim().is_empty() {
+                candidates.push(PromptCandidate {
+                    id: "skill_state_summary".to_string(),
+                    kind: CandidateKind::SkillStateSummary,
+                    priority_score: 600.0,
+                    token_cost: Self::est_tokens(skill_state_summary),
+                    layer: 5,
+                    required: false,
+                    content: format!("--- [ACTIVE SKILL STATE] ---\n{skill_state_summary}"),
+                });
+            }
+        }
+
         // Layer 3: Task State
         let state_summary = task_state.summary();
 
@@ -131,7 +181,7 @@ impl ContextAssembler {
             kind: CandidateKind::TaskStateSummary,
             priority_score: 500.0, // usually we want this over old transcript
             token_cost: Self::est_tokens(&state_summary),
-            layer: 3,
+            layer: 6,
             required: true, // Should never really drop the task summary unless absolutely starved
             content: format!("TASK STATE:\n{}", state_summary),
         });
@@ -144,7 +194,7 @@ impl ContextAssembler {
                 // Recent turns are higher priority than older ones
                 priority_score: 100.0 + (i as f32),
                 token_cost: Self::est_tokens(&turn),
-                layer: 4,
+                layer: 7,
                 required: false,
                 content: turn,
             });
@@ -219,7 +269,7 @@ impl ContextAssembler {
             final_prompt.push_str(&item.content);
 
             report.used_tokens += item.token_cost;
-            if item.layer <= 3 {
+            if item.layer <= 6 {
                 report.stable_tokens += item.token_cost;
             } else {
                 report.volatile_tokens += item.token_cost;
@@ -270,6 +320,9 @@ mod tests {
             "System Instructions",
             "Tool Schema",
             None,
+            None,
+            None,
+            None,
             &state,
             active_evidence,
             vec!["Turn 1".into(), "Turn 2".into()],
@@ -305,6 +358,9 @@ mod tests {
             "SYS",
             "TOOLS",
             Some("DURABLE MEMORY"),
+            Some("SKILL CONTRACT"),
+            Some("SKILL INSTRUCTIONS"),
+            Some("SKILL STATE"),
             &state,
             vec![ev1],
             vec!["LAST VOLATILE".into()],
@@ -314,12 +370,45 @@ mod tests {
         let idx_sys = prompt.find("SYS").unwrap();
         let idx_mem = prompt.find("DURABLE MEMORY").unwrap();
         let idx_ev = prompt.find("Evidence content").unwrap();
+        let idx_skill = prompt.find("SKILL CONTRACT").unwrap();
+        let idx_instructions = prompt.find("SKILL INSTRUCTIONS").unwrap();
+        let idx_skill_state = prompt.find("SKILL STATE").unwrap();
         let idx_state = prompt.find("TASK STATE").unwrap();
         let idx_vol = prompt.find("LAST VOLATILE").unwrap();
 
         assert!(idx_sys < idx_mem);
         assert!(idx_mem < idx_ev);
-        assert!(idx_ev < idx_state);
+        assert!(idx_ev < idx_skill);
+        assert!(idx_skill < idx_instructions);
+        assert!(idx_instructions < idx_skill_state);
+        assert!(idx_skill_state < idx_state);
         assert!(idx_state < idx_vol);
+    }
+
+    #[test]
+    fn test_skill_contract_respects_budget_as_optional_candidate() {
+        let assembler = ContextAssembler::new(35);
+        let state = TaskStateSnapshot::empty();
+
+        let (prompt, report) = assembler.assemble_prompt(
+            "SYS",
+            "",
+            None,
+            Some(&"Long skill contract ".repeat(20)),
+            Some(&"Long skill instructions ".repeat(20)),
+            Some(&"Long skill state ".repeat(20)),
+            &state,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        assert!(prompt.contains("SYS"));
+        assert!(prompt.contains("TASK STATE"));
+        assert!(!prompt.contains("[ACTIVE SKILL CONTRACT]"));
+        assert!(!prompt.contains("[ACTIVE SKILL INSTRUCTIONS]"));
+        assert!(!prompt.contains("[ACTIVE SKILL STATE]"));
+        assert!(report.evicted_items.contains(&"skill_contract".to_string()));
+        assert!(report.evicted_items.contains(&"skill_instructions".to_string()));
+        assert!(report.evicted_items.contains(&"skill_state_summary".to_string()));
     }
 }
