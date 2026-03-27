@@ -490,3 +490,56 @@ pub(crate) fn normalize_schema_for_gemini(value: &mut Value) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{FunctionCall, FunctionResponse, Part};
+    use serde_json::json;
+
+    #[test]
+    fn test_to_vertex_message_thought_signature_isolation() {
+        let model_msg = Message {
+            role: "model".to_string(),
+            parts: vec![Part {
+                text: None,
+                function_call: Some(FunctionCall {
+                    name: "test_tool".to_string(),
+                    args: json!({"arg": "value"}),
+                    id: Some("call_1".to_string()),
+                }),
+                function_response: None,
+                thought_signature: Some("sig_123".to_string()),
+                file_data: None,
+            }],
+        };
+
+        let vertex_model_msg = to_vertex_message(&model_msg);
+        assert_eq!(
+            vertex_model_msg.parts[0].thought_signature.as_deref(),
+            Some("sig_123")
+        );
+        assert!(vertex_model_msg.parts[0].function_call.is_some());
+        assert!(vertex_model_msg.parts[0].function_response.is_none());
+
+        let function_msg = Message {
+            role: "function".to_string(),
+            parts: vec![Part {
+                text: None,
+                function_call: None,
+                function_response: Some(FunctionResponse {
+                    name: "test_tool".to_string(),
+                    response: json!({"result": "success"}),
+                    id: Some("call_1".to_string()),
+                }),
+                thought_signature: None,
+                file_data: None,
+            }],
+        };
+
+        let vertex_function_msg = to_vertex_message(&function_msg);
+        assert_eq!(vertex_function_msg.parts[0].thought_signature, None);
+        assert!(vertex_function_msg.parts[0].function_call.is_none());
+        assert!(vertex_function_msg.parts[0].function_response.is_some());
+    }
+}
