@@ -5,6 +5,7 @@ pub mod lsp;
 pub mod memory;
 pub mod protocol;
 pub mod scheduler;
+pub mod shell;
 pub mod web;
 
 pub use bash::BashTool;

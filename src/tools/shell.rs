@@ -1,0 +1,111 @@
+//! Unified shell execution component.
+//!
+//! Provides a lightweight, non-PTY shell executor used by:
+//! - `SkillTool` (legacy skill script execution)
+//! - `SkillPreamble` (preamble bootstrapping)
+//!
+//! `BashTool` retains its own PTY-based implementation for interactive use,
+//! but this module can be extended to consolidate further in the future.
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+use tokio::process::Command;
+
+use super::protocol::ToolError;
+
+/// Result of a non-interactive shell execution.
+#[derive(Debug, Clone)]
+pub struct ShellExecResult {
+    pub ok: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u128,
+}
+
+/// Execute a shell command via `bash -c` with a timeout.
+///
+/// This is the **non-PTY** path — suitable for preamble scripts, legacy skill
+/// templates, and any context where interactive terminal emulation is not
+/// required.
+pub async fn execute_shell(
+    command: &str,
+    timeout: Duration,
+    cwd: Option<&Path>,
+) -> Result<ShellExecResult, ToolError> {
+    let start = Instant::now();
+
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(command);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.env("GIT_PAGER", "cat");
+    cmd.env("PAGER", "cat");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
+    let output = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| ToolError::Timeout)?
+        .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code();
+    let ok = output.status.success();
+
+    Ok(ShellExecResult {
+        ok,
+        stdout,
+        stderr,
+        exit_code,
+        duration_ms: start.elapsed().as_millis(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_execute_shell_echo() {
+        let result = execute_shell("echo hello", Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert!(result.ok);
+        assert!(result.stdout.trim().contains("hello"));
+        assert!(result.exit_code == Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_execute_shell_failure() {
+        let result = execute_shell("exit 42", Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert!(!result.ok);
+        assert_eq!(result.exit_code, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_execute_shell_timeout() {
+        let result = execute_shell("sleep 60", Duration::from_millis(200), None).await;
+        assert!(matches!(result, Err(ToolError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn test_execute_shell_with_cwd() {
+        let result = execute_shell("pwd", Duration::from_secs(5), Some(Path::new("/tmp")))
+            .await
+            .unwrap();
+        assert!(result.ok);
+        // macOS resolves /tmp -> /private/tmp
+        assert!(
+            result.stdout.trim() == "/tmp" || result.stdout.trim() == "/private/tmp",
+            "unexpected cwd: {}",
+            result.stdout.trim()
+        );
+    }
+}

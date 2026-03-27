@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 mod step_helpers;
+pub mod extensions;
 
 pub struct ScopeGuard<F: FnOnce()> {
     closure: Option<F>,
@@ -165,6 +166,7 @@ pub struct AgentLoop {
     reflection_strike: u8,
     autopilot_todos_completed_count: usize,
     autopilot_work_dir: Option<PathBuf>,
+    extensions: Vec<Box<dyn extensions::ExecutionExtension>>,
 }
 
 impl AgentLoop {
@@ -198,7 +200,13 @@ impl AgentLoop {
             reflection_strike: 0,
             autopilot_todos_completed_count: 0,
             autopilot_work_dir: None,
+            extensions: Vec::new(),
         }
+    }
+
+    /// Register an execution extension (e.g. SkillRuntime).
+    pub fn add_extension(&mut self, ext: Box<dyn extensions::ExecutionExtension>) {
+        self.extensions.push(ext);
     }
 
     pub fn request_cancel(&self) {
