@@ -18,6 +18,8 @@ pub struct AgentContext {
     pub rolling_summary: Option<String>,
     /// Injected by SkillRuntime via before_prompt_build hook.
     pub skill_contract: Option<String>,
+    pub skill_instructions: Option<String>,
+    pub skill_state_summary: Option<String>,
 }
 
 impl AgentContext {
@@ -47,6 +49,8 @@ impl AgentContext {
             active_evidence: Vec::new(),
             rolling_summary: None,
             skill_contract: None,
+            skill_instructions: None,
+            skill_state_summary: None,
         }
     }
 

@@ -64,6 +64,10 @@ pub enum ExtensionDecision {
     Intercept {
         prompt_overlay: Option<String>,
     },
+    /// The extension handled this input directly and the loop should yield.
+    Halt {
+        message: String,
+    },
 }
 
 /// Returned by `on_user_resume`.

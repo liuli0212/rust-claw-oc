@@ -167,6 +167,7 @@ pub struct AgentLoop {
     autopilot_todos_completed_count: usize,
     autopilot_work_dir: Option<PathBuf>,
     extensions: Vec<Box<dyn extensions::ExecutionExtension>>,
+    initial_energy_budget: usize,
 }
 
 impl AgentLoop {
@@ -201,12 +202,17 @@ impl AgentLoop {
             autopilot_todos_completed_count: 0,
             autopilot_work_dir: None,
             extensions: Vec::new(),
+            initial_energy_budget: Self::INITIAL_ENERGY,
         }
     }
 
     /// Register an execution extension (e.g. SkillRuntime).
     pub fn add_extension(&mut self, ext: Box<dyn extensions::ExecutionExtension>) {
         self.extensions.push(ext);
+    }
+
+    pub fn set_initial_energy_budget(&mut self, energy_budget: usize) {
+        self.initial_energy_budget = energy_budget.max(1);
     }
 
     pub fn request_cancel(&self) {
@@ -510,21 +516,42 @@ impl AgentLoop {
 
         let mut task_state = TaskState {
             iterations: 0,
-            energy_points: Self::INITIAL_ENERGY,
+            energy_points: self.initial_energy_budget,
         };
 
         let mut compaction_checked = false;
         let mut consecutive_empty_responses = 0;
 
-        self.context.start_turn(goal.clone());
-
-        // Extension hook: before_turn_start
-        for ext in &self.extensions {
-            let _decision = ext.before_turn_start(&goal).await;
-            // Future: handle ExtensionDecision::Halt
+        let mut turn_goal = goal.clone();
+        if !turn_goal.starts_with("/skill ") {
+            for ext in &self.extensions {
+                match ext.on_user_resume(&turn_goal).await {
+                    crate::core::extensions::ResumeDecision::ResumeSkill { .. } => break,
+                    crate::core::extensions::ResumeDecision::PassThrough => {}
+                }
+            }
         }
 
-        let (mut state, c_ids) = self.initialize_task_state(&goal);
+        for ext in &self.extensions {
+            match ext.before_turn_start(&turn_goal).await {
+                crate::core::extensions::ExtensionDecision::Continue => {}
+                crate::core::extensions::ExtensionDecision::Intercept { prompt_overlay } => {
+                    if let Some(overlay) = prompt_overlay {
+                        turn_goal = overlay;
+                    }
+                }
+                crate::core::extensions::ExtensionDecision::Halt { message } => {
+                    self.output.on_text(&message).await;
+                    self.output.on_text("\n").await;
+                    self.output.flush().await;
+                    return Ok(RunExit::YieldedToUser);
+                }
+            }
+        }
+
+        self.context.start_turn(turn_goal.clone());
+
+        let (mut state, c_ids) = self.initialize_task_state(&turn_goal);
 
         let _run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
         self.telemetry.start_span("agent_step", c_ids.clone());
@@ -591,7 +618,7 @@ impl AgentLoop {
             }
 
             let state_before_tools = state.clone();
-            let response_parts = self
+            let (response_parts, should_yield_to_user) = self
                 .execute_tool_round(tool_calls_accumulated, &current_tools, &mut state)
                 .await;
 
@@ -638,6 +665,13 @@ impl AgentLoop {
                     let summary = state.summary();
                     return Ok(self.finalize_finished_run(summary).await);
                 }
+            }
+
+            if should_yield_to_user {
+                self.output.flush().await;
+                self.context.end_turn();
+                self.telemetry.end_span("agent_step");
+                return Ok(RunExit::YieldedToUser);
             }
 
             state = self.reconcile_after_tool_calls(&state_before_tools).await;

@@ -2,9 +2,8 @@ use crate::tools::protocol::StructuredToolOutput;
 use crate::tools::{Tool, ToolError};
 use async_trait::async_trait;
 use serde_json::Value;
-use std::process::Stdio;
+use std::time::Duration;
 use std::time::Instant;
-use tokio::process::Command;
 
 pub struct SkillTool {
     pub name: String,
@@ -50,18 +49,17 @@ impl Tool for SkillTool {
 
         tracing::info!("Executing skill: {}", self.name);
 
-        let output = Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let output = crate::tools::shell::execute_shell(&script, Duration::from_secs(120), None)
+            .await?;
+        let crate::tools::shell::ShellExecResult {
+            ok,
+            stdout: stdout_str,
+            stderr: stderr_str,
+            exit_code,
+            ..
+        } = output;
 
         let mut res = String::new();
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
 
         if !stdout_str.is_empty() {
             res.push_str("STDOUT:\n");
@@ -75,12 +73,10 @@ impl Tool for SkillTool {
             res.push_str(&stderr_str);
         }
 
-        let ok = output.status.success();
-
         if !ok {
             res.push_str(&format!(
                 "\nExit code: {}",
-                output.status.code().unwrap_or(-1)
+                exit_code.unwrap_or(-1)
             ));
         } else if res.is_empty() {
             res.push_str("Skill executed successfully with no output.");
@@ -90,7 +86,7 @@ impl Tool for SkillTool {
             self.name.clone(),
             ok,
             res,
-            output.status.code(),
+            exit_code,
             Some(start.elapsed().as_millis()),
             false,
         )
@@ -262,10 +258,10 @@ echo "{{n}}"
         let envelope: crate::tools::protocol::ToolExecutionEnvelope =
             serde_json::from_str(&result).unwrap();
 
-        assert!(envelope.ok);
-        assert_eq!(envelope.tool_name, "echo_skill");
-        assert_eq!(envelope.payload_kind.as_deref(), Some("skill"));
-        assert!(envelope.output.contains("STDOUT:"));
-        assert!(envelope.output.contains("hello"));
+        assert!(envelope.result.ok);
+        assert_eq!(envelope.result.tool_name, "echo_skill");
+        assert_eq!(envelope.effects.payload_kind.as_deref(), Some("skill"));
+        assert!(envelope.result.output.contains("STDOUT:"));
+        assert!(envelope.result.output.contains("hello"));
     }
 }

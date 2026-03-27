@@ -83,6 +83,10 @@ impl SkillRegistry {
     pub fn insert(&mut self, def: SkillDef) {
         self.skills.insert(def.meta.name.clone(), def);
     }
+
+    pub fn clone_skill(&self, name: &str) -> Option<SkillDef> {
+        self.skills.get(name).cloned()
+    }
 }
 
 #[cfg(test)]

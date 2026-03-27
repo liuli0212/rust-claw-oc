@@ -1,4 +1,5 @@
 use super::model::FunctionResponse;
+use crate::tools::protocol::ToolExecutionEnvelope;
 
 pub(crate) fn strip_thinking_tags(text: &str) -> String {
     let mut result = text.to_string();
@@ -78,9 +79,9 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
         None => return,
     };
 
-    let mut envelope: serde_json::Value = match serde_json::from_str(&result_str) {
-        Ok(v) => v,
-        Err(_) => {
+    let mut envelope: ToolExecutionEnvelope = match ToolExecutionEnvelope::from_json_str(&result_str) {
+        Some(v) => v,
+        None => {
             if result_str.len() > 500 {
                 let head: String = result_str.chars().take(200).collect();
                 *result_val = serde_json::Value::String(format!(
@@ -93,19 +94,13 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
         }
     };
 
-    let env_obj = match envelope.as_object_mut() {
-        Some(o) => o,
-        None => return,
+    let tool_name = if envelope.result.tool_name.is_empty() {
+        fr.name.as_str()
+    } else {
+        envelope.result.tool_name.as_str()
     };
-
-    let tool_name = env_obj
-        .get("tool_name")
-        .and_then(|value| value.as_str())
-        .unwrap_or(fr.name.as_str());
-    let evidence_kind = env_obj
-        .get("evidence_kind")
-        .and_then(|value| value.as_str());
-    let payload_kind = env_obj.get("payload_kind").and_then(|value| value.as_str());
+    let evidence_kind = envelope.effects.evidence_kind.as_deref();
+    let payload_kind = envelope.effects.payload_kind.as_deref();
 
     match (payload_kind, tool_name) {
         (Some("plan"), _) | (_, "task_plan") => {
@@ -113,54 +108,45 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
             return;
         }
         _ if evidence_kind == Some("file") => {
-            if let Some(output) = env_obj.get_mut("output") {
-                if let Some(s) = output.as_str() {
-                    if s.lines().count() > 10 {
-                        *output = serde_json::Value::String(truncate_lines_with_marker(s, 5, 5));
-                    }
-                }
+            if envelope.result.output.lines().count() > 10 {
+                envelope.result.output =
+                    truncate_lines_with_marker(&envelope.result.output, 5, 5);
             }
         }
         _ if matches!(evidence_kind, Some("diagnostic" | "directory"))
             || tool_name == "execute_bash" =>
         {
-            if let Some(output) = env_obj.get_mut("output") {
-                if let Some(s) = output.as_str() {
-                    if s.chars().count() > 500 {
-                        *output =
-                            serde_json::Value::String(truncate_chars_with_marker(s, 200, 200));
-                    }
-                }
+            if envelope.result.output.chars().count() > 500 {
+                envelope.result.output =
+                    truncate_chars_with_marker(&envelope.result.output, 200, 200);
             }
         }
         (Some("web_content" | "web_search"), _) | (_, "web_fetch" | "web_search_tavily") => {
-            if let Some(output) = env_obj.get_mut("output") {
-                if let Some(s) = output.as_str() {
-                    *output = serde_json::Value::String(format!(
-                        "[web content stripped - {} chars]",
-                        s.len()
-                    ));
-                }
-            }
+            envelope.result.output = format!(
+                "[web content stripped - {} chars]",
+                envelope.result.output.len()
+            );
         }
         (Some("skill"), _) | (_, "skill" | "use_skill") => {
-            if let Some(output) = env_obj.get_mut("output") {
-                *output = serde_json::Value::String("Skill loaded.".to_string());
-            }
+            envelope.result.output = "Skill loaded.".to_string();
         }
         (_, "write_file" | "patch_file") => {}
         _ => {
-            if let Some(output) = env_obj.get_mut("output") {
-                if let Some(s) = output.as_str() {
-                    if s.len() > 500 {
-                        *output =
-                            serde_json::Value::String(truncate_chars_with_marker(s, 200, 100));
-                    }
-                }
+            if envelope.result.output.len() > 500 {
+                envelope.result.output =
+                    truncate_chars_with_marker(&envelope.result.output, 200, 100);
             }
         }
     }
 
+    let mut envelope_value = match serde_json::to_value(&envelope) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+    let env_obj = match envelope_value.as_object_mut() {
+        Some(obj) => obj,
+        None => return,
+    };
     env_obj.remove("duration_ms");
     env_obj.remove("truncated");
     env_obj.remove("recovery_attempted");

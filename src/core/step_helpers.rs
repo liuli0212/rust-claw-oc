@@ -189,11 +189,12 @@ impl AgentLoop {
     pub(super) fn parse_tool_envelope(
         result: &str,
     ) -> Option<crate::tools::protocol::ToolExecutionEnvelope> {
-        serde_json::from_str(result).ok()
+        crate::tools::protocol::ToolExecutionEnvelope::from_json_str(result)
     }
 
     pub(super) fn extract_finish_task_summary_from_result(result: &str) -> Option<String> {
-        Self::parse_tool_envelope(result).and_then(|envelope| envelope.finish_task_summary)
+        Self::parse_tool_envelope(result)
+            .and_then(|envelope| envelope.effects.finish_task_summary)
     }
 
     pub(super) fn build_function_response_part(
@@ -378,6 +379,8 @@ impl AgentLoop {
         } else {
             self.context.skill_contract = None;
         }
+        self.context.skill_instructions = draft.skill_instructions.clone();
+        self.context.skill_state_summary = draft.skill_state_summary.clone();
 
         let max_tokens = self.context.max_history_tokens;
         let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
@@ -470,14 +473,14 @@ impl AgentLoop {
             ext.after_tool_result(&envelope).await;
         }
 
-        if let Some(path) = envelope.file_path.as_deref() {
+        if let Some(path) = envelope.effects.file_path.as_deref() {
             self.output.on_file(path).await;
         }
 
         if let (Some(kind), Some(source_path), Some(summary)) = (
-            envelope.evidence_kind.as_deref(),
-            envelope.evidence_source_path.as_deref(),
-            envelope.evidence_summary.as_deref(),
+            envelope.effects.evidence_kind.as_deref(),
+            envelope.effects.evidence_source_path.as_deref(),
+            envelope.effects.evidence_summary.as_deref(),
         ) {
             let evidence = crate::evidence::Evidence::new(
                 format!("{}_{}", kind, uuid::Uuid::new_v4().simple()),
@@ -485,7 +488,7 @@ impl AgentLoop {
                 source_path.to_string(),
                 1.0,
                 summary.to_string(),
-                envelope.output.clone(),
+                envelope.result.output.clone(),
             );
 
             if kind == "directory" || kind == "file" {
@@ -501,7 +504,7 @@ impl AgentLoop {
             self.context.active_evidence.push(evidence);
         }
 
-        if envelope.invalidate_diagnostic_evidence {
+        if envelope.effects.invalidate_diagnostic_evidence {
             for evidence in &mut self.context.active_evidence {
                 if evidence.source_kind == "diagnostic" {
                     evidence.source_version = Some("invalidated_by_write".to_string());
@@ -510,13 +513,25 @@ impl AgentLoop {
         }
     }
 
+    fn format_user_prompt(request: &crate::tools::protocol::UserPromptRequest) -> String {
+        let mut message = request.question.clone();
+        if !request.options.is_empty() {
+            message.push_str(&format!("\nOptions: {}", request.options.join(", ")));
+        }
+        if let Some(recommendation) = &request.recommendation {
+            message.push_str(&format!("\nRecommended: {}", recommendation));
+        }
+        message
+    }
+
     pub(super) async fn execute_tool_round(
         &mut self,
         tool_calls_accumulated: Vec<ToolCallRecord>,
         current_tools: &[Arc<dyn Tool>],
         state: &mut crate::task_state::TaskStateSnapshot,
-    ) -> Vec<Part> {
+    ) -> (Vec<Part>, bool) {
         let mut skip_remaining = false;
+        let mut should_yield_to_user = false;
         let mut response_parts = Vec::new();
         
         let todos_before = if self.is_autopilot { self.count_todos_status() } else { (0, 0) };
@@ -625,14 +640,23 @@ impl AgentLoop {
                     thought_sig.clone(),
                 ));
                 skip_remaining = true;
-                continue;
-            }
+                    continue;
+                }
 
             if is_error {
                 self.output.on_error(&result).await;
             } else {
                 self.output.on_tool_end(&result).await;
                 self.handle_successful_tool_effects(&result).await;
+                if let Some(envelope) = Self::parse_tool_envelope(&result) {
+                    if let Some(prompt) = envelope.effects.await_user {
+                        should_yield_to_user = true;
+                        skip_remaining = true;
+                        self.output
+                            .on_text(&format!("{}\n", Self::format_user_prompt(&prompt)))
+                            .await;
+                    }
+                }
                 if let Some(summary) = Self::extract_finish_task_summary_from_result(&result) {
                     if self.is_autopilot && self.has_uncompleted_todos() {
                         response_parts.push(Self::build_function_response_part(
@@ -677,7 +701,7 @@ impl AgentLoop {
             }
         }
 
-        response_parts
+        (response_parts, should_yield_to_user)
     }
 
     /// Generate a rolling summary of recent history via the LLM.

@@ -116,9 +116,9 @@ mod tests {
         let result = tool.execute(args, &make_ctx()).await.unwrap();
         let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
 
-        assert!(envelope.ok);
-        assert!(envelope.await_user.is_some());
-        let prompt = envelope.await_user.unwrap();
+        assert!(envelope.result.ok);
+        assert!(envelope.effects.await_user.is_some());
+        let prompt = envelope.effects.await_user.unwrap();
         assert_eq!(prompt.question, "What is the project name?");
         assert_eq!(prompt.context_key, "project_name");
         assert!(prompt.options.is_empty());
@@ -137,7 +137,7 @@ mod tests {
         let result = tool.execute(args, &make_ctx()).await.unwrap();
         let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
 
-        let prompt = envelope.await_user.unwrap();
+        let prompt = envelope.effects.await_user.unwrap();
         assert_eq!(prompt.options.len(), 3);
         assert_eq!(prompt.recommendation.as_deref(), Some("growth"));
     }
