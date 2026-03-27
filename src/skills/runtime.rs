@@ -53,17 +53,13 @@ impl SkillRuntime {
         def: &SkillDef,
         initial_args: Option<String>,
     ) -> Result<(), String> {
-        let mut state = ActiveSkillState::new(
-            def.meta.name.clone(),
-            def.constraints.clone(),
-        );
+        let mut state = ActiveSkillState::new(def.meta.name.clone(), def.constraints.clone());
         state.initial_args = initial_args;
 
         // Execute preamble if present
         if let Some(preamble) = &def.preamble {
             state.execution_state = SkillExecutionState::Bootstrapping;
-            let result =
-                super::preamble::execute_preamble(&preamble.shell, None).await;
+            let result = super::preamble::execute_preamble(&preamble.shell, None).await;
 
             state.preamble_result = Some(PreambleState {
                 ok: result.ok,
@@ -153,28 +149,16 @@ impl SkillRuntime {
         Some(parts.join("\n"))
     }
 
-    async fn activate_skill_from_command(
-        &self,
-        input: &str,
-    ) -> Result<Option<String>, String> {
+    async fn activate_skill_from_command(&self, input: &str) -> Result<Option<String>, String> {
         let trimmed = input.trim();
-        if !trimmed.starts_with("/skill") {
+        if !trimmed.starts_with('/') {
             return Ok(None);
         }
 
-        let mut parts = trimmed.splitn(3, ' ');
-        let _cmd = parts.next();
-        let skill_name = match parts.next() {
-            Some(name) if !name.trim().is_empty() => name.trim(),
-            _ => {
-                let available = self.registry.names().join(", ");
-                return Err(if available.is_empty() {
-                    "Usage: /skill <name> [activation args]".to_string()
-                } else {
-                    format!("Usage: /skill <name> [activation args]\nAvailable skills: {}", available)
-                });
-            }
-        };
+        let mut parts = trimmed.splitn(2, ' ');
+        let cmd = parts.next().unwrap();
+        let skill_name = &cmd[1..];
+
         let activation_args = parts
             .next()
             .map(str::trim)
@@ -183,10 +167,23 @@ impl SkillRuntime {
 
         let Some(def) = self.registry.clone_skill(skill_name) else {
             let available = self.registry.names().join(", ");
+            if skill_name == "skill" {
+                return Err(if available.is_empty() {
+                    "Usage: /<skill_name> [activation args]".to_string()
+                } else {
+                    format!(
+                        "Usage: /<skill_name> [activation args]\nAvailable skills: {}",
+                        available
+                    )
+                });
+            }
             return Err(if available.is_empty() {
                 format!("Unknown skill '{}'.", skill_name)
             } else {
-                format!("Unknown skill '{}'. Available skills: {}", skill_name, available)
+                format!(
+                    "Unknown skill '{}'. Available skills: {}",
+                    skill_name, available
+                )
             });
         };
 
@@ -202,7 +199,9 @@ impl SkillRuntime {
         Ok(Some(message))
     }
 
-    fn required_artifact_kind_name(required_kind: &super::definition::ArtifactKind) -> &'static str {
+    fn required_artifact_kind_name(
+        required_kind: &super::definition::ArtifactKind,
+    ) -> &'static str {
         match required_kind {
             super::definition::ArtifactKind::DesignDoc => "design_doc",
             super::definition::ArtifactKind::ReviewReport => "review_report",
@@ -252,10 +251,7 @@ impl ExecutionExtension for SkillRuntime {
         draft
     }
 
-    async fn before_tool_resolution(
-        &self,
-        tools: Vec<Arc<dyn Tool>>,
-    ) -> Vec<Arc<dyn Tool>> {
+    async fn before_tool_resolution(&self, tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
         let def = self.active_def.read().await;
         let state = self.state.read().await;
 
@@ -365,7 +361,9 @@ impl ExecutionExtension for SkillRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::extensions::{ExecutionExtension, FinishDecision, PromptDraft, ResumeDecision};
+    use crate::core::extensions::{
+        ExecutionExtension, FinishDecision, PromptDraft, ResumeDecision,
+    };
     use crate::skills::definition::*;
     use crate::skills::state::PendingInteraction;
 
@@ -449,10 +447,22 @@ mod tests {
         struct MockTool(String);
         #[async_trait]
         impl Tool for MockTool {
-            fn name(&self) -> String { self.0.clone() }
-            fn description(&self) -> String { String::new() }
-            fn parameters_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-            async fn execute(&self, _: serde_json::Value, _: &crate::tools::protocol::ToolContext) -> Result<String, crate::tools::protocol::ToolError> { Ok(String::new()) }
+            fn name(&self) -> String {
+                self.0.clone()
+            }
+            fn description(&self) -> String {
+                String::new()
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+                _: &crate::tools::protocol::ToolContext,
+            ) -> Result<String, crate::tools::protocol::ToolError> {
+                Ok(String::new())
+            }
         }
 
         let tools: Vec<Arc<dyn Tool>> = vec![
@@ -499,7 +509,10 @@ mod tests {
 
         let decision = rt.on_user_resume("MyProject").await;
         match decision {
-            ResumeDecision::ResumeSkill { context_key, answer } => {
+            ResumeDecision::ResumeSkill {
+                context_key,
+                answer,
+            } => {
                 assert_eq!(context_key, "project_name");
                 assert_eq!(answer, "MyProject");
             }
@@ -572,7 +585,9 @@ mod tests {
         registry.insert(make_test_skill(false, None));
         let rt = SkillRuntime::with_registry(registry);
 
-        let decision = rt.before_turn_start("/skill test_skill collect requirements").await;
+        let decision = rt
+            .before_turn_start("/test_skill collect requirements")
+            .await;
         match decision {
             ExtensionDecision::Intercept { prompt_overlay } => {
                 let overlay = prompt_overlay.expect("expected overlay");
@@ -586,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn test_before_turn_start_halts_on_unknown_skill() {
         let rt = SkillRuntime::with_registry(SkillRegistry::new());
-        let decision = rt.before_turn_start("/skill missing").await;
+        let decision = rt.before_turn_start("/missing").await;
         assert!(matches!(decision, ExtensionDecision::Halt { .. }));
     }
 
@@ -614,13 +629,20 @@ mod tests {
                 }),
                 ..Default::default()
             },
-        }).await;
+        })
+        .await;
 
         let state = rt.state.read().await;
         let state = state.as_ref().unwrap();
-        assert!(matches!(state.execution_state, SkillExecutionState::WaitingUser));
+        assert!(matches!(
+            state.execution_state,
+            SkillExecutionState::WaitingUser
+        ));
         assert_eq!(
-            state.pending_interaction.as_ref().map(|pi| pi.context_key.as_str()),
+            state
+                .pending_interaction
+                .as_ref()
+                .map(|pi| pi.context_key.as_str()),
             Some("goal")
         );
     }
@@ -641,6 +663,9 @@ mod tests {
             });
         }
 
-        assert!(matches!(rt.before_finish().await, FinishDecision::Deny { .. }));
+        assert!(matches!(
+            rt.before_finish().await,
+            FinishDecision::Deny { .. }
+        ));
     }
 }

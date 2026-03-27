@@ -115,11 +115,7 @@ impl CommandOutput for CliCommandOutput {
     }
 
     fn send_context_dump(&self, path: String) {
-        println!(
-            "  {} Context dumped to {}",
-            style("✔").green(),
-            path
-        );
+        println!("  {} Context dumped to {}", style("✔").green(), path);
     }
 
     fn send_context_compact(&self, result: Result<(), String>) {
@@ -270,7 +266,10 @@ pub async fn run_cli_repl(
                 continue;
             }
 
-            if let Err(e) = executor.execute("cli", "cli", output.clone(), cmd_output.clone(), cmd).await {
+            if let Err(e) = executor
+                .execute("cli", "cli", output.clone(), cmd_output.clone(), cmd)
+                .await
+            {
                 cmd_output.send_error(&e);
             }
             continue;
@@ -303,6 +302,26 @@ fn print_help() {
     println!("  {} - List all sessions", style("/session").white());
     println!("  {} - Manage scheduled tasks", style("/cron").yellow());
     println!("  {} - Inspect context", style("/context").blue());
+
+    let mut registry = crate::skills::registry::SkillRegistry::new();
+    registry.discover(std::path::Path::new("skills"));
+    let names = registry.names();
+    if !names.is_empty() {
+        println!();
+        println!("  {}", style("Available Skills:").bold());
+        for name in names {
+            if let Some(skill) = registry.clone_skill(&name) {
+                let desc = skill.meta.description.lines().next().unwrap_or("").trim();
+                let short_desc = if desc.chars().count() > 60 {
+                    format!("{}...", desc.chars().take(57).collect::<String>())
+                } else {
+                    desc.to_string()
+                };
+                println!("  {} - {}", style(format!("/{}", name)).cyan(), short_desc);
+            }
+        }
+    }
+
     println!();
 }
 
@@ -348,7 +367,11 @@ async fn run_cli_agent_step(
                 println!("\n  {}", style("Execution Stopped by User").yellow());
                 println!("  The current operation was manually cancelled.");
                 if agent_guard.is_autopilot {
-                    println!("  {} {}", style("Autopilot Paused").yellow().bold(), style("任务已安全暂停。").yellow());
+                    println!(
+                        "  {} {}",
+                        style("Autopilot Paused").yellow().bold(),
+                        style("任务已安全暂停。").yellow()
+                    );
                     println!("  👉 您可以直接输入指导意见来纠偏并自动继续，或者输入 /manual 彻底退出自动驾驶。");
                 }
             }

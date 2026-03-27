@@ -60,8 +60,20 @@ pub fn parse_skill_md(content: &str) -> Option<SkillDef> {
     let yaml_str = parts[1].trim();
     let body = parts[2].trim().to_string();
 
-    let yaml_val: serde_yaml::Value = serde_yaml::from_str(yaml_str).ok()?;
-    let raw: RawFrontmatter = serde_yaml::from_value(yaml_val.clone()).ok()?;
+    let yaml_val: serde_yaml::Value = match serde_yaml::from_str(yaml_str) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("YAML parse error: {}", e);
+            return None;
+        }
+    };
+    let raw: RawFrontmatter = match serde_yaml::from_value(yaml_val.clone()) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Frontmatter parse error: {}", e);
+            return None;
+        }
+    };
     let parameters_json: Option<serde_json::Value> = yaml_val
         .get("parameters")
         .and_then(|p| serde_json::to_value(p).ok());
@@ -96,9 +108,7 @@ pub fn parse_skill_md(content: &str) -> Option<SkillDef> {
         },
         instructions: body,
         preamble,
-        parameters: raw
-            .parameters
-            .and_then(|p| serde_json::to_value(p).ok()),
+        parameters: raw.parameters.and_then(|p| serde_json::to_value(p).ok()),
         constraints: raw.constraints.unwrap_or_default(),
     })
 }

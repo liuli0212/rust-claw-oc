@@ -88,7 +88,8 @@ mod tests {
             _messages: Vec<crate::context::Message>,
             system_instruction: Option<crate::context::Message>,
             _tools: Vec<Arc<dyn Tool>>,
-        ) -> Result<mpsc::Receiver<crate::llm_client::StreamEvent>, crate::llm_client::LlmError> {
+        ) -> Result<mpsc::Receiver<crate::llm_client::StreamEvent>, crate::llm_client::LlmError>
+        {
             let text = system_instruction
                 .and_then(|message| message.parts.into_iter().find_map(|part| part.text))
                 .unwrap_or_default();
@@ -97,7 +98,9 @@ mod tests {
             let (tx, rx) = mpsc::channel(4);
             tokio::spawn(async move {
                 let _ = tx
-                    .send(crate::llm_client::StreamEvent::Text("skill ready".to_string()))
+                    .send(crate::llm_client::StreamEvent::Text(
+                        "skill ready".to_string(),
+                    ))
                     .await;
                 let _ = tx.send(crate::llm_client::StreamEvent::Done).await;
             });
@@ -138,7 +141,7 @@ mod tests {
         .unwrap();
 
         let mut agent = agent.lock().await;
-        let exit = agent.step("/skill check_git_status".to_string()).await.unwrap();
+        let exit = agent.step("/check_git_status".to_string()).await.unwrap();
         assert_eq!(exit, crate::core::RunExit::YieldedToUser);
 
         let system = llm.last_system.lock().unwrap().clone().unwrap_or_default();
