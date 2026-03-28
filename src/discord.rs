@@ -304,6 +304,10 @@ impl CommandOutput for DiscordCommandOutput {
             Err(e) => self.send_error(&format!("Compaction failed: {}", e)),
         }
     }
+
+    fn send_trace(&self, trace: String) {
+        self.send_text(&trace);
+    }
 }
 
 struct Handler {

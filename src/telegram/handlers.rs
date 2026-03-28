@@ -214,6 +214,14 @@ impl CommandOutput for TelegramCommandOutput {
             }
         });
     }
+
+    fn send_trace(&self, trace: String) {
+        let bot = self.bot.clone();
+        let chat_id = self.chat_id;
+        tokio::spawn(async move {
+            let _ = bot.send_message(chat_id, trace).await;
+        });
+    }
 }
 
 pub(super) async fn handle_callback_query(

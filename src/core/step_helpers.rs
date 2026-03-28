@@ -61,6 +61,9 @@ impl AgentLoop {
         let full_text = loop {
             llm_attempts += 1;
 
+            let prompt_summary = format!("System + {} messages", messages.len());
+            self.output.on_llm_request(&prompt_summary).await;
+
             let stream_res = tokio::select! {
                 res = self.llm.stream(messages.clone(), system.clone(), current_tools.clone()) => res,
                 _ = self.cancel_token.notified() => {
@@ -133,6 +136,8 @@ impl AgentLoop {
                 }
             }
         };
+
+        self.output.on_llm_response(&full_text).await;
 
         Ok(StreamCollectionOutcome::Completed {
             full_text,

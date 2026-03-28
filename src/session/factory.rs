@@ -217,6 +217,24 @@ impl crate::core::AgentOutput for CollectorOutput {
             .await
             .push_str(&format!("[ERROR] {}\n", error));
     }
+
+    async fn on_llm_request(&self, prompt_summary: &str) {
+        self.append_event(
+            "llm_request",
+            serde_json::json!({ "summary": prompt_summary }),
+            &format!("LLM Request: {}", prompt_summary),
+            None,
+        ).await;
+    }
+
+    async fn on_llm_response(&self, response_summary: &str) {
+        self.append_event(
+            "llm_response",
+            serde_json::json!({ "summary": crate::subagent_runtime::truncate_debug_text(response_summary, 500) }),
+            &format!("LLM Response: {}", crate::subagent_runtime::truncate_debug_text(response_summary, 120)),
+            None,
+        ).await;
+    }
 }
 
 pub fn filter_subagent_tools(

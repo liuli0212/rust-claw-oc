@@ -65,6 +65,8 @@ pub trait AgentOutput: Send + Sync {
     async fn on_task_finish(&self, _summary: &str) {
         // Default: no-op
     }
+    async fn on_llm_request(&self, _prompt_summary: &str) {}
+    async fn on_llm_response(&self, _response_summary: &str) {}
 }
 
 pub struct SilentOutputWrapper {
@@ -111,6 +113,12 @@ impl AgentOutput for SilentOutputWrapper {
     }
     async fn on_task_finish(&self, summary: &str) {
         self.inner.on_task_finish(summary).await;
+    }
+    async fn on_llm_request(&self, prompt_summary: &str) {
+        self.inner.on_llm_request(prompt_summary).await;
+    }
+    async fn on_llm_response(&self, response_summary: &str) {
+        self.inner.on_llm_response(response_summary).await;
     }
 }
 

@@ -124,6 +124,10 @@ impl CommandOutput for CliCommandOutput {
             Err(e) => println!("  {} Compaction failed: {}", style("❌").red(), e),
         }
     }
+
+    fn send_trace(&self, trace: String) {
+        println!("\n{}\n", trace);
+    }
 }
 
 pub async fn run_headless_command(
@@ -302,6 +306,7 @@ fn print_help() {
     println!("  {} - List all sessions", style("/session").white());
     println!("  {} - Manage scheduled tasks", style("/cron").yellow());
     println!("  {} - Inspect context", style("/context").blue());
+    println!("  {} - Trace subagent execution", style("/trace <job_id>").magenta());
 
     let mut registry = crate::skills::registry::SkillRegistry::new();
     registry.discover(std::path::Path::new("skills"));
