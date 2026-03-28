@@ -770,8 +770,8 @@ v3 明确初始化顺序如下：
 - [x] **TODO-1.4** 改造同步 `DispatchSubagentTool::execute()` 调用 `build_subagent_session()`
 - [x] **TODO-1.5** 新增 `src/subagent_runtime.rs`：定义 `SubagentJobMeta`, `SubagentJobState`, `SubagentJobHandle`, `SubagentResult`, `RunningJobGuard` 数据结构
 - [x] **TODO-1.5a** 明确 `SubagentBuildMode::{AsyncReadonly, SyncCompatible}`，禁止 builder 复用造成同步接口语义回归
-- [ ] **TODO-1.6** 验证：全部现有测试通过 (`cargo test`)
-- [ ] **TODO-1.7** 验证：`cargo clippy -- -D warnings` 通过
+- [x] **TODO-1.6** 验证：全部现有测试通过 (`cargo test`)
+- [x] **TODO-1.7** 验证：`cargo clippy -- -D warnings` 通过
 
 ### Phase 2: Runtime 核心
 
@@ -786,7 +786,7 @@ v3 明确初始化顺序如下：
 - [x] **TODO-2.7** 实现 `SubagentRuntime::cleanup_expired_jobs()`
 - [x] **TODO-2.7a** 保留 `JoinHandle` 以支持 panic 观测、shutdown abort 和运行态托管
 - [x] **TODO-2.8** 编写 Runtime 单元测试 R1-R9
-- [ ] **TODO-2.9** 验证：`cargo test` + `cargo clippy` 通过
+- [x] **TODO-2.9** 验证：`cargo test` + `cargo clippy` 通过
 
 ### Phase 3: Tool 层 + 注册
 
@@ -802,7 +802,7 @@ v3 明确初始化顺序如下：
 - [x] **TODO-3.7a** 打通 `bootstrap -> runtime -> session_manager -> factory` 的依赖注入链路，避免循环依赖
 - [x] **TODO-3.8** 编写 Tool 单元测试 T1-T5
 - [x] **TODO-3.9** 编写 Builder 回归测试 B1-B4
-- [ ] **TODO-3.10** 验证：`cargo test` + `cargo clippy` 通过
+- [x] **TODO-3.10** 验证：`cargo test` + `cargo clippy` 通过
 
 ### Phase 4: 集成测试 + 文档
 
@@ -810,7 +810,7 @@ v3 明确初始化顺序如下：
 
 - [x] **TODO-4.1** 编写集成测试 I1-I6
 - [x] **TODO-4.2** 更新 `AGENTS.md` 添加异步 subagent 工具说明
-- [ ] **TODO-4.3** 最终验证：`cargo test` + `cargo clippy` + `cargo fmt --check` 全部通过
+- [x] **TODO-4.3** 最终验证：`cargo test` + `cargo clippy` + `cargo fmt --check` 全部通过
 
 ---
 

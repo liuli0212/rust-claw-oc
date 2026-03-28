@@ -94,6 +94,7 @@ pub struct SkillPreamble {
 /// Whether this `SkillDef` originated from the new unified format or was
 /// migrated from an old script-template.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
 pub enum SkillOrigin {
     /// New unified `SKILL.md` format.
     #[default]

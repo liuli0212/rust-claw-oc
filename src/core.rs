@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
-mod step_helpers;
 pub mod extensions;
+mod step_helpers;
 
 pub struct ScopeGuard<F: FnOnce()> {
     closure: Option<F>,
@@ -73,15 +73,27 @@ pub struct SilentOutputWrapper {
 
 #[async_trait]
 impl AgentOutput for SilentOutputWrapper {
-    async fn on_waiting(&self, message: &str) { self.inner.on_waiting(message).await; }
-    fn clear_waiting(&self) { self.inner.clear_waiting(); }
-    async fn on_text(&self, text: &str) { self.inner.on_text(text).await; }
+    async fn on_waiting(&self, message: &str) {
+        self.inner.on_waiting(message).await;
+    }
+    fn clear_waiting(&self) {
+        self.inner.clear_waiting();
+    }
+    async fn on_text(&self, text: &str) {
+        self.inner.on_text(text).await;
+    }
     async fn on_thinking(&self, _text: &str) {}
     async fn on_tool_start(&self, _name: &str, _args: &str) {}
     async fn on_tool_end(&self, _result: &str) {}
-    async fn on_error(&self, error: &str) { self.inner.on_error(error).await; }
-    async fn flush(&self) { self.inner.flush().await; }
-    async fn on_file(&self, path: &str) { self.inner.on_file(path).await; }
+    async fn on_error(&self, error: &str) {
+        self.inner.on_error(error).await;
+    }
+    async fn flush(&self) {
+        self.inner.flush().await;
+    }
+    async fn on_file(&self, path: &str) {
+        self.inner.on_file(path).await;
+    }
     async fn on_plan_update(&self, state: &crate::task_state::TaskStateSnapshot) {
         self.inner.on_plan_update(state).await;
     }
@@ -175,6 +187,7 @@ impl AgentLoop {
     const MAX_CONSECUTIVE_EMPTY_RESPONSES: usize = 3;
     const INITIAL_ENERGY: usize = 25; // 每轮最大生存时间（步数），AutoPilot中由物理审计自动续期
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_id: String,
         llm: Arc<dyn LlmClient>,
@@ -279,6 +292,7 @@ impl AgentLoop {
         self.output.flush().await;
     }
 
+    #[allow(dead_code)]
     pub fn get_session_details(&self) -> serde_json::Value {
         let (tokens, max_tokens, turns, system_tokens, _) = self.context.get_context_status();
         let state = self
@@ -338,6 +352,7 @@ impl AgentLoop {
         self.context.get_context_details()
     }
 
+    #[allow(dead_code)]
     pub fn get_detailed_stats(&self) -> crate::context::DetailedContextStats {
         self.context.get_detailed_stats(None)
     }
@@ -508,7 +523,7 @@ impl AgentLoop {
         // Reset cancel flag at start of each step
         self.cancelled
             .store(false, std::sync::atomic::Ordering::SeqCst);
-            
+
         if self.is_autopilot {
             self.autopilot_todos_completed_count = self.count_completed_todos();
         }
@@ -625,10 +640,7 @@ impl AgentLoop {
             if !response_parts.is_empty() {
                 for part in &response_parts {
                     if let Some(res) = &part.function_response {
-                        if res
-                            .response
-                            .get("signal")
-                            .and_then(|s| s.as_str())
+                        if res.response.get("signal").and_then(|s| s.as_str())
                             == Some("autopilot_meltdown")
                         {
                             return Ok(RunExit::AutopilotStalled(
@@ -652,9 +664,7 @@ impl AgentLoop {
                         ext.before_finish().await
                     {
                         tracing::warn!("Extension denied finish: {}", reason);
-                        self.output
-                            .on_text(&format!("[System] {}", reason))
-                            .await;
+                        self.output.on_text(&format!("[System] {}", reason)).await;
                         allow_finish = false;
                         state.status = "in_progress".to_string();
                         let _ = self.task_state_store.save(&state);

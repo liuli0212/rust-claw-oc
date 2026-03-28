@@ -30,7 +30,6 @@ pub enum SubagentBuildMode {
 }
 
 pub struct BuiltSubagentSession {
-    pub session_id: String,
     pub agent_loop: AgentLoop,
     pub collector: Arc<CollectorOutput>,
 }
@@ -147,6 +146,7 @@ pub fn filter_subagent_tools(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_subagent_session(
     parent_ctx: &ToolContext,
     llm: Arc<dyn LlmClient>,
@@ -217,7 +217,6 @@ pub fn build_subagent_session(
     agent_loop.cancel_token = cancel_notify;
 
     Ok(BuiltSubagentSession {
-        session_id: sub_session_id,
         agent_loop,
         collector,
     })

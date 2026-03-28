@@ -1,7 +1,7 @@
 use crate::core::AgentOutput;
-use crate::session_manager::SessionManager;
-use crate::task_state::{TaskStateStore, TaskStateSnapshot};
 use crate::scheduler::Scheduler;
+use crate::session_manager::SessionManager;
+use crate::task_state::{TaskStateSnapshot, TaskStateStore};
 use std::sync::Arc;
 
 pub enum Command {
@@ -107,13 +107,13 @@ impl CommandExecutor {
                 Ok(())
             }
             Command::Status => {
-                let agent = self.session_manager
+                let agent = self
+                    .session_manager
                     .get_or_create_session(session_id, reply_to, agent_output)
-                    .await
-                    .map_err(|e| e)?;
+                    .await?;
                 let agent_guard = agent.lock().await;
                 let (provider, model, tokens, max_tokens) = agent_guard.get_status();
-                
+
                 let ts = TaskStateStore::new(session_id);
                 let active_plan = if ts.has_active_plan() {
                     ts.load().ok()
@@ -142,7 +142,11 @@ impl CommandExecutor {
                 }
                 let provider = parts[0];
                 let model = parts.get(1).map(|s| s.to_string());
-                match self.session_manager.update_session_llm(session_id, provider, model).await {
+                match self
+                    .session_manager
+                    .update_session_llm(session_id, provider, model)
+                    .await
+                {
                     Ok(msg) => {
                         cmd_output.send_success(&msg);
                         Ok(())
@@ -152,7 +156,7 @@ impl CommandExecutor {
             }
             Command::Cron(args) => {
                 let parts: Vec<&str> = args.split_whitespace().collect();
-                let action = parts.get(0).copied().unwrap_or("list");
+                let action = parts.first().copied().unwrap_or("list");
                 let scheduler = Scheduler::new(self.session_manager.clone());
 
                 match action {
@@ -163,7 +167,9 @@ impl CommandExecutor {
                     "remove" => {
                         if let Some(id) = parts.get(1) {
                             match scheduler.remove_task(id).await {
-                                Ok(_) => cmd_output.send_success(&format!("Task '{}' removed.", id)),
+                                Ok(_) => {
+                                    cmd_output.send_success(&format!("Task '{}' removed.", id))
+                                }
                                 Err(e) => return Err(e.to_string()),
                             }
                         } else {
@@ -178,7 +184,11 @@ impl CommandExecutor {
                                 _ => return Err("Usage: /cron toggle <id> <on|off>".to_string()),
                             };
                             match scheduler.toggle_task(id, enabled).await {
-                                Ok(_) => cmd_output.send_success(&format!("Task '{}' is now {}.", id, if enabled { "enabled" } else { "disabled" })),
+                                Ok(_) => cmd_output.send_success(&format!(
+                                    "Task '{}' is now {}.",
+                                    id,
+                                    if enabled { "enabled" } else { "disabled" }
+                                )),
                                 Err(e) => return Err(e.to_string()),
                             }
                         } else {
@@ -190,13 +200,13 @@ impl CommandExecutor {
                 Ok(())
             }
             Command::Context(args) => {
-                let agent = self.session_manager
+                let agent = self
+                    .session_manager
                     .get_or_create_session(session_id, reply_to, agent_output)
-                    .await
-                    .map_err(|e| e)?;
+                    .await?;
                 let mut agent_guard = agent.lock().await;
                 let parts: Vec<&str> = args.split_whitespace().collect();
-                let subcommand = parts.get(0).copied().unwrap_or("");
+                let subcommand = parts.first().copied().unwrap_or("");
 
                 match subcommand {
                     "audit" => {
@@ -224,7 +234,10 @@ impl CommandExecutor {
                         });
                         if let Ok(json_str) = serde_json::to_string_pretty(&dump_data) {
                             let filename = if session_id.starts_with("telegram:") {
-                                format!("debug_context_tg_{}.json", session_id.strip_prefix("telegram:").unwrap())
+                                format!(
+                                    "debug_context_tg_{}.json",
+                                    session_id.strip_prefix("telegram:").unwrap()
+                                )
                             } else {
                                 "debug_context.json".to_string()
                             };
@@ -236,7 +249,10 @@ impl CommandExecutor {
                         }
                     }
                     "compact" => {
-                        let res = agent_guard.maybe_compact_history(true).await.map_err(|e| e.to_string());
+                        let res = agent_guard
+                            .maybe_compact_history(true)
+                            .await
+                            .map_err(|e| e.to_string());
                         cmd_output.send_context_compact(res);
                     }
                     _ => {
@@ -247,10 +263,10 @@ impl CommandExecutor {
                 Ok(())
             }
             Command::Autopilot(_goal) => {
-                let agent = self.session_manager
+                let agent = self
+                    .session_manager
                     .get_or_create_session(session_id, reply_to, agent_output)
-                    .await
-                    .map_err(|e| e)?;
+                    .await?;
                 let mut agent_guard = agent.lock().await;
                 agent_guard.enable_autopilot();
                 cmd_output.send_success("Autopilot mode enabled.");
@@ -258,10 +274,10 @@ impl CommandExecutor {
                 Ok(())
             }
             Command::Manual => {
-                let agent = self.session_manager
+                let agent = self
+                    .session_manager
                     .get_or_create_session(session_id, reply_to, agent_output)
-                    .await
-                    .map_err(|e| e)?;
+                    .await?;
                 let mut agent_guard = agent.lock().await;
                 agent_guard.is_autopilot = false;
                 cmd_output.send_success("Autopilot mode disabled. Switched to manual mode.");

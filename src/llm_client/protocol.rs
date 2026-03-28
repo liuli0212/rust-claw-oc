@@ -6,6 +6,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug)]
 pub enum LlmError {
     #[error("Network error: {0}")]

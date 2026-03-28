@@ -109,7 +109,7 @@ pub fn create_llm_client(
                     None,
                 )))
             }
-            "gemini" | _ => {
+            "gemini" => {
                 let api_key = std::env::var("GEMINI_API_KEY")
                     .map(|s| s.trim().to_string())
                     .map_err(|_| "GEMINI_API_KEY must be set for gemini provider")?;
@@ -130,6 +130,30 @@ pub fn create_llm_client(
                     model,
                     context_window,
                     provider.to_string(),
+                    platform,
+                )))
+            }
+            _ => {
+                let api_key = std::env::var("GEMINI_API_KEY")
+                    .map(|s| s.trim().to_string())
+                    .map_err(|_| "GEMINI_API_KEY must be set for gemini provider")?;
+                tracing::info!(
+                    "Using Gemini provider with model: {:?}",
+                    model.as_deref().unwrap_or("default")
+                );
+                let model_str = model
+                    .clone()
+                    .unwrap_or_else(|| "gemini-3.1-pro-preview".to_string());
+                let context_window = estimate_context_window(&model_str);
+                let platform = match platform_override.as_deref() {
+                    Some("gen") => GeminiPlatform::Gen,
+                    _ => GeminiPlatform::Vertex,
+                };
+                Ok(Arc::new(GeminiClient::new_with_platform_and_window(
+                    api_key,
+                    model,
+                    context_window,
+                    "gemini".to_string(),
                     platform,
                 )))
             }

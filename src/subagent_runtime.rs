@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::llm_client::LlmClient;
 use crate::session::factory::{build_subagent_session, BuiltSubagentSession, SubagentBuildMode};
@@ -105,7 +105,6 @@ pub struct SubagentJobHandle {
     pub consumed_at_unix_ms: tokio::sync::RwLock<Option<u64>>,
     pub cancelled: Arc<AtomicBool>,
     pub cancel_notify: Arc<tokio::sync::Notify>,
-    pub created_at: Instant,
     pub task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -117,7 +116,6 @@ impl SubagentJobHandle {
             consumed_at_unix_ms: tokio::sync::RwLock::new(None),
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
-            created_at: Instant::now(),
             task: tokio::sync::Mutex::new(None),
         }
     }

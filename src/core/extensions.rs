@@ -67,6 +67,7 @@ pub enum ExtensionDecision {
 
 /// Returned by `on_user_resume`.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ResumeDecision {
     /// The user's input should be treated as a skill-resume answer.
     ResumeSkill { context_key: String, answer: String },

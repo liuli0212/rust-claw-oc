@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::tools::shell::{execute_shell, ShellExecResult};
 
 /// Result of a preamble execution.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PreambleResult {
     pub ok: bool,
@@ -19,10 +20,7 @@ pub struct PreambleResult {
 const PREAMBLE_TIMEOUT_SECS: u64 = 30;
 
 /// Execute a preamble shell script and parse `KEY=VALUE` output lines.
-pub async fn execute_preamble(
-    shell_cmd: &str,
-    cwd: Option<&std::path::Path>,
-) -> PreambleResult {
+pub async fn execute_preamble(shell_cmd: &str, cwd: Option<&std::path::Path>) -> PreambleResult {
     let timeout = Duration::from_secs(PREAMBLE_TIMEOUT_SECS);
 
     match execute_shell(shell_cmd, timeout, cwd).await {
@@ -86,10 +84,7 @@ echo "DEBUG=1""#,
         .await;
         assert!(result.ok);
         assert_eq!(result.vars.get("MODE").map(|s| s.as_str()), Some("startup"));
-        assert_eq!(
-            result.vars.get("VERSION").map(|s| s.as_str()),
-            Some("2.0")
-        );
+        assert_eq!(result.vars.get("VERSION").map(|s| s.as_str()), Some("2.0"));
         assert_eq!(result.vars.get("DEBUG").map(|s| s.as_str()), Some("1"));
         assert_eq!(result.vars.len(), 3);
     }
@@ -102,8 +97,7 @@ echo "DEBUG=1""#,
 
     #[tokio::test]
     async fn test_execute_preamble_invalid_command() {
-        let result =
-            execute_preamble("this_command_does_not_exist_xyz_12345", None).await;
+        let result = execute_preamble("this_command_does_not_exist_xyz_12345", None).await;
         // The command will run but fail
         assert!(!result.ok);
     }

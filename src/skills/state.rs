@@ -26,6 +26,7 @@ pub struct ActiveSkillState {
 }
 
 /// Generic execution state — controlled by the runtime, not the skill.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillExecutionState {
     Bootstrapping,
@@ -37,6 +38,7 @@ pub enum SkillExecutionState {
 }
 
 /// A user's answer to a structured question.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SkillAnswer {
     pub question: String,
@@ -45,6 +47,7 @@ pub struct SkillAnswer {
 }
 
 /// A pending structured question awaiting user response.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PendingInteraction {
     pub skill_name: String,
@@ -56,6 +59,7 @@ pub struct PendingInteraction {
 }
 
 /// Summary of a preamble execution.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PreambleState {
     pub ok: bool,
@@ -63,6 +67,7 @@ pub struct PreambleState {
 }
 
 /// An artifact produced by the skill.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SkillArtifact {
     pub kind: String,
@@ -135,8 +140,7 @@ mod tests {
 
     #[test]
     fn test_state_summary() {
-        let mut state =
-            ActiveSkillState::new("review".to_string(), SkillConstraints::default());
+        let mut state = ActiveSkillState::new("review".to_string(), SkillConstraints::default());
         state.execution_state = SkillExecutionState::Running;
         state
             .labels

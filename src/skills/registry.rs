@@ -64,6 +64,7 @@ impl SkillRegistry {
     }
 
     /// Look up a skill by name.
+    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<&SkillDef> {
         self.skills.get(name)
     }
@@ -74,16 +75,19 @@ impl SkillRegistry {
     }
 
     /// Total number of registered skills.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.skills.len()
     }
 
     /// Whether the registry is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }
 
     /// Insert a skill definition directly (used by migration).
+    #[allow(dead_code)]
     pub fn insert(&mut self, def: SkillDef) {
         self.skills.insert(def.meta.name.clone(), def);
     }

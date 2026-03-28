@@ -148,7 +148,9 @@ impl ToolExecutionEnvelope {
 }
 
 fn get_string(obj: &Map<String, Value>, key: &str) -> Option<String> {
-    obj.get(key).and_then(|value| value.as_str()).map(str::to_string)
+    obj.get(key)
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
 }
 
 fn get_bool(obj: &Map<String, Value>, key: &str) -> Option<bool> {
@@ -231,6 +233,7 @@ impl StructuredToolOutput {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_json_string(self) -> Result<String, ToolError> {
         serde_json::to_string(&self.into_envelope())
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))

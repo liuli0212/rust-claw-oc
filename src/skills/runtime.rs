@@ -86,6 +86,7 @@ impl SkillRuntime {
     }
 
     /// Deactivate the current skill and clean up state.
+    #[allow(dead_code)]
     pub async fn deactivate_skill(&self) {
         let name = {
             let state = self.state.read().await;
@@ -99,6 +100,7 @@ impl SkillRuntime {
     }
 
     /// Whether a skill is currently active.
+    #[allow(dead_code)]
     pub async fn is_active(&self) -> bool {
         self.state.read().await.is_some()
     }

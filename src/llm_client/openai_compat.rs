@@ -76,12 +76,8 @@ impl OpenAiCompatClient {
 
                             if let Some(func) = tc.get("function") {
                                 if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                    if entry.0.is_empty() {
+                                    if entry.0.is_empty() || !entry.0.contains(name) {
                                         entry.0.push_str(name);
-                                    } else if !entry.0.contains(name) {
-                                        entry.0.push_str(name);
-                                    } else {
-                                        entry.0 = name.to_string();
                                     }
                                 }
                                 if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {

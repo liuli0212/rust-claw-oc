@@ -14,15 +14,14 @@
 //! echo "{{arg1}}"
 //! ```
 
-use super::definition::{
-    SkillConstraints, SkillDef, SkillMeta, SkillPreamble, SkillTrigger,
-};
+use super::definition::{SkillConstraints, SkillDef, SkillMeta, SkillPreamble, SkillTrigger};
 
 /// Attempt to convert a legacy skill markdown string into a `SkillDef`.
 ///
 /// If the content has a `parameters` field in its frontmatter, it is treated
 /// as a legacy script-template skill. The script body becomes a preamble
 /// (shell script) and the instructions explain how to invoke it.
+#[allow(dead_code)]
 pub fn migrate_legacy_skill(content: &str) -> Option<SkillDef> {
     let parts: Vec<&str> = content.splitn(3, "---").collect();
     if parts.len() < 3 {
@@ -55,10 +54,7 @@ pub fn migrate_legacy_skill(content: &str) -> Option<SkillDef> {
         param_docs.push_str("## Parameters\n\n");
         for (k, v) in params {
             let key = k.as_str().unwrap_or("?");
-            let desc = v
-                .get("description")
-                .and_then(|d| d.as_str())
-                .unwrap_or("");
+            let desc = v.get("description").and_then(|d| d.as_str()).unwrap_or("");
             let ptype = v.get("type").and_then(|t| t.as_str()).unwrap_or("string");
             param_docs.push_str(&format!("- `{}` ({}): {}\n", key, ptype, desc));
         }

@@ -390,13 +390,9 @@ pub(crate) fn inline_schema_refs(value: &mut Value, root: &Value, depth: usize) 
             if let Some(Value::String(ref_path)) = map.get("$ref") {
                 let prefix1 = "#/$defs/";
                 let prefix2 = "#/definitions/";
-                let def_name = if ref_path.starts_with(prefix1) {
-                    Some(&ref_path[prefix1.len()..])
-                } else if ref_path.starts_with(prefix2) {
-                    Some(&ref_path[prefix2.len()..])
-                } else {
-                    None
-                };
+                let def_name = ref_path
+                    .strip_prefix(prefix1)
+                    .or_else(|| ref_path.strip_prefix(prefix2));
 
                 if let Some(name) = def_name {
                     let mut resolved = None;

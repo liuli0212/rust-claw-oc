@@ -310,7 +310,7 @@ fn print_help() {
         println!();
         println!("  {}", style("Available Skills:").bold());
         for name in names {
-            if let Some(skill) = registry.clone_skill(&name) {
+            if let Some(skill) = registry.clone_skill(name) {
                 let desc = skill.meta.description.lines().next().unwrap_or("").trim();
                 let short_desc = if desc.chars().count() > 60 {
                     format!("{}...", desc.chars().take(57).collect::<String>())

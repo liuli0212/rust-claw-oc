@@ -73,6 +73,7 @@ impl SkillToolPolicy {
     }
 
     /// Check if a specific tool is allowed.
+    #[allow(dead_code)]
     pub fn can_call(&self, tool_name: &str, skill: &SkillDef) -> bool {
         if skill.meta.allowed_tools.is_empty() {
             return true;

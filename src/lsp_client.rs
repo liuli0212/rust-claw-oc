@@ -103,8 +103,8 @@ impl LspClient {
                     break;
                 }
 
-                if line.starts_with("Content-Length: ") {
-                    let len_res: Result<usize, _> = line["Content-Length: ".len()..].trim().parse();
+                if let Some(stripped) = line.strip_prefix("Content-Length: ") {
+                    let len_res: Result<usize, _> = stripped.trim().parse();
 
                     let len = match len_res {
                         Ok(l) => l,

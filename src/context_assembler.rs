@@ -47,6 +47,7 @@ impl ContextAssembler {
     }
 
     /// Primary entry point for constructing a deterministic cache-aware prompt.
+    #[allow(clippy::too_many_arguments)]
     pub fn assemble_prompt(
         &self,
         system_static: &str,

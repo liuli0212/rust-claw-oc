@@ -20,6 +20,7 @@ pub struct ShellExecResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
+    #[allow(dead_code)]
     pub duration_ms: u128,
 }
 
