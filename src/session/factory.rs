@@ -146,6 +146,7 @@ pub fn filter_subagent_tools(
         if blocked_by_policy {
             // Only track rejection if the user explicitly requested this tool
             if allowed.contains(&name) {
+                tracing::info!("Tool '{}' blocked by policy in mode {:?}", name, mode);
                 rejected.push(name);
             }
             continue;

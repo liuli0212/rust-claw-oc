@@ -466,14 +466,16 @@ impl SubagentRuntime {
                 rejected_tools,
             }) => {
                 if !rejected_tools.is_empty() {
+                    let err_msg = format!(
+                        "Cannot execute subagent: requested tools [{}] are forbidden \
+                         in background mode. Alter the plan to run synchronously or \
+                         remove these tools from allowed_tools.",
+                        rejected_tools.join(", ")
+                    );
+                    tracing::error!("{}", err_msg);
                     SubagentJobState::Failed {
                         finished_at_unix_ms: unix_ms_now(),
-                        error: format!(
-                            "Cannot execute subagent: requested tools [{}] are forbidden \
-                             in background mode. Alter the plan to run synchronously or \
-                             remove these tools from allowed_tools.",
-                            rejected_tools.join(", ")
-                        ),
+                        error: err_msg,
                         partial: None,
                     }
                 } else {
