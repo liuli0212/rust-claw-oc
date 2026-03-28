@@ -27,6 +27,7 @@ pub struct SubagentJobMeta {
     pub goal: String,
     pub input_summary: String,
     pub allowed_tools: Vec<String>,
+    pub claimed_paths: Vec<String>,
     pub timeout_sec: u64,
     pub max_steps: usize,
     pub created_at_unix_ms: u64,
@@ -221,10 +222,20 @@ impl SubagentRuntime {
             goal: args.goal.clone(),
             input_summary: args.input_summary.clone(),
             allowed_tools: args.allowed_tools.clone(),
+            claimed_paths: normalize_claimed_paths(&args.claimed_paths),
             timeout_sec,
             max_steps,
             created_at_unix_ms: unix_ms_now(),
         };
+
+        if let Some((conflicting_job_id, claimed_path)) =
+            self.find_claimed_path_conflict(&meta.claimed_paths).await
+        {
+            return Err(ToolError::ExecutionFailed(format!(
+                "Claimed path conflict for '{}'. Active subagent job '{}' already owns an overlapping path. Wait for it to finish or choose a non-overlapping path range.",
+                claimed_path, conflicting_job_id
+            )));
+        }
 
         let handle = Arc::new(SubagentJobHandle::new(meta));
         {
@@ -340,6 +351,38 @@ impl SubagentRuntime {
     async fn get_job_handle(&self, job_id: &str) -> Option<Arc<SubagentJobHandle>> {
         let jobs = self.inner.jobs.read().await;
         jobs.get(job_id).cloned()
+    }
+
+    async fn find_claimed_path_conflict(
+        &self,
+        claimed_paths: &[String],
+    ) -> Option<(String, String)> {
+        if claimed_paths.is_empty() {
+            return None;
+        }
+
+        let handles: Vec<Arc<SubagentJobHandle>> = {
+            let jobs = self.inner.jobs.read().await;
+            jobs.values().cloned().collect()
+        };
+
+        for handle in handles {
+            let state = handle.state.read().await;
+            if state.is_terminal() {
+                continue;
+            }
+            drop(state);
+
+            for existing in &handle.meta.claimed_paths {
+                for incoming in claimed_paths {
+                    if claimed_paths_overlap(existing, incoming) {
+                        return Some((handle.meta.job_id.clone(), incoming.clone()));
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     async fn run_job(
@@ -553,6 +596,38 @@ fn unix_ms_now() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn normalize_claimed_paths(paths: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for path in paths {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut canonical = trimmed.replace('\\', "/");
+        while canonical.ends_with('/') && canonical.len() > 1 {
+            canonical.pop();
+        }
+        if canonical == "." {
+            canonical.clear();
+        }
+        if canonical.is_empty() {
+            continue;
+        }
+        if !normalized.iter().any(|existing| existing == &canonical) {
+            normalized.push(canonical);
+        }
+    }
+    normalized
+}
+
+fn claimed_paths_overlap(left: &str, right: &str) -> bool {
+    let left = left.trim_matches('/');
+    let right = right.trim_matches('/');
+    left == right
+        || left.starts_with(&format!("{right}/"))
+        || right.starts_with(&format!("{left}/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,6 +760,7 @@ mod tests {
                     goal: "inspect".to_string(),
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
+                    claimed_paths: Vec::new(),
                     timeout_sec: Some(5),
                     max_steps: Some(4),
                 },
@@ -717,6 +793,7 @@ mod tests {
                     goal: "hang".to_string(),
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
+                    claimed_paths: Vec::new(),
                     timeout_sec: Some(30),
                     max_steps: Some(4),
                 },
@@ -731,6 +808,7 @@ mod tests {
                     goal: "blocked".to_string(),
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
+                    claimed_paths: Vec::new(),
                     timeout_sec: Some(30),
                     max_steps: Some(4),
                 },
@@ -759,6 +837,7 @@ mod tests {
                     goal: "hang".to_string(),
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
+                    claimed_paths: Vec::new(),
                     timeout_sec: Some(30),
                     max_steps: Some(4),
                 },
@@ -769,5 +848,54 @@ mod tests {
         runtime.cancel_job(&spawned.job_id).await.unwrap();
         let state = wait_for_terminal_state(&runtime, &spawned.job_id).await;
         assert!(matches!(state, SubagentJobState::Cancelled { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_job_rejects_overlapping_claimed_paths() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(HangingLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            2,
+        );
+
+        let first = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "own parser".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    claimed_paths: vec!["src/parser".to_string()],
+                    timeout_sec: Some(30),
+                    max_steps: Some(4),
+                },
+            )
+            .await
+            .unwrap();
+
+        let second = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "touch parser child".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    claimed_paths: vec!["src/parser/ast".to_string()],
+                    timeout_sec: Some(30),
+                    max_steps: Some(4),
+                },
+            )
+            .await;
+
+        match second {
+            Err(ToolError::ExecutionFailed(message)) => {
+                assert!(message.contains("Claimed path conflict"));
+                assert!(message.contains(&first.job_id));
+            }
+            other => panic!("expected claimed path conflict, got {:?}", other),
+        }
+
+        runtime.cancel_job(&first.job_id).await.unwrap();
+        let _ = wait_for_terminal_state(&runtime, &first.job_id).await;
     }
 }
