@@ -46,6 +46,7 @@ impl PromptCapturingLlm {
         }
     }
 
+    #[allow(dead_code)]
     fn last_system_text(&self) -> Option<String> {
         self.last_system.lock().unwrap().clone()
     }
@@ -362,7 +363,10 @@ async fn test_step_yields_after_ask_user_tool_result() {
         Arc::new(crate::task_state::TaskStateStore::new(session_id)),
     );
 
-    let exit = agent.step("Help me choose a goal".to_string()).await.unwrap();
+    let exit = agent
+        .step("Help me choose a goal".to_string())
+        .await
+        .unwrap();
     let (text, _) = output.snapshot();
 
     assert_eq!(exit, RunExit::YieldedToUser);

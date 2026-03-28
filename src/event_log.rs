@@ -97,6 +97,7 @@ impl EventLog {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn read_all(&self) -> std::io::Result<Vec<AgentEvent>> {
         if !self.file_path.exists() {
             return Ok(Vec::new());

@@ -2,11 +2,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::context::AgentContext;
 use crate::core::{AgentLoop, AgentOutput};
+use crate::event_log::{AgentEvent, EventLog};
 use crate::llm_client::LlmClient;
+use crate::subagent_runtime::{push_recent_debug_event, SubagentDebugEvent, SubagentDebugSnapshot};
 use crate::tools::{Tool, ToolContext};
 
 const DEFAULT_SUBAGENT_ALLOWED_TOOLS: &[&str] = &["read_file", "web_fetch"];
@@ -38,16 +41,26 @@ pub struct BuiltSubagentSession {
 }
 
 pub struct CollectorOutput {
+    session_id: String,
     label: String,
+    event_log: EventLog,
+    debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
     text: AsyncMutex<String>,
     tool_outputs: AsyncMutex<Vec<String>>,
     artifacts: AsyncMutex<Vec<String>>,
 }
 
 impl CollectorOutput {
-    pub fn new(label: String) -> Self {
+    pub fn new(
+        session_id: String,
+        label: String,
+        debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
+    ) -> Self {
         Self {
+            session_id: session_id.clone(),
             label,
+            event_log: EventLog::new(&session_id),
+            debug,
             text: AsyncMutex::new(String::new()),
             tool_outputs: AsyncMutex::new(Vec::new()),
             artifacts: AsyncMutex::new(Vec::new()),
@@ -68,18 +81,83 @@ impl CollectorOutput {
         let mut artifacts = self.artifacts.lock().await;
         std::mem::take(&mut *artifacts)
     }
+
+    async fn append_event(
+        &self,
+        event_type: &str,
+        payload: serde_json::Value,
+        text: &str,
+        tool_name: Option<&str>,
+    ) {
+        let mut debug = self.debug.write().await;
+        debug.updated_at_unix_ms = crate::subagent_runtime::unix_ms_now();
+        push_recent_debug_event(
+            &mut debug,
+            SubagentDebugEvent {
+                kind: event_type.to_string(),
+                tool_name: tool_name.map(|value| value.to_string()),
+                text: text.to_string(),
+                at_unix_ms: crate::subagent_runtime::unix_ms_now(),
+            },
+        );
+        drop(debug);
+
+        let _ = self
+            .event_log
+            .append(AgentEvent::new(
+                event_type,
+                self.session_id.clone(),
+                None,
+                None,
+                payload,
+            ))
+            .await;
+    }
 }
 
 #[async_trait]
 impl crate::core::AgentOutput for CollectorOutput {
     async fn on_text(&self, text: &str) {
+        if !text.trim().is_empty() {
+            let mut debug = self.debug.write().await;
+            debug.last_model_text = Some(crate::subagent_runtime::truncate_debug_text(text, 500));
+            debug.updated_at_unix_ms = crate::subagent_runtime::unix_ms_now();
+        }
         self.text.lock().await.push_str(text);
     }
 
-    async fn on_thinking(&self, _text: &str) {}
+    async fn on_thinking(&self, text: &str) {
+        if !text.trim().is_empty() {
+            let mut debug = self.debug.write().await;
+            debug.last_thought_text = Some(crate::subagent_runtime::truncate_debug_text(text, 500));
+            debug.updated_at_unix_ms = crate::subagent_runtime::unix_ms_now();
+        }
+    }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
         tracing::debug!(target: "subagent", "[Sub:{}] → {} {}", self.label, name, &args[..args.len().min(200)]);
+        {
+            let mut debug = self.debug.write().await;
+            debug.step_count += 1;
+            debug.last_tool_name = Some(name.to_string());
+            debug.last_tool_args_summary =
+                Some(crate::subagent_runtime::truncate_debug_text(args, 500));
+            debug.updated_at_unix_ms = crate::subagent_runtime::unix_ms_now();
+        }
+        self.append_event(
+            "subagent_tool_start",
+            json!({
+                "tool_name": name,
+                "args": crate::subagent_runtime::truncate_debug_text(args, 500),
+            }),
+            &format!(
+                "{} {}",
+                name,
+                crate::subagent_runtime::truncate_debug_text(args, 120)
+            ),
+            Some(name),
+        )
+        .await;
         if name == "write_file" || name == "patch_file" {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
                 if let Some(path) = parsed.get("path").and_then(|p| p.as_str()) {
@@ -91,6 +169,23 @@ impl crate::core::AgentOutput for CollectorOutput {
 
     async fn on_tool_end(&self, result: &str) {
         tracing::debug!(target: "subagent", "[Sub:{}] ← {}", self.label, &result[..result.len().min(200)]);
+        {
+            let mut debug = self.debug.write().await;
+            debug.last_tool_result_summary =
+                Some(crate::subagent_runtime::truncate_debug_text(result, 500));
+            debug.updated_at_unix_ms = crate::subagent_runtime::unix_ms_now();
+        }
+        let current_tool = self.debug.read().await.last_tool_name.clone();
+        self.append_event(
+            "subagent_tool_end",
+            json!({
+                "tool_name": current_tool,
+                "result": crate::subagent_runtime::truncate_debug_text(result, 500),
+            }),
+            &crate::subagent_runtime::truncate_debug_text(result, 160),
+            current_tool.as_deref(),
+        )
+        .await;
         let truncated = if result.len() > 500 {
             format!("{}...(truncated)", &result[..500])
         } else {
@@ -101,6 +196,22 @@ impl crate::core::AgentOutput for CollectorOutput {
 
     async fn on_error(&self, error: &str) {
         tracing::warn!(target: "subagent", "[Sub:{}] ✗ {}", self.label, error);
+        {
+            let mut debug = self.debug.write().await;
+            debug.last_error = Some(crate::subagent_runtime::truncate_debug_text(error, 500));
+            debug.updated_at_unix_ms = crate::subagent_runtime::unix_ms_now();
+        }
+        let current_tool = self.debug.read().await.last_tool_name.clone();
+        self.append_event(
+            "subagent_error",
+            json!({
+                "tool_name": current_tool,
+                "error": crate::subagent_runtime::truncate_debug_text(error, 500),
+            }),
+            &crate::subagent_runtime::truncate_debug_text(error, 160),
+            current_tool.as_deref(),
+        )
+        .await;
         self.text
             .lock()
             .await
@@ -170,6 +281,7 @@ pub fn build_subagent_session(
     allowed_tools: &[String],
     energy_budget: usize,
     input_summary: &str,
+    debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     cancel_notify: Arc<tokio::sync::Notify>,
 ) -> Result<BuiltSubagentSession, String> {
@@ -187,8 +299,8 @@ pub fn build_subagent_session(
         sub_session_id.clone()
     };
 
-    let collector = Arc::new(CollectorOutput::new(label));
-    
+    let collector = Arc::new(CollectorOutput::new(sub_session_id.clone(), label, debug));
+
     let session_dir = crate::schema::StoragePaths::session_dir(&sub_session_id);
     let _ = std::fs::create_dir_all(&session_dir);
     let transcript_path = session_dir.join("transcript.json");
@@ -209,7 +321,6 @@ pub fn build_subagent_session(
 
     context.system_prompts.push(prompt);
     context.max_history_tokens = 100_000;
-
 
     let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
     let telemetry = Arc::new(telemetry);

@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use super::gemini_context;
 use super::protocol::{create_standard_client, GeminiPlatform, LlmClient, LlmError, StreamEvent};
@@ -188,97 +189,100 @@ impl LlmClient for GeminiClient {
         let model_name = self.model_name.clone();
         let platform = self.platform;
 
-        tokio::spawn(async move {
-            let generation_config = gemini_context::text_generation_config(&model_name);
+        tokio::spawn(
+            async move {
+                let generation_config = gemini_context::text_generation_config(&model_name);
 
-            let req_body = GeminiRequest {
-                contents: messages,
-                system_instruction: final_system_instruction,
-                tools: if function_declarations.is_empty() {
-                    None
-                } else {
-                    Some(vec![ToolDeclarationWrapper {
-                        function_declarations,
-                    }])
-                },
-                tool_config: None,
-                generation_config,
-                cached_content: cached_content_id,
-            };
+                let req_body = GeminiRequest {
+                    contents: messages,
+                    system_instruction: final_system_instruction,
+                    tools: if function_declarations.is_empty() {
+                        None
+                    } else {
+                        Some(vec![ToolDeclarationWrapper {
+                            function_declarations,
+                        }])
+                    },
+                    tool_config: None,
+                    generation_config,
+                    cached_content: cached_content_id,
+                };
 
-            let url = gemini_context::request_url(platform, &model_name, true);
-            let body_json_string = gemini_context::request_body_json(platform, &req_body, None);
+                let url = gemini_context::request_url(platform, &model_name, true);
+                let body_json_string = gemini_context::request_body_json(platform, &req_body, None);
 
-            let resp = match gemini_context::stream_connect_with_retry(
-                &client,
-                &api_key,
-                &url,
-                &body_json_string,
-            )
-            .await
-            {
-                Ok(resp) => resp,
-                Err(message) => {
-                    let _ = tx.send(StreamEvent::Error(message)).await;
-                    return;
-                }
-            };
+                let resp = match gemini_context::stream_connect_with_retry(
+                    &client,
+                    &api_key,
+                    &url,
+                    &body_json_string,
+                )
+                .await
+                {
+                    Ok(resp) => resp,
+                    Err(message) => {
+                        let _ = tx.send(StreamEvent::Error(message)).await;
+                        return;
+                    }
+                };
 
-            let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
-            let mut total_text_len: usize = 0;
-            let mut total_tool_calls: usize = 0;
-            let mut chunk_count: usize = 0;
-            tracing::debug!("Gemini stream connected, starting to receive chunks");
+                let mut stream = resp.bytes_stream();
+                let mut buffer = String::new();
+                let mut total_text_len: usize = 0;
+                let mut total_tool_calls: usize = 0;
+                let mut chunk_count: usize = 0;
+                tracing::debug!("Gemini stream connected, starting to receive chunks");
 
-            while let Some(chunk_res) = stream.next().await {
-                match chunk_res {
-                    Ok(chunk) => {
-                        let chunk_str = String::from_utf8_lossy(&chunk);
-                        tracing::trace!("Received streaming chunk: {}", chunk_str);
-                        buffer.push_str(&chunk_str);
-                        while let Some(idx) =
-                            buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n"))
-                        {
-                            let sep_len = if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
-                                4
-                            } else {
-                                2
-                            };
-                            let line = buffer[..idx].trim().to_string();
-                            buffer = buffer[idx + sep_len..].to_string();
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                if gemini_context::emit_sse_data_block(
-                                    &tx,
-                                    data,
-                                    &mut total_text_len,
-                                    &mut total_tool_calls,
-                                    &mut chunk_count,
-                                )
-                                .await
-                                {
-                                    return;
+                while let Some(chunk_res) = stream.next().await {
+                    match chunk_res {
+                        Ok(chunk) => {
+                            let chunk_str = String::from_utf8_lossy(&chunk);
+                            tracing::trace!("Received streaming chunk: {}", chunk_str);
+                            buffer.push_str(&chunk_str);
+                            while let Some(idx) =
+                                buffer.find("\r\n\r\n").or_else(|| buffer.find("\n\n"))
+                            {
+                                let sep_len = if buffer.get(idx..idx + 4) == Some("\r\n\r\n") {
+                                    4
+                                } else {
+                                    2
+                                };
+                                let line = buffer[..idx].trim().to_string();
+                                buffer = buffer[idx + sep_len..].to_string();
+                                if let Some(data) = line.strip_prefix("data: ") {
+                                    if gemini_context::emit_sse_data_block(
+                                        &tx,
+                                        data,
+                                        &mut total_text_len,
+                                        &mut total_tool_calls,
+                                        &mut chunk_count,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!("Gemini stream read error: {}", e);
-                        let _ = tx
-                            .send(StreamEvent::Error(format!("Stream read error: {}", e)))
-                            .await;
-                        return;
+                        Err(e) => {
+                            tracing::error!("Gemini stream read error: {}", e);
+                            let _ = tx
+                                .send(StreamEvent::Error(format!("Stream read error: {}", e)))
+                                .await;
+                            return;
+                        }
                     }
                 }
+                tracing::debug!(
+                    "Gemini stream ended. chunks={}, total_text={} chars, tool_calls={}",
+                    chunk_count,
+                    total_text_len,
+                    total_tool_calls
+                );
+                let _ = tx.send(StreamEvent::Done).await;
             }
-            tracing::debug!(
-                "Gemini stream ended. chunks={}, total_text={} chars, tool_calls={}",
-                chunk_count,
-                total_text_len,
-                total_tool_calls
-            );
-            let _ = tx.send(StreamEvent::Done).await;
-        });
+            .in_current_span(),
+        );
 
         Ok(rx)
     }

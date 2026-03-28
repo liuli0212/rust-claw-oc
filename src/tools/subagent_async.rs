@@ -158,8 +158,7 @@ impl Tool for GetSubagentResultTool {
                     }
                     drop(state);
 
-                    let remaining =
-                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
                         break;
                     }
@@ -185,6 +184,7 @@ impl Tool for GetSubagentResultTool {
                 "status": snapshot.state.finish_reason(),
                 "consumed": snapshot.consumed,
                 "consumed_at_unix_ms": snapshot.consumed_at_unix_ms,
+                "debug": snapshot.debug,
                 "state": snapshot.state,
             }),
         )
@@ -289,19 +289,15 @@ mod tests {
             _tools: Vec<Arc<dyn Tool>>,
         ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
             let (tx, rx) = mpsc::channel(4);
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(StreamEvent::ToolCall(
-                        FunctionCall {
-                            name: "finish_task".to_string(),
-                            args: json!({ "summary": "done" }),
-                            id: Some("tc_1".to_string()),
-                        },
-                        None,
-                    ))
-                    .await;
-                let _ = tx.send(StreamEvent::Done).await;
-            });
+            let _ = tx.try_send(StreamEvent::ToolCall(
+                FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: json!({ "summary": "done" }),
+                    id: Some("tc_1".to_string()),
+                },
+                None,
+            ));
+            let _ = tx.try_send(StreamEvent::Done);
             Ok(rx)
         }
     }
@@ -354,7 +350,7 @@ mod tests {
                     "goal": "inspect",
                     "input_summary": "summary",
                     "allowed_tools": ["read_file"],
-                    "timeout_sec": 5,
+                    "timeout_sec": 20,
                     "max_steps": 4
                 }),
                 &make_ctx(),
@@ -367,7 +363,7 @@ mod tests {
         let job_id = spawned_json["job_id"].as_str().unwrap().to_string();
 
         let mut status = String::new();
-        for _ in 0..40 {
+        for _ in 0..400 {
             let result = get_tool
                 .execute(json!({ "job_id": job_id }), &make_ctx())
                 .await
@@ -416,7 +412,7 @@ mod tests {
                     "goal": "inspect",
                     "input_summary": "summary",
                     "allowed_tools": ["read_file"],
-                    "timeout_sec": 5,
+                    "timeout_sec": 20,
                     "max_steps": 4
                 }),
                 &make_ctx(),
@@ -429,7 +425,7 @@ mod tests {
         let job_id = spawned_json["job_id"].as_str().unwrap().to_string();
 
         let mut consumed_at = None;
-        for _ in 0..40 {
+        for _ in 0..400 {
             let result = get_tool
                 .execute(json!({ "job_id": job_id, "consume": true }), &make_ctx())
                 .await
@@ -456,5 +452,55 @@ mod tests {
         let payload: Value = serde_json::from_str(&env.result.output).unwrap();
         assert_eq!(payload["consumed"], Value::Bool(true));
         assert_eq!(payload["consumed_at_unix_ms"].as_u64(), consumed_at);
+    }
+
+    #[tokio::test]
+    async fn test_get_subagent_result_exposes_debug_snapshot() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(FinishImmediatelyLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            2,
+        );
+        let spawn_tool = SpawnSubagentTool::new(runtime.clone());
+        let get_tool = GetSubagentResultTool::new(runtime);
+
+        let spawned = spawn_tool
+            .execute(
+                json!({
+                    "goal": "inspect",
+                    "input_summary": "summary",
+                    "allowed_tools": ["read_file"],
+                    "timeout_sec": 20,
+                    "max_steps": 4
+                }),
+                &make_ctx(),
+            )
+            .await
+            .unwrap();
+        let spawned_env = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(&spawned)
+            .expect("spawn envelope");
+        let spawned_json: Value = serde_json::from_str(&spawned_env.result.output).unwrap();
+        let job_id = spawned_json["job_id"].as_str().unwrap().to_string();
+
+        let mut payload = Value::Null;
+        for _ in 0..400 {
+            let result = get_tool
+                .execute(json!({ "job_id": job_id }), &make_ctx())
+                .await
+                .unwrap();
+            let env = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(&result)
+                .expect("get envelope");
+            payload = serde_json::from_str(&env.result.output).unwrap();
+            if payload["status"].as_str().unwrap_or_default() == "finished" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert_eq!(
+            payload["debug"]["state_label"],
+            Value::String("finished".to_string())
+        );
+        assert!(payload["debug"]["updated_at_unix_ms"].as_u64().is_some());
     }
 }

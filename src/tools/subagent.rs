@@ -104,6 +104,9 @@ impl Tool for DispatchSubagentTool {
             &parsed.allowed_tools,
             max_steps,
             &parsed.input_summary,
+            std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::subagent_runtime::SubagentDebugSnapshot::default(),
+            )),
             cancelled,
             cancel_notify,
         )

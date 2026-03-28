@@ -7,6 +7,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 
 use super::protocol::{create_standard_client, LlmClient, LlmError, StreamEvent};
 use crate::utils::{format_full_error, truncate_log, truncate_log_error};
@@ -246,175 +247,179 @@ impl LlmClient for OpenAiCompatClient {
         let api_key = self.api_key.clone();
         let base_url = self.base_url.clone();
 
-        tokio::spawn(async move {
-            let mut attempts = 0;
-            let max_attempts = 5;
+        tokio::spawn(
+            async move {
+                let mut attempts = 0;
+                let max_attempts = 5;
 
-            let resp = loop {
-                attempts += 1;
-                let body_json_string = serde_json::to_string(&body_map).unwrap_or_default();
+                let resp = loop {
+                    attempts += 1;
+                    let body_json_string = serde_json::to_string(&body_map).unwrap_or_default();
 
-                tracing::info!(
-                    "Sending stream request to {} (Attempt {}/{}, body_size={} bytes)",
-                    base_url,
-                    attempts,
-                    max_attempts,
-                    body_json_string.len()
-                );
-                tracing::debug!("OpenAI stream body: {}", truncate_log(&body_json_string));
+                    tracing::info!(
+                        "Sending stream request to {} (Attempt {}/{}, body_size={} bytes)",
+                        base_url,
+                        attempts,
+                        max_attempts,
+                        body_json_string.len()
+                    );
+                    tracing::debug!("OpenAI stream body: {}", truncate_log(&body_json_string));
 
-                let req_result = client
-                    .post(&base_url)
-                    .header(AUTHORIZATION, format!("Bearer {}", api_key))
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(body_json_string)
-                    .send()
-                    .await;
+                    let req_result = client
+                        .post(&base_url)
+                        .header(AUTHORIZATION, format!("Bearer {}", api_key))
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body_json_string)
+                        .send()
+                        .await;
 
-                match req_result {
-                    Ok(r) if r.status().is_success() => break r,
-                    Ok(r) => {
-                        let status = r.status();
-                        let is_transient = status.is_server_error() || status.as_u16() == 429;
-                        let body = r.text().await.unwrap_or_default();
-                        let last_error =
-                            format!("status={} body={}", status, truncate_log_error(&body));
+                    match req_result {
+                        Ok(r) if r.status().is_success() => break r,
+                        Ok(r) => {
+                            let status = r.status();
+                            let is_transient = status.is_server_error() || status.as_u16() == 429;
+                            let body = r.text().await.unwrap_or_default();
+                            let last_error =
+                                format!("status={} body={}", status, truncate_log_error(&body));
 
-                        tracing::warn!(
-                            "OpenAI Stream API Error (Attempt {}/{}): {}",
-                            attempts,
-                            max_attempts,
-                            last_error
-                        );
+                            tracing::warn!(
+                                "OpenAI Stream API Error (Attempt {}/{}): {}",
+                                attempts,
+                                max_attempts,
+                                last_error
+                            );
 
-                        if !is_transient || attempts >= max_attempts {
-                            let _ = tx
-                                .send(StreamEvent::Error(format!(
-                                    "OpenAI API error after {} attempts: {}",
-                                    attempts, last_error
-                                )))
-                                .await;
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        let last_error = format_full_error(&e);
-                        tracing::warn!(
-                            "OpenAI Network Error (Attempt {}/{}):\n{}",
-                            attempts,
-                            max_attempts,
-                            last_error
-                        );
-
-                        if attempts >= max_attempts {
-                            let _ = tx
-                                .send(StreamEvent::Error(format!(
-                                    "OpenAI network error after {} attempts: {}",
-                                    attempts, last_error
-                                )))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-
-                let backoff = std::time::Duration::from_secs(1 << (attempts - 1));
-                tracing::info!("Transient error detected. Retrying in {:?}...", backoff);
-                tokio::time::sleep(backoff).await;
-            };
-
-            let mut stream = resp.bytes_stream();
-            let mut buffer = String::new();
-            let mut active_tools: std::collections::HashMap<
-                usize,
-                (String, String, Option<String>),
-            > = std::collections::HashMap::new();
-            let mut index_map: std::collections::HashMap<usize, usize> =
-                std::collections::HashMap::new();
-
-            while let Some(chunk_res) = stream.next().await {
-                match chunk_res {
-                    Ok(chunk) => {
-                        let chunk_str = String::from_utf8_lossy(&chunk);
-                        tracing::debug!("Received OpenAI streaming chunk: {}", chunk_str);
-                        buffer.push_str(&chunk_str);
-
-                        while let Some(idx) = buffer.find('\n') {
-                            let line = buffer[..idx].trim().to_string();
-                            buffer = buffer[idx + 1..].to_string();
-
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                if data == "[DONE]" {
-                                    tracing::debug!("OpenAI stream received [DONE]");
-                                    continue;
-                                }
-                                if let Ok(json) = serde_json::from_str::<Value>(data) {
-                                    OpenAiCompatClient::process_delta_json(
-                                        json,
-                                        &tx,
-                                        &mut active_tools,
-                                        &mut index_map,
-                                    )
+                            if !is_transient || attempts >= max_attempts {
+                                let _ = tx
+                                    .send(StreamEvent::Error(format!(
+                                        "OpenAI API error after {} attempts: {}",
+                                        attempts, last_error
+                                    )))
                                     .await;
-                                }
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let last_error = format_full_error(&e);
+                            tracing::warn!(
+                                "OpenAI Network Error (Attempt {}/{}):\n{}",
+                                attempts,
+                                max_attempts,
+                                last_error
+                            );
+
+                            if attempts >= max_attempts {
+                                let _ = tx
+                                    .send(StreamEvent::Error(format!(
+                                        "OpenAI network error after {} attempts: {}",
+                                        attempts, last_error
+                                    )))
+                                    .await;
+                                return;
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("OpenAI stream read error: {}", e);
-                        let _ = tx
-                            .send(StreamEvent::Error(format!("Stream read error: {}", e)))
-                            .await;
-                        return;
-                    }
-                }
-            }
 
-            if !buffer.trim().is_empty() {
-                let line = buffer.trim();
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data != "[DONE]" {
-                        if let Ok(json) = serde_json::from_str::<Value>(data) {
-                            OpenAiCompatClient::process_delta_json(
-                                json,
-                                &tx,
-                                &mut active_tools,
-                                &mut index_map,
-                            )
-                            .await;
+                    let backoff = std::time::Duration::from_secs(1 << (attempts - 1));
+                    tracing::info!("Transient error detected. Retrying in {:?}...", backoff);
+                    tokio::time::sleep(backoff).await;
+                };
+
+                let mut stream = resp.bytes_stream();
+                let mut buffer = String::new();
+                let mut active_tools: std::collections::HashMap<
+                    usize,
+                    (String, String, Option<String>),
+                > = std::collections::HashMap::new();
+                let mut index_map: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+
+                while let Some(chunk_res) = stream.next().await {
+                    match chunk_res {
+                        Ok(chunk) => {
+                            let chunk_str = String::from_utf8_lossy(&chunk);
+                            tracing::debug!("Received OpenAI streaming chunk: {}", chunk_str);
+                            buffer.push_str(&chunk_str);
+
+                            while let Some(idx) = buffer.find('\n') {
+                                let line = buffer[..idx].trim().to_string();
+                                buffer = buffer[idx + 1..].to_string();
+
+                                if let Some(data) = line.strip_prefix("data: ") {
+                                    if data == "[DONE]" {
+                                        tracing::debug!("OpenAI stream received [DONE]");
+                                        continue;
+                                    }
+                                    if let Ok(json) = serde_json::from_str::<Value>(data) {
+                                        OpenAiCompatClient::process_delta_json(
+                                            json,
+                                            &tx,
+                                            &mut active_tools,
+                                            &mut index_map,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("OpenAI stream read error: {}", e);
+                            let _ = tx
+                                .send(StreamEvent::Error(format!("Stream read error: {}", e)))
+                                .await;
+                            return;
                         }
                     }
                 }
-            }
 
-            let mut tool_indices: Vec<usize> = active_tools.keys().cloned().collect();
-            tool_indices.sort_unstable();
-            for idx in tool_indices {
-                if let Some((name, args_str, id)) = active_tools.remove(&idx) {
-                    if !name.trim().is_empty() {
-                        let args = if args_str.trim().is_empty() {
-                            serde_json::Value::Object(serde_json::Map::new())
-                        } else {
-                            serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
-                        };
-                        let final_id =
-                            id.or_else(|| Some(format!("call_{}", uuid::Uuid::new_v4().simple())));
-                        let _ = tx
-                            .send(StreamEvent::ToolCall(
-                                FunctionCall {
-                                    name,
-                                    args,
-                                    id: final_id,
-                                },
-                                None,
-                            ))
-                            .await;
+                if !buffer.trim().is_empty() {
+                    let line = buffer.trim();
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data != "[DONE]" {
+                            if let Ok(json) = serde_json::from_str::<Value>(data) {
+                                OpenAiCompatClient::process_delta_json(
+                                    json,
+                                    &tx,
+                                    &mut active_tools,
+                                    &mut index_map,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
-            }
 
-            let _ = tx.send(StreamEvent::Done).await;
-        });
+                let mut tool_indices: Vec<usize> = active_tools.keys().cloned().collect();
+                tool_indices.sort_unstable();
+                for idx in tool_indices {
+                    if let Some((name, args_str, id)) = active_tools.remove(&idx) {
+                        if !name.trim().is_empty() {
+                            let args = if args_str.trim().is_empty() {
+                                serde_json::Value::Object(serde_json::Map::new())
+                            } else {
+                                serde_json::from_str(&args_str).unwrap_or(serde_json::Value::Null)
+                            };
+                            let final_id = id.or_else(|| {
+                                Some(format!("call_{}", uuid::Uuid::new_v4().simple()))
+                            });
+                            let _ = tx
+                                .send(StreamEvent::ToolCall(
+                                    FunctionCall {
+                                        name,
+                                        args,
+                                        id: final_id,
+                                    },
+                                    None,
+                                ))
+                                .await;
+                        }
+                    }
+                }
+
+                let _ = tx.send(StreamEvent::Done).await;
+            }
+            .in_current_span(),
+        );
         Ok(rx)
     }
 }

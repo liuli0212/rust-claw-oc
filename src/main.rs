@@ -4,7 +4,6 @@ mod app;
 #[cfg(test)]
 mod browser;
 mod context_assembler;
-#[cfg(test)]
 mod event_log;
 mod evidence;
 mod lsp_client;

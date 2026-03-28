@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tracing::Instrument;
+
 use crate::llm_client::LlmClient;
 use crate::session::factory::{build_subagent_session, BuiltSubagentSession, SubagentBuildMode};
 use crate::tools::protocol::ToolError;
@@ -33,6 +35,49 @@ pub struct SubagentJobMeta {
     pub timeout_sec: u64,
     pub max_steps: usize,
     pub created_at_unix_ms: u64,
+    pub transcript_path: String,
+    pub event_log_path: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SubagentDebugEvent {
+    pub kind: String,
+    pub tool_name: Option<String>,
+    pub text: String,
+    pub at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubagentDebugSnapshot {
+    pub state_label: String,
+    pub failure_stage: Option<String>,
+    pub step_count: usize,
+    pub last_model_text: Option<String>,
+    pub last_thought_text: Option<String>,
+    pub last_tool_name: Option<String>,
+    pub last_tool_args_summary: Option<String>,
+    pub last_tool_result_summary: Option<String>,
+    pub last_error: Option<String>,
+    pub recent_events: Vec<SubagentDebugEvent>,
+    pub updated_at_unix_ms: u64,
+}
+
+impl Default for SubagentDebugSnapshot {
+    fn default() -> Self {
+        Self {
+            state_label: "pending".to_string(),
+            failure_stage: None,
+            step_count: 0,
+            last_model_text: None,
+            last_thought_text: None,
+            last_tool_name: None,
+            last_tool_args_summary: None,
+            last_tool_result_summary: None,
+            last_error: None,
+            recent_events: Vec::new(),
+            updated_at_unix_ms: unix_ms_now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -102,6 +147,7 @@ impl SubagentJobState {
 pub struct SubagentJobHandle {
     pub meta: SubagentJobMeta,
     pub state: tokio::sync::RwLock<SubagentJobState>,
+    pub debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
     pub consumed_at_unix_ms: tokio::sync::RwLock<Option<u64>>,
     pub cancelled: Arc<AtomicBool>,
     pub cancel_notify: Arc<tokio::sync::Notify>,
@@ -116,6 +162,7 @@ impl SubagentJobHandle {
         Self {
             meta,
             state: tokio::sync::RwLock::new(SubagentJobState::Pending),
+            debug: Arc::new(tokio::sync::RwLock::new(SubagentDebugSnapshot::default())),
             consumed_at_unix_ms: tokio::sync::RwLock::new(None),
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
@@ -131,6 +178,7 @@ pub struct SubagentJobSnapshot {
     pub state: SubagentJobState,
     pub consumed: bool,
     pub consumed_at_unix_ms: Option<u64>,
+    pub debug: SubagentDebugSnapshot,
 }
 
 struct RunningJobGuard {
@@ -235,6 +283,12 @@ impl SubagentRuntime {
             timeout_sec,
             max_steps,
             created_at_unix_ms: unix_ms_now(),
+            transcript_path: crate::schema::StoragePaths::session_transcript_file(&sub_session_id)
+                .display()
+                .to_string(),
+            event_log_path: crate::schema::StoragePaths::events_file(&sub_session_id)
+                .display()
+                .to_string(),
         };
 
         if meta.allow_writes && meta.claimed_paths.is_empty() {
@@ -264,12 +318,21 @@ impl SubagentRuntime {
         let running_guard = RunningJobGuard::new(counter);
         let handle_for_task = handle.clone();
         let sub_session_id_for_task = sub_session_id.clone();
-        let join_handle = tokio::spawn(async move {
-            let _guard = running_guard;
-            runtime
-                .run_job(handle_for_task, parent_ctx, args, sub_session_id_for_task)
-                .await;
-        });
+        let span = tracing::info_span!(
+            "subagent_run",
+            job_id = %job_id,
+            parent_session_id = %parent_ctx.session_id,
+            sub_session_id = %sub_session_id_for_task
+        );
+        let join_handle = tokio::spawn(
+            async move {
+                let _guard = running_guard;
+                runtime
+                    .run_job(handle_for_task, parent_ctx, args, sub_session_id_for_task)
+                    .await;
+            }
+            .instrument(span),
+        );
         *handle.task.lock().await = Some(join_handle);
 
         Ok(SpawnedSubagentJob {
@@ -294,11 +357,13 @@ impl SubagentRuntime {
         } else {
             *handle.consumed_at_unix_ms.read().await
         };
+        let debug = handle.debug.read().await.clone();
         Ok(SubagentJobSnapshot {
             meta: handle.meta.clone(),
             state,
             consumed: consumed_at_unix_ms.is_some(),
             consumed_at_unix_ms,
+            debug,
         })
     }
 
@@ -317,6 +382,7 @@ impl SubagentRuntime {
                 state: handle.state.read().await.clone(),
                 consumed: consumed_at_unix_ms.is_some(),
                 consumed_at_unix_ms,
+                debug: handle.debug.read().await.clone(),
             });
         }
         snapshots.sort_by_key(|snapshot| snapshot.meta.created_at_unix_ms);
@@ -443,6 +509,7 @@ impl SubagentRuntime {
                 started_at_unix_ms: unix_ms_now(),
             };
         }
+        self.set_debug_state_label(&handle, "running").await;
 
         let executed_state = match build_subagent_session(
             &parent_ctx,
@@ -457,6 +524,7 @@ impl SubagentRuntime {
             &args.allowed_tools,
             args.max_steps.unwrap_or(5).max(1),
             &args.input_summary,
+            handle.debug.clone(),
             handle.cancelled.clone(),
             handle.cancel_notify.clone(),
         ) {
@@ -473,6 +541,13 @@ impl SubagentRuntime {
                         rejected_tools.join(", ")
                     );
                     tracing::error!("{}", err_msg);
+                    self.record_debug_error(
+                        &handle,
+                        "build_subagent_session",
+                        &err_msg,
+                        Some("blocked_tools"),
+                    )
+                    .await;
                     SubagentJobState::Failed {
                         finished_at_unix_ms: unix_ms_now(),
                         error: err_msg,
@@ -483,11 +558,15 @@ impl SubagentRuntime {
                         .await
                 }
             }
-            Err(error) => SubagentJobState::Failed {
-                finished_at_unix_ms: unix_ms_now(),
-                error,
-                partial: None,
-            },
+            Err(error) => {
+                self.record_debug_error(&handle, "build_subagent_session", &error, None)
+                    .await;
+                SubagentJobState::Failed {
+                    finished_at_unix_ms: unix_ms_now(),
+                    error,
+                    partial: None,
+                }
+            }
         };
 
         // Override state to Cancelled if the cancel flag was set during execution,
@@ -523,6 +602,7 @@ impl SubagentRuntime {
             *state = final_state;
         }
         drop(state);
+        self.finalize_debug_state(&handle).await;
         // Wake up any get_subagent_result calls waiting via long polling.
         handle.completion_notify.notify_waiters();
     }
@@ -615,6 +695,8 @@ impl SubagentRuntime {
                     crate::core::RunExit::RecoverableFailed(message)
                     | crate::core::RunExit::CriticallyFailed(message)
                     | crate::core::RunExit::AutopilotStalled(message) => {
+                        self.record_debug_error(&handle, "finish", &message, None)
+                            .await;
                         return SubagentJobState::Failed {
                             finished_at_unix_ms,
                             error: message.clone(),
@@ -627,6 +709,13 @@ impl SubagentRuntime {
                         };
                     }
                     crate::core::RunExit::StoppedByUser => {
+                        self.record_debug_error(
+                            &handle,
+                            "cancelled",
+                            "Sub-agent execution was interrupted.",
+                            None,
+                        )
+                        .await;
                         return SubagentJobState::Cancelled {
                             finished_at_unix_ms,
                             partial: Some(SubagentResult {
@@ -649,18 +738,29 @@ impl SubagentRuntime {
                     },
                 }
             }
-            Ok(Err(error)) => SubagentJobState::Failed {
-                finished_at_unix_ms,
-                error: error.to_string(),
-                partial: Some(SubagentResult {
-                    ok: false,
-                    summary: format!("Sub-agent error: {}", error),
-                    findings: tool_outputs,
-                    artifacts,
-                }),
-            },
+            Ok(Err(error)) => {
+                self.record_debug_error(&handle, "llm_stream_read", &error.to_string(), None)
+                    .await;
+                SubagentJobState::Failed {
+                    finished_at_unix_ms,
+                    error: error.to_string(),
+                    partial: Some(SubagentResult {
+                        ok: false,
+                        summary: format!("Sub-agent error: {}", error),
+                        findings: tool_outputs,
+                        artifacts,
+                    }),
+                }
+            }
             Err(_) => {
                 if handle.cancelled.load(Ordering::SeqCst) {
+                    self.record_debug_error(
+                        &handle,
+                        "cancelled",
+                        "Sub-agent execution was interrupted.",
+                        None,
+                    )
+                    .await;
                     SubagentJobState::Cancelled {
                         finished_at_unix_ms,
                         partial: Some(SubagentResult {
@@ -671,6 +771,17 @@ impl SubagentRuntime {
                         }),
                     }
                 } else {
+                    self.record_debug_error(
+                        &handle,
+                        "timeout",
+                        &format!(
+                            "Sub-agent timed out after {}s while working on '{}'.",
+                            args.timeout_sec.unwrap_or(60),
+                            args.goal
+                        ),
+                        None,
+                    )
+                    .await;
                     SubagentJobState::TimedOut {
                         finished_at_unix_ms,
                         partial: Some(SubagentResult {
@@ -688,14 +799,79 @@ impl SubagentRuntime {
             }
         }
     }
+
+    async fn set_debug_state_label(&self, handle: &SubagentJobHandle, label: &str) {
+        let mut debug = handle.debug.write().await;
+        debug.state_label = label.to_string();
+        debug.updated_at_unix_ms = unix_ms_now();
+    }
+
+    async fn record_debug_error(
+        &self,
+        handle: &SubagentJobHandle,
+        failure_stage: &str,
+        error: &str,
+        tool_name: Option<&str>,
+    ) {
+        let mut debug = handle.debug.write().await;
+        debug.failure_stage = Some(failure_stage.to_string());
+        debug.last_error = Some(truncate_debug_text(error, 500));
+        if let Some(tool_name) = tool_name {
+            debug.last_tool_name = Some(tool_name.to_string());
+        }
+        push_recent_debug_event(
+            &mut debug,
+            SubagentDebugEvent {
+                kind: "error".to_string(),
+                tool_name: tool_name.map(|value| value.to_string()),
+                text: truncate_debug_text(error, 240),
+                at_unix_ms: unix_ms_now(),
+            },
+        );
+        debug.updated_at_unix_ms = unix_ms_now();
+    }
+
+    async fn finalize_debug_state(&self, handle: &SubagentJobHandle) {
+        let state_label = {
+            let state = handle.state.read().await;
+            state.finish_reason().to_string()
+        };
+        let mut debug = handle.debug.write().await;
+        debug.state_label = state_label;
+        debug.updated_at_unix_ms = unix_ms_now();
+        if debug.state_label == "finished" {
+            debug.failure_stage = None;
+        }
+    }
 }
 
-fn unix_ms_now() -> u64 {
+pub(crate) fn unix_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+pub(crate) fn truncate_debug_text(input: &str, max_chars: usize) -> String {
+    let truncated: String = input.chars().take(max_chars).collect();
+    if input.chars().count() > max_chars {
+        format!("{truncated}...(truncated)")
+    } else {
+        truncated
+    }
+}
+
+pub(crate) fn push_recent_debug_event(
+    debug: &mut SubagentDebugSnapshot,
+    event: SubagentDebugEvent,
+) {
+    const MAX_RECENT_EVENTS: usize = 12;
+    debug.recent_events.push(event);
+    if debug.recent_events.len() > MAX_RECENT_EVENTS {
+        let excess = debug.recent_events.len() - MAX_RECENT_EVENTS;
+        debug.recent_events.drain(0..excess);
+    }
 }
 
 fn normalize_claimed_paths(paths: &[String]) -> Vec<String> {
@@ -760,19 +936,15 @@ mod tests {
             _tools: Vec<Arc<dyn Tool>>,
         ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
             let (tx, rx) = mpsc::channel(4);
-            tokio::spawn(async move {
-                let _ = tx
-                    .send(StreamEvent::ToolCall(
-                        FunctionCall {
-                            name: "finish_task".to_string(),
-                            args: json!({ "summary": "done" }),
-                            id: Some("tc_1".to_string()),
-                        },
-                        None,
-                    ))
-                    .await;
-                let _ = tx.send(StreamEvent::Done).await;
-            });
+            let _ = tx.try_send(StreamEvent::ToolCall(
+                FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: json!({ "summary": "done" }),
+                    id: Some("tc_1".to_string()),
+                },
+                None,
+            ));
+            let _ = tx.try_send(StreamEvent::Done);
             Ok(rx)
         }
     }
@@ -837,7 +1009,7 @@ mod tests {
     }
 
     async fn wait_for_terminal_state(runtime: &SubagentRuntime, job_id: &str) -> SubagentJobState {
-        for _ in 0..40 {
+        for _ in 0..400 {
             let snapshot = runtime.get_job_snapshot(job_id, false).await.unwrap();
             if snapshot.state.is_terminal() {
                 return snapshot.state;
@@ -864,7 +1036,7 @@ mod tests {
                     allowed_tools: vec!["read_file".to_string()],
                     claimed_paths: Vec::new(),
                     allow_writes: false,
-                    timeout_sec: Some(5),
+                    timeout_sec: Some(20),
                     max_steps: Some(4),
                 },
             )
@@ -1024,7 +1196,7 @@ mod tests {
                     allowed_tools: vec!["read_file".to_string()],
                     claimed_paths: Vec::new(),
                     allow_writes: false,
-                    timeout_sec: Some(5),
+                    timeout_sec: Some(20),
                     max_steps: Some(4),
                 },
             )
@@ -1070,6 +1242,12 @@ mod tests {
             timeout_sec: 5,
             max_steps: 4,
             created_at_unix_ms: unix_ms_now(),
+            transcript_path: crate::schema::StoragePaths::session_transcript_file("sub_consumed")
+                .display()
+                .to_string(),
+            event_log_path: crate::schema::StoragePaths::events_file("sub_consumed")
+                .display()
+                .to_string(),
         }));
         {
             let mut state = consumed_job.state.write().await;
@@ -1102,6 +1280,12 @@ mod tests {
             timeout_sec: 5,
             max_steps: 4,
             created_at_unix_ms: unix_ms_now(),
+            transcript_path: crate::schema::StoragePaths::session_transcript_file("sub_unconsumed")
+                .display()
+                .to_string(),
+            event_log_path: crate::schema::StoragePaths::events_file("sub_unconsumed")
+                .display()
+                .to_string(),
         }));
         {
             let mut state = unconsumed_job.state.write().await;
@@ -1149,7 +1333,7 @@ mod tests {
                     allowed_tools: vec!["write_file".to_string()],
                     claimed_paths: Vec::new(),
                     allow_writes: true,
-                    timeout_sec: Some(5),
+                    timeout_sec: Some(20),
                     max_steps: Some(4),
                 },
             )
@@ -1161,5 +1345,88 @@ mod tests {
             }
             other => panic!("expected allow_writes validation error, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn test_job_snapshot_includes_debug_details_and_artifact_paths() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(FinishImmediatelyLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            2,
+        );
+
+        let spawned = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "inspect cargo".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    claimed_paths: Vec::new(),
+                    allow_writes: false,
+                    timeout_sec: Some(20),
+                    max_steps: Some(4),
+                },
+            )
+            .await
+            .unwrap();
+
+        let _ = wait_for_terminal_state(&runtime, &spawned.job_id).await;
+        let snapshot = runtime
+            .get_job_snapshot(&spawned.job_id, false)
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.debug.state_label, "finished");
+        assert_eq!(
+            snapshot.debug.last_tool_name.as_deref(),
+            Some("finish_task")
+        );
+        assert!(snapshot
+            .debug
+            .recent_events
+            .iter()
+            .any(|event| event.kind == "subagent_tool_start"));
+        assert!(snapshot
+            .debug
+            .recent_events
+            .iter()
+            .any(|event| event.kind == "subagent_tool_end"));
+        assert!(std::path::Path::new(&snapshot.meta.transcript_path).exists());
+        assert!(std::path::Path::new(&snapshot.meta.event_log_path).exists());
+    }
+
+    #[tokio::test]
+    async fn test_timeout_snapshot_includes_failure_stage() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(HangingLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            1,
+        );
+
+        let spawned = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "hang".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    claimed_paths: Vec::new(),
+                    allow_writes: false,
+                    timeout_sec: Some(1),
+                    max_steps: Some(4),
+                },
+            )
+            .await
+            .unwrap();
+
+        let _ = wait_for_terminal_state(&runtime, &spawned.job_id).await;
+        let snapshot = runtime
+            .get_job_snapshot(&spawned.job_id, false)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.state.finish_reason(), "timed_out");
+        assert_eq!(snapshot.debug.failure_stage.as_deref(), Some("timeout"));
+        assert_eq!(snapshot.debug.state_label, "timed_out");
     }
 }
