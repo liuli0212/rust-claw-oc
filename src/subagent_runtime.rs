@@ -9,7 +9,8 @@ use crate::tools::protocol::ToolError;
 use crate::tools::subagent::{DispatchSubagentArgs, SubagentResult};
 use crate::tools::{Tool, ToolContext};
 
-const TERMINAL_JOB_TTL: Duration = Duration::from_secs(30 * 60);
+const UNCONSUMED_TERMINAL_JOB_TTL: Duration = Duration::from_secs(30 * 60);
+const CONSUMED_TERMINAL_JOB_TTL: Duration = Duration::from_secs(5 * 60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
@@ -100,6 +101,7 @@ impl SubagentJobState {
 pub struct SubagentJobHandle {
     pub meta: SubagentJobMeta,
     pub state: tokio::sync::RwLock<SubagentJobState>,
+    pub consumed_at_unix_ms: tokio::sync::RwLock<Option<u64>>,
     pub cancelled: Arc<AtomicBool>,
     pub cancel_notify: Arc<tokio::sync::Notify>,
     pub created_at: Instant,
@@ -111,6 +113,7 @@ impl SubagentJobHandle {
         Self {
             meta,
             state: tokio::sync::RwLock::new(SubagentJobState::Pending),
+            consumed_at_unix_ms: tokio::sync::RwLock::new(None),
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
             created_at: Instant::now(),
@@ -123,6 +126,8 @@ impl SubagentJobHandle {
 pub struct SubagentJobSnapshot {
     pub meta: SubagentJobMeta,
     pub state: SubagentJobState,
+    pub consumed: bool,
+    pub consumed_at_unix_ms: Option<u64>,
 }
 
 struct RunningJobGuard {
@@ -262,18 +267,32 @@ impl SubagentRuntime {
         })
     }
 
-    pub async fn get_job_snapshot(&self, job_id: &str) -> Result<SubagentJobSnapshot, ToolError> {
+    pub async fn get_job_snapshot(
+        &self,
+        job_id: &str,
+        consume: bool,
+    ) -> Result<SubagentJobSnapshot, ToolError> {
+        self.cleanup_expired_jobs().await;
         let handle = self.get_job_handle(job_id).await.ok_or_else(|| {
             ToolError::ExecutionFailed(format!("Unknown subagent job: {}", job_id))
         })?;
         let state = handle.state.read().await.clone();
+        let consumed_at_unix_ms = if consume && state.is_terminal() {
+            let mut consumed_at = handle.consumed_at_unix_ms.write().await;
+            Some(*consumed_at.get_or_insert_with(unix_ms_now))
+        } else {
+            *handle.consumed_at_unix_ms.read().await
+        };
         Ok(SubagentJobSnapshot {
             meta: handle.meta.clone(),
             state,
+            consumed: consumed_at_unix_ms.is_some(),
+            consumed_at_unix_ms,
         })
     }
 
     pub async fn list_jobs(&self) -> Vec<SubagentJobSnapshot> {
+        self.cleanup_expired_jobs().await;
         let handles: Vec<Arc<SubagentJobHandle>> = {
             let jobs = self.inner.jobs.read().await;
             jobs.values().cloned().collect()
@@ -281,9 +300,12 @@ impl SubagentRuntime {
 
         let mut snapshots = Vec::with_capacity(handles.len());
         for handle in handles {
+            let consumed_at_unix_ms = *handle.consumed_at_unix_ms.read().await;
             snapshots.push(SubagentJobSnapshot {
                 meta: handle.meta.clone(),
                 state: handle.state.read().await.clone(),
+                consumed: consumed_at_unix_ms.is_some(),
+                consumed_at_unix_ms,
             });
         }
         snapshots.sort_by_key(|snapshot| snapshot.meta.created_at_unix_ms);
@@ -296,6 +318,7 @@ impl SubagentRuntime {
     }
 
     pub async fn cancel_job(&self, job_id: &str) -> Result<(), ToolError> {
+        self.cleanup_expired_jobs().await;
         let handle = self.get_job_handle(job_id).await.ok_or_else(|| {
             ToolError::ExecutionFailed(format!("Unknown subagent job: {}", job_id))
         })?;
@@ -328,8 +351,18 @@ impl SubagentRuntime {
                 .filter_map(|(job_id, handle)| {
                     let state = handle.state.try_read().ok()?;
                     let finished_at = state.finished_at_unix_ms()?;
+                    let consumed_at_unix_ms = handle
+                        .consumed_at_unix_ms
+                        .try_read()
+                        .ok()
+                        .and_then(|value| *value);
                     let age_ms = unix_ms_now().saturating_sub(finished_at);
-                    if age_ms >= TERMINAL_JOB_TTL.as_millis() as u64 {
+                    let ttl = if consumed_at_unix_ms.is_some() {
+                        CONSUMED_TERMINAL_JOB_TTL
+                    } else {
+                        UNCONSUMED_TERMINAL_JOB_TTL
+                    };
+                    if age_ms >= ttl.as_millis() as u64 {
                         Some(job_id.clone())
                     } else {
                         None
@@ -736,7 +769,7 @@ mod tests {
 
     async fn wait_for_terminal_state(runtime: &SubagentRuntime, job_id: &str) -> SubagentJobState {
         for _ in 0..40 {
-            let snapshot = runtime.get_job_snapshot(job_id).await.unwrap();
+            let snapshot = runtime.get_job_snapshot(job_id, false).await.unwrap();
             if snapshot.state.is_terminal() {
                 return snapshot.state;
             }
@@ -897,5 +930,124 @@ mod tests {
 
         runtime.cancel_job(&first.job_id).await.unwrap();
         let _ = wait_for_terminal_state(&runtime, &first.job_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_get_job_snapshot_can_mark_terminal_job_consumed() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(FinishImmediatelyLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            2,
+        );
+
+        let spawned = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "inspect".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    claimed_paths: Vec::new(),
+                    timeout_sec: Some(5),
+                    max_steps: Some(4),
+                },
+            )
+            .await
+            .unwrap();
+
+        let _ = wait_for_terminal_state(&runtime, &spawned.job_id).await;
+        let first_snapshot = runtime
+            .get_job_snapshot(&spawned.job_id, true)
+            .await
+            .unwrap();
+        let second_snapshot = runtime
+            .get_job_snapshot(&spawned.job_id, false)
+            .await
+            .unwrap();
+
+        assert!(first_snapshot.consumed);
+        assert!(first_snapshot.consumed_at_unix_ms.is_some());
+        assert_eq!(
+            first_snapshot.consumed_at_unix_ms,
+            second_snapshot.consumed_at_unix_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_jobs_uses_consumed_ttl() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(FinishImmediatelyLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            2,
+        );
+
+        let consumed_job = Arc::new(SubagentJobHandle::new(SubagentJobMeta {
+            job_id: "consumed".to_string(),
+            parent_session_id: "parent".to_string(),
+            parent_reply_to: "cli".to_string(),
+            sub_session_id: "sub_consumed".to_string(),
+            goal: "inspect".to_string(),
+            input_summary: "summary".to_string(),
+            allowed_tools: vec!["read_file".to_string()],
+            claimed_paths: Vec::new(),
+            timeout_sec: 5,
+            max_steps: 4,
+            created_at_unix_ms: unix_ms_now(),
+        }));
+        {
+            let mut state = consumed_job.state.write().await;
+            *state = SubagentJobState::Completed {
+                finished_at_unix_ms: unix_ms_now()
+                    .saturating_sub(CONSUMED_TERMINAL_JOB_TTL.as_millis() as u64 + 1),
+                result: SubagentResult {
+                    ok: true,
+                    summary: "done".to_string(),
+                    findings: Vec::new(),
+                    artifacts: Vec::new(),
+                },
+            };
+        }
+        {
+            let mut consumed_at = consumed_job.consumed_at_unix_ms.write().await;
+            *consumed_at = Some(unix_ms_now());
+        }
+
+        let unconsumed_job = Arc::new(SubagentJobHandle::new(SubagentJobMeta {
+            job_id: "unconsumed".to_string(),
+            parent_session_id: "parent".to_string(),
+            parent_reply_to: "cli".to_string(),
+            sub_session_id: "sub_unconsumed".to_string(),
+            goal: "inspect".to_string(),
+            input_summary: "summary".to_string(),
+            allowed_tools: vec!["read_file".to_string()],
+            claimed_paths: Vec::new(),
+            timeout_sec: 5,
+            max_steps: 4,
+            created_at_unix_ms: unix_ms_now(),
+        }));
+        {
+            let mut state = unconsumed_job.state.write().await;
+            *state = SubagentJobState::Completed {
+                finished_at_unix_ms: unix_ms_now()
+                    .saturating_sub(CONSUMED_TERMINAL_JOB_TTL.as_millis() as u64 + 1),
+                result: SubagentResult {
+                    ok: true,
+                    summary: "done".to_string(),
+                    findings: Vec::new(),
+                    artifacts: Vec::new(),
+                },
+            };
+        }
+
+        {
+            let mut jobs = runtime.inner.jobs.write().await;
+            jobs.insert("consumed".to_string(), consumed_job);
+            jobs.insert("unconsumed".to_string(), unconsumed_job);
+        }
+
+        runtime.cleanup_expired_jobs().await;
+
+        assert!(runtime.get_job_handle("consumed").await.is_none());
+        assert!(runtime.get_job_handle("unconsumed").await.is_some());
     }
 }

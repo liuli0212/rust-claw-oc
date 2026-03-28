@@ -616,7 +616,7 @@ mod tests {
 
     async fn wait_for_cancelled(runtime: &crate::subagent_runtime::SubagentRuntime, job_id: &str) {
         for _ in 0..40 {
-            let snapshot = runtime.get_job_snapshot(job_id).await.unwrap();
+            let snapshot = runtime.get_job_snapshot(job_id, false).await.unwrap();
             if matches!(
                 snapshot.state,
                 crate::subagent_runtime::SubagentJobState::Cancelled { .. }

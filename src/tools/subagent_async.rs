@@ -53,6 +53,13 @@ struct JobIdArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct GetSubagentResultArgs {
+    job_id: String,
+    #[serde(default)]
+    consume: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct EmptyArgs {}
 
 fn serialize_output(tool_name: &str, payload: Value) -> Result<String, ToolError> {
@@ -117,7 +124,7 @@ impl Tool for GetSubagentResultTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        clean_schema(serde_json::to_value(schema_for!(JobIdArgs)).unwrap())
+        clean_schema(serde_json::to_value(schema_for!(GetSubagentResultArgs)).unwrap())
     }
 
     fn has_side_effects(&self) -> bool {
@@ -129,14 +136,19 @@ impl Tool for GetSubagentResultTool {
         args: Value,
         _ctx: &crate::tools::ToolContext,
     ) -> Result<String, ToolError> {
-        let parsed: JobIdArgs =
+        let parsed: GetSubagentResultArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-        let snapshot = self.runtime.get_job_snapshot(&parsed.job_id).await?;
+        let snapshot = self
+            .runtime
+            .get_job_snapshot(&parsed.job_id, parsed.consume)
+            .await?;
         serialize_output(
             "get_subagent_result",
             json!({
                 "job_id": snapshot.meta.job_id,
                 "status": snapshot.state.finish_reason(),
+                "consumed": snapshot.consumed,
+                "consumed_at_unix_ms": snapshot.consumed_at_unix_ms,
                 "state": snapshot.state,
             }),
         )
@@ -350,5 +362,63 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn test_get_subagent_result_can_consume_terminal_job() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(FinishImmediatelyLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            2,
+        );
+        let spawn_tool = SpawnSubagentTool::new(runtime.clone());
+        let get_tool = GetSubagentResultTool::new(runtime);
+
+        let spawned = spawn_tool
+            .execute(
+                json!({
+                    "goal": "inspect",
+                    "input_summary": "summary",
+                    "allowed_tools": ["read_file"],
+                    "timeout_sec": 5,
+                    "max_steps": 4
+                }),
+                &make_ctx(),
+            )
+            .await
+            .unwrap();
+        let spawned_env = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(&spawned)
+            .expect("spawn envelope");
+        let spawned_json: Value = serde_json::from_str(&spawned_env.result.output).unwrap();
+        let job_id = spawned_json["job_id"].as_str().unwrap().to_string();
+
+        let mut consumed_at = None;
+        for _ in 0..40 {
+            let result = get_tool
+                .execute(json!({ "job_id": job_id, "consume": true }), &make_ctx())
+                .await
+                .unwrap();
+            let env = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(&result)
+                .expect("get envelope");
+            let payload: Value = serde_json::from_str(&env.result.output).unwrap();
+            if payload["status"].as_str().unwrap_or_default() == "finished" {
+                assert_eq!(payload["consumed"], Value::Bool(true));
+                consumed_at = payload["consumed_at_unix_ms"].as_u64();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert!(consumed_at.is_some());
+
+        let result = get_tool
+            .execute(json!({ "job_id": job_id }), &make_ctx())
+            .await
+            .unwrap();
+        let env = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(&result)
+            .expect("get envelope");
+        let payload: Value = serde_json::from_str(&env.result.output).unwrap();
+        assert_eq!(payload["consumed"], Value::Bool(true));
+        assert_eq!(payload["consumed_at_unix_ms"].as_u64(), consumed_at);
     }
 }
