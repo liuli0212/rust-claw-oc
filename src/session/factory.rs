@@ -135,7 +135,7 @@ impl crate::core::AgentOutput for CollectorOutput {
     }
 
     async fn on_tool_start(&self, name: &str, args: &str) {
-        tracing::debug!(target: "subagent", "[Sub:{}] → {} {}", self.label, name, &args[..args.len().min(200)]);
+        tracing::debug!(target: "subagent", "[Sub:{}] → {} {}", self.label, name, crate::context::AgentContext::truncate_chars(args, 200));
         {
             let mut debug = self.debug.write().await;
             debug.step_count += 1;
@@ -146,7 +146,7 @@ impl crate::core::AgentOutput for CollectorOutput {
         }
         self.append_event(
             "subagent_tool_start",
-            json!({
+            serde_json::json!({
                 "tool_name": name,
                 "args": crate::subagent_runtime::truncate_debug_text(args, 500),
             }),
@@ -168,7 +168,7 @@ impl crate::core::AgentOutput for CollectorOutput {
     }
 
     async fn on_tool_end(&self, result: &str) {
-        tracing::debug!(target: "subagent", "[Sub:{}] ← {}", self.label, &result[..result.len().min(200)]);
+        tracing::debug!(target: "subagent", "[Sub:{}] ← {}", self.label, crate::context::AgentContext::truncate_chars(result, 200));
         {
             let mut debug = self.debug.write().await;
             debug.last_tool_result_summary =
@@ -187,7 +187,7 @@ impl crate::core::AgentOutput for CollectorOutput {
         )
         .await;
         let truncated = if result.len() > 500 {
-            format!("{}...(truncated)", &result[..500])
+            format!("{}...(truncated)", crate::context::AgentContext::truncate_chars(result, 500))
         } else {
             result.to_string()
         };
