@@ -140,6 +140,7 @@ pub fn build_subagent_session(
     llm: Arc<dyn LlmClient>,
     base_tools: &[Arc<dyn Tool>],
     mode: SubagentBuildMode,
+    sub_session_id: Option<String>,
     allowed_tools: &[String],
     energy_budget: usize,
     input_summary: &str,
@@ -165,11 +166,13 @@ pub fn build_subagent_session(
     context.system_prompts.push(prompt);
     context.max_history_tokens = 100_000;
 
-    let sub_session_id = format!(
-        "sub_{}_{}",
-        parent_ctx.session_id,
-        uuid::Uuid::new_v4().simple()
-    );
+    let sub_session_id = sub_session_id.unwrap_or_else(|| {
+        format!(
+            "sub_{}_{}",
+            parent_ctx.session_id,
+            uuid::Uuid::new_v4().simple()
+        )
+    });
     let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
     let telemetry = Arc::new(telemetry);
     let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(&sub_session_id));

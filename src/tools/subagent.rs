@@ -21,7 +21,7 @@ pub struct DispatchSubagentTool {
     base_tools: Vec<Arc<dyn Tool>>,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DispatchSubagentArgs {
     pub goal: String,
     pub input_summary: String,
@@ -83,6 +83,7 @@ impl Tool for DispatchSubagentTool {
             self.llm.clone(),
             &self.base_tools,
             crate::session::factory::SubagentBuildMode::SyncCompatible,
+            None,
             &parsed.allowed_tools,
             max_steps,
             &parsed.input_summary,

@@ -1,0 +1,701 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::llm_client::LlmClient;
+use crate::session::factory::{build_subagent_session, BuiltSubagentSession, SubagentBuildMode};
+use crate::tools::protocol::ToolError;
+use crate::tools::subagent::{DispatchSubagentArgs, SubagentResult};
+use crate::tools::{Tool, ToolContext};
+
+const TERMINAL_JOB_TTL: Duration = Duration::from_secs(30 * 60);
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Debug, Clone)]
+pub struct SpawnedSubagentJob {
+    pub job_id: String,
+    pub sub_session_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubagentJobMeta {
+    pub job_id: String,
+    pub parent_session_id: String,
+    pub parent_reply_to: String,
+    pub sub_session_id: String,
+    pub goal: String,
+    pub input_summary: String,
+    pub allowed_tools: Vec<String>,
+    pub timeout_sec: u64,
+    pub max_steps: usize,
+    pub created_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum SubagentJobState {
+    Pending,
+    Running {
+        started_at_unix_ms: u64,
+    },
+    Completed {
+        finished_at_unix_ms: u64,
+        result: SubagentResult,
+    },
+    Failed {
+        finished_at_unix_ms: u64,
+        error: String,
+        partial: Option<SubagentResult>,
+    },
+    Cancelled {
+        finished_at_unix_ms: u64,
+        partial: Option<SubagentResult>,
+    },
+    TimedOut {
+        finished_at_unix_ms: u64,
+        partial: Option<SubagentResult>,
+    },
+}
+
+impl SubagentJobState {
+    pub fn finish_reason(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running { .. } => "running",
+            Self::Completed { .. } => "finished",
+            Self::Failed { .. } => "failed",
+            Self::Cancelled { .. } => "cancelled",
+            Self::TimedOut { .. } => "timed_out",
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, Self::Pending | Self::Running { .. })
+    }
+
+    fn finished_at_unix_ms(&self) -> Option<u64> {
+        match self {
+            Self::Completed {
+                finished_at_unix_ms,
+                ..
+            }
+            | Self::Failed {
+                finished_at_unix_ms,
+                ..
+            }
+            | Self::Cancelled {
+                finished_at_unix_ms,
+                ..
+            }
+            | Self::TimedOut {
+                finished_at_unix_ms,
+                ..
+            } => Some(*finished_at_unix_ms),
+            Self::Pending | Self::Running { .. } => None,
+        }
+    }
+}
+
+pub struct SubagentJobHandle {
+    pub meta: SubagentJobMeta,
+    pub state: tokio::sync::RwLock<SubagentJobState>,
+    pub cancelled: Arc<AtomicBool>,
+    pub cancel_notify: Arc<tokio::sync::Notify>,
+    pub created_at: Instant,
+    pub task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl SubagentJobHandle {
+    fn new(meta: SubagentJobMeta) -> Self {
+        Self {
+            meta,
+            state: tokio::sync::RwLock::new(SubagentJobState::Pending),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            created_at: Instant::now(),
+            task: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubagentJobSnapshot {
+    pub meta: SubagentJobMeta,
+    pub state: SubagentJobState,
+}
+
+struct RunningJobGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl RunningJobGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for RunningJobGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[derive(Clone)]
+pub struct SubagentRuntime {
+    inner: Arc<SubagentRuntimeInner>,
+}
+
+struct SubagentRuntimeInner {
+    jobs: tokio::sync::RwLock<HashMap<String, Arc<SubagentJobHandle>>>,
+    running_jobs: Arc<AtomicUsize>,
+    max_concurrent_jobs: usize,
+    llm: Arc<dyn LlmClient>,
+    base_tools: Vec<Arc<dyn Tool>>,
+}
+
+impl SubagentRuntime {
+    pub fn new(
+        llm: Arc<dyn LlmClient>,
+        base_tools: Vec<Arc<dyn Tool>>,
+        max_concurrent_jobs: usize,
+    ) -> Self {
+        let runtime = Self {
+            inner: Arc::new(SubagentRuntimeInner {
+                jobs: tokio::sync::RwLock::new(HashMap::new()),
+                running_jobs: Arc::new(AtomicUsize::new(0)),
+                max_concurrent_jobs: max_concurrent_jobs.max(1),
+                llm,
+                base_tools,
+            }),
+        };
+
+        let cleanup_runtime = runtime.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+            loop {
+                interval.tick().await;
+                cleanup_runtime.cleanup_expired_jobs().await;
+            }
+        });
+
+        runtime
+    }
+
+    pub async fn spawn_job(
+        &self,
+        parent_ctx: ToolContext,
+        args: DispatchSubagentArgs,
+    ) -> Result<SpawnedSubagentJob, ToolError> {
+        self.cleanup_expired_jobs().await;
+
+        if self.inner.running_jobs.load(Ordering::SeqCst) >= self.inner.max_concurrent_jobs {
+            return Err(ToolError::ExecutionFailed(
+                "Too many concurrent subagent jobs. Wait for existing jobs to finish before spawning more.".to_string(),
+            ));
+        }
+
+        let timeout_sec = args.timeout_sec.unwrap_or(60);
+        let max_steps = args.max_steps.unwrap_or(5).max(1);
+        let job_id = format!("subjob_{}", uuid::Uuid::new_v4().simple());
+        let sub_session_id = format!(
+            "sub_{}_{}",
+            parent_ctx.session_id,
+            uuid::Uuid::new_v4().simple()
+        );
+        let meta = SubagentJobMeta {
+            job_id: job_id.clone(),
+            parent_session_id: parent_ctx.session_id.clone(),
+            parent_reply_to: parent_ctx.reply_to.clone(),
+            sub_session_id: sub_session_id.clone(),
+            goal: args.goal.clone(),
+            input_summary: args.input_summary.clone(),
+            allowed_tools: args.allowed_tools.clone(),
+            timeout_sec,
+            max_steps,
+            created_at_unix_ms: unix_ms_now(),
+        };
+
+        let handle = Arc::new(SubagentJobHandle::new(meta));
+        {
+            let mut jobs = self.inner.jobs.write().await;
+            jobs.insert(job_id.clone(), handle.clone());
+        }
+
+        let runtime = self.clone();
+        let counter = self.inner.running_jobs.clone();
+        let running_guard = RunningJobGuard::new(counter);
+        let handle_for_task = handle.clone();
+        let sub_session_id_for_task = sub_session_id.clone();
+        let join_handle = tokio::spawn(async move {
+            let _guard = running_guard;
+            runtime
+                .run_job(handle_for_task, parent_ctx, args, sub_session_id_for_task)
+                .await;
+        });
+        *handle.task.lock().await = Some(join_handle);
+
+        Ok(SpawnedSubagentJob {
+            job_id,
+            sub_session_id,
+        })
+    }
+
+    pub async fn get_job_snapshot(&self, job_id: &str) -> Result<SubagentJobSnapshot, ToolError> {
+        let handle = self.get_job_handle(job_id).await.ok_or_else(|| {
+            ToolError::ExecutionFailed(format!("Unknown subagent job: {}", job_id))
+        })?;
+        let state = handle.state.read().await.clone();
+        Ok(SubagentJobSnapshot {
+            meta: handle.meta.clone(),
+            state,
+        })
+    }
+
+    pub async fn list_jobs(&self) -> Vec<SubagentJobSnapshot> {
+        let handles: Vec<Arc<SubagentJobHandle>> = {
+            let jobs = self.inner.jobs.read().await;
+            jobs.values().cloned().collect()
+        };
+
+        let mut snapshots = Vec::with_capacity(handles.len());
+        for handle in handles {
+            snapshots.push(SubagentJobSnapshot {
+                meta: handle.meta.clone(),
+                state: handle.state.read().await.clone(),
+            });
+        }
+        snapshots.sort_by_key(|snapshot| snapshot.meta.created_at_unix_ms);
+        snapshots
+    }
+
+    pub async fn cancel_job(&self, job_id: &str) -> Result<(), ToolError> {
+        let handle = self.get_job_handle(job_id).await.ok_or_else(|| {
+            ToolError::ExecutionFailed(format!("Unknown subagent job: {}", job_id))
+        })?;
+        handle.cancelled.store(true, Ordering::SeqCst);
+        handle.cancel_notify.notify_waiters();
+        if let Some(task) = handle.task.lock().await.as_ref() {
+            task.abort();
+        }
+        let mut state = handle.state.write().await;
+        if !state.is_terminal() {
+            *state = SubagentJobState::Cancelled {
+                finished_at_unix_ms: unix_ms_now(),
+                partial: None,
+            };
+        }
+        Ok(())
+    }
+
+    pub async fn cleanup_expired_jobs(&self) {
+        let expired_ids: Vec<String> = {
+            let jobs = self.inner.jobs.read().await;
+            jobs.iter()
+                .filter_map(|(job_id, handle)| {
+                    let state = handle.state.try_read().ok()?;
+                    let finished_at = state.finished_at_unix_ms()?;
+                    let age_ms = unix_ms_now().saturating_sub(finished_at);
+                    if age_ms >= TERMINAL_JOB_TTL.as_millis() as u64 {
+                        Some(job_id.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        if expired_ids.is_empty() {
+            return;
+        }
+
+        let mut jobs = self.inner.jobs.write().await;
+        for job_id in expired_ids {
+            jobs.remove(&job_id);
+        }
+    }
+
+    async fn get_job_handle(&self, job_id: &str) -> Option<Arc<SubagentJobHandle>> {
+        let jobs = self.inner.jobs.read().await;
+        jobs.get(job_id).cloned()
+    }
+
+    async fn run_job(
+        &self,
+        handle: Arc<SubagentJobHandle>,
+        parent_ctx: ToolContext,
+        args: DispatchSubagentArgs,
+        sub_session_id: String,
+    ) {
+        {
+            let mut state = handle.state.write().await;
+            *state = SubagentJobState::Running {
+                started_at_unix_ms: unix_ms_now(),
+            };
+        }
+
+        let final_state = match build_subagent_session(
+            &parent_ctx,
+            self.inner.llm.clone(),
+            &self.inner.base_tools,
+            SubagentBuildMode::AsyncReadonly,
+            Some(sub_session_id),
+            &args.allowed_tools,
+            args.max_steps.unwrap_or(5).max(1),
+            &args.input_summary,
+            handle.cancelled.clone(),
+            handle.cancel_notify.clone(),
+        ) {
+            Ok(BuiltSubagentSession {
+                mut agent_loop,
+                collector,
+                ..
+            }) => {
+                self.execute_subagent(handle.clone(), args, collector, &mut agent_loop)
+                    .await
+            }
+            Err(error) => SubagentJobState::Failed {
+                finished_at_unix_ms: unix_ms_now(),
+                error,
+                partial: None,
+            },
+        };
+
+        let mut state = handle.state.write().await;
+        *state = final_state;
+    }
+
+    async fn execute_subagent(
+        &self,
+        handle: Arc<SubagentJobHandle>,
+        args: DispatchSubagentArgs,
+        collector: Arc<crate::session::factory::CollectorOutput>,
+        agent_loop: &mut crate::core::AgentLoop,
+    ) -> SubagentJobState {
+        let run_result = tokio::time::timeout(
+            Duration::from_secs(args.timeout_sec.unwrap_or(60)),
+            agent_loop.step(args.goal.clone()),
+        )
+        .await;
+
+        let collected_text = collector.take_text().await;
+        let tool_outputs = collector.take_tool_outputs().await;
+        let artifacts = collector.take_artifacts().await;
+        let finished_at_unix_ms = unix_ms_now();
+
+        match run_result {
+            Ok(Ok(exit)) => {
+                let ok = matches!(exit, crate::core::RunExit::Finished(_));
+                let summary = match exit {
+                    crate::core::RunExit::Finished(summary) => summary,
+                    crate::core::RunExit::YieldedToUser => {
+                        if collected_text.trim().is_empty() {
+                            "Sub-agent yielded without visible output.".to_string()
+                        } else {
+                            format!("Sub-agent yielded with output: {}", collected_text.trim())
+                        }
+                    }
+                    crate::core::RunExit::RecoverableFailed(message)
+                    | crate::core::RunExit::CriticallyFailed(message)
+                    | crate::core::RunExit::AutopilotStalled(message) => {
+                        return SubagentJobState::Failed {
+                            finished_at_unix_ms,
+                            error: message.clone(),
+                            partial: Some(SubagentResult {
+                                ok,
+                                summary: message,
+                                findings: tool_outputs,
+                                artifacts,
+                            }),
+                        };
+                    }
+                    crate::core::RunExit::StoppedByUser => {
+                        return SubagentJobState::Cancelled {
+                            finished_at_unix_ms,
+                            partial: Some(SubagentResult {
+                                ok: false,
+                                summary: "Sub-agent execution was interrupted.".to_string(),
+                                findings: tool_outputs,
+                                artifacts,
+                            }),
+                        };
+                    }
+                };
+
+                SubagentJobState::Completed {
+                    finished_at_unix_ms,
+                    result: SubagentResult {
+                        ok,
+                        summary,
+                        findings: tool_outputs,
+                        artifacts,
+                    },
+                }
+            }
+            Ok(Err(error)) => SubagentJobState::Failed {
+                finished_at_unix_ms,
+                error: error.to_string(),
+                partial: Some(SubagentResult {
+                    ok: false,
+                    summary: format!("Sub-agent error: {}", error),
+                    findings: tool_outputs,
+                    artifacts,
+                }),
+            },
+            Err(_) => {
+                if handle.cancelled.load(Ordering::SeqCst) {
+                    SubagentJobState::Cancelled {
+                        finished_at_unix_ms,
+                        partial: Some(SubagentResult {
+                            ok: false,
+                            summary: "Sub-agent execution was interrupted.".to_string(),
+                            findings: tool_outputs,
+                            artifacts,
+                        }),
+                    }
+                } else {
+                    SubagentJobState::TimedOut {
+                        finished_at_unix_ms,
+                        partial: Some(SubagentResult {
+                            ok: false,
+                            summary: format!(
+                                "Sub-agent timed out after {}s while working on '{}'.",
+                                args.timeout_sec.unwrap_or(60),
+                                args.goal
+                            ),
+                            findings: tool_outputs,
+                            artifacts,
+                        }),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use crate::context::{FunctionCall, Message};
+    use crate::llm_client::{LlmError, StreamEvent};
+
+    struct FinishImmediatelyLlm;
+
+    #[async_trait]
+    impl LlmClient for FinishImmediatelyLlm {
+        fn model_name(&self) -> &str {
+            "finish-immediately"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        async fn stream(
+            &self,
+            _messages: Vec<Message>,
+            _system_instruction: Option<Message>,
+            _tools: Vec<Arc<dyn Tool>>,
+        ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+            let (tx, rx) = mpsc::channel(4);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(StreamEvent::ToolCall(
+                        FunctionCall {
+                            name: "finish_task".to_string(),
+                            args: json!({ "summary": "done" }),
+                            id: Some("tc_1".to_string()),
+                        },
+                        None,
+                    ))
+                    .await;
+                let _ = tx.send(StreamEvent::Done).await;
+            });
+            Ok(rx)
+        }
+    }
+
+    struct HangingLlm;
+
+    #[async_trait]
+    impl LlmClient for HangingLlm {
+        fn model_name(&self) -> &str {
+            "hanging"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        async fn stream(
+            &self,
+            _messages: Vec<Message>,
+            _system_instruction: Option<Message>,
+            _tools: Vec<Arc<dyn Tool>>,
+        ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+            let (tx, rx) = mpsc::channel(4);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(tx);
+            });
+            Ok(rx)
+        }
+    }
+
+    struct MockTool(&'static str);
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> String {
+            self.0.to_string()
+        }
+
+        fn description(&self) -> String {
+            String::new()
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            json!({})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<String, ToolError> {
+            Ok(String::new())
+        }
+    }
+
+    fn make_ctx() -> ToolContext {
+        ToolContext {
+            session_id: "parent".to_string(),
+            reply_to: "cli".to_string(),
+        }
+    }
+
+    async fn wait_for_terminal_state(runtime: &SubagentRuntime, job_id: &str) -> SubagentJobState {
+        for _ in 0..40 {
+            let snapshot = runtime.get_job_snapshot(job_id).await.unwrap();
+            if snapshot.state.is_terminal() {
+                return snapshot.state;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("job did not reach terminal state in time");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_job_completes_and_records_result() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(FinishImmediatelyLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            2,
+        );
+
+        let spawned = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "inspect".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    timeout_sec: Some(5),
+                    max_steps: Some(4),
+                },
+            )
+            .await
+            .unwrap();
+
+        let state = wait_for_terminal_state(&runtime, &spawned.job_id).await;
+        match state {
+            SubagentJobState::Completed { result, .. } => {
+                assert!(result.ok);
+                assert!(result.summary.contains("done"));
+            }
+            other => panic!("expected completed state, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_job_respects_concurrency_limit() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(HangingLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            1,
+        );
+
+        let first = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "hang".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    timeout_sec: Some(30),
+                    max_steps: Some(4),
+                },
+            )
+            .await
+            .unwrap();
+
+        let second = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "blocked".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    timeout_sec: Some(30),
+                    max_steps: Some(4),
+                },
+            )
+            .await;
+
+        assert!(matches!(second, Err(ToolError::ExecutionFailed(_))));
+
+        runtime.cancel_job(&first.job_id).await.unwrap();
+        let state = wait_for_terminal_state(&runtime, &first.job_id).await;
+        assert!(matches!(state, SubagentJobState::Cancelled { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_job_transitions_running_job_to_cancelled() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(HangingLlm),
+            vec![Arc::new(MockTool("read_file"))],
+            1,
+        );
+
+        let spawned = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "hang".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    timeout_sec: Some(30),
+                    max_steps: Some(4),
+                },
+            )
+            .await
+            .unwrap();
+
+        runtime.cancel_job(&spawned.job_id).await.unwrap();
+        let state = wait_for_terminal_state(&runtime, &spawned.job_id).await;
+        assert!(matches!(state, SubagentJobState::Cancelled { .. }));
+    }
+}
