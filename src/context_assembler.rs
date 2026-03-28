@@ -24,6 +24,7 @@ pub enum CandidateKind {
     SkillContract,       // Active skill contract
     SkillInstructions,   // Active skill instructions
     SkillStateSummary,   // Active skill state summary
+    ExecutionNotices,    // Runtime-level execution notices
 }
 
 #[derive(Debug, Default, Clone)]
@@ -54,6 +55,7 @@ impl ContextAssembler {
         skill_contract: Option<&str>,
         skill_instructions: Option<&str>,
         skill_state_summary: Option<&str>,
+        execution_notices: Option<&str>,
         task_state: &TaskStateSnapshot,
         mut active_evidence: Vec<Evidence>,
         transcript_tail: Vec<String>,
@@ -169,6 +171,20 @@ impl ContextAssembler {
                     layer: 5,
                     required: false,
                     content: format!("--- [ACTIVE SKILL STATE] ---\n{skill_state_summary}"),
+                });
+            }
+        }
+
+        if let Some(execution_notices) = execution_notices {
+            if !execution_notices.trim().is_empty() {
+                candidates.push(PromptCandidate {
+                    id: "execution_notices".to_string(),
+                    kind: CandidateKind::ExecutionNotices,
+                    priority_score: 575.0,
+                    token_cost: Self::est_tokens(execution_notices),
+                    layer: 5,
+                    required: false,
+                    content: format!("--- [EXECUTION NOTICES] ---\n{execution_notices}"),
                 });
             }
         }
@@ -323,6 +339,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &state,
             active_evidence,
             vec!["Turn 1".into(), "Turn 2".into()],
@@ -361,6 +378,7 @@ mod tests {
             Some("SKILL CONTRACT"),
             Some("SKILL INSTRUCTIONS"),
             Some("SKILL STATE"),
+            Some("EXECUTION NOTICE"),
             &state,
             vec![ev1],
             vec!["LAST VOLATILE".into()],
@@ -373,6 +391,7 @@ mod tests {
         let idx_skill = prompt.find("SKILL CONTRACT").unwrap();
         let idx_instructions = prompt.find("SKILL INSTRUCTIONS").unwrap();
         let idx_skill_state = prompt.find("SKILL STATE").unwrap();
+        let idx_notice = prompt.find("EXECUTION NOTICE").unwrap();
         let idx_state = prompt.find("TASK STATE").unwrap();
         let idx_vol = prompt.find("LAST VOLATILE").unwrap();
 
@@ -381,7 +400,8 @@ mod tests {
         assert!(idx_ev < idx_skill);
         assert!(idx_skill < idx_instructions);
         assert!(idx_instructions < idx_skill_state);
-        assert!(idx_skill_state < idx_state);
+        assert!(idx_skill_state < idx_notice);
+        assert!(idx_notice < idx_state);
         assert!(idx_state < idx_vol);
     }
 
@@ -397,6 +417,7 @@ mod tests {
             Some(&"Long skill contract ".repeat(20)),
             Some(&"Long skill instructions ".repeat(20)),
             Some(&"Long skill state ".repeat(20)),
+            Some(&"Long execution notice ".repeat(20)),
             &state,
             Vec::new(),
             Vec::new(),
@@ -407,8 +428,16 @@ mod tests {
         assert!(!prompt.contains("[ACTIVE SKILL CONTRACT]"));
         assert!(!prompt.contains("[ACTIVE SKILL INSTRUCTIONS]"));
         assert!(!prompt.contains("[ACTIVE SKILL STATE]"));
+        assert!(!prompt.contains("[EXECUTION NOTICES]"));
         assert!(report.evicted_items.contains(&"skill_contract".to_string()));
-        assert!(report.evicted_items.contains(&"skill_instructions".to_string()));
-        assert!(report.evicted_items.contains(&"skill_state_summary".to_string()));
+        assert!(report
+            .evicted_items
+            .contains(&"skill_instructions".to_string()));
+        assert!(report
+            .evicted_items
+            .contains(&"skill_state_summary".to_string()));
+        assert!(report
+            .evicted_items
+            .contains(&"execution_notices".to_string()));
     }
 }

@@ -20,6 +20,7 @@ pub struct AgentContext {
     pub skill_contract: Option<String>,
     pub skill_instructions: Option<String>,
     pub skill_state_summary: Option<String>,
+    pub execution_notices: Option<String>,
 }
 
 impl AgentContext {
@@ -51,6 +52,7 @@ impl AgentContext {
             skill_contract: None,
             skill_instructions: None,
             skill_state_summary: None,
+            execution_notices: None,
         }
     }
 

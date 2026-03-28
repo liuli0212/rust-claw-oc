@@ -20,10 +20,7 @@ pub trait ExecutionExtension: Send + Sync {
 
     /// Called before the tool list is sent to the model.
     /// Extensions may filter, reorder or augment the visible tool set.
-    async fn before_tool_resolution(
-        &self,
-        tools: Vec<Arc<dyn Tool>>,
-    ) -> Vec<Arc<dyn Tool>>;
+    async fn before_tool_resolution(&self, tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>>;
 
     /// Called after every successful tool execution.
     /// Extensions may update internal state based on the result.
@@ -53,6 +50,8 @@ pub struct PromptDraft {
     pub skill_instructions: Option<String>,
     /// A human-readable summary of the skill's current execution state.
     pub skill_state_summary: Option<String>,
+    /// General execution notices surfaced by runtime-level extensions.
+    pub execution_notices: Option<String>,
 }
 
 /// Returned by `before_turn_start`.
@@ -61,23 +60,16 @@ pub enum ExtensionDecision {
     /// Let the turn proceed normally.
     Continue,
     /// The extension wants to intercept this turn.
-    Intercept {
-        prompt_overlay: Option<String>,
-    },
+    Intercept { prompt_overlay: Option<String> },
     /// The extension handled this input directly and the loop should yield.
-    Halt {
-        message: String,
-    },
+    Halt { message: String },
 }
 
 /// Returned by `on_user_resume`.
 #[derive(Debug)]
 pub enum ResumeDecision {
     /// The user's input should be treated as a skill-resume answer.
-    ResumeSkill {
-        context_key: String,
-        answer: String,
-    },
+    ResumeSkill { context_key: String, answer: String },
     /// No pending interaction; let AgentLoop handle the input normally.
     PassThrough,
 }
@@ -88,7 +80,5 @@ pub enum FinishDecision {
     /// Completion is allowed.
     Allow,
     /// Completion is denied; the agent should continue working.
-    Deny {
-        reason: String,
-    },
+    Deny { reason: String },
 }

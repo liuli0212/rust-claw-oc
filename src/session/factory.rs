@@ -251,7 +251,7 @@ pub fn build_agent_session(
         subagent_runtime.clone(),
     )));
     session_tools.push(Arc::new(crate::tools::ListSubagentJobsTool::new(
-        subagent_runtime,
+        subagent_runtime.clone(),
     )));
 
     let mut agent_loop = AgentLoop::new(
@@ -265,6 +265,12 @@ pub fn build_agent_session(
         task_state_store,
     );
     agent_loop.add_extension(Box::new(crate::skills::runtime::SkillRuntime::new()));
+    agent_loop.add_extension(Box::new(
+        crate::subagent_notification::SubagentNotificationExtension::new(
+            session_id,
+            subagent_runtime.clone(),
+        ),
+    ));
 
     Ok(Arc::new(AsyncMutex::new(agent_loop)))
 }

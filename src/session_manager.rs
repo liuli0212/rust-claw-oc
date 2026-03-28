@@ -207,3 +207,654 @@ impl SessionManager {
         self.registry.list_sessions()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc;
+
+    use crate::context::{FunctionCall, Message};
+    use crate::core::RunExit;
+    use crate::llm_client::{LlmError, StreamEvent};
+    use crate::tools::protocol::{StructuredToolOutput, ToolContext, ToolExecutionEnvelope};
+    use crate::tools::ToolError;
+
+    #[derive(Default)]
+    struct CaptureOutput {
+        tool_results: std::sync::Mutex<Vec<String>>,
+        errors: std::sync::Mutex<Vec<String>>,
+        finish_summaries: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CaptureOutput {
+        fn tool_results(&self) -> Vec<String> {
+            self.tool_results.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentOutput for CaptureOutput {
+        async fn on_text(&self, _text: &str) {}
+
+        async fn on_tool_start(&self, _name: &str, _args: &str) {}
+
+        async fn on_tool_end(&self, result: &str) {
+            self.tool_results.lock().unwrap().push(result.to_string());
+        }
+
+        async fn on_error(&self, error: &str) {
+            self.errors.lock().unwrap().push(error.to_string());
+        }
+
+        async fn on_task_finish(&self, summary: &str) {
+            self.finish_summaries
+                .lock()
+                .unwrap()
+                .push(summary.to_string());
+        }
+    }
+
+    struct MockReadTool;
+
+    #[async_trait]
+    impl Tool for MockReadTool {
+        fn name(&self) -> String {
+            "read_file".to_string()
+        }
+
+        fn description(&self) -> String {
+            "Mock read-only tool".to_string()
+        }
+
+        fn parameters_schema(&self) -> Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            })
+        }
+
+        fn has_side_effects(&self) -> bool {
+            false
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<String, ToolError> {
+            StructuredToolOutput::new(
+                "read_file",
+                true,
+                "mock read".to_string(),
+                Some(0),
+                None,
+                false,
+            )
+            .to_json_string()
+        }
+    }
+
+    struct AsyncSubagentScenarioLlm;
+
+    #[async_trait]
+    impl LlmClient for AsyncSubagentScenarioLlm {
+        fn model_name(&self) -> &str {
+            "async-subagent-scenario"
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        async fn stream(
+            &self,
+            messages: Vec<Message>,
+            system_instruction: Option<Message>,
+            tools: Vec<Arc<dyn Tool>>,
+        ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+            let tool_names: Vec<String> = tools.iter().map(|tool| tool.name()).collect();
+            let user_text = latest_user_text(&messages);
+            let system_text = system_instruction
+                .and_then(|message| {
+                    message
+                        .parts
+                        .into_iter()
+                        .find_map(|part| part.text.map(|text| text.to_string()))
+                })
+                .unwrap_or_default();
+
+            if tool_names.iter().any(|name| name == "spawn_subagent") {
+                parent_stream(user_text, &messages, system_text)
+            } else {
+                subagent_stream(user_text)
+            }
+        }
+    }
+
+    fn latest_user_text(messages: &[Message]) -> String {
+        messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .and_then(|message| {
+                message
+                    .parts
+                    .iter()
+                    .find_map(|part| part.text.as_ref().map(ToString::to_string))
+            })
+            .unwrap_or_default()
+    }
+
+    fn extract_job_ids_from_messages(messages: &[Message]) -> Vec<String> {
+        let mut job_ids = Vec::new();
+        for message in messages {
+            for part in &message.parts {
+                let Some(response) = &part.function_response else {
+                    continue;
+                };
+                let Some(result_json) = response.response.get("result").and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(envelope) = ToolExecutionEnvelope::from_json_str(result_json) else {
+                    continue;
+                };
+                if envelope.result.tool_name != "spawn_subagent" {
+                    continue;
+                }
+                let Ok(payload) = serde_json::from_str::<Value>(&envelope.result.output) else {
+                    continue;
+                };
+                if let Some(job_id) = payload.get("job_id").and_then(Value::as_str) {
+                    job_ids.push(job_id.to_string());
+                }
+            }
+        }
+        job_ids
+    }
+
+    fn parent_stream(
+        user_text: String,
+        messages: &[Message],
+        system_text: String,
+    ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+        let (tx, rx) = mpsc::channel(16);
+        let job_ids = extract_job_ids_from_messages(messages);
+
+        tokio::spawn(async move {
+            let events = if user_text.contains("spawn two background jobs") {
+                vec![
+                    make_tool_call(
+                        "spawn_subagent",
+                        json!({
+                            "goal": "inspect alpha module",
+                            "input_summary": "Inspect alpha module and report findings.",
+                            "allowed_tools": ["read_file"],
+                            "timeout_sec": 5,
+                            "max_steps": 4
+                        }),
+                        "parent_spawn_1",
+                    ),
+                    make_tool_call(
+                        "spawn_subagent",
+                        json!({
+                            "goal": "inspect beta module",
+                            "input_summary": "Inspect beta module and report findings.",
+                            "allowed_tools": ["read_file"],
+                            "timeout_sec": 5,
+                            "max_steps": 4
+                        }),
+                        "parent_spawn_2",
+                    ),
+                    make_tool_call(
+                        "finish_task",
+                        json!({ "summary": "spawned background jobs" }),
+                        "parent_finish_1",
+                    ),
+                ]
+            } else if user_text.contains("collect two background jobs") {
+                let mut calls = vec![make_tool_call(
+                    "list_subagent_jobs",
+                    json!({}),
+                    "parent_list_jobs",
+                )];
+                for (idx, job_id) in job_ids.iter().enumerate() {
+                    calls.push(make_tool_call(
+                        "get_subagent_result",
+                        json!({ "job_id": job_id }),
+                        &format!("parent_get_{}", idx + 1),
+                    ));
+                }
+                calls.push(make_tool_call(
+                    "finish_task",
+                    json!({ "summary": "collected background jobs" }),
+                    "parent_finish_2",
+                ));
+                calls
+            } else if user_text.contains("spawn success and fail jobs") {
+                vec![
+                    make_tool_call(
+                        "spawn_subagent",
+                        json!({
+                            "goal": "inspect success module",
+                            "input_summary": "Return a successful summary.",
+                            "allowed_tools": ["read_file"],
+                            "timeout_sec": 5,
+                            "max_steps": 4
+                        }),
+                        "mixed_spawn_1",
+                    ),
+                    make_tool_call(
+                        "spawn_subagent",
+                        json!({
+                            "goal": "force fail module",
+                            "input_summary": "This subagent should fail immediately.",
+                            "allowed_tools": ["read_file"],
+                            "timeout_sec": 5,
+                            "max_steps": 4
+                        }),
+                        "mixed_spawn_2",
+                    ),
+                    make_tool_call(
+                        "finish_task",
+                        json!({ "summary": "spawned mixed jobs" }),
+                        "mixed_finish_1",
+                    ),
+                ]
+            } else if user_text.contains("collect mixed job results") {
+                let mut calls = Vec::new();
+                for (idx, job_id) in job_ids.iter().enumerate() {
+                    calls.push(make_tool_call(
+                        "get_subagent_result",
+                        json!({ "job_id": job_id }),
+                        &format!("mixed_get_{}", idx + 1),
+                    ));
+                }
+                calls.push(make_tool_call(
+                    "finish_task",
+                    json!({ "summary": "collected mixed jobs" }),
+                    "mixed_finish_2",
+                ));
+                calls
+            } else if user_text.contains("spawn hanging job") {
+                vec![
+                    make_tool_call(
+                        "spawn_subagent",
+                        json!({
+                            "goal": "hang forever",
+                            "input_summary": "This subagent should hang until cancelled.",
+                            "allowed_tools": ["read_file"],
+                            "timeout_sec": 30,
+                            "max_steps": 4
+                        }),
+                        "hang_spawn",
+                    ),
+                    make_tool_call(
+                        "finish_task",
+                        json!({ "summary": "spawned hanging job" }),
+                        "hang_finish_1",
+                    ),
+                ]
+            } else if user_text.contains("cancel hanging job") {
+                let first_job = job_ids.first().cloned().unwrap_or_default();
+                vec![
+                    make_tool_call(
+                        "cancel_subagent",
+                        json!({ "job_id": first_job }),
+                        "hang_cancel",
+                    ),
+                    make_tool_call(
+                        "finish_task",
+                        json!({ "summary": "cancelled hanging job" }),
+                        "hang_finish_2",
+                    ),
+                ]
+            } else if user_text.contains("continue after cancellation") {
+                vec![make_tool_call(
+                    "finish_task",
+                    json!({ "summary": "continued after cancellation" }),
+                    "hang_finish_3",
+                )]
+            } else if user_text.contains("continue after background work") {
+                let summary = if system_text.contains("Background subagent updates are available") {
+                    "noticed background update"
+                } else {
+                    "missed background update"
+                };
+                vec![make_tool_call(
+                    "finish_task",
+                    json!({ "summary": summary }),
+                    "notice_finish",
+                )]
+            } else {
+                vec![make_tool_call(
+                    "finish_task",
+                    json!({ "summary": "no-op" }),
+                    "parent_default_finish",
+                )]
+            };
+
+            for event in events {
+                let _ = tx.send(event).await;
+            }
+            let _ = tx.send(StreamEvent::Done).await;
+        });
+
+        Ok(rx)
+    }
+
+    fn subagent_stream(user_text: String) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+        if user_text.contains("force fail") {
+            return Err(LlmError::ApiError(
+                "forced subagent failure for integration test".to_string(),
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            if user_text.contains("hang forever") {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                drop(tx);
+                return;
+            }
+
+            let _ = tx
+                .send(make_tool_call(
+                    "finish_task",
+                    json!({
+                        "summary": format!("completed {}", user_text)
+                    }),
+                    "subagent_finish",
+                ))
+                .await;
+            let _ = tx.send(StreamEvent::Done).await;
+        });
+        Ok(rx)
+    }
+
+    fn make_tool_call(name: &str, args: Value, id: &str) -> StreamEvent {
+        StreamEvent::ToolCall(
+            FunctionCall {
+                name: name.to_string(),
+                args,
+                id: Some(id.to_string()),
+            },
+            None,
+        )
+    }
+
+    fn session_dir(session_id: &str) -> std::path::PathBuf {
+        crate::schema::StoragePaths::session_dir(session_id)
+    }
+
+    fn cleanup_session_artifacts(session_id: &str) {
+        let _ = std::fs::remove_dir_all(session_dir(session_id));
+    }
+
+    async fn wait_for_jobs(runtime: &crate::subagent_runtime::SubagentRuntime, expected: usize) {
+        for _ in 0..40 {
+            if runtime.list_jobs().await.len() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for {} jobs", expected);
+    }
+
+    async fn wait_for_all_terminal(runtime: &crate::subagent_runtime::SubagentRuntime) {
+        for _ in 0..80 {
+            let jobs = runtime.list_jobs().await;
+            if !jobs.is_empty() && jobs.iter().all(|job| job.state.is_terminal()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for subagent jobs to finish");
+    }
+
+    async fn wait_for_cancelled(runtime: &crate::subagent_runtime::SubagentRuntime, job_id: &str) {
+        for _ in 0..40 {
+            let snapshot = runtime.get_job_snapshot(job_id).await.unwrap();
+            if matches!(
+                snapshot.state,
+                crate::subagent_runtime::SubagentJobState::Cancelled { .. }
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for cancelled state");
+    }
+
+    fn extract_tool_payloads(tool_results: &[String], tool_name: &str) -> Vec<serde_json::Value> {
+        tool_results
+            .iter()
+            .filter_map(|result| ToolExecutionEnvelope::from_json_str(result))
+            .filter(|envelope| envelope.result.tool_name == tool_name)
+            .filter_map(|envelope| serde_json::from_str::<Value>(&envelope.result.output).ok())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_parent_session_can_spawn_and_collect_background_subagents() {
+        let session_id = "integration_async_subagent_spawn_collect";
+        cleanup_session_artifacts(session_id);
+
+        let manager = SessionManager::new(
+            Some(Arc::new(AsyncSubagentScenarioLlm)),
+            vec![Arc::new(MockReadTool)],
+        );
+        let output = Arc::new(CaptureOutput::default());
+        let agent = manager
+            .get_or_create_session(session_id, "test_cli", output.clone())
+            .await
+            .unwrap();
+
+        let exit = agent
+            .lock()
+            .await
+            .step("spawn two background jobs".to_string())
+            .await
+            .unwrap();
+        match exit {
+            RunExit::Finished(summary) => assert!(summary.starts_with("spawned background jobs")),
+            other => panic!("expected finished exit, got {:?}", other),
+        }
+
+        let runtime = manager.subagent_runtime.read().unwrap().clone().unwrap();
+        wait_for_jobs(&runtime, 2).await;
+        wait_for_all_terminal(&runtime).await;
+
+        let exit = agent
+            .lock()
+            .await
+            .step("collect two background jobs".to_string())
+            .await
+            .unwrap();
+        match exit {
+            RunExit::Finished(summary) => {
+                assert!(summary.starts_with("collected background jobs"))
+            }
+            other => panic!("expected finished exit, got {:?}", other),
+        }
+
+        let tool_results = output.tool_results();
+        let listed_jobs = extract_tool_payloads(&tool_results, "list_subagent_jobs");
+        assert_eq!(listed_jobs.len(), 1);
+        assert_eq!(
+            listed_jobs[0]
+                .get("jobs")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+
+        let result_payloads = extract_tool_payloads(&tool_results, "get_subagent_result");
+        assert_eq!(result_payloads.len(), 2);
+        assert!(result_payloads
+            .iter()
+            .all(|payload| { payload.get("status").and_then(Value::as_str) == Some("finished") }));
+
+        cleanup_session_artifacts(session_id);
+    }
+
+    #[tokio::test]
+    async fn test_failed_subagent_does_not_block_successful_sibling_job() {
+        let session_id = "integration_async_subagent_failure_isolation";
+        cleanup_session_artifacts(session_id);
+
+        let manager = SessionManager::new(
+            Some(Arc::new(AsyncSubagentScenarioLlm)),
+            vec![Arc::new(MockReadTool)],
+        );
+        let output = Arc::new(CaptureOutput::default());
+        let agent = manager
+            .get_or_create_session(session_id, "test_cli", output.clone())
+            .await
+            .unwrap();
+
+        let exit = agent
+            .lock()
+            .await
+            .step("spawn success and fail jobs".to_string())
+            .await
+            .unwrap();
+        match exit {
+            RunExit::Finished(summary) => assert!(summary.starts_with("spawned mixed jobs")),
+            other => panic!("expected finished exit, got {:?}", other),
+        }
+
+        let runtime = manager.subagent_runtime.read().unwrap().clone().unwrap();
+        wait_for_jobs(&runtime, 2).await;
+        wait_for_all_terminal(&runtime).await;
+
+        let exit = agent
+            .lock()
+            .await
+            .step("collect mixed job results".to_string())
+            .await
+            .unwrap();
+        match exit {
+            RunExit::Finished(summary) => assert!(summary.starts_with("collected mixed jobs")),
+            other => panic!("expected finished exit, got {:?}", other),
+        }
+
+        let result_payloads = extract_tool_payloads(&output.tool_results(), "get_subagent_result");
+        assert_eq!(result_payloads.len(), 2);
+        let statuses: Vec<&str> = result_payloads
+            .iter()
+            .filter_map(|payload| payload.get("status").and_then(Value::as_str))
+            .collect();
+        assert!(statuses.contains(&"finished"));
+        assert!(statuses.contains(&"failed"));
+
+        cleanup_session_artifacts(session_id);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_subagent_does_not_block_parent_session_progress() {
+        let session_id = "integration_async_subagent_cancel";
+        cleanup_session_artifacts(session_id);
+
+        let manager = SessionManager::new(
+            Some(Arc::new(AsyncSubagentScenarioLlm)),
+            vec![Arc::new(MockReadTool)],
+        );
+        let output = Arc::new(CaptureOutput::default());
+        let agent = manager
+            .get_or_create_session(session_id, "test_cli", output)
+            .await
+            .unwrap();
+        let tool_ctx = ToolContext {
+            session_id: session_id.to_string(),
+            reply_to: "test_cli".to_string(),
+        };
+
+        let exit = agent
+            .lock()
+            .await
+            .step("spawn hanging job".to_string())
+            .await
+            .unwrap();
+        match exit {
+            RunExit::Finished(summary) => assert!(summary.starts_with("spawned hanging job")),
+            other => panic!("expected finished exit, got {:?}", other),
+        }
+
+        let runtime = manager.subagent_runtime.read().unwrap().clone().unwrap();
+        wait_for_jobs(&runtime, 1).await;
+        let spawned_job_id = runtime.list_jobs().await[0].meta.job_id.clone();
+
+        let start = Instant::now();
+        let cancel_result = crate::tools::CancelSubagentTool::new(runtime.clone())
+            .execute(json!({ "job_id": spawned_job_id }), &tool_ctx)
+            .await
+            .unwrap();
+        let cancel_envelope = ToolExecutionEnvelope::from_json_str(&cancel_result).unwrap();
+        assert_eq!(cancel_envelope.result.tool_name, "cancel_subagent");
+        assert!(cancel_envelope.result.ok);
+        wait_for_cancelled(&runtime, &spawned_job_id).await;
+
+        let exit = agent
+            .lock()
+            .await
+            .step("continue after cancellation".to_string())
+            .await
+            .unwrap();
+        match exit {
+            RunExit::Finished(summary) => {
+                assert!(summary.starts_with("continued after cancellation"))
+            }
+            other => panic!("expected finished exit, got {:?}", other),
+        }
+        assert!(start.elapsed() < Duration::from_secs(15));
+
+        cleanup_session_artifacts(session_id);
+    }
+
+    #[tokio::test]
+    async fn test_parent_session_receives_background_completion_notice_on_next_turn() {
+        let session_id = "integration_async_subagent_notification";
+        cleanup_session_artifacts(session_id);
+
+        let manager = SessionManager::new(
+            Some(Arc::new(AsyncSubagentScenarioLlm)),
+            vec![Arc::new(MockReadTool)],
+        );
+        let output = Arc::new(CaptureOutput::default());
+        let agent = manager
+            .get_or_create_session(session_id, "test_cli", output)
+            .await
+            .unwrap();
+
+        let exit = agent
+            .lock()
+            .await
+            .step("spawn two background jobs".to_string())
+            .await
+            .unwrap();
+        match exit {
+            RunExit::Finished(summary) => assert!(summary.starts_with("spawned background jobs")),
+            other => panic!("expected finished exit, got {:?}", other),
+        }
+
+        let runtime = manager.subagent_runtime.read().unwrap().clone().unwrap();
+        wait_for_jobs(&runtime, 2).await;
+        wait_for_all_terminal(&runtime).await;
+
+        let exit = agent
+            .lock()
+            .await
+            .step("continue after background work".to_string())
+            .await
+            .unwrap();
+        match exit {
+            RunExit::Finished(summary) => assert!(summary.starts_with("noticed background update")),
+            other => panic!("expected finished exit, got {:?}", other),
+        }
+
+        cleanup_session_artifacts(session_id);
+    }
+}

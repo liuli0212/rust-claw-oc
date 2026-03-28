@@ -277,6 +277,7 @@ Architecture: {}
         ctx.skill_contract.as_deref(),
         ctx.skill_instructions.as_deref(),
         ctx.skill_state_summary.as_deref(),
+        ctx.execution_notices.as_deref(),
         task_state,
         active_evidence,
         Vec::new(),

@@ -146,8 +146,17 @@ pub struct SubagentRuntime {
     inner: Arc<SubagentRuntimeInner>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SubagentNotification {
+    pub job_id: String,
+    pub sub_session_id: String,
+    pub status: String,
+    pub summary: String,
+}
+
 struct SubagentRuntimeInner {
     jobs: tokio::sync::RwLock<HashMap<String, Arc<SubagentJobHandle>>>,
+    notifications: tokio::sync::RwLock<HashMap<String, Vec<SubagentNotification>>>,
     running_jobs: Arc<AtomicUsize>,
     max_concurrent_jobs: usize,
     llm: Arc<dyn LlmClient>,
@@ -163,6 +172,7 @@ impl SubagentRuntime {
         let runtime = Self {
             inner: Arc::new(SubagentRuntimeInner {
                 jobs: tokio::sync::RwLock::new(HashMap::new()),
+                notifications: tokio::sync::RwLock::new(HashMap::new()),
                 running_jobs: Arc::new(AtomicUsize::new(0)),
                 max_concurrent_jobs: max_concurrent_jobs.max(1),
                 llm,
@@ -269,6 +279,11 @@ impl SubagentRuntime {
         snapshots
     }
 
+    pub async fn take_notifications(&self, parent_session_id: &str) -> Vec<SubagentNotification> {
+        let mut notifications = self.inner.notifications.write().await;
+        notifications.remove(parent_session_id).unwrap_or_default()
+    }
+
     pub async fn cancel_job(&self, job_id: &str) -> Result<(), ToolError> {
         let handle = self.get_job_handle(job_id).await.ok_or_else(|| {
             ToolError::ExecutionFailed(format!("Unknown subagent job: {}", job_id))
@@ -278,12 +293,19 @@ impl SubagentRuntime {
         if let Some(task) = handle.task.lock().await.as_ref() {
             task.abort();
         }
-        let mut state = handle.state.write().await;
-        if !state.is_terminal() {
-            *state = SubagentJobState::Cancelled {
-                finished_at_unix_ms: unix_ms_now(),
-                partial: None,
-            };
+        let mut should_notify = None;
+        {
+            let mut state = handle.state.write().await;
+            if !state.is_terminal() {
+                *state = SubagentJobState::Cancelled {
+                    finished_at_unix_ms: unix_ms_now(),
+                    partial: None,
+                };
+                should_notify = Some(state.clone());
+            }
+        }
+        if let Some(state) = should_notify {
+            self.enqueue_notification(&handle.meta, &state).await;
         }
         Ok(())
     }
@@ -361,8 +383,58 @@ impl SubagentRuntime {
             },
         };
 
+        self.enqueue_notification(&handle.meta, &final_state).await;
         let mut state = handle.state.write().await;
         *state = final_state;
+    }
+
+    async fn enqueue_notification(&self, meta: &SubagentJobMeta, final_state: &SubagentJobState) {
+        if !final_state.is_terminal() {
+            return;
+        }
+
+        let summary = match final_state {
+            SubagentJobState::Completed { result, .. } => result.summary.clone(),
+            SubagentJobState::Failed { error, partial, .. } => partial
+                .as_ref()
+                .map(|result| result.summary.clone())
+                .unwrap_or_else(|| error.clone()),
+            SubagentJobState::Cancelled { partial, .. } => partial
+                .as_ref()
+                .map(|result| result.summary.clone())
+                .unwrap_or_else(|| "Sub-agent execution was interrupted.".to_string()),
+            SubagentJobState::TimedOut { partial, .. } => partial
+                .as_ref()
+                .map(|result| result.summary.clone())
+                .unwrap_or_else(|| "Sub-agent timed out.".to_string()),
+            SubagentJobState::Pending | SubagentJobState::Running { .. } => return,
+        };
+
+        let notification = SubagentNotification {
+            job_id: meta.job_id.clone(),
+            sub_session_id: meta.sub_session_id.clone(),
+            status: final_state.finish_reason().to_string(),
+            summary,
+        };
+
+        let mut notifications = self.inner.notifications.write().await;
+        notifications
+            .entry(meta.parent_session_id.clone())
+            .or_default()
+            .push(notification);
+    }
+
+    #[cfg(test)]
+    pub async fn record_notification_for_test(
+        &self,
+        parent_session_id: &str,
+        notification: SubagentNotification,
+    ) {
+        let mut notifications = self.inner.notifications.write().await;
+        notifications
+            .entry(parent_session_id.to_string())
+            .or_default()
+            .push(notification);
     }
 
     async fn execute_subagent(
