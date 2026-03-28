@@ -82,7 +82,7 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn description(&self) -> String {
-        "Start a background subagent and return a job ID immediately. Use this for independent work that can continue while you do other tasks."
+        "Start a background subagent and return a job ID immediately. Use this for independent work that can continue while you do other tasks. Background subagents run read-only by default; if you set allow_writes=true, you must also provide non-overlapping claimed_paths and only file mutation tools are enabled."
             .to_string()
     }
 

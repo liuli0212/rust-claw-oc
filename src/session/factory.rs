@@ -20,10 +20,12 @@ const FORBIDDEN_ASYNC_SUBAGENT_TOOLS: &[&str] = &[
     "manage_schedule",
     "send_telegram_message",
 ];
+const ASYNC_CONTROLLED_WRITE_TOOLS: &[&str] = &["write_file", "patch_file"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentBuildMode {
     AsyncReadonly,
+    AsyncControlledWrite,
     SyncCompatible,
 }
 
@@ -123,10 +125,20 @@ pub fn filter_subagent_tools(
                 return false;
             }
 
-            if matches!(mode, SubagentBuildMode::AsyncReadonly)
-                && FORBIDDEN_ASYNC_SUBAGENT_TOOLS.contains(&name.as_str())
-            {
-                return false;
+            match mode {
+                SubagentBuildMode::AsyncReadonly => {
+                    if FORBIDDEN_ASYNC_SUBAGENT_TOOLS.contains(&name.as_str()) {
+                        return false;
+                    }
+                }
+                SubagentBuildMode::AsyncControlledWrite => {
+                    if FORBIDDEN_ASYNC_SUBAGENT_TOOLS.contains(&name.as_str())
+                        && !ASYNC_CONTROLLED_WRITE_TOOLS.contains(&name.as_str())
+                    {
+                        return false;
+                    }
+                }
+                SubagentBuildMode::SyncCompatible => {}
             }
 
             runtime_tools.contains(&name.as_str()) || effective_allowed.contains(&name)
@@ -438,5 +450,33 @@ mod tests {
         assert!(!names.contains(&"write_file".to_string()));
         assert!(!names.contains(&"patch_file".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
+    }
+
+    #[test]
+    fn test_filter_subagent_tools_async_controlled_write_keeps_file_mutation_tools_only() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool("read_file")),
+            Arc::new(MockTool("write_file")),
+            Arc::new(MockTool("patch_file")),
+            Arc::new(MockTool("execute_bash")),
+            Arc::new(MockTool("finish_task")),
+        ];
+
+        let filtered = filter_subagent_tools(
+            &tools,
+            &[
+                "read_file".to_string(),
+                "write_file".to_string(),
+                "patch_file".to_string(),
+                "execute_bash".to_string(),
+            ],
+            SubagentBuildMode::AsyncControlledWrite,
+        );
+        let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"write_file".to_string()));
+        assert!(names.contains(&"patch_file".to_string()));
+        assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"execute_bash".to_string()));
     }
 }

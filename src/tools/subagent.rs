@@ -29,6 +29,8 @@ pub struct DispatchSubagentArgs {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub claimed_paths: Vec<String>,
+    #[serde(default)]
+    pub allow_writes: bool,
     pub timeout_sec: Option<u64>,
     pub max_steps: Option<usize>,
 }

@@ -29,6 +29,7 @@ pub struct SubagentJobMeta {
     pub input_summary: String,
     pub allowed_tools: Vec<String>,
     pub claimed_paths: Vec<String>,
+    pub allow_writes: bool,
     pub timeout_sec: u64,
     pub max_steps: usize,
     pub created_at_unix_ms: u64,
@@ -228,10 +229,18 @@ impl SubagentRuntime {
             input_summary: args.input_summary.clone(),
             allowed_tools: args.allowed_tools.clone(),
             claimed_paths: normalize_claimed_paths(&args.claimed_paths),
+            allow_writes: args.allow_writes,
             timeout_sec,
             max_steps,
             created_at_unix_ms: unix_ms_now(),
         };
+
+        if meta.allow_writes && meta.claimed_paths.is_empty() {
+            return Err(ToolError::ExecutionFailed(
+                "Background subagents with allow_writes=true must declare at least one claimed path."
+                    .to_string(),
+            ));
+        }
 
         if let Some((conflicting_job_id, claimed_path)) =
             self.find_claimed_path_conflict(&meta.claimed_paths).await
@@ -436,7 +445,11 @@ impl SubagentRuntime {
             &parent_ctx,
             self.inner.llm.clone(),
             &self.inner.base_tools,
-            SubagentBuildMode::AsyncReadonly,
+            if handle.meta.allow_writes {
+                SubagentBuildMode::AsyncControlledWrite
+            } else {
+                SubagentBuildMode::AsyncReadonly
+            },
             Some(sub_session_id),
             &args.allowed_tools,
             args.max_steps.unwrap_or(5).max(1),
@@ -794,6 +807,7 @@ mod tests {
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
                     claimed_paths: Vec::new(),
+                    allow_writes: false,
                     timeout_sec: Some(5),
                     max_steps: Some(4),
                 },
@@ -827,6 +841,7 @@ mod tests {
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
                     claimed_paths: Vec::new(),
+                    allow_writes: false,
                     timeout_sec: Some(30),
                     max_steps: Some(4),
                 },
@@ -842,6 +857,7 @@ mod tests {
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
                     claimed_paths: Vec::new(),
+                    allow_writes: false,
                     timeout_sec: Some(30),
                     max_steps: Some(4),
                 },
@@ -871,6 +887,7 @@ mod tests {
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
                     claimed_paths: Vec::new(),
+                    allow_writes: false,
                     timeout_sec: Some(30),
                     max_steps: Some(4),
                 },
@@ -899,6 +916,7 @@ mod tests {
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
                     claimed_paths: vec!["src/parser".to_string()],
+                    allow_writes: false,
                     timeout_sec: Some(30),
                     max_steps: Some(4),
                 },
@@ -914,6 +932,7 @@ mod tests {
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
                     claimed_paths: vec!["src/parser/ast".to_string()],
+                    allow_writes: false,
                     timeout_sec: Some(30),
                     max_steps: Some(4),
                 },
@@ -948,6 +967,7 @@ mod tests {
                     input_summary: "summary".to_string(),
                     allowed_tools: vec!["read_file".to_string()],
                     claimed_paths: Vec::new(),
+                    allow_writes: false,
                     timeout_sec: Some(5),
                     max_steps: Some(4),
                 },
@@ -990,6 +1010,7 @@ mod tests {
             input_summary: "summary".to_string(),
             allowed_tools: vec!["read_file".to_string()],
             claimed_paths: Vec::new(),
+            allow_writes: false,
             timeout_sec: 5,
             max_steps: 4,
             created_at_unix_ms: unix_ms_now(),
@@ -1021,6 +1042,7 @@ mod tests {
             input_summary: "summary".to_string(),
             allowed_tools: vec!["read_file".to_string()],
             claimed_paths: Vec::new(),
+            allow_writes: false,
             timeout_sec: 5,
             max_steps: 4,
             created_at_unix_ms: unix_ms_now(),
@@ -1049,5 +1071,39 @@ mod tests {
 
         assert!(runtime.get_job_handle("consumed").await.is_none());
         assert!(runtime.get_job_handle("unconsumed").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_job_rejects_allow_writes_without_claimed_paths() {
+        let runtime = SubagentRuntime::new(
+            Arc::new(FinishImmediatelyLlm),
+            vec![
+                Arc::new(MockTool("read_file")),
+                Arc::new(MockTool("write_file")),
+            ],
+            2,
+        );
+
+        let result = runtime
+            .spawn_job(
+                make_ctx(),
+                DispatchSubagentArgs {
+                    goal: "edit parser".to_string(),
+                    input_summary: "summary".to_string(),
+                    allowed_tools: vec!["write_file".to_string()],
+                    claimed_paths: Vec::new(),
+                    allow_writes: true,
+                    timeout_sec: Some(5),
+                    max_steps: Some(4),
+                },
+            )
+            .await;
+
+        match result {
+            Err(ToolError::ExecutionFailed(message)) => {
+                assert!(message.contains("allow_writes=true"));
+            }
+            other => panic!("expected allow_writes validation error, got {:?}", other),
+        }
     }
 }

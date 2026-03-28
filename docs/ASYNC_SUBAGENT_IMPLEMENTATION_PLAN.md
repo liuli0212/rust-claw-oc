@@ -352,7 +352,11 @@ const FORBIDDEN_WRITE_TOOLS: &[&str] = &[
 ];
 ```
 
-第一阶段不暴露 `allow_writes: true` 给模型。
+后续实现中，`allow_writes: true` 可以按受控模式开放，但必须满足：
+
+1. 至少声明一个 `claimed_paths`
+2. 仅放开 `write_file` / `patch_file`
+3. 仍然禁止 `execute_bash` 等高风险工具
 
 ### 5.3 同步 `DispatchSubagentTool` 改造
 
@@ -634,7 +638,7 @@ tokio::spawn(async move {
 
 ### 10.3 二阶段可选增强
 
-未来可增加 `claimed_paths: Vec<String>` 做软冲突检测。第一阶段不实现。
+当前实现已支持 `claimed_paths: Vec<String>` 做软冲突检测；若启用 `allow_writes: true`，则必须显式声明该字段。
 
 ---
 
@@ -827,5 +831,4 @@ v3 明确初始化顺序如下：
 ## 16. 二阶段扩展方向（备忘，不在本期实施）
 
 1. **通知机制**：`SubagentNotificationExtension` 挂载到父 session，`before_turn_start()` 检查已完成 job
-2. **写权限开放**：`allow_writes: true` 标志
-3. **子 Agent 挂载 SkillRuntime**：builder 接受可选 `extensions` 参数
+2. **子 Agent 挂载 SkillRuntime**：builder 接受可选 `extensions` 参数
