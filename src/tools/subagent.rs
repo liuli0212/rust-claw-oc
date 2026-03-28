@@ -126,7 +126,6 @@ impl Tool for DispatchSubagentTool {
 
         let result = match run_result {
             Ok(Ok(exit)) => {
-                tracing::info!("Subagent exited with status: {:?}", exit);
                 let ok = matches!(exit, crate::core::RunExit::Finished(_));
                 let summary = match exit {
                     crate::core::RunExit::Finished(summary) => summary,
@@ -144,6 +143,9 @@ impl Tool for DispatchSubagentTool {
                         "Sub-agent execution was interrupted.".to_string()
                     }
                 };
+
+                let status_label = if ok { "Finished" } else { "Failed" };
+                tracing::info!(target: "subagent", "[Sub:dispatch] {} with summary: {}", status_label, summary);
 
                 SubagentResult {
                     ok,

@@ -41,7 +41,14 @@ impl ExecutionExtension for SubagentNotificationExtension {
             "If you need the final output, call `get_subagent_result` with the relevant `job_id` before finishing this turn."
                 .to_string(),
         );
-        for notification in notifications {
+        for notification in &notifications {
+            tracing::info!(
+                target: "subagent",
+                "[Sub:{}] Background subagent returned via notification ({}) with summary:\n{}",
+                notification.job_id,
+                notification.status,
+                notification.summary
+            );
             lines.push(format!(
                 "- job `{}` ({}) is `{}`: {}",
                 notification.job_id,

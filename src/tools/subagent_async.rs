@@ -177,6 +177,19 @@ impl Tool for GetSubagentResultTool {
             .runtime
             .get_job_snapshot(&parsed.job_id, parsed.consume)
             .await?;
+
+        if snapshot.state.is_terminal() {
+            let status = snapshot.state.finish_reason();
+            let summary_text = match &snapshot.state {
+                crate::subagent_runtime::SubagentJobState::Completed { result, .. } => result.summary.clone(),
+                crate::subagent_runtime::SubagentJobState::Failed { error, partial, .. } => partial.as_ref().map(|p| p.summary.clone()).unwrap_or_else(|| error.clone()),
+                crate::subagent_runtime::SubagentJobState::Cancelled { partial, .. } => partial.as_ref().map(|p| p.summary.clone()).unwrap_or_else(|| "Cancelled".to_string()),
+                crate::subagent_runtime::SubagentJobState::TimedOut { partial, .. } => partial.as_ref().map(|p| p.summary.clone()).unwrap_or_else(|| "Timed out".to_string()),
+                _ => String::new(),
+            };
+            tracing::info!(target: "subagent", "[Sub:{}] Fetched {} result: {}", parsed.job_id, status, summary_text);
+        }
+
         serialize_output(
             "get_subagent_result",
             json!({
