@@ -52,7 +52,9 @@ impl SkillRegistry {
 
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Some(def) = parse_skill_md(&content) {
-                        self.skills.insert(def.meta.name.clone(), def);
+                        let name = def.meta.name.clone();
+                        self.skills.insert(name.clone(), def);
+                        tracing::debug!("Discovered skill '{}' from {:?}", name, path);
                     } else {
                         tracing::warn!("Failed to parse skill file: {:?}", path);
                     }

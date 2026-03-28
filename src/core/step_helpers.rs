@@ -193,8 +193,7 @@ impl AgentLoop {
     }
 
     pub(super) fn extract_finish_task_summary_from_result(result: &str) -> Option<String> {
-        Self::parse_tool_envelope(result)
-            .and_then(|envelope| envelope.effects.finish_task_summary)
+        Self::parse_tool_envelope(result).and_then(|envelope| envelope.effects.finish_task_summary)
     }
 
     pub(super) fn build_function_response_part(
@@ -313,15 +312,23 @@ impl AgentLoop {
                 let current_completed = self.count_completed_todos();
                 if current_completed > self.autopilot_todos_completed_count {
                     // Physical audit passed — generate rolling summary via LLM
-                    tracing::info!("Autopilot physical audit passed. Resetting energy and generating summary.");
-                    self.output.on_text("[System] 物理审计通过，正在生成滚动摘要并重置上下文...\n").await;
+                    tracing::info!(
+                        "Autopilot physical audit passed. Resetting energy and generating summary."
+                    );
+                    self.output
+                        .on_text("[System] 物理审计通过，正在生成滚动摘要并重置上下文...\n")
+                        .await;
 
                     let summary = self.generate_rolling_summary().await;
                     self.context.rolling_summary = Some(summary);
 
                     // Use rule_based_compact to safely compress history (preserves message pairing)
                     let keep_turns = 3;
-                    let to_compact = self.context.dialogue_history.len().saturating_sub(keep_turns);
+                    let to_compact = self
+                        .context
+                        .dialogue_history
+                        .len()
+                        .saturating_sub(keep_turns);
                     if to_compact > 0 {
                         if let Some(reason) = self.context.rule_based_compact(to_compact) {
                             tracing::info!("Autopilot compaction: {}", reason);
@@ -381,6 +388,7 @@ impl AgentLoop {
         }
         self.context.skill_instructions = draft.skill_instructions.clone();
         self.context.skill_state_summary = draft.skill_state_summary.clone();
+        self.context.execution_notices = draft.execution_notices.clone();
 
         let max_tokens = self.context.max_history_tokens;
         let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
@@ -424,6 +432,7 @@ impl AgentLoop {
         let tool_opt = current_tools.iter().find(|tool| tool.name() == call.name);
 
         if let Some(tool) = tool_opt {
+            tracing::info!("Executing tool '{}' with args: {}", call.name, call.args);
             self.output
                 .on_tool_start(&call.name, &call.args.to_string())
                 .await;
@@ -439,12 +448,22 @@ impl AgentLoop {
                     tool.execute(call.args.clone(), &ctx)
                 ) => {
                     match exec_res {
-                        Ok(Ok(res)) => (res, false, false),
-                        Ok(Err(e)) => (format!("Tool error: {}", e), true, false),
-                        Err(e) => (format!("Timeout executing {}: {}", call.name, e), true, false),
+                        Ok(Ok(res)) => {
+                            tracing::info!("Tool '{}' executed successfully", call.name);
+                            (res, false, false)
+                        },
+                        Ok(Err(e)) => {
+                            tracing::warn!("Tool '{}' returned an error: {}", call.name, e);
+                            (format!("Tool error: {}", e), true, false)
+                        },
+                        Err(e) => {
+                            tracing::error!("Tool '{}' timed out: {}", call.name, e);
+                            (format!("Timeout executing {}: {}", call.name, e), true, false)
+                        },
                     }
                 }
                 _ = self.cancel_token.notified() => {
+                    tracing::warn!("Tool execution '{}' interrupted by user", call.name);
                     ("Tool execution interrupted by user.".to_string(), true, true)
                 }
             };
@@ -533,8 +552,12 @@ impl AgentLoop {
         let mut skip_remaining = false;
         let mut should_yield_to_user = false;
         let mut response_parts = Vec::new();
-        
-        let todos_before = if self.is_autopilot { self.count_todos_status() } else { (0, 0) };
+
+        let todos_before = if self.is_autopilot {
+            self.count_todos_status()
+        } else {
+            (0, 0)
+        };
 
         for (mut call, thought_sig) in tool_calls_accumulated {
             if skip_remaining {
@@ -640,8 +663,8 @@ impl AgentLoop {
                     thought_sig.clone(),
                 ));
                 skip_remaining = true;
-                    continue;
-                }
+                continue;
+            }
 
             if is_error {
                 self.output.on_error(&result).await;
@@ -716,14 +739,28 @@ impl AgentLoop {
             for msg in &turn.messages {
                 for part in &msg.parts {
                     if let Some(fc) = &part.function_call {
-                        turn_desc.push_str(&format!("  → {}({})\n", fc.name,
-                            crate::context::AgentContext::truncate_chars(&fc.args.to_string(), 100)));
+                        turn_desc.push_str(&format!(
+                            "  → {}({})\n",
+                            fc.name,
+                            crate::context::AgentContext::truncate_chars(&fc.args.to_string(), 100)
+                        ));
                     }
                     if let Some(fr) = &part.function_response {
-                        let ok = fr.response.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
+                        let ok = fr
+                            .response
+                            .get("ok")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
                         let label = if ok { "✓" } else { "✗" };
-                        turn_desc.push_str(&format!("  {} {} -> {}\n", label, fr.name,
-                            crate::context::AgentContext::truncate_chars(&fr.response.to_string(), 80)));
+                        turn_desc.push_str(&format!(
+                            "  {} {} -> {}\n",
+                            label,
+                            fr.name,
+                            crate::context::AgentContext::truncate_chars(
+                                &fr.response.to_string(),
+                                80
+                            )
+                        ));
                     }
                 }
             }
@@ -785,8 +822,10 @@ impl AgentLoop {
         // Fallback: structural summary from history
         let mut fallback = String::from("Structural summary of recent autopilot activity:\n");
         for turn in self.context.dialogue_history.iter().rev().take(5) {
-            fallback.push_str(&format!("- User: {}\n", 
-                crate::context::AgentContext::truncate_chars(&turn.user_message, 100)));
+            fallback.push_str(&format!(
+                "- User: {}\n",
+                crate::context::AgentContext::truncate_chars(&turn.user_message, 100)
+            ));
             let mut tool_count = 0;
             let mut error_count = 0;
             for msg in &turn.messages {
@@ -801,10 +840,16 @@ impl AgentLoop {
                     }
                 }
             }
-            fallback.push_str(&format!("  ({} tool calls, {} errors)\n", tool_count, error_count));
+            fallback.push_str(&format!(
+                "  ({} tool calls, {} errors)\n",
+                tool_count, error_count
+            ));
         }
         let (completed, uncompleted) = self.count_todos_status();
-        fallback.push_str(&format!("Current TODOS: {} completed, {} remaining\n", completed, uncompleted));
+        fallback.push_str(&format!(
+            "Current TODOS: {} completed, {} remaining\n",
+            completed, uncompleted
+        ));
         fallback
     }
 

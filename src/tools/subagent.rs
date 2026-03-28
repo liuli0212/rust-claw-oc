@@ -74,12 +74,25 @@ impl Tool for DispatchSubagentTool {
         args: Value,
         ctx: &super::protocol::ToolContext,
     ) -> Result<String, ToolError> {
+        tracing::debug!(
+            "DispatchSubagentTool invoked within session: {}",
+            ctx.session_id
+        );
         let parsed: DispatchSubagentArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
         let timeout_sec = parsed.timeout_sec.unwrap_or(60);
         let max_steps = parsed.max_steps.unwrap_or(5).max(1);
         let goal = parsed.goal.clone();
+
+        tracing::info!(
+            "Dispatching subagent with goal: '{}', timeout: {}s, max_steps: {}",
+            goal,
+            timeout_sec,
+            max_steps
+        );
+        tracing::debug!("Subagent allowed_tools: {:?}", parsed.allowed_tools);
+
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_notify = Arc::new(tokio::sync::Notify::new());
         let built = crate::session::factory::build_subagent_session(
@@ -102,12 +115,15 @@ impl Tool for DispatchSubagentTool {
         })
         .await;
 
+        tracing::info!("Subagent execution completed.");
+
         let collected_text = built.collector.take_text().await;
         let tool_outputs = built.collector.take_tool_outputs().await;
         let artifacts = built.collector.take_artifacts().await;
 
         let result = match run_result {
             Ok(Ok(exit)) => {
+                tracing::info!("Subagent exited with status: {:?}", exit);
                 let ok = matches!(exit, crate::core::RunExit::Finished(_));
                 let summary = match exit {
                     crate::core::RunExit::Finished(summary) => summary,
@@ -133,21 +149,27 @@ impl Tool for DispatchSubagentTool {
                     artifacts,
                 }
             }
-            Ok(Err(error)) => SubagentResult {
-                ok: false,
-                summary: format!("Sub-agent error: {}", error),
-                findings: tool_outputs,
-                artifacts,
-            },
-            Err(_) => SubagentResult {
-                ok: false,
-                summary: format!(
-                    "Sub-agent timed out after {}s while working on '{}'.",
-                    timeout_sec, parsed.goal
-                ),
-                findings: tool_outputs,
-                artifacts,
-            },
+            Ok(Err(error)) => {
+                tracing::warn!("Subagent encountered an error: {}", error);
+                SubagentResult {
+                    ok: false,
+                    summary: format!("Sub-agent error: {}", error),
+                    findings: tool_outputs,
+                    artifacts,
+                }
+            }
+            Err(_) => {
+                tracing::warn!("Subagent timed out after {}s", timeout_sec);
+                SubagentResult {
+                    ok: false,
+                    summary: format!(
+                        "Sub-agent timed out after {}s while working on '{}'.",
+                        timeout_sec, parsed.goal
+                    ),
+                    findings: tool_outputs,
+                    artifacts,
+                }
+            }
         };
 
         StructuredToolOutput::new(

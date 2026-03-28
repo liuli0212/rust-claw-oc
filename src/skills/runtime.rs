@@ -33,6 +33,7 @@ pub struct SkillRuntime {
 
 impl SkillRuntime {
     pub fn new() -> Self {
+        tracing::debug!("Initializing SkillRuntime and discovering skills...");
         let mut registry = SkillRegistry::new();
         registry.discover(Path::new("skills"));
         Self::with_registry(registry)
@@ -53,11 +54,17 @@ impl SkillRuntime {
         def: &SkillDef,
         initial_args: Option<String>,
     ) -> Result<(), String> {
+        tracing::info!(
+            "Activating skill '{}' with args: {:?}",
+            def.meta.name,
+            initial_args
+        );
         let mut state = ActiveSkillState::new(def.meta.name.clone(), def.constraints.clone());
         state.initial_args = initial_args;
 
         // Execute preamble if present
         if let Some(preamble) = &def.preamble {
+            tracing::debug!("Executing preamble for skill '{}'", def.meta.name);
             state.execution_state = SkillExecutionState::Bootstrapping;
             let result = super::preamble::execute_preamble(&preamble.shell, None).await;
 
