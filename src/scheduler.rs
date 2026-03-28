@@ -51,10 +51,7 @@ impl AgentOutput for CronOutput {
 }
 
 impl Scheduler {
-    pub fn new(session_manager: Arc<SessionManager>) -> Self {
-        // Note: The "rusty_claw" path is an implicit convention shared
-        // with `SessionRegistryStore`. In the future this should be injected.
-        let file_path = PathBuf::from("rusty_claw").join("schedule.json");
+    pub fn new(session_manager: Arc<SessionManager>, file_path: PathBuf) -> Self {
         let tasks = if file_path.exists() {
             let content = fs::read_to_string(&file_path).unwrap_or_default();
             serde_json::from_str(&content).unwrap_or_default()
@@ -228,8 +225,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_once_deletion() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_schedule.json");
         let sm = Arc::new(SessionManager::new(None, Vec::new()));
-        let scheduler = Arc::new(Scheduler::new(sm));
+        let scheduler = Arc::new(Scheduler::new(sm, file_path));
 
         let task_id = "test_once".to_string();
         let task = ScheduledTask {

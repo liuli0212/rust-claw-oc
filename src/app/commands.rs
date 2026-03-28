@@ -1,5 +1,4 @@
 use crate::core::AgentOutput;
-use crate::scheduler::Scheduler;
 use crate::session_manager::SessionManager;
 use crate::task_state::{TaskStateSnapshot, TaskStateStore};
 use std::sync::Arc;
@@ -158,7 +157,11 @@ impl CommandExecutor {
             Command::Cron(args) => {
                 let parts: Vec<&str> = args.split_whitespace().collect();
                 let action = parts.first().copied().unwrap_or("list");
-                let scheduler = Scheduler::new(self.session_manager.clone());
+                
+                let scheduler = match self.session_manager.scheduler() {
+                    Some(s) => s,
+                    None => return Err("Scheduler is not initialized".to_string()),
+                };
 
                 match action {
                     "list" => {

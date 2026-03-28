@@ -148,7 +148,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = Arc::new(TuiOutput::new());
 
     // Initialize and start the scheduler
-    let scheduler = Arc::new(scheduler::Scheduler::new(session_manager.clone()));
+    let scheduler_path = std::path::PathBuf::from("rusty_claw").join("schedule.json");
+    let scheduler = Arc::new(scheduler::Scheduler::new(session_manager.clone(), scheduler_path));
+    session_manager.set_scheduler(scheduler.clone());
     let scheduler_clone = scheduler.clone();
     tokio::spawn(async move {
         scheduler_clone.run_loop().await;

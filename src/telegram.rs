@@ -90,7 +90,6 @@ pub async fn run_telegram_bot(token: String, session_manager: Arc<SessionManager
                 tracing::info!("Telegram bot @{} connected successfully.", me.username());
                 let mut dispatcher = Dispatcher::builder(bot.clone(), handler.clone())
                     .dependencies(dptree::deps![session_manager.clone()])
-                    .enable_ctrlc_handler()
                     .build();
 
                 // Use spawn to isolate potential panics from the main process

@@ -17,6 +17,8 @@ type SessionEntryMap = AsyncMutex<
 >;
 
 pub struct SessionManager {
+    scheduler: std::sync::RwLock<Option<Arc<crate::scheduler::Scheduler>>>,
+
     llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     tools: RwLock<Vec<Arc<dyn Tool>>>,
     subagent_runtime: Arc<RwLock<Option<crate::subagent_runtime::SubagentRuntime>>>,
@@ -36,10 +38,19 @@ impl SessionManager {
             subagent_runtime: Arc::new(RwLock::new(runtime)),
             routers: RwLock::new(Vec::new()),
             sessions: AsyncMutex::new(HashMap::new()),
+            scheduler: std::sync::RwLock::new(None),
             registry: crate::session::repository::SessionRegistryStore::new(
                 std::path::PathBuf::from("rusty_claw"),
             ),
         }
+    }
+
+    pub fn set_scheduler(&self, scheduler: Arc<crate::scheduler::Scheduler>) {
+        *self.scheduler.write().unwrap() = Some(scheduler);
+    }
+
+    pub fn scheduler(&self) -> Option<Arc<crate::scheduler::Scheduler>> {
+        self.scheduler.read().unwrap().clone()
     }
 
     pub fn add_output_router(&self, router: Arc<dyn OutputRouter>) {
