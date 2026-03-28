@@ -52,7 +52,6 @@ impl DispatchSubagentTool {
         let effective_allowed: Vec<String> = if allowed.is_empty() {
             vec![
                 "read_file".to_string(),
-                "execute_bash".to_string(),
                 "web_fetch".to_string(),
             ]
         } else {
@@ -65,7 +64,7 @@ impl DispatchSubagentTool {
             .iter()
             .filter(|tool| {
                 let name = tool.name();
-                runtime_tools.contains(&name.as_str()) || effective_allowed.contains(&name)
+                name != "dispatch_subagent" && (runtime_tools.contains(&name.as_str()) || effective_allowed.contains(&name))
             })
             .cloned()
             .collect()
@@ -105,11 +104,21 @@ impl Tool for DispatchSubagentTool {
 
         let collector = Arc::new(CollectorOutput::new());
         let mut context = crate::context::AgentContext::new();
-        context.system_prompts.push(format!(
+        
+        let mut prompt = format!(
             "You are a restricted sub-agent. Complete the assigned goal with the available tools, \
              then call `finish_task`.\nParent context summary:\n{}\n\nBe concise.",
             parsed.input_summary
-        ));
+        );
+
+        if let Ok(memory) = std::fs::read_to_string("MEMORY.md") {
+            prompt.push_str(&format!("\n\nWorkspace Memory:\n{}", memory));
+        }
+        if let Ok(agents_md) = std::fs::read_to_string("AGENTS.md") {
+            prompt.push_str(&format!("\n\nAgent Guidelines:\n{}", agents_md));
+        }
+
+        context.system_prompts.push(prompt);
         context.max_history_tokens = 100_000;
 
         let sub_session_id = format!("sub_{}_{}", ctx.session_id, uuid::Uuid::new_v4().simple());
@@ -150,6 +159,7 @@ impl Tool for DispatchSubagentTool {
 
         let collected_text = collector.take_text().await;
         let tool_outputs = collector.take_tool_outputs().await;
+        let artifacts = collector.take_artifacts().await;
 
         let result = match run_result {
             Ok(Ok(exit)) => {
@@ -175,14 +185,14 @@ impl Tool for DispatchSubagentTool {
                     ok,
                     summary,
                     findings: tool_outputs,
-                    artifacts: Vec::new(),
+                    artifacts,
                 }
             }
             Ok(Err(error)) => SubagentResult {
                 ok: false,
                 summary: format!("Sub-agent error: {}", error),
                 findings: tool_outputs,
-                artifacts: Vec::new(),
+                artifacts,
             },
             Err(_) => SubagentResult {
                 ok: false,
@@ -191,7 +201,7 @@ impl Tool for DispatchSubagentTool {
                     timeout_sec, parsed.goal
                 ),
                 findings: tool_outputs,
-                artifacts: Vec::new(),
+                artifacts,
             },
         };
 
@@ -211,6 +221,7 @@ impl Tool for DispatchSubagentTool {
 struct CollectorOutput {
     text: AsyncMutex<String>,
     tool_outputs: AsyncMutex<Vec<String>>,
+    artifacts: AsyncMutex<Vec<String>>,
 }
 
 impl CollectorOutput {
@@ -218,6 +229,7 @@ impl CollectorOutput {
         Self {
             text: AsyncMutex::new(String::new()),
             tool_outputs: AsyncMutex::new(Vec::new()),
+            artifacts: AsyncMutex::new(Vec::new()),
         }
     }
 
@@ -230,6 +242,11 @@ impl CollectorOutput {
         let mut outputs = self.tool_outputs.lock().await;
         std::mem::take(&mut *outputs)
     }
+
+    async fn take_artifacts(&self) -> Vec<String> {
+        let mut artifacts = self.artifacts.lock().await;
+        std::mem::take(&mut *artifacts)
+    }
 }
 
 #[async_trait]
@@ -240,7 +257,15 @@ impl crate::core::AgentOutput for CollectorOutput {
 
     async fn on_thinking(&self, _text: &str) {}
 
-    async fn on_tool_start(&self, _name: &str, _args: &str) {}
+    async fn on_tool_start(&self, name: &str, args: &str) {
+        if name == "write_file" || name == "patch_file" {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
+                if let Some(path) = parsed.get("path").and_then(|p| p.as_str()) {
+                    self.artifacts.lock().await.push(path.to_string());
+                }
+            }
+        }
+    }
 
     async fn on_tool_end(&self, result: &str) {
         let truncated = if result.len() > 500 {
@@ -333,7 +358,7 @@ mod tests {
         let filtered = tool.filter_tools(&[]);
         let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"execute_bash".to_string()));
+        assert!(!names.contains(&"execute_bash".to_string()));
         assert!(names.contains(&"web_fetch".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
@@ -346,15 +371,17 @@ mod tests {
             Arc::new(MockTool("write_file".to_string())),
             Arc::new(MockTool("execute_bash".to_string())),
             Arc::new(MockTool("finish_task".to_string())),
+            Arc::new(MockTool("dispatch_subagent".to_string())),
         ];
         let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), base_tools);
 
-        let filtered = tool.filter_tools(&["read_file".to_string()]);
+        let filtered = tool.filter_tools(&["read_file".to_string(), "dispatch_subagent".to_string()]);
         let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
         assert!(!names.contains(&"execute_bash".to_string()));
+        assert!(!names.contains(&"dispatch_subagent".to_string())); // Should be filtered out
     }
 
     #[tokio::test]
