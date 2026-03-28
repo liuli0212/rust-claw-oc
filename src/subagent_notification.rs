@@ -32,9 +32,13 @@ impl ExecutionExtension for SubagentNotificationExtension {
             return ExtensionDecision::Continue;
         }
 
-        let mut lines = Vec::with_capacity(notifications.len() + 1);
+        let mut lines = Vec::with_capacity(notifications.len() * 2 + 2);
         lines.push(
             "Background subagent updates are available from earlier work in this session:"
+                .to_string(),
+        );
+        lines.push(
+            "If you need the final output, call `get_subagent_result` with the relevant `job_id` before finishing this turn."
                 .to_string(),
         );
         for notification in notifications {
@@ -44,6 +48,10 @@ impl ExecutionExtension for SubagentNotificationExtension {
                 notification.sub_session_id,
                 notification.status,
                 notification.summary
+            ));
+            lines.push(format!(
+                "  Suggested next step: call `get_subagent_result` with `{{\"job_id\":\"{}\"}}` to inspect the final result.",
+                notification.job_id
             ));
         }
 
@@ -130,6 +138,8 @@ mod tests {
         let notices = draft.execution_notices.unwrap();
         assert!(notices.contains("job `job-1`"));
         assert!(notices.contains("Completed parser analysis"));
+        assert!(notices.contains("get_subagent_result"));
+        assert!(notices.contains("\"job_id\":\"job-1\""));
 
         let next_draft = extension.before_prompt_build(PromptDraft::default()).await;
         assert!(next_draft.execution_notices.is_none());
