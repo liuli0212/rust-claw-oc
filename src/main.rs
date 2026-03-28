@@ -24,6 +24,7 @@ mod memory;
 mod session;
 mod session_manager;
 mod skills;
+mod subagent_runtime;
 mod telegram;
 mod tools;
 mod ui;

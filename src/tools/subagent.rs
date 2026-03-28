@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex as AsyncMutex;
 
 use super::protocol::{clean_schema, StructuredToolOutput, Tool, ToolError};
 
@@ -22,7 +21,7 @@ pub struct DispatchSubagentTool {
     base_tools: Vec<Arc<dyn Tool>>,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DispatchSubagentArgs {
     pub goal: String,
     pub input_summary: String,
@@ -41,33 +40,8 @@ pub struct SubagentResult {
 }
 
 impl DispatchSubagentTool {
-    pub fn new(
-        llm: Arc<dyn crate::llm_client::LlmClient>,
-        base_tools: Vec<Arc<dyn Tool>>,
-    ) -> Self {
+    pub fn new(llm: Arc<dyn crate::llm_client::LlmClient>, base_tools: Vec<Arc<dyn Tool>>) -> Self {
         Self { llm, base_tools }
-    }
-
-    fn filter_tools(&self, allowed: &[String]) -> Vec<Arc<dyn Tool>> {
-        let effective_allowed: Vec<String> = if allowed.is_empty() {
-            vec![
-                "read_file".to_string(),
-                "web_fetch".to_string(),
-            ]
-        } else {
-            allowed.to_vec()
-        };
-
-        let runtime_tools = ["finish_task", "task_plan"];
-
-        self.base_tools
-            .iter()
-            .filter(|tool| {
-                let name = tool.name();
-                name != "dispatch_subagent" && (runtime_tools.contains(&name.as_str()) || effective_allowed.contains(&name))
-            })
-            .cloned()
-            .collect()
     }
 }
 
@@ -96,70 +70,37 @@ impl Tool for DispatchSubagentTool {
         args: Value,
         ctx: &super::protocol::ToolContext,
     ) -> Result<String, ToolError> {
-        let parsed: DispatchSubagentArgs = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        let parsed: DispatchSubagentArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
         let timeout_sec = parsed.timeout_sec.unwrap_or(60);
         let max_steps = parsed.max_steps.unwrap_or(5).max(1);
-
-        let collector = Arc::new(CollectorOutput::new());
-        let mut context = crate::context::AgentContext::new();
-        
-        let mut prompt = format!(
-            "You are a restricted sub-agent. Complete the assigned goal with the available tools, \
-             then call `finish_task`.\nParent context summary:\n{}\n\nBe concise.",
-            parsed.input_summary
-        );
-
-        if let Ok(memory) = std::fs::read_to_string("MEMORY.md") {
-            prompt.push_str(&format!("\n\nWorkspace Memory:\n{}", memory));
-        }
-        if let Ok(agents_md) = std::fs::read_to_string("AGENTS.md") {
-            prompt.push_str(&format!("\n\nAgent Guidelines:\n{}", agents_md));
-        }
-
-        context.system_prompts.push(prompt);
-        context.max_history_tokens = 100_000;
-
-        let sub_session_id = format!("sub_{}_{}", ctx.session_id, uuid::Uuid::new_v4().simple());
-        let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
-        let telemetry = Arc::new(telemetry);
-        let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(&sub_session_id));
-
-        let mut tools = self.filter_tools(&parsed.allowed_tools);
-        if !tools.iter().any(|tool| tool.name() == "task_plan") {
-            tools.push(Arc::new(crate::tools::TaskPlanTool::new(
-                sub_session_id.clone(),
-                task_state_store.clone(),
-            )));
-        }
-        if !tools.iter().any(|tool| tool.name() == "finish_task") {
-            tools.push(Arc::new(crate::tools::FinishTaskTool {
-                task_state_store: task_state_store.clone(),
-            }));
-        }
-
-        let mut sub_loop = crate::core::AgentLoop::new(
-            sub_session_id,
+        let goal = parsed.goal.clone();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_notify = Arc::new(tokio::sync::Notify::new());
+        let built = crate::session::factory::build_subagent_session(
+            ctx,
             self.llm.clone(),
-            ctx.reply_to.clone(),
-            tools,
-            context,
-            collector.clone() as Arc<dyn crate::core::AgentOutput>,
-            telemetry,
-            task_state_store,
-        );
-        sub_loop.set_initial_energy_budget(max_steps);
-
-        let run_result = tokio::time::timeout(
-            Duration::from_secs(timeout_sec),
-            sub_loop.step(parsed.goal.clone()),
+            &self.base_tools,
+            crate::session::factory::SubagentBuildMode::SyncCompatible,
+            None,
+            &parsed.allowed_tools,
+            max_steps,
+            &parsed.input_summary,
+            cancelled,
+            cancel_notify,
         )
+        .map_err(ToolError::ExecutionFailed)?;
+
+        let run_result = tokio::time::timeout(Duration::from_secs(timeout_sec), async move {
+            let mut agent_loop = built.agent_loop;
+            agent_loop.step(goal).await
+        })
         .await;
 
-        let collected_text = collector.take_text().await;
-        let tool_outputs = collector.take_tool_outputs().await;
-        let artifacts = collector.take_artifacts().await;
+        let collected_text = built.collector.take_text().await;
+        let tool_outputs = built.collector.take_tool_outputs().await;
+        let artifacts = built.collector.take_artifacts().await;
 
         let result = match run_result {
             Ok(Ok(exit)) => {
@@ -215,69 +156,6 @@ impl Tool for DispatchSubagentTool {
             false,
         )
         .to_json_string()
-    }
-}
-
-struct CollectorOutput {
-    text: AsyncMutex<String>,
-    tool_outputs: AsyncMutex<Vec<String>>,
-    artifacts: AsyncMutex<Vec<String>>,
-}
-
-impl CollectorOutput {
-    fn new() -> Self {
-        Self {
-            text: AsyncMutex::new(String::new()),
-            tool_outputs: AsyncMutex::new(Vec::new()),
-            artifacts: AsyncMutex::new(Vec::new()),
-        }
-    }
-
-    async fn take_text(&self) -> String {
-        let mut text = self.text.lock().await;
-        std::mem::take(&mut *text)
-    }
-
-    async fn take_tool_outputs(&self) -> Vec<String> {
-        let mut outputs = self.tool_outputs.lock().await;
-        std::mem::take(&mut *outputs)
-    }
-
-    async fn take_artifacts(&self) -> Vec<String> {
-        let mut artifacts = self.artifacts.lock().await;
-        std::mem::take(&mut *artifacts)
-    }
-}
-
-#[async_trait]
-impl crate::core::AgentOutput for CollectorOutput {
-    async fn on_text(&self, text: &str) {
-        self.text.lock().await.push_str(text);
-    }
-
-    async fn on_thinking(&self, _text: &str) {}
-
-    async fn on_tool_start(&self, name: &str, args: &str) {
-        if name == "write_file" || name == "patch_file" {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(args) {
-                if let Some(path) = parsed.get("path").and_then(|p| p.as_str()) {
-                    self.artifacts.lock().await.push(path.to_string());
-                }
-            }
-        }
-    }
-
-    async fn on_tool_end(&self, result: &str) {
-        let truncated = if result.len() > 500 {
-            format!("{}...(truncated)", &result[..500])
-        } else {
-            result.to_string()
-        };
-        self.tool_outputs.lock().await.push(truncated);
-    }
-
-    async fn on_error(&self, error: &str) {
-        self.text.lock().await.push_str(&format!("[ERROR] {}\n", error));
     }
 }
 
@@ -355,7 +233,11 @@ mod tests {
         ];
         let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), base_tools);
 
-        let filtered = tool.filter_tools(&[]);
+        let filtered = crate::session::factory::filter_subagent_tools(
+            &tool.base_tools,
+            &[],
+            crate::session::factory::SubagentBuildMode::SyncCompatible,
+        );
         let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"execute_bash".to_string()));
@@ -375,7 +257,11 @@ mod tests {
         ];
         let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), base_tools);
 
-        let filtered = tool.filter_tools(&["read_file".to_string(), "dispatch_subagent".to_string()]);
+        let filtered = crate::session::factory::filter_subagent_tools(
+            &tool.base_tools,
+            &["read_file".to_string(), "dispatch_subagent".to_string()],
+            crate::session::factory::SubagentBuildMode::SyncCompatible,
+        );
         let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
@@ -408,5 +294,32 @@ mod tests {
             serde_json::from_str(&result).unwrap();
         assert!(!envelope.result.ok);
         assert!(envelope.result.output.contains("Energy depleted"));
+    }
+
+    #[test]
+    fn test_filter_tools_async_readonly_blocks_write_like_tools() {
+        let base_tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool("read_file".to_string())),
+            Arc::new(MockTool("write_file".to_string())),
+            Arc::new(MockTool("patch_file".to_string())),
+            Arc::new(MockTool("execute_bash".to_string())),
+            Arc::new(MockTool("finish_task".to_string())),
+        ];
+        let filtered = crate::session::factory::filter_subagent_tools(
+            &base_tools,
+            &[
+                "read_file".to_string(),
+                "write_file".to_string(),
+                "patch_file".to_string(),
+                "execute_bash".to_string(),
+            ],
+            crate::session::factory::SubagentBuildMode::AsyncReadonly,
+        );
+        let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"patch_file".to_string()));
+        assert!(!names.contains(&"execute_bash".to_string()));
     }
 }
