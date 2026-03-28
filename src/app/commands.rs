@@ -16,6 +16,7 @@ pub enum Command {
     Context(String),
     Autopilot(String),
     Manual,
+    Agent(String),
 }
 
 impl Command {
@@ -38,7 +39,7 @@ impl Command {
             "/context" => Some(Command::Context(args)),
             "/autopilot" => Some(Command::Autopilot(args)),
             "/manual" => Some(Command::Manual),
-            _ => None,
+            _ => Some(Command::Agent(line.to_string())),
         }
     }
 }
@@ -283,6 +284,41 @@ impl CommandExecutor {
                 cmd_output.send_success("Autopilot mode disabled. Switched to manual mode.");
                 Ok(())
             }
+            Command::Agent(msg) => {
+                let agent = self
+                    .session_manager
+                    .get_or_create_session(session_id, reply_to, agent_output)
+                    .await?;
+                let mut agent_guard = agent.lock().await;
+                let _ = agent_guard.step(msg).await.map_err(|e| e.to_string())?;
+                Ok(())
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_command_parse_passthrough() {
+        // Unknown command starting with / should be captured as Command::Agent
+        // to allow it to be passed through to the agent's skill runtime.
+        let line = "/system_audit --check-all";
+        let cmd = Command::parse(line).expect("Should parse unknown slash command");
+        if let Command::Agent(msg) = cmd {
+            assert_eq!(msg, line);
+        } else {
+            panic!("Expected Command::Agent for unknown slash command");
+        }
+
+        // Known command should still work as before
+        let cmd_new = Command::parse("/new").expect("Should parse /new");
+        assert!(matches!(cmd_new, Command::New));
+
+        // Non-command (not starting with /) should remain None
+        let cmd_text = Command::parse("hi agent");
+        assert!(cmd_text.is_none());
     }
 }
