@@ -259,7 +259,7 @@ mod tests {
         ];
         let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), base_tools);
 
-        let filtered = crate::session::factory::filter_subagent_tools(
+        let (filtered, _) = crate::session::factory::filter_subagent_tools(
             &tool.base_tools,
             &[],
             crate::session::factory::SubagentBuildMode::SyncCompatible,
@@ -283,7 +283,7 @@ mod tests {
         ];
         let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), base_tools);
 
-        let filtered = crate::session::factory::filter_subagent_tools(
+        let (filtered, _) = crate::session::factory::filter_subagent_tools(
             &tool.base_tools,
             &["read_file".to_string(), "dispatch_subagent".to_string()],
             crate::session::factory::SubagentBuildMode::SyncCompatible,
@@ -331,7 +331,7 @@ mod tests {
             Arc::new(MockTool("execute_bash".to_string())),
             Arc::new(MockTool("finish_task".to_string())),
         ];
-        let filtered = crate::session::factory::filter_subagent_tools(
+        let (filtered, _) = crate::session::factory::filter_subagent_tools(
             &base_tools,
             &[
                 "read_file".to_string(),

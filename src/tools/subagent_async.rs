@@ -57,6 +57,10 @@ struct GetSubagentResultArgs {
     job_id: String,
     #[serde(default)]
     consume: bool,
+    /// Optional: block up to this many seconds waiting for the subagent to finish.
+    /// If omitted, returns immediately with current status.
+    #[serde(default)]
+    wait_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -120,7 +124,10 @@ impl Tool for GetSubagentResultTool {
     }
 
     fn description(&self) -> String {
-        "Get the current status or final result of a background subagent job by job ID.".to_string()
+        "Get the current status or final result of a background subagent job. \
+         Set `wait_sec` (e.g. 10) to block and wait for completion instead of \
+         polling repeatedly. Do NOT call this tool in a tight loop without wait_sec."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -138,6 +145,35 @@ impl Tool for GetSubagentResultTool {
     ) -> Result<String, ToolError> {
         let parsed: GetSubagentResultArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        // Long polling: if wait_sec is set and job is not yet terminal, block.
+        if let Some(wait_sec) = parsed.wait_sec {
+            if let Some(handle) = self.runtime.get_job_handle(&parsed.job_id).await {
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(wait_sec);
+                loop {
+                    let state = handle.state.read().await;
+                    if state.is_terminal() {
+                        break;
+                    }
+                    drop(state);
+
+                    let remaining =
+                        deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+
+                    // Wait for completion signal OR heartbeat (2s max to guard against
+                    // lost Notify signals — see implementation_plan.md #2 rationale).
+                    tokio::select! {
+                        _ = handle.completion_notify.notified() => {}
+                        _ = tokio::time::sleep(remaining.min(std::time::Duration::from_secs(2))) => {}
+                    }
+                }
+            }
+        }
+
         let snapshot = self
             .runtime
             .get_job_snapshot(&parsed.job_id, parsed.consume)

@@ -78,6 +78,25 @@ impl BashTool {
     }
 }
 
+/// RAII guard that ensures both the child process and PTY master are cleaned up
+/// when the execution future is dropped (e.g., by `tokio::time::timeout` or task abort).
+/// Dropping the master PTY causes the reader thread to receive EOF and exit.
+struct BashExecutionGuard {
+    child: std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+}
+
+impl Drop for BashExecutionGuard {
+    fn drop(&mut self) {
+        // 1. Kill the child process
+        if let Ok(mut c) = self.child.lock() {
+            let _ = c.kill();
+        }
+        // 2. Drop the master PTY to unblock any reader threads waiting on read()
+        self.master.take();
+    }
+}
+
 #[async_trait]
 impl Tool for BashTool {
     fn name(&self) -> String {
@@ -156,6 +175,14 @@ impl Tool for BashTool {
             .try_clone_reader()
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
+        // RAII guard: owns both child and master. When the async future is dropped
+        // (timeout/abort), the guard kills the child and closes the PTY master,
+        // which unblocks the reader thread.
+        let guard = BashExecutionGuard {
+            child: child.clone(),
+            master: Some(pair.master),
+        };
+
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 1024];
@@ -171,6 +198,10 @@ impl Tool for BashTool {
 
         let child_clone = child.clone();
         let read_future = async move {
+            // Guard lives inside the future; it is dropped when the future completes
+            // or is cancelled by timeout.
+            let _guard = guard;
+
             let mut raw_output = String::new();
             while let Some(chunk) = rx.recv().await {
                 raw_output.push_str(&String::from_utf8_lossy(&chunk));
@@ -229,8 +260,8 @@ impl Tool for BashTool {
                 structured.to_json_string()
             }
             Err(_) => {
-                let mut c = child.lock().unwrap();
-                let _ = c.kill();
+                // Timeout: the read_future was dropped, which dropped the guard,
+                // which killed the child and closed the PTY master.
                 tracing::warn!(
                     "Bash command timed out after {}s: {}",
                     timeout_secs,

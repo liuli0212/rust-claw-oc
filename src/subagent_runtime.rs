@@ -105,6 +105,9 @@ pub struct SubagentJobHandle {
     pub consumed_at_unix_ms: tokio::sync::RwLock<Option<u64>>,
     pub cancelled: Arc<AtomicBool>,
     pub cancel_notify: Arc<tokio::sync::Notify>,
+    /// Fired when the job reaches a terminal state (completed/failed/cancelled/timed_out).
+    /// Separate from cancel_notify to avoid conflating cancellation and completion semantics.
+    pub completion_notify: Arc<tokio::sync::Notify>,
     pub task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -116,6 +119,7 @@ impl SubagentJobHandle {
             consumed_at_unix_ms: tokio::sync::RwLock::new(None),
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            completion_notify: Arc::new(tokio::sync::Notify::new()),
             task: tokio::sync::Mutex::new(None),
         }
     }
@@ -347,6 +351,7 @@ impl SubagentRuntime {
         }
         if let Some(state) = should_notify {
             self.enqueue_notification(&handle.meta, &state).await;
+            handle.completion_notify.notify_waiters();
         }
         Ok(())
     }
@@ -388,7 +393,7 @@ impl SubagentRuntime {
         }
     }
 
-    async fn get_job_handle(&self, job_id: &str) -> Option<Arc<SubagentJobHandle>> {
+    pub(crate) async fn get_job_handle(&self, job_id: &str) -> Option<Arc<SubagentJobHandle>> {
         let jobs = self.inner.jobs.read().await;
         jobs.get(job_id).cloned()
     }
@@ -439,7 +444,7 @@ impl SubagentRuntime {
             };
         }
 
-        let final_state = match build_subagent_session(
+        let executed_state = match build_subagent_session(
             &parent_ctx,
             self.inner.llm.clone(),
             &self.inner.base_tools,
@@ -458,10 +463,23 @@ impl SubagentRuntime {
             Ok(BuiltSubagentSession {
                 mut agent_loop,
                 collector,
-                ..
+                rejected_tools,
             }) => {
-                self.execute_subagent(handle.clone(), args, collector, &mut agent_loop)
-                    .await
+                if !rejected_tools.is_empty() {
+                    SubagentJobState::Failed {
+                        finished_at_unix_ms: unix_ms_now(),
+                        error: format!(
+                            "Cannot execute subagent: requested tools [{}] are forbidden \
+                             in background mode. Alter the plan to run synchronously or \
+                             remove these tools from allowed_tools.",
+                            rejected_tools.join(", ")
+                        ),
+                        partial: None,
+                    }
+                } else {
+                    self.execute_subagent(handle.clone(), args, collector, &mut agent_loop)
+                        .await
+                }
             }
             Err(error) => SubagentJobState::Failed {
                 finished_at_unix_ms: unix_ms_now(),
@@ -470,9 +488,41 @@ impl SubagentRuntime {
             },
         };
 
+        // Override state to Cancelled if the cancel flag was set during execution,
+        // regardless of what execute_subagent returned.
+        let final_state = if handle.cancelled.load(Ordering::SeqCst) {
+            match executed_state {
+                SubagentJobState::Cancelled { .. } => executed_state,
+                SubagentJobState::Completed {
+                    finished_at_unix_ms,
+                    result,
+                }
+                | SubagentJobState::Failed {
+                    finished_at_unix_ms,
+                    partial: Some(result),
+                    ..
+                } => SubagentJobState::Cancelled {
+                    finished_at_unix_ms,
+                    partial: Some(result),
+                },
+                _ => SubagentJobState::Cancelled {
+                    finished_at_unix_ms: unix_ms_now(),
+                    partial: None,
+                },
+            }
+        } else {
+            executed_state
+        };
+
         self.enqueue_notification(&handle.meta, &final_state).await;
+        // Only write state if cancel_job() hasn't already set a terminal state.
         let mut state = handle.state.write().await;
-        *state = final_state;
+        if !state.is_terminal() {
+            *state = final_state;
+        }
+        drop(state);
+        // Wake up any get_subagent_result calls waiting via long polling.
+        handle.completion_notify.notify_waiters();
     }
 
     async fn enqueue_notification(&self, meta: &SubagentJobMeta, final_state: &SubagentJobState) {
@@ -536,6 +586,12 @@ impl SubagentRuntime {
             agent_loop.step(args.goal.clone()),
         )
         .await;
+
+        // Give any in-flight async tool outputs an extra 50ms to flush to the collector
+        // if we just timed out and cancelled their parent task.
+        if run_result.is_err() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
         let collected_text = collector.take_text().await;
         let tool_outputs = collector.take_tool_outputs().await;

@@ -25,10 +25,16 @@ impl SkillToolPolicy {
         name_map.insert("Write".to_string(), "write_file".to_string());
         name_map.insert("Edit".to_string(), "patch_file".to_string());
         name_map.insert("WebSearch".to_string(), "web_search".to_string());
+        name_map.insert("AskUser".to_string(), "ask_user_question".to_string());
+        name_map.insert("ask_user".to_string(), "ask_user_question".to_string());
         name_map.insert(
             "AskUserQuestion".to_string(),
             "ask_user_question".to_string(),
         );
+        name_map.insert("spawn_subagent".to_string(), "spawn_subagent".to_string());
+        name_map.insert("get_subagent_result".to_string(), "get_subagent_result".to_string());
+        name_map.insert("cancel_subagent".to_string(), "cancel_subagent".to_string());
+        name_map.insert("list_subagent_jobs".to_string(), "list_subagent_jobs".to_string());
         Self { name_map }
     }
 

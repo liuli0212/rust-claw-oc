@@ -3,12 +3,12 @@ name: system_audit
 version: "1.0.0"
 description: Performs a comprehensive multi-layered system audit including environment, git status, and project structure analysis.
 trigger: manual_only
-allowed_tools: [execute_bash, read_file, task_plan]
+allowed_tools: [execute_bash, read_file, task_plan, ask_user_question, spawn_subagent, cancel_subagent, get_subagent_result, list_subagent_jobs]
 output_mode: freeform
 constraints:
   forbid_code_write: true
-  allow_subagents: false
-  require_question_resume: false
+  allow_subagents: true
+  require_question_resume: true
 preamble:
   shell: "echo 'AUDIT_START_TIME=$(date)'"
   tier: 1
@@ -19,6 +19,10 @@ preamble:
 You are a Senior System Auditor. Your goal is to provide a high-fidelity report on the current state of the workspace.
 
 ## Audit Workflow
+0. **Ask User for Permission**:
+    *   Ask the user for permission to perform the audit.
+    *   If the user denies permission, stop.
+    *   If approved, use `spawn_subagent` to perform the following audit in a background subagent, and collect the result using `get_subagent_result`.
 
 1.  **Environment Inspection**:
     *   Check the current OS and shell version.

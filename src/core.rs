@@ -174,6 +174,7 @@ pub struct AgentLoop {
     pub cancel_token: Arc<Notify>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     pub is_autopilot: bool,
+    pub is_subagent: bool,
     action_history: std::collections::VecDeque<String>,
     reflection_strike: u8,
     autopilot_todos_completed_count: usize,
@@ -210,6 +211,7 @@ impl AgentLoop {
             cancel_token: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_autopilot: false,
+            is_subagent: false,
             action_history: std::collections::VecDeque::new(),
             reflection_strike: 0,
             autopilot_todos_completed_count: 0,
@@ -520,9 +522,16 @@ impl AgentLoop {
             return Ok(RunExit::YieldedToUser);
         }
 
-        // Reset cancel flag at start of each step
-        self.cancelled
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+        // Subagents share the cancelled flag with the parent runtime;
+        // resetting it here would swallow cancel signals from cancel_job().
+        if self.is_subagent {
+            if self.is_cancelled() {
+                return Ok(RunExit::StoppedByUser);
+            }
+        } else {
+            self.cancelled
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
 
         if self.is_autopilot {
             self.autopilot_todos_completed_count = self.count_completed_todos();

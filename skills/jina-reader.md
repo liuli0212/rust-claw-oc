@@ -1,5 +1,7 @@
+---
 name: jina-reader
 description: Extract clean, AI-friendly content from any webpage using Jina Reader API. Bypasses JavaScript restrictions and returns markdown format. Use when web_fetch fails or when you need clean content extraction from complex websites.
+---
 
 # Jina Reader
 
