@@ -216,6 +216,7 @@ pub fn build_agent_session(
     reply_to: &str,
     llm: Arc<dyn LlmClient>,
     tools: Vec<Arc<dyn Tool>>,
+    subagent_runtime: crate::subagent_runtime::SubagentRuntime,
     transcript_path: PathBuf,
     output: Arc<dyn AgentOutput>,
 ) -> Result<Arc<AsyncMutex<AgentLoop>>, String> {
@@ -239,6 +240,18 @@ pub fn build_agent_session(
     session_tools.push(Arc::new(crate::tools::DispatchSubagentTool::new(
         llm.clone(),
         subagent_base_tools,
+    )));
+    session_tools.push(Arc::new(crate::tools::SpawnSubagentTool::new(
+        subagent_runtime.clone(),
+    )));
+    session_tools.push(Arc::new(crate::tools::GetSubagentResultTool::new(
+        subagent_runtime.clone(),
+    )));
+    session_tools.push(Arc::new(crate::tools::CancelSubagentTool::new(
+        subagent_runtime.clone(),
+    )));
+    session_tools.push(Arc::new(crate::tools::ListSubagentJobsTool::new(
+        subagent_runtime,
     )));
 
     let mut agent_loop = AgentLoop::new(
@@ -364,6 +377,7 @@ mod tests {
             "cli",
             llm.clone(),
             Vec::new(),
+            crate::subagent_runtime::SubagentRuntime::new(llm.clone(), Vec::new(), 2),
             transcript_path,
             output,
         )

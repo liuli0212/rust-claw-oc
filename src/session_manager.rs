@@ -19,6 +19,7 @@ type SessionEntryMap = AsyncMutex<
 pub struct SessionManager {
     llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     tools: RwLock<Vec<Arc<dyn Tool>>>,
+    subagent_runtime: Arc<RwLock<Option<crate::subagent_runtime::SubagentRuntime>>>,
     routers: RwLock<Vec<Arc<dyn OutputRouter>>>,
     sessions: SessionEntryMap,
     registry: crate::session::repository::SessionRegistryStore,
@@ -26,9 +27,13 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new(llm: Option<Arc<dyn LlmClient>>, tools: Vec<Arc<dyn Tool>>) -> Self {
+        let runtime = llm.as_ref().map(|llm| {
+            crate::subagent_runtime::SubagentRuntime::new(llm.clone(), tools.clone(), 3)
+        });
         Self {
             llm: Arc::new(RwLock::new(llm)),
             tools: RwLock::new(tools),
+            subagent_runtime: Arc::new(RwLock::new(runtime)),
             routers: RwLock::new(Vec::new()),
             sessions: AsyncMutex::new(HashMap::new()),
             registry: crate::session::repository::SessionRegistryStore::new(
@@ -44,7 +49,11 @@ impl SessionManager {
 
     pub fn route_output(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>> {
         let routers = self.routers.read().unwrap();
-        tracing::debug!("Routing output for reply_to: {}, routers count: {}", reply_to, routers.len());
+        tracing::debug!(
+            "Routing output for reply_to: {}, routers count: {}",
+            reply_to,
+            routers.len()
+        );
         for router in routers.iter() {
             if let Some(output) = router.try_route(reply_to) {
                 tracing::debug!("Found router for reply_to: {}", reply_to);
@@ -58,6 +67,10 @@ impl SessionManager {
     pub fn add_tool(&self, tool: Arc<dyn Tool>) {
         let mut tools = self.tools.write().unwrap();
         tools.push(tool);
+        let llm = self.llm.read().unwrap().clone();
+        let runtime =
+            llm.map(|llm| crate::subagent_runtime::SubagentRuntime::new(llm, tools.clone(), 3));
+        *self.subagent_runtime.write().unwrap() = runtime;
     }
 
     pub async fn reset_session(&self, session_id: &str) {
@@ -106,11 +119,26 @@ impl SessionManager {
                 .clone()
         };
         let tools = self.tools.read().unwrap().clone();
+        let subagent_runtime = {
+            let mut runtime_guard = self.subagent_runtime.write().unwrap();
+            if runtime_guard.is_none() {
+                *runtime_guard = Some(crate::subagent_runtime::SubagentRuntime::new(
+                    llm.clone(),
+                    tools.clone(),
+                    3,
+                ));
+            }
+            runtime_guard
+                .as_ref()
+                .expect("subagent runtime should be initialized")
+                .clone()
+        };
         let agent = crate::session::factory::build_agent_session(
             session_id,
             reply_to,
             llm,
             tools,
+            subagent_runtime,
             transcript_path.clone(),
             output,
         )?;
@@ -139,6 +167,15 @@ impl SessionManager {
                 {
                     let mut llm_guard = self.llm.write().unwrap();
                     *llm_guard = Some(new_llm.clone());
+                }
+                {
+                    let tools = self.tools.read().unwrap().clone();
+                    let mut runtime_guard = self.subagent_runtime.write().unwrap();
+                    *runtime_guard = Some(crate::subagent_runtime::SubagentRuntime::new(
+                        new_llm.clone(),
+                        tools,
+                        3,
+                    ));
                 }
 
                 let agent_mutex = {
