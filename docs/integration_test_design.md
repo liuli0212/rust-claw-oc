@@ -130,6 +130,9 @@
 - 每个测试清理自己的 session/transcript/task state 产物
 - 不依赖测试执行顺序
 - 对异步后台行为设置明确超时
+- 涉及 RAG/记忆的测试必须隔离数据库路径
+- RAG 存储优先使用 `tempdir` 下独立 SQLite 文件；可行时使用 `:memory:`
+- 严禁多个并行测试共享同一个向量库或 SQLite 文件
 
 #### 5.1.3 LLM 测试替身策略
 
@@ -229,6 +232,12 @@ Telegram 第一阶段不做完整 Bot API mock。
 - Telegram 输出能路由到正确 `chat_id`
 
 如果后续确实需要更强保障，可以在第二阶段再为 `run_telegram_bot` 增加受控适配层和有限 mock。
+
+第二阶段若引入 `/getUpdates` 相关 mock，需要额外约束：
+
+- 避免无状态 mock 对同一 update 无限重复返回
+- 使用状态化 mock 或消费后失效策略，确保同一 update 只处理一次
+- 为测试执行增加上限保护，例如最大轮询次数或最大迭代步数
 
 ### 5.4 第四层：黑盒冒烟测试
 
@@ -460,6 +469,18 @@ tests/
 
 - 在 `tests/support/temp_workspace.rs` 中封装清理逻辑
 
+#### 改造 4：RAG/记忆存储路径可注入
+
+目标：
+
+- 防止并行测试读写同一个 SQLite/向量库文件导致污染或锁冲突
+
+建议：
+
+- 为测试初始化入口提供显式的存储路径注入
+- 默认将测试存储目录放在 `tempdir` 内
+- 为需要极致隔离的用例支持内存存储模式
+
 ### 8.2 暂不做的改造
 
 第一阶段明确不做：
@@ -469,6 +490,19 @@ tests/
 - 不改造主循环去专门适配某一类端到端测试
 
 如果后续确实需要真实协议级测试，再在第二阶段单独设计。
+
+第二阶段如果推进 Telegram 协议级测试，可按如下思路落地：
+
+```rust
+// 参考思路：具体可用 API 以当前 teloxide 版本为准
+let bot = Bot::with_client(token, client);
+if let Ok(api_url) = std::env::var("TELEGRAM_API_URL") {
+    if let Ok(url) = reqwest::Url::parse(&api_url) {
+        // 在适配层里注入自定义 API URL，而不是把逻辑散落到业务分支
+        // bot = bot.set_api_url(url);
+    }
+}
+```
 
 ## 9. CI 策略
 
@@ -597,6 +631,21 @@ CI 必须区分快速稳定测试和较慢/较脆的测试。
 - 统一使用临时工作目录
 - 统一清理 session 与状态文件
 - 对有副作用工具优先使用受控路径
+
+### 风险 4：并行测试端口冲突
+
+控制措施：
+
+- 任何本地 mock server 都使用随机可用端口绑定
+- 通过测试运行时动态拼装 `base_url`/`TELEGRAM_API_URL`
+- 禁止硬编码固定端口号
+
+### 风险 5：Telegram 长轮询重复消费
+
+控制措施：
+
+- 对 `/getUpdates` mock 加入状态流转
+- 加入最大轮询次数/最大迭代保护，防止死循环
 
 ## 13. 结论
 
