@@ -71,39 +71,3 @@ impl Tool for MockTool {
         }
     }
 }
-
-pub struct BlockingTool {
-    pub name: String,
-}
-
-impl BlockingTool {
-    pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for BlockingTool {
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    fn description(&self) -> String {
-        "A tool that blocks forever".to_string()
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "OBJECT",
-            "properties": {}
-        })
-    }
-
-    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<String, ToolError> {
-        // Block for a long time
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        Ok(StructuredToolOutput::new(&self.name, true, "done".to_string(), Some(0), None, false).to_json_string().unwrap())
-    }
-}
