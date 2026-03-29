@@ -1,14 +1,11 @@
 use async_trait::async_trait;
-use rusty_claw::tools::{Tool, ToolContext, ToolError};
-use rusty_claw::tools::protocol::StructuredToolOutput;
+use rusty_claw::tools::protocol::{StructuredToolOutput, Tool, ToolContext, ToolError};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct MockTool {
     pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value,
     pub results: Arc<Mutex<Vec<Result<String, String>>>>,
     pub calls: Arc<Mutex<Vec<Value>>>,
 }
@@ -17,13 +14,6 @@ impl MockTool {
     pub fn new(name: &str, result: Result<String, String>) -> Self {
         Self {
             name: name.to_string(),
-            description: format!("Mock tool {}", name),
-            parameters: serde_json::json!({
-                "type": "OBJECT",
-                "properties": {
-                    "arg": { "type": "STRING" }
-                }
-            }),
             results: Arc::new(Mutex::new(vec![result])),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -32,13 +22,6 @@ impl MockTool {
     pub fn with_results(name: &str, results: Vec<Result<String, String>>) -> Self {
         Self {
             name: name.to_string(),
-            description: format!("Mock tool {}", name),
-            parameters: serde_json::json!({
-                "type": "OBJECT",
-                "properties": {
-                    "arg": { "type": "STRING" }
-                }
-            }),
             results: Arc::new(Mutex::new(results)),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
@@ -52,31 +35,39 @@ impl Tool for MockTool {
     }
 
     fn description(&self) -> String {
-        self.description.clone()
+        format!("Mock tool for {}", self.name)
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        self.parameters.clone()
+        serde_json::json!({
+            "type": "OBJECT",
+            "properties": {
+                "arg": {
+                    "type": "STRING"
+                }
+            }
+        })
     }
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String, ToolError> {
-        self.calls.lock().await.push(args.clone());
+        self.calls.lock().await.push(args);
+
         let mut results = self.results.lock().await;
-        let res = if results.len() > 1 {
-            results.remove(0)
+        let result = if results.is_empty() {
+            Ok("default mock result".to_string())
         } else {
-            results[0].clone()
+            results.remove(0)
         };
 
-        match res {
-            Ok(s) => {
-                let mut output = StructuredToolOutput::new(&self.name, true, s.clone(), None, None, false);
+        match result {
+            Ok(res) => {
+                let mut output = StructuredToolOutput::new(&self.name, true, res.clone(), Some(0), None, false);
                 if self.name == "finish_task" {
-                    output = output.with_finish_task_summary(s);
+                    output = output.with_finish_task_summary(res);
                 }
-                output.to_json_string()
-            },
-            Err(e) => Err(ToolError::ExecutionFailed(e)),
+                Ok(output.to_json_string().unwrap())
+            }
+            Err(err) => Err(ToolError::ExecutionFailed(err)),
         }
     }
 }
@@ -113,6 +104,6 @@ impl Tool for BlockingTool {
     async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<String, ToolError> {
         // Block for a long time
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        Ok(StructuredToolOutput::new(&self.name, true, "done".to_string(), None, None, false).to_json_string().unwrap())
+        Ok(StructuredToolOutput::new(&self.name, true, "done".to_string(), Some(0), None, false).to_json_string().unwrap())
     }
 }

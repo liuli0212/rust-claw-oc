@@ -67,9 +67,11 @@ impl LlmClient for ScenarioLlm {
                 if tx.send(stream_event).await.is_err() {
                     break;
                 }
+                // Yield to allow the receiver to process the event
+                tokio::task::yield_now().await;
             }
-            // Add a small delay to ensure events are processed before Done
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Yield before sending Done
+            tokio::task::yield_now().await;
             let _ = tx.send(StreamEvent::Done).await;
         });
 

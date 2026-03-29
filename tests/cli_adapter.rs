@@ -12,7 +12,7 @@ mod support;
 
 #[tokio::test]
 async fn test_cli_headless_command() {
-    let _session_id = "cli_test_session".to_string();
+    let _session_id = format!("cli_test_session_{}", uuid::Uuid::new_v4().simple());
 
     let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
     let tools: Vec<Arc<dyn Tool>> = vec![finish_tool.clone()];
@@ -42,4 +42,5 @@ async fn test_cli_headless_command() {
 
     let texts = output.texts.lock().await;
     assert!(texts.iter().any(|t: &String| t.contains("I will finish the task.")));
+    support::temp_workspace::cleanup_session(&_session_id);
 }

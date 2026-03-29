@@ -14,7 +14,7 @@ use support::test_tools::MockTool;
 #[tokio::test]
 async fn test_single_turn_tool_call_and_finish() {
     let _workspace = TempWorkspace::new();
-    let session_id = "test_session_1".to_string();
+    let session_id = format!("test_session_{}", uuid::Uuid::new_v4().simple());
 
     // Setup mock tools
     let mock_tool = Arc::new(MockTool::new("mock_tool", Ok("mock_result".to_string())));
@@ -58,7 +58,7 @@ async fn test_single_turn_tool_call_and_finish() {
     let task_state_store = Arc::new(TaskStateStore::new(&session_id));
 
     let mut agent = AgentLoop::new(
-        session_id,
+        session_id.clone(),
         llm,
         "cli".to_string(),
         tools,
@@ -70,6 +70,7 @@ async fn test_single_turn_tool_call_and_finish() {
 
     let result = agent.step("Do the task".to_string()).await.unwrap();
 
+    println!("Result: {:?}", result);
     assert!(matches!(result, RunExit::Finished(_)));
 
     let texts = output.texts.lock().await;
@@ -79,12 +80,13 @@ async fn test_single_turn_tool_call_and_finish() {
     let calls = mock_tool.calls.lock().await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].get("arg").unwrap().as_str().unwrap(), "test");
+     
 }
 
 #[tokio::test]
 async fn test_read_then_write_file() {
     let workspace = TempWorkspace::new();
-    let session_id = "test_session_2".to_string();
+    let session_id = format!("test_session_{}", uuid::Uuid::new_v4().simple());
 
     // Setup real tools
     let read_tool = Arc::new(rusty_claw::tools::files::ReadFileTool);
@@ -147,7 +149,7 @@ async fn test_read_then_write_file() {
     let task_state_store = Arc::new(TaskStateStore::new(&session_id));
 
     let mut agent = AgentLoop::new(
-        session_id,
+        session_id.clone(),
         llm,
         "cli".to_string(),
         tools,
@@ -159,17 +161,19 @@ async fn test_read_then_write_file() {
 
     let result = agent.step("Read input.txt and write to output.txt".to_string()).await.unwrap();
 
+    println!("Result: {:?}", result);
     assert!(matches!(result, RunExit::Finished(_)));
 
     // Verify output file
     let output_content = std::fs::read_to_string(&output_path).unwrap();
     assert_eq!(output_content, "Hello from input - modified");
+     
 }
 
 #[tokio::test]
 async fn test_tool_failure_and_recovery() {
     let _workspace = TempWorkspace::new();
-    let session_id = "test_session_3".to_string();
+    let session_id = format!("test_session_{}", uuid::Uuid::new_v4().simple());
 
     // Setup mock tools
     let flaky_tool = Arc::new(MockTool::with_results(
@@ -232,7 +236,7 @@ async fn test_tool_failure_and_recovery() {
     let task_state_store = Arc::new(TaskStateStore::new(&session_id));
 
     let mut agent = AgentLoop::new(
-        session_id,
+        session_id.clone(),
         llm,
         "cli".to_string(),
         tools,
@@ -244,6 +248,7 @@ async fn test_tool_failure_and_recovery() {
 
     let result = agent.step("Do the flaky task".to_string()).await.unwrap();
 
+    println!("Result: {:?}", result);
     assert!(matches!(result, RunExit::Finished(_)));
 
     let errors = output.errors.lock().await;
@@ -253,12 +258,13 @@ async fn test_tool_failure_and_recovery() {
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].get("arg").unwrap().as_str().unwrap(), "try_1");
     assert_eq!(calls[1].get("arg").unwrap().as_str().unwrap(), "try_2");
+     
 }
 
 #[tokio::test]
 async fn test_session_recovery() {
     let _workspace = TempWorkspace::new();
-    let session_id = "test_session_4".to_string();
+    let session_id = format!("test_session_{}", uuid::Uuid::new_v4().simple());
 
     let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
     let tools: Vec<Arc<dyn Tool>> = vec![finish_tool.clone()];
@@ -285,11 +291,13 @@ async fn test_session_recovery() {
     // Turn 1
     {
         let session_manager = rusty_claw::session_manager::SessionManager::new(Some(llm_turn1), tools.clone());
-        let agent_mutex = session_manager.get_or_create_session(&session_id, "cli", output.clone()).await.unwrap();
+        let agent_mutex = session_manager.get_or_create_session(&session_id.clone(), "cli", output.clone()).await.unwrap();
         let mut agent = agent_mutex.lock().await;
         let result = agent.step("Do turn 1".to_string()).await.unwrap();
-        assert!(matches!(result, RunExit::Finished(_)));
-    }
+        println!("Result: {:?}", result);
+    assert!(matches!(result, RunExit::Finished(_)));
+         
+}
 
     // Setup scenario LLM for turn 2
     let llm_turn2 = Arc::new(ScenarioLlm::new(vec![
@@ -311,7 +319,7 @@ async fn test_session_recovery() {
     // Turn 2 with a new SessionManager (simulating restart)
     {
         let session_manager = rusty_claw::session_manager::SessionManager::new(Some(llm_turn2), tools.clone());
-        let agent_mutex = session_manager.get_or_create_session(&session_id, "cli", output.clone()).await.unwrap();
+        let agent_mutex = session_manager.get_or_create_session(&session_id.clone(), "cli", output.clone()).await.unwrap();
         let mut agent = agent_mutex.lock().await;
         
         // Verify context has history
@@ -319,18 +327,21 @@ async fn test_session_recovery() {
         assert!(turns > 0, "History should be loaded");
         
         let result = agent.step("Do turn 2".to_string()).await.unwrap();
-        assert!(matches!(result, RunExit::Finished(_)));
-    }
+        println!("Result: {:?}", result);
+    assert!(matches!(result, RunExit::Finished(_)));
+         
+}
 
     let texts = output.texts.lock().await;
     assert!(texts.iter().any(|t| t.contains("I am doing turn 1.")));
     assert!(texts.iter().any(|t| t.contains("I remember turn 1. Now doing turn 2.")));
+     
 }
 
 #[tokio::test]
 async fn test_large_output_compression() {
     let _workspace = TempWorkspace::new();
-    let session_id = "test_session_5".to_string();
+    let session_id = format!("test_session_{}", uuid::Uuid::new_v4().simple());
 
     // Create a very large string (e.g., 100KB)
     let large_string = "A".repeat(100_000);
@@ -385,7 +396,7 @@ async fn test_large_output_compression() {
     let task_state_store = Arc::new(TaskStateStore::new(&session_id));
 
     let mut agent = AgentLoop::new(
-        session_id,
+        session_id.clone(),
         llm,
         "cli".to_string(),
         tools,
@@ -406,12 +417,13 @@ async fn test_large_output_compression() {
     // Verify that compression happened (the system message should indicate it)
     let texts = output.texts.lock().await;
     assert!(texts.iter().any(|t| t.contains("[System]")));
+     
 }
 
 #[tokio::test]
 async fn test_cancel_task() {
     let _workspace = TempWorkspace::new();
-    let session_id = "test_session_6".to_string();
+    let session_id = format!("test_session_{}", uuid::Uuid::new_v4().simple());
 
     // Setup mock tools
     let blocking_tool = Arc::new(support::test_tools::BlockingTool::new("blocking_tool"));
@@ -440,7 +452,7 @@ async fn test_cancel_task() {
     let task_state_store = Arc::new(TaskStateStore::new(&session_id));
 
     let mut agent = AgentLoop::new(
-        session_id,
+        session_id.clone(),
         llm,
         "cli".to_string(),
         tools,
@@ -460,7 +472,10 @@ async fn test_cancel_task() {
         cancel_token.notify_waiters();
     });
 
-    let result = agent.step("Do the blocking task".to_string()).await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), agent.step("Do the blocking task".to_string())).await.expect("Test timed out").unwrap();
 
     assert!(matches!(result, RunExit::StoppedByUser));
+     
 }
+
+// Add cleanup at the end of the file
