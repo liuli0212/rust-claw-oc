@@ -69,8 +69,6 @@ async fn test_single_turn_tool_call_and_finish() {
     );
 
     let result = agent.step("Do the task".to_string()).await.unwrap();
-
-    println!("Result: {:?}", result);
     assert!(matches!(result, RunExit::Finished(_)));
 
     let texts = output.texts.lock().await;
@@ -80,7 +78,7 @@ async fn test_single_turn_tool_call_and_finish() {
     let calls = mock_tool.calls.lock().await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].get("arg").unwrap().as_str().unwrap(), "test");
-     
+    support::temp_workspace::cleanup_session(&session_id);
 }
 
 #[tokio::test]
@@ -160,14 +158,12 @@ async fn test_read_then_write_file() {
     );
 
     let result = agent.step("Read input.txt and write to output.txt".to_string()).await.unwrap();
-
-    println!("Result: {:?}", result);
     assert!(matches!(result, RunExit::Finished(_)));
 
     // Verify output file
     let output_content = std::fs::read_to_string(&output_path).unwrap();
     assert_eq!(output_content, "Hello from input - modified");
-     
+    support::temp_workspace::cleanup_session(&session_id);
 }
 
 #[tokio::test]
@@ -247,8 +243,6 @@ async fn test_tool_failure_and_recovery() {
     );
 
     let result = agent.step("Do the flaky task".to_string()).await.unwrap();
-
-    println!("Result: {:?}", result);
     assert!(matches!(result, RunExit::Finished(_)));
 
     let errors = output.errors.lock().await;
@@ -258,7 +252,7 @@ async fn test_tool_failure_and_recovery() {
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].get("arg").unwrap().as_str().unwrap(), "try_1");
     assert_eq!(calls[1].get("arg").unwrap().as_str().unwrap(), "try_2");
-     
+    support::temp_workspace::cleanup_session(&session_id);
 }
 
 #[tokio::test]
@@ -294,10 +288,8 @@ async fn test_session_recovery() {
         let agent_mutex = session_manager.get_or_create_session(&session_id.clone(), "cli", output.clone()).await.unwrap();
         let mut agent = agent_mutex.lock().await;
         let result = agent.step("Do turn 1".to_string()).await.unwrap();
-        println!("Result: {:?}", result);
-    assert!(matches!(result, RunExit::Finished(_)));
-         
-}
+        assert!(matches!(result, RunExit::Finished(_)));
+    }
 
     // Setup scenario LLM for turn 2
     let llm_turn2 = Arc::new(ScenarioLlm::new(vec![
@@ -327,15 +319,13 @@ async fn test_session_recovery() {
         assert!(turns > 0, "History should be loaded");
         
         let result = agent.step("Do turn 2".to_string()).await.unwrap();
-        println!("Result: {:?}", result);
-    assert!(matches!(result, RunExit::Finished(_)));
-         
-}
+        assert!(matches!(result, RunExit::Finished(_)));
+    }
 
     let texts = output.texts.lock().await;
     assert!(texts.iter().any(|t| t.contains("I am doing turn 1.")));
     assert!(texts.iter().any(|t| t.contains("I remember turn 1. Now doing turn 2.")));
-     
+    support::temp_workspace::cleanup_session(&session_id);
 }
 
 #[tokio::test]
@@ -417,7 +407,7 @@ async fn test_large_output_compression() {
     // Verify that compression happened (the system message should indicate it)
     let texts = output.texts.lock().await;
     assert!(texts.iter().any(|t| t.contains("[System]")));
-     
+    support::temp_workspace::cleanup_session(&session_id);
 }
 
 #[tokio::test]
@@ -475,7 +465,5 @@ async fn test_cancel_task() {
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), agent.step("Do the blocking task".to_string())).await.expect("Test timed out").unwrap();
 
     assert!(matches!(result, RunExit::StoppedByUser));
-     
+    support::temp_workspace::cleanup_session(&session_id);
 }
-
-// Add cleanup at the end of the file

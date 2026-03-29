@@ -39,18 +39,22 @@ struct TelegramOutputRouter {
     bot: Bot,
 }
 
+pub fn parse_telegram_reply_to(reply_to: &str) -> Option<i64> {
+    reply_to
+        .strip_prefix("tg_")
+        .or_else(|| reply_to.strip_prefix("telegram:"))
+        .and_then(|chat_id_str| chat_id_str.parse::<i64>().ok())
+}
+
 impl OutputRouter for TelegramOutputRouter {
     fn try_route(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>> {
         tracing::debug!("TelegramOutputRouter checking reply_to: '{}'", reply_to);
-        let chat_id_str = reply_to.strip_prefix("tg_").or_else(|| reply_to.strip_prefix("telegram:"));
-        if let Some(chat_id_str) = chat_id_str {
-            if let Ok(id) = chat_id_str.parse::<i64>() {
-                let base_output = Arc::new(output::TelegramOutput::new(
-                    self.bot.clone(),
-                    teloxide::types::ChatId(id),
-                ));
-                return Some(Arc::new(SilentOutputWrapper { inner: base_output }));
-            }
+        if let Some(id) = parse_telegram_reply_to(reply_to) {
+            let base_output = Arc::new(output::TelegramOutput::new(
+                self.bot.clone(),
+                teloxide::types::ChatId(id),
+            ));
+            return Some(Arc::new(SilentOutputWrapper { inner: base_output }));
         }
         None
     }
