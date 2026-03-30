@@ -16,8 +16,6 @@ parameters:
     type: string
     description: "The name of the voice to use. Options: Aoede (Female, Prof), Fenrir (Male, Energetic), Kore (Soft), etc."
     required: false
-preamble:
-  shell: 'python3 skills/scripts/generate_tts.py "{{text}}" "{{output_path}}" "{{voice}}"'
 ---
 # Generate TTS Audio
 
@@ -28,3 +26,13 @@ This skill generates high-quality TTS audio from text using the Gemini 2.5 Flash
 - `text` (string, required): The text content to be converted to speech.
 - `output_path` (string, required): The local path for the output file (MP3 format).
 - `voice` (string, optional): Voice name. Options include Aoede (Female, Prof), Fenrir (Male, Energetic), Kore (Soft), etc.
+
+## Execution
+
+Use `execute_bash` to run:
+
+```bash
+python3 skills/scripts/generate_tts.py "{{text}}" "{{output_path}}" "{{voice}}"
+```
+
+If `voice` is omitted, let the script use its default behavior.

@@ -27,7 +27,6 @@ pub struct ActiveSkillState {
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillExecutionState {
-    Bootstrapping,
     Running,
     WaitingUser,
     WaitingSubagent,
@@ -70,7 +69,7 @@ impl ActiveSkillState {
     pub fn new(skill_name: String, constraints: SkillConstraints) -> Self {
         Self {
             skill_name,
-            execution_state: SkillExecutionState::Bootstrapping,
+            execution_state: SkillExecutionState::Running,
             labels: BTreeMap::new(),
             answers: BTreeMap::new(),
             pending_interaction: None,
@@ -123,7 +122,7 @@ mod tests {
     fn test_new_state() {
         let state = ActiveSkillState::new("test".to_string(), SkillConstraints::default());
         assert_eq!(state.skill_name, "test");
-        assert_eq!(state.execution_state, SkillExecutionState::Bootstrapping);
+        assert_eq!(state.execution_state, SkillExecutionState::Running);
         assert!(state.answers.is_empty());
     }
 

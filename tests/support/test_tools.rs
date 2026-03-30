@@ -3,6 +3,7 @@ use rusty_claw::tools::protocol::{StructuredToolOutput, Tool, ToolContext, ToolE
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::time::Duration;
 
 pub struct MockTool {
     pub name: String,
@@ -61,7 +62,8 @@ impl Tool for MockTool {
 
         match result {
             Ok(res) => {
-                let mut output = StructuredToolOutput::new(&self.name, true, res.clone(), Some(0), None, false);
+                let mut output =
+                    StructuredToolOutput::new(&self.name, true, res.clone(), Some(0), None, false);
                 if self.name == "finish_task" {
                     output = output.with_finish_task_summary(res);
                 }
@@ -69,5 +71,44 @@ impl Tool for MockTool {
             }
             Err(err) => Err(ToolError::ExecutionFailed(err)),
         }
+    }
+}
+
+pub struct BlockingTool {
+    pub name: String,
+}
+
+impl BlockingTool {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for BlockingTool {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn description(&self) -> String {
+        "A tool that blocks until cancelled".to_string()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "OBJECT",
+            "properties": {}
+        })
+    }
+
+    async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<String, ToolError> {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        Ok(
+            StructuredToolOutput::new(&self.name, true, "done".to_string(), Some(0), None, false)
+                .to_json_string()
+                .unwrap(),
+        )
     }
 }

@@ -12,8 +12,6 @@ parameters:
     type: string
     description: The local path (e.g., image.png) where the resulting image will be saved.
     required: true
-preamble:
-  shell: 'python3 skills/scripts/generate_image.py "{{prompt}}" "{{output_path}}"'
 ---
 # Generate Image
 
@@ -27,3 +25,13 @@ Provide a text prompt describing the desired image and an output file path.
 
 - `prompt` (string, required): The text description of the image to generate.
 - `output_path` (string, required): The local path (e.g., image.png) where the resulting image will be saved.
+
+## Execution
+
+Use `execute_bash` to run:
+
+```bash
+python3 skills/scripts/generate_image.py "{{prompt}}" "{{output_path}}"
+```
+
+Then confirm where the image was written.

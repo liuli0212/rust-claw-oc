@@ -48,7 +48,7 @@ impl SkillRuntime {
         }
     }
 
-    /// Activate a skill, executing its preamble if present.
+    /// Activate a skill for the current session.
     pub async fn activate_skill(
         &self,
         def: &SkillDef,
@@ -61,8 +61,6 @@ impl SkillRuntime {
         );
         let mut state = ActiveSkillState::new(def.meta.name.clone(), def.constraints.clone());
         state.initial_args = initial_args;
-
-
         state.execution_state = SkillExecutionState::Running;
 
         *self.active_def.write().await = Some(def.clone());

@@ -12,8 +12,6 @@ parameters:
     type: string
     description: 输出语言（例如：zh, en）。默认为 zh。
     required: false
-preamble:
-  shell: "summarize \"{{input}}\" --model free --language \"{{language}}\""
 ---
 # Summarize Info
 
@@ -23,3 +21,13 @@ preamble:
 
 - `input` (string, required): 要总结的 URL、本地文件路径或文本内容。
 - `language` (string, optional): 输出语言（例如：zh, en）。默认为 zh。
+
+## Execution
+
+使用 `execute_bash` 运行：
+
+```bash
+summarize "{{input}}" --model free --language "{{language}}"
+```
+
+如果 `language` 为空，则省略该参数并使用默认语言。

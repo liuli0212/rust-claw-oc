@@ -19,9 +19,6 @@ impl SkillRegistry {
     }
 
     /// Recursively scan `base_dir` for `SKILL.md` files and register them.
-    ///
-    /// Also scans for legacy `*.md` files (non-SKILL.md) and attempts to
-    /// parse them with the unified parser first, falling back if needed.
     pub fn discover(&mut self, base_dir: &Path) {
         if !base_dir.exists() || !base_dir.is_dir() {
             return;
@@ -45,8 +42,7 @@ impl SkillRegistry {
                     .and_then(|n| n.to_str())
                     .unwrap_or_default();
 
-                // Only process .md files
-                if !filename.ends_with(".md") {
+                if filename != "SKILL.md" {
                     continue;
                 }
 
@@ -168,6 +164,26 @@ body
     fn test_discover_nonexistent_dir() {
         let mut reg = SkillRegistry::new();
         reg.discover(Path::new("/nonexistent/path/12345"));
+        assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn test_ignore_non_skill_markdown_files() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("README.md"),
+            r#"---
+name: should_not_load
+description: Not a skill file
+---
+body
+"#,
+        )
+        .unwrap();
+
+        let mut reg = SkillRegistry::new();
+        reg.discover(dir.path());
+
         assert!(reg.is_empty());
     }
 }

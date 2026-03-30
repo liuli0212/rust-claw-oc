@@ -1,8 +1,7 @@
 //! Core data structures for the unified skill definition model.
 //!
-//! All skills — legacy script-template and new complex workflow — are
-//! represented by `SkillDef`. Runtime behaviour (tool policy,
-//! prompt injection) is driven by these structures.
+//! All skills are represented by `SkillDef`. Runtime behaviour (tool policy
+//! and prompt injection) is driven by these structures.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -78,19 +77,6 @@ pub struct SkillConstraints {
 pub enum ArtifactKind {
     DesignDoc,
     ReviewReport,
-}
-
-
-/// Whether this `SkillDef` originated from the new unified format or was
-/// migrated from an old script-template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(dead_code)]
-pub enum SkillOrigin {
-    /// New unified `SKILL.md` format.
-    #[default]
-    Unified,
-    /// Migrated from legacy `skills/*.md` script-template format.
-    LegacyMigrated,
 }
 
 fn default_version() -> String {

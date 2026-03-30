@@ -12,8 +12,6 @@ parameters:
     type: string
     description: 'Specific question or instruction about the image. Example: "What is in this image?"'
     required: true
-preamble:
-  shell: 'python3 skills/scripts/vision.py "{{image_path}}" "{{prompt}}"'
 ---
 # Understand Image
 
@@ -23,3 +21,13 @@ This skill uses the Google Gemini API to analyze and understand an image file.
 
 - `image_path` (string, required): The local path to the image file to analyze.
 - `prompt` (string, required): Specific question or instruction about the image.
+
+## Execution
+
+Use `execute_bash` to run:
+
+```bash
+python3 skills/scripts/vision.py "{{image_path}}" "{{prompt}}"
+```
+
+Summarize the result in plain language after the command completes.

@@ -430,6 +430,18 @@ impl AgentLoop {
                 .on_tool_start(&call.name, &call.args.to_string())
                 .await;
 
+            if self.is_cancelled() {
+                tracing::warn!(
+                    "Tool execution '{}' aborted before dispatch because the run was already cancelled",
+                    call.name
+                );
+                return ToolDispatchOutcome {
+                    result: "Tool execution interrupted by user.".to_string(),
+                    is_error: true,
+                    stopped: true,
+                };
+            }
+
             let ctx = crate::tools::ToolContext {
                 session_id: self.session_id.clone(),
                 reply_to: self.reply_to.clone(),

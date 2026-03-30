@@ -17,6 +17,7 @@ use serde::Deserialize;
 
 /// Raw YAML frontmatter before conversion to `SkillDef`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFrontmatter {
     name: String,
     #[serde(default = "default_version")]
@@ -30,7 +31,6 @@ struct RawFrontmatter {
     output_mode: Option<String>,
     #[serde(default)]
     constraints: Option<SkillConstraints>,
-    // Legacy fields — script-template skills
     #[serde(default)]
     parameters: Option<serde_yaml::Value>,
 }
@@ -154,5 +154,17 @@ Review the code carefully.
     fn test_parse_invalid_returns_none() {
         assert!(parse_skill_md("no frontmatter here").is_none());
         assert!(parse_skill_md("---\ninvalid: [yaml\n---\nbody").is_none());
+    }
+
+    #[test]
+    fn test_parse_rejects_unknown_frontmatter_field() {
+        let md = r#"---
+name: old_skill
+description: Uses an unsupported field
+unsupported_field: true
+---
+body
+"#;
+        assert!(parse_skill_md(md).is_none());
     }
 }

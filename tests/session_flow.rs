@@ -9,7 +9,7 @@ use std::sync::Arc;
 use support::capture_output::CaptureOutput;
 use support::scenario_llm::{ScenarioEvent, ScenarioLlm, ScenarioTurn};
 use support::temp_workspace::TempWorkspace;
-use support::test_tools::MockTool;
+use support::test_tools::{BlockingTool, MockTool};
 
 #[tokio::test]
 async fn test_single_turn_tool_call_and_finish() {
@@ -72,7 +72,9 @@ async fn test_single_turn_tool_call_and_finish() {
     assert!(matches!(result, RunExit::Finished(_)));
 
     let texts = output.texts.lock().await;
-    assert!(texts.iter().any(|t| t.contains("I will call the mock tool.")));
+    assert!(texts
+        .iter()
+        .any(|t| t.contains("I will call the mock tool.")));
     assert!(texts.iter().any(|t| t.contains("Now I will finish.")));
 
     let calls = mock_tool.calls.lock().await;
@@ -157,7 +159,10 @@ async fn test_read_then_write_file() {
         task_state_store,
     );
 
-    let result = agent.step("Read input.txt and write to output.txt".to_string()).await.unwrap();
+    let result = agent
+        .step("Read input.txt and write to output.txt".to_string())
+        .await
+        .unwrap();
     assert!(matches!(result, RunExit::Finished(_)));
 
     // Verify output file
@@ -264,67 +269,73 @@ async fn test_session_recovery() {
     let tools: Vec<Arc<dyn Tool>> = vec![finish_tool.clone()];
 
     // Setup scenario LLM for turn 1
-    let llm_turn1 = Arc::new(ScenarioLlm::new(vec![
-        ScenarioTurn {
-            events: vec![
-                ScenarioEvent::Text("I am doing turn 1.".to_string()),
-                ScenarioEvent::ToolCall(
-                    FunctionCall {
-                        name: "finish_task".to_string(),
-                        args: serde_json::json!({"summary": "done turn 1"}),
-                        id: Some("call_1".to_string()),
-                    },
-                    Some("call_1".to_string()),
-                ),
-            ],
-        },
-    ]));
+    let llm_turn1 = Arc::new(ScenarioLlm::new(vec![ScenarioTurn {
+        events: vec![
+            ScenarioEvent::Text("I am doing turn 1.".to_string()),
+            ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: serde_json::json!({"summary": "done turn 1"}),
+                    id: Some("call_1".to_string()),
+                },
+                Some("call_1".to_string()),
+            ),
+        ],
+    }]));
 
     let output = Arc::new(CaptureOutput::new());
-    
+
     // Turn 1
     {
-        let session_manager = rusty_claw::session_manager::SessionManager::new(Some(llm_turn1), tools.clone());
-        let agent_mutex = session_manager.get_or_create_session(&session_id.clone(), "cli", output.clone()).await.unwrap();
+        let session_manager =
+            rusty_claw::session_manager::SessionManager::new(Some(llm_turn1), tools.clone());
+        let agent_mutex = session_manager
+            .get_or_create_session(&session_id.clone(), "cli", output.clone())
+            .await
+            .unwrap();
         let mut agent = agent_mutex.lock().await;
         let result = agent.step("Do turn 1".to_string()).await.unwrap();
         assert!(matches!(result, RunExit::Finished(_)));
     }
 
     // Setup scenario LLM for turn 2
-    let llm_turn2 = Arc::new(ScenarioLlm::new(vec![
-        ScenarioTurn {
-            events: vec![
-                ScenarioEvent::Text("I remember turn 1. Now doing turn 2.".to_string()),
-                ScenarioEvent::ToolCall(
-                    FunctionCall {
-                        name: "finish_task".to_string(),
-                        args: serde_json::json!({"summary": "done turn 2"}),
-                        id: Some("call_2".to_string()),
-                    },
-                    Some("call_2".to_string()),
-                ),
-            ],
-        },
-    ]));
+    let llm_turn2 = Arc::new(ScenarioLlm::new(vec![ScenarioTurn {
+        events: vec![
+            ScenarioEvent::Text("I remember turn 1. Now doing turn 2.".to_string()),
+            ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: serde_json::json!({"summary": "done turn 2"}),
+                    id: Some("call_2".to_string()),
+                },
+                Some("call_2".to_string()),
+            ),
+        ],
+    }]));
 
     // Turn 2 with a new SessionManager (simulating restart)
     {
-        let session_manager = rusty_claw::session_manager::SessionManager::new(Some(llm_turn2), tools.clone());
-        let agent_mutex = session_manager.get_or_create_session(&session_id.clone(), "cli", output.clone()).await.unwrap();
+        let session_manager =
+            rusty_claw::session_manager::SessionManager::new(Some(llm_turn2), tools.clone());
+        let agent_mutex = session_manager
+            .get_or_create_session(&session_id.clone(), "cli", output.clone())
+            .await
+            .unwrap();
         let mut agent = agent_mutex.lock().await;
-        
+
         // Verify context has history
         let (_, _, turns, _, _) = agent.context.get_context_status();
         assert!(turns > 0, "History should be loaded");
-        
+
         let result = agent.step("Do turn 2".to_string()).await.unwrap();
         assert!(matches!(result, RunExit::Finished(_)));
     }
 
     let texts = output.texts.lock().await;
     assert!(texts.iter().any(|t| t.contains("I am doing turn 1.")));
-    assert!(texts.iter().any(|t| t.contains("I remember turn 1. Now doing turn 2.")));
+    assert!(texts
+        .iter()
+        .any(|t| t.contains("I remember turn 1. Now doing turn 2.")));
     support::temp_workspace::cleanup_session(&session_id);
 }
 
@@ -358,9 +369,9 @@ async fn test_large_output_compression() {
             ],
         },
         ScenarioTurn {
-            events: vec![
-                ScenarioEvent::Text("I got the large output, now I will yield.".to_string()),
-            ],
+            events: vec![ScenarioEvent::Text(
+                "I got the large output, now I will yield.".to_string(),
+            )],
         },
         ScenarioTurn {
             events: vec![
@@ -380,7 +391,7 @@ async fn test_large_output_compression() {
     let mut context = AgentContext::new();
     // Force a small max_tokens to trigger compression
     context.max_history_tokens = 1000;
-    
+
     let output = Arc::new(CaptureOutput::new());
     let (telemetry, _handle) = TelemetryExporter::new();
     let task_state_store = Arc::new(TaskStateStore::new(&session_id));
@@ -407,5 +418,72 @@ async fn test_large_output_compression() {
     // Verify that compression happened (the system message should indicate it)
     let texts = output.texts.lock().await;
     assert!(texts.iter().any(|t| t.contains("[System]")));
+    support::temp_workspace::cleanup_session(&session_id);
+}
+
+#[tokio::test]
+async fn test_cancel_task() {
+    let _workspace = TempWorkspace::new();
+    let session_id = format!("test_session_{}", uuid::Uuid::new_v4().simple());
+
+    let blocking_tool = Arc::new(BlockingTool::new("blocking_tool"));
+    let tools: Vec<Arc<dyn Tool>> = vec![blocking_tool];
+
+    let llm = Arc::new(ScenarioLlm::new(vec![ScenarioTurn {
+        events: vec![
+            ScenarioEvent::Text("I will call the blocking tool.".to_string()),
+            ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "blocking_tool".to_string(),
+                    args: serde_json::json!({}),
+                    id: Some("call_1".to_string()),
+                },
+                Some("call_1".to_string()),
+            ),
+        ],
+    }]));
+
+    let context = AgentContext::new();
+    let output = Arc::new(CaptureOutput::new());
+    let (telemetry, _handle) = TelemetryExporter::new();
+    let task_state_store = Arc::new(TaskStateStore::new(&session_id));
+
+    let mut agent = AgentLoop::new(
+        session_id.clone(),
+        llm,
+        "cli".to_string(),
+        tools,
+        context,
+        output.clone(),
+        Arc::new(telemetry),
+        task_state_store,
+    );
+
+    let cancel_token = agent.cancel_token.clone();
+    let cancelled_flag = agent.cancelled.clone();
+
+    let output_for_cancel = output.clone();
+    tokio::spawn(async move {
+        for _ in 0..200 {
+            if !output_for_cancel.tool_starts.lock().await.is_empty() {
+                cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                cancel_token.notify_waiters();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        cancel_token.notify_waiters();
+    });
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent.step("Do the blocking task".to_string()),
+    )
+    .await
+    .expect("Test timed out")
+    .unwrap();
+
+    assert!(matches!(result, RunExit::StoppedByUser));
     support::temp_workspace::cleanup_session(&session_id);
 }

@@ -1,11 +1,8 @@
 //! Unified shell execution component.
 //!
-//! Provides a lightweight, non-PTY shell executor used by:
-//! - `SkillTool` (legacy skill script execution)
-//! - `SkillPreamble` (preamble bootstrapping)
-//!
-//! `BashTool` retains its own PTY-based implementation for interactive use,
-//! but this module can be extended to consolidate further in the future.
+//! Provides a lightweight, non-PTY shell executor for non-interactive shell
+//! work. `BashTool` retains its own PTY-based implementation for interactive
+//! use, but this module can be extended to consolidate further in the future.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -26,9 +23,8 @@ pub struct ShellExecResult {
 
 /// Execute a shell command via `bash -c` with a timeout.
 ///
-/// This is the **non-PTY** path — suitable for preamble scripts, legacy skill
-/// templates, and any context where interactive terminal emulation is not
-/// required.
+/// This is the **non-PTY** path for any context where interactive terminal
+/// emulation is not required.
 pub async fn execute_shell(
     command: &str,
     timeout: Duration,
