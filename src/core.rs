@@ -327,11 +327,7 @@ impl AgentLoop {
     }
 
     pub fn get_tools_metadata(&self) -> serde_json::Value {
-        // Include both base tools and dynamically loaded skills
-        let mut all_tools = self.tools.clone();
-        for skill in crate::skills::load_skills("skills") {
-            all_tools.push(std::sync::Arc::new(skill));
-        }
+        let all_tools = self.tools.clone();
 
         serde_json::Value::Array(
             all_tools

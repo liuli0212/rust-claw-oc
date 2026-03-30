@@ -226,9 +226,6 @@ impl AgentLoop {
 
     pub(super) async fn load_current_tools(&self) -> Vec<Arc<dyn Tool>> {
         let mut current_tools = self.tools.clone();
-        for skill in crate::skills::load_skills("skills") {
-            current_tools.push(Arc::new(skill));
-        }
 
         // Extension hook: before_tool_resolution — let extensions filter the tool set
         for ext in &self.extensions {

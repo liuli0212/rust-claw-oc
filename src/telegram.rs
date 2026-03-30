@@ -35,8 +35,8 @@ enum Command {
     Context(String),
 }
 
-struct TelegramOutputRouter {
-    bot: Bot,
+pub struct TelegramOutputRouter {
+    pub bot: Bot,
 }
 
 pub fn parse_telegram_reply_to(reply_to: &str) -> Option<i64> {

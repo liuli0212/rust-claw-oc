@@ -1,37 +1,13 @@
-#[cfg(feature = "acp")]
-mod acp;
-mod app;
-#[cfg(test)]
-mod browser;
-mod context_assembler;
-mod event_log;
-mod evidence;
-mod lsp_client;
-mod rag;
-mod scheduler;
-mod schema;
-mod task_state;
-mod telemetry;
-
-mod config;
-mod context;
-mod core;
-mod discord;
-mod llm_client;
-mod logging;
-mod memory;
-mod session;
-mod session_manager;
-mod skills;
-mod subagent_notification;
-mod subagent_runtime;
-mod telegram;
-mod tools;
-mod ui;
-mod utils;
-
-use crate::session_manager::SessionManager;
-use crate::ui::TuiOutput;
+use rusty_claw::app;
+use rusty_claw::config;
+use rusty_claw::discord;
+use rusty_claw::llm_client;
+use rusty_claw::logging;
+use rusty_claw::scheduler;
+use rusty_claw::session_manager::SessionManager;
+use rusty_claw::telegram;
+use rusty_claw::tools;
+use rusty_claw::ui::{TuiOutput, TuiOutputRouter};
 use clap::Parser;
 use console::style;
 use dotenvy::dotenv;
@@ -143,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
 
     let session_manager = Arc::new(SessionManager::new(llm_opt, bootstrap.tools.clone()));
-    session_manager.add_output_router(Arc::new(ui::TuiOutputRouter));
+    session_manager.add_output_router(Arc::new(TuiOutputRouter));
     let output = Arc::new(TuiOutput::new());
 
     // Initialize and start the scheduler
@@ -179,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sm = session_manager.clone();
                 tokio::spawn(async move {
                     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-                    let acp_server = acp::AcpServer::new(sm);
+                    let acp_server = rusty_claw::acp::AcpServer::new(sm);
                     if let Err(e) = acp_server.run(addr).await {
                         tracing::error!("ACP server failed: {}", e);
                     }

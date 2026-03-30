@@ -3,6 +3,10 @@ name = "rusty-claw"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "rusty_claw"
+path = "src/lib.rs"
+
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
 teloxide = { version = "0.13", features = ["macros"] }
