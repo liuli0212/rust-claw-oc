@@ -153,8 +153,13 @@ impl Scheduler {
                             let last_run_ts = task.last_run.unwrap_or(0);
                             let now_ts = now.timestamp() as u64;
 
-                            tracing::debug!("[Scheduler] Task {}: next={}, now={}, last_run={}", 
-                                task.id, next, now, last_run_ts);
+                            tracing::debug!(
+                                "[Scheduler] Task {}: next={}, now={}, last_run={}",
+                                task.id,
+                                next,
+                                now,
+                                last_run_ts
+                            );
 
                             // If next run is in the past or now, and we haven't run in this minute
                             if next <= now && (now_ts / 60 > last_run_ts / 60) {
@@ -186,7 +191,10 @@ impl Scheduler {
                     let output = sm
                         .route_output(&task.reply_to)
                         .unwrap_or_else(|| Arc::new(CronOutput));
-                    match sm.get_or_create_session(&task.session_id, &task.reply_to, output.clone()).await {
+                    match sm
+                        .get_or_create_session(&task.session_id, &task.reply_to, output.clone())
+                        .await
+                    {
                         Ok(agent_mutex) => {
                             {
                                 let mut agent = agent_mutex.lock().await;
@@ -197,7 +205,7 @@ impl Scheduler {
                                 "[SYSTEM: SCHEDULED EVENT TRIGGERED]\nThis is a scheduled task that has just been triggered. Execute the goal immediately and output the result. DO NOT create new scheduled tasks or reminders for this.\n\nTask Goal: {}",
                                 task.goal
                             );
-                            
+
                             if let Err(e) = agent.step(injected_goal).await {
                                 tracing::error!("Scheduled task {} failed: {}", task.id, e);
                             }
@@ -287,14 +295,17 @@ mod tests {
         // 27 40 8 21 3 ? 2026
         let cron_str = "27 40 8 21 3 ? 2026";
         let schedule = Schedule::from_str(cron_str).expect("Failed to parse cron");
-        
+
         let now = Local.with_ymd_and_hms(2026, 3, 21, 8, 40, 30).unwrap();
         let window_start = now - chrono::Duration::seconds(60);
-        
-        let next = schedule.after(&window_start).next().expect("No next occurrence");
+
+        let next = schedule
+            .after(&window_start)
+            .next()
+            .expect("No next occurrence");
         println!("Now: {}", now);
         println!("Next: {}", next);
-        
+
         assert!(next <= now);
         assert_eq!(next.second(), 27);
     }

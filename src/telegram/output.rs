@@ -309,7 +309,11 @@ impl AgentOutput for TelegramOutput {
             let summary = if output_text.len() > 100 {
                 format!(
                     "{}...",
-                    &output_text.chars().take(80).collect::<String>().replace('\n', " ")
+                    &output_text
+                        .chars()
+                        .take(80)
+                        .collect::<String>()
+                        .replace('\n', " ")
                 )
             } else {
                 output_text.replace('\n', " ")

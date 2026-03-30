@@ -160,7 +160,10 @@ impl AgentOutput for DiscordOutput {
             output_text
         };
         let status_emoji = if ok { "✅" } else { "❌" };
-        let msg = format!("{} **Tool Result**:\n```\n{}\n```", status_emoji, display_result);
+        let msg = format!(
+            "{} **Tool Result**:\n```\n{}\n```",
+            status_emoji, display_result
+        );
         let _ = self.channel_id.say(&self.ctx.http, msg).await;
     }
 
@@ -214,7 +217,10 @@ impl CommandOutput for DiscordCommandOutput {
         let channel_id = self.channel_id;
         tokio::spawn(async move {
             let mut status_msg = "📊 **Bot Status**\n".to_string();
-            status_msg.push_str(&format!("*Provider*: {}\n*Model*: {}\n*Context*: {}/{} tokens\n", data.provider, data.model, data.tokens, data.max_tokens));
+            status_msg.push_str(&format!(
+                "*Provider*: {}\n*Model*: {}\n*Context*: {}/{} tokens\n",
+                data.provider, data.model, data.tokens, data.max_tokens
+            ));
 
             if let Some(state) = data.active_plan {
                 status_msg.push_str(&format!(
@@ -227,10 +233,7 @@ impl CommandOutput for DiscordCommandOutput {
                         "in_progress" => "⏳",
                         _ => "⬜",
                     };
-                    status_msg.push_str(&format!(
-                        "  [{}] {} {}\n",
-                        i, icon, step.step
-                    ));
+                    status_msg.push_str(&format!("  [{}] {} {}\n", i, icon, step.step));
                 }
                 status_msg.push_str(
                     "\n💡 You can say \"continue\" to proceed, or use `/cancel_task` to abort.",
@@ -251,7 +254,10 @@ impl CommandOutput for DiscordCommandOutput {
                 msg.push_str("(No sessions found)");
             } else {
                 for (id, updated, turns) in sessions {
-                    msg.push_str(&format!("• `{}` (Turns: {}, Updated: {})\n", id, turns, updated));
+                    msg.push_str(&format!(
+                        "• `{}` (Turns: {}, Updated: {})\n",
+                        id, turns, updated
+                    ));
                 }
             }
             let _ = channel_id.say(&http, msg).await;
@@ -324,7 +330,10 @@ impl EventHandler for Handler {
         let session_id = format!("discord:{}", msg.channel_id);
         let output = Arc::new(DiscordOutput::new(ctx.clone(), msg.channel_id));
         let executor = CommandExecutor::new(self.session_manager.clone());
-        let cmd_output = Arc::new(DiscordCommandOutput { ctx: ctx.clone(), channel_id: msg.channel_id });
+        let cmd_output = Arc::new(DiscordCommandOutput {
+            ctx: ctx.clone(),
+            channel_id: msg.channel_id,
+        });
 
         let content = msg.content.clone();
         let channel_id = msg.channel_id;
@@ -338,16 +347,39 @@ impl EventHandler for Handler {
                 }
             }
 
-            if let Err(e) = executor.execute(&session_id, &session_id, output.clone(), cmd_output.clone(), cmd).await {
+            if let Err(e) = executor
+                .execute(
+                    &session_id,
+                    &session_id,
+                    output.clone(),
+                    cmd_output.clone(),
+                    cmd,
+                )
+                .await
+            {
                 cmd_output.send_error(&e);
             }
             if let Some(goal) = autopilot_goal {
-                dispatch_agent_step(self.session_manager.clone(), session_id, channel_id, http, output, goal);
+                dispatch_agent_step(
+                    self.session_manager.clone(),
+                    session_id,
+                    channel_id,
+                    http,
+                    output,
+                    goal,
+                );
             }
             return;
         }
 
-        dispatch_agent_step(self.session_manager.clone(), session_id, channel_id, http, output, content);
+        dispatch_agent_step(
+            self.session_manager.clone(),
+            session_id,
+            channel_id,
+            http,
+            output,
+            content,
+        );
     }
 
     async fn ready(&self, _: Context, ready: Ready) {
@@ -370,9 +402,7 @@ fn dispatch_agent_step(
         {
             Ok(a) => a,
             Err(e) => {
-                let _ = channel_id
-                    .say(&http, format!("❌ Error: {}", e))
-                    .await;
+                let _ = channel_id.say(&http, format!("❌ Error: {}", e)).await;
                 return;
             }
         };
@@ -382,11 +412,11 @@ fn dispatch_agent_step(
                 Ok(guard) => guard,
                 Err(_) => {
                     let _ = channel_id
-                    .say(
-                        &http,
-                        "⏳ Previous task is still running. Please wait or cancel it first.",
-                    )
-                    .await;
+                        .say(
+                            &http,
+                            "⏳ Previous task is still running. Please wait or cancel it first.",
+                        )
+                        .await;
                     return;
                 }
             };

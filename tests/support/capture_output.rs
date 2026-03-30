@@ -27,7 +27,10 @@ impl AgentOutput for CaptureOutput {
         self.thoughts.lock().await.push(text.to_string());
     }
     async fn on_tool_start(&self, name: &str, args: &str) {
-        self.tool_starts.lock().await.push((name.to_string(), args.to_string()));
+        self.tool_starts
+            .lock()
+            .await
+            .push((name.to_string(), args.to_string()));
     }
     async fn on_tool_end(&self, result: &str) {
         self.tool_ends.lock().await.push(result.to_string());

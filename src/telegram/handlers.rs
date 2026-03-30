@@ -4,7 +4,7 @@ use crate::app::commands::{Command, CommandExecutor, CommandOutput, StatusData};
 use crate::core::{AgentOutput, RunExit};
 use crate::session_manager::SessionManager;
 use std::sync::Arc;
-use teloxide::{prelude::*, types::ParseMode, utils::command::BotCommands, net::Download};
+use teloxide::{net::Download, prelude::*, types::ParseMode, utils::command::BotCommands};
 
 pub struct TelegramCommandOutput {
     bot: Bot,
@@ -83,8 +83,7 @@ impl CommandOutput for TelegramCommandOutput {
                     .iter()
                     .filter(|s| s.status == "completed")
                     .count();
-                let current_step =
-                    state.plan_steps.iter().find(|s| s.status == "in_progress");
+                let current_step = state.plan_steps.iter().find(|s| s.status == "in_progress");
 
                 status_msg.push_str(&format!(
                     "🎯 *Active Plan*: {}%\n\
@@ -94,18 +93,13 @@ impl CommandOutput for TelegramCommandOutput {
                     } else {
                         0
                     },
-                    Self::escape(
-                        &state.goal.unwrap_or_else(|| "Unknown".to_string())
-                    ),
+                    Self::escape(&state.goal.unwrap_or_else(|| "Unknown".to_string())),
                     completed_steps,
                     total_steps
                 ));
 
                 if let Some(step) = current_step {
-                    status_msg.push_str(&format!(
-                        "👉 *Now*: {}\n",
-                        Self::escape(&step.step)
-                    ));
+                    status_msg.push_str(&format!("👉 *Now*: {}\n", Self::escape(&step.step)));
                 }
 
                 status_msg.push_str("\n💡 Say \"continue\" or use /cancel\\.");
@@ -139,7 +133,10 @@ impl CommandOutput for TelegramCommandOutput {
                     ));
                 }
             }
-            let _ = bot.send_message(chat_id, msg).parse_mode(ParseMode::MarkdownV2).await;
+            let _ = bot
+                .send_message(chat_id, msg)
+                .parse_mode(ParseMode::MarkdownV2)
+                .await;
         });
     }
 
@@ -148,7 +145,9 @@ impl CommandOutput for TelegramCommandOutput {
         let chat_id = self.chat_id;
         tokio::spawn(async move {
             if tasks.is_empty() {
-                let _ = bot.send_message(chat_id, "⚪ No scheduled tasks found.").await;
+                let _ = bot
+                    .send_message(chat_id, "⚪ No scheduled tasks found.")
+                    .await;
             } else {
                 let mut msg = "📅 *Scheduled Tasks*\n━━━━━━━━━━━━━━━━━━━━━\n".to_string();
                 for task in tasks {
@@ -161,7 +160,8 @@ impl CommandOutput for TelegramCommandOutput {
                         Self::escape(&task.goal)
                     ));
                 }
-                let _ = bot.send_message(chat_id, msg)
+                let _ = bot
+                    .send_message(chat_id, msg)
                     .parse_mode(ParseMode::MarkdownV2)
                     .await;
             }
@@ -183,7 +183,9 @@ impl CommandOutput for TelegramCommandOutput {
             if let Some(diff) = diff {
                 let _ = bot.send_message(chat_id, diff).await;
             } else {
-                let _ = bot.send_message(chat_id, "ℹ️ No changes since last snapshot.").await;
+                let _ = bot
+                    .send_message(chat_id, "ℹ️ No changes since last snapshot.")
+                    .await;
             }
         });
     }
@@ -200,7 +202,9 @@ impl CommandOutput for TelegramCommandOutput {
         let bot = self.bot.clone();
         let chat_id = self.chat_id;
         tokio::spawn(async move {
-            let _ = bot.send_message(chat_id, format!("✅ Context dumped locally to {}", path)).await;
+            let _ = bot
+                .send_message(chat_id, format!("✅ Context dumped locally to {}", path))
+                .await;
         });
     }
 
@@ -209,8 +213,14 @@ impl CommandOutput for TelegramCommandOutput {
         let chat_id = self.chat_id;
         tokio::spawn(async move {
             match result {
-                Ok(_) => { let _ = bot.send_message(chat_id, "✅ Compaction finished.").await; }
-                Err(e) => { let _ = bot.send_message(chat_id, format!("❌ Compaction failed: {}", e)).await; }
+                Ok(_) => {
+                    let _ = bot.send_message(chat_id, "✅ Compaction finished.").await;
+                }
+                Err(e) => {
+                    let _ = bot
+                        .send_message(chat_id, format!("❌ Compaction failed: {}", e))
+                        .await;
+                }
             }
         });
     }
@@ -262,7 +272,8 @@ pub(super) async fn handle_command(
 
     let cmd = match tg_cmd {
         TgCommand::Help => {
-            bot.send_message(chat_id, TgCommand::descriptions().to_string()).await?;
+            bot.send_message(chat_id, TgCommand::descriptions().to_string())
+                .await?;
             return Ok(());
         }
         TgCommand::New => Command::New,
@@ -287,7 +298,16 @@ pub(super) async fn handle_command(
         }
     }
 
-    if let Err(e) = executor.execute(&session_id, &session_id, agent_output, cmd_output.clone(), cmd).await {
+    if let Err(e) = executor
+        .execute(
+            &session_id,
+            &session_id,
+            agent_output,
+            cmd_output.clone(),
+            cmd,
+        )
+        .await
+    {
         cmd_output.send_error(&e);
     }
 

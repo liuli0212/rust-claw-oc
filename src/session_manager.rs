@@ -219,7 +219,12 @@ impl SessionManager {
     }
 
     pub fn subagent_runtime(&self) -> crate::subagent_runtime::SubagentRuntime {
-        self.subagent_runtime.read().unwrap().as_ref().expect("subagent runtime should be initialized").clone()
+        self.subagent_runtime
+            .read()
+            .unwrap()
+            .as_ref()
+            .expect("subagent runtime should be initialized")
+            .clone()
     }
 }
 

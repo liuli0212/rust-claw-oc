@@ -1,3 +1,6 @@
+use clap::Parser;
+use console::style;
+use dotenvy::dotenv;
 use rusty_claw::app;
 use rusty_claw::config;
 use rusty_claw::discord;
@@ -8,9 +11,6 @@ use rusty_claw::session_manager::SessionManager;
 use rusty_claw::telegram;
 use rusty_claw::tools;
 use rusty_claw::ui::{TuiOutput, TuiOutputRouter};
-use clap::Parser;
-use console::style;
-use dotenvy::dotenv;
 use std::sync::Arc;
 
 const LOGO: &str = r#"
@@ -124,7 +124,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize and start the scheduler
     let scheduler_path = std::path::PathBuf::from("rusty_claw").join("schedule.json");
-    let scheduler = Arc::new(scheduler::Scheduler::new(session_manager.clone(), scheduler_path));
+    let scheduler = Arc::new(scheduler::Scheduler::new(
+        session_manager.clone(),
+        scheduler_path,
+    ));
     session_manager.set_scheduler(scheduler.clone());
     let scheduler_clone = scheduler.clone();
     tokio::spawn(async move {

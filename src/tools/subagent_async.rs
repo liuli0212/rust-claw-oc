@@ -181,10 +181,21 @@ impl Tool for GetSubagentResultTool {
         if snapshot.state.is_terminal() {
             let status = snapshot.state.finish_reason();
             let summary_text = match &snapshot.state {
-                crate::subagent_runtime::SubagentJobState::Completed { result, .. } => result.summary.clone(),
-                crate::subagent_runtime::SubagentJobState::Failed { error, partial, .. } => partial.as_ref().map(|p| p.summary.clone()).unwrap_or_else(|| error.clone()),
-                crate::subagent_runtime::SubagentJobState::Cancelled { partial, .. } => partial.as_ref().map(|p| p.summary.clone()).unwrap_or_else(|| "Cancelled".to_string()),
-                crate::subagent_runtime::SubagentJobState::TimedOut { partial, .. } => partial.as_ref().map(|p| p.summary.clone()).unwrap_or_else(|| "Timed out".to_string()),
+                crate::subagent_runtime::SubagentJobState::Completed { result, .. } => {
+                    result.summary.clone()
+                }
+                crate::subagent_runtime::SubagentJobState::Failed { error, partial, .. } => partial
+                    .as_ref()
+                    .map(|p| p.summary.clone())
+                    .unwrap_or_else(|| error.clone()),
+                crate::subagent_runtime::SubagentJobState::Cancelled { partial, .. } => partial
+                    .as_ref()
+                    .map(|p| p.summary.clone())
+                    .unwrap_or_else(|| "Cancelled".to_string()),
+                crate::subagent_runtime::SubagentJobState::TimedOut { partial, .. } => partial
+                    .as_ref()
+                    .map(|p| p.summary.clone())
+                    .unwrap_or_else(|| "Timed out".to_string()),
                 _ => String::new(),
             };
             tracing::info!(target: "subagent", "[Sub:{}] Fetched {} result: {}", parsed.job_id, status, summary_text);
@@ -517,4 +528,3 @@ mod tests {
         assert!(payload["debug"]["updated_at_unix_ms"].as_u64().is_some());
     }
 }
-

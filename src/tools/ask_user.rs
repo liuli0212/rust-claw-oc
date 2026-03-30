@@ -5,9 +5,7 @@ use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::protocol::{
-    clean_schema, StructuredToolOutput, Tool, ToolError, UserPromptRequest,
-};
+use super::protocol::{clean_schema, StructuredToolOutput, Tool, ToolError, UserPromptRequest};
 
 pub struct AskUserQuestionTool;
 
@@ -43,7 +41,8 @@ impl Tool for AskUserQuestionTool {
     }
 
     fn description(&self) -> String {
-        "Ask the user a structured question. Execution will pause until the user responds.".to_string()
+        "Ask the user a structured question. Execution will pause until the user responds."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -59,8 +58,8 @@ impl Tool for AskUserQuestionTool {
         args: Value,
         _ctx: &super::protocol::ToolContext,
     ) -> Result<String, ToolError> {
-        let parsed: AskUserQuestionArgs = serde_json::from_value(args)
-            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        let parsed: AskUserQuestionArgs =
+            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
         let prompt_request = UserPromptRequest {
             question: parsed.question.clone(),
@@ -79,15 +78,9 @@ impl Tool for AskUserQuestionTool {
         }
         output.push_str("\n\n[Waiting for user response...]");
 
-        let structured = StructuredToolOutput::new(
-            "ask_user_question",
-            true,
-            output,
-            None,
-            None,
-            false,
-        )
-        .with_await_user(prompt_request);
+        let structured =
+            StructuredToolOutput::new("ask_user_question", true, output, None, None, false)
+                .with_await_user(prompt_request);
 
         structured.to_json_string()
     }

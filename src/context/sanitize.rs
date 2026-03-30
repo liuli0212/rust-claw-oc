@@ -79,20 +79,21 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
         None => return,
     };
 
-    let mut envelope: ToolExecutionEnvelope = match ToolExecutionEnvelope::from_json_str(&result_str) {
-        Some(v) => v,
-        None => {
-            if result_str.len() > 500 {
-                let head: String = result_str.chars().take(200).collect();
-                *result_val = serde_json::Value::String(format!(
-                    "{}\n... [stripped {} chars]",
-                    head,
-                    result_str.len()
-                ));
+    let mut envelope: ToolExecutionEnvelope =
+        match ToolExecutionEnvelope::from_json_str(&result_str) {
+            Some(v) => v,
+            None => {
+                if result_str.len() > 500 {
+                    let head: String = result_str.chars().take(200).collect();
+                    *result_val = serde_json::Value::String(format!(
+                        "{}\n... [stripped {} chars]",
+                        head,
+                        result_str.len()
+                    ));
+                }
+                return;
             }
-            return;
-        }
-    };
+        };
 
     let tool_name = if envelope.result.tool_name.is_empty() {
         fr.name.as_str()
@@ -109,8 +110,7 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
         }
         _ if evidence_kind == Some("file") => {
             if envelope.result.output.lines().count() > 10 {
-                envelope.result.output =
-                    truncate_lines_with_marker(&envelope.result.output, 5, 5);
+                envelope.result.output = truncate_lines_with_marker(&envelope.result.output, 5, 5);
             }
         }
         _ if matches!(evidence_kind, Some("diagnostic" | "directory"))

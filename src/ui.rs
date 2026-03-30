@@ -449,7 +449,11 @@ impl AgentOutput for TuiOutput {
             output_text.replace('\n', " ")
         };
 
-        let icon = if ok { style("✔").green() } else { style("✖").red() };
+        let icon = if ok {
+            style("✔").green()
+        } else {
+            style("✖").red()
+        };
         println!("  {} {}", icon, style(summary).dim());
     }
 
@@ -480,7 +484,11 @@ impl AgentOutput for TuiOutput {
         let fingerprint = format!(
             "{}:{}",
             state.goal.as_deref().unwrap_or(""),
-            state.plan_steps.iter().map(|s| format!("{}{}", s.step, s.status)).collect::<String>()
+            state
+                .plan_steps
+                .iter()
+                .map(|s| format!("{}{}", s.step, s.status))
+                .collect::<String>()
         );
 
         // Update internal state

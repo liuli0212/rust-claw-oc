@@ -36,7 +36,7 @@ impl TaskStateSnapshot {
     pub fn summary(&self) -> String {
         use std::fmt::Write;
         let mut s = String::new();
-        
+
         if self.status != "finished" {
             let _ = writeln!(s, "Current task ({})", self.status);
         }
