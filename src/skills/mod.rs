@@ -8,7 +8,6 @@ pub mod definition;
 pub mod migrate;
 pub mod parser;
 pub mod policy;
-pub mod preamble;
 pub mod registry;
 pub mod runtime;
 pub mod state;

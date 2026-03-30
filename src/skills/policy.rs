@@ -120,7 +120,6 @@ mod tests {
                 parameters: None,
             },
             instructions: String::new(),
-            preamble: None,
             parameters: None,
             constraints: SkillConstraints::default(),
         }

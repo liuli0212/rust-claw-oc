@@ -14,7 +14,7 @@
 //! echo "{{arg1}}"
 //! ```
 
-use super::definition::{SkillConstraints, SkillDef, SkillMeta, SkillPreamble, SkillTrigger};
+use super::definition::{SkillConstraints, SkillDef, SkillMeta, SkillTrigger};
 
 /// Attempt to convert a legacy skill markdown string into a `SkillDef`.
 ///
@@ -83,10 +83,6 @@ pub fn migrate_legacy_skill(content: &str) -> Option<SkillDef> {
             parameters: parameters_json.clone(),
         },
         instructions,
-        preamble: Some(SkillPreamble {
-            shell: script_body,
-            tier: None,
-        }),
         parameters: parameters_json,
         constraints: SkillConstraints::default(),
     })
@@ -114,12 +110,7 @@ echo "Hello {{person_name}}"
         assert_eq!(def.meta.version, "0.1.0-legacy");
         assert!(def.instructions.contains("Legacy Migrated"));
         assert!(def.instructions.contains("person_name"));
-        assert!(def.preamble.is_some());
-        assert!(def
-            .preamble
-            .unwrap()
-            .shell
-            .contains("Hello {{person_name}}"));
+        assert!(def.instructions.contains("Hello {{person_name}}"));
     }
 
     #[test]

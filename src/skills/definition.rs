@@ -1,7 +1,7 @@
 //! Core data structures for the unified skill definition model.
 //!
 //! All skills — legacy script-template and new complex workflow — are
-//! represented by `SkillDef`. Runtime behaviour (tool policy, preamble,
+//! represented by `SkillDef`. Runtime behaviour (tool policy,
 //! prompt injection) is driven by these structures.
 
 use serde::{Deserialize, Serialize};
@@ -13,8 +13,6 @@ pub struct SkillDef {
     pub meta: SkillMeta,
     /// The skill's instruction body (markdown).
     pub instructions: String,
-    /// Optional preamble to execute before skill activation.
-    pub preamble: Option<SkillPreamble>,
     /// Optional parameter definitions (schema).
     pub parameters: Option<Value>,
     /// Runtime constraints and policies.
@@ -82,14 +80,6 @@ pub enum ArtifactKind {
     ReviewReport,
 }
 
-/// Preamble configuration — a shell script run once at skill activation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillPreamble {
-    /// The shell command / script body.
-    pub shell: String,
-    /// Optional priority tier (lower = higher priority).
-    pub tier: Option<u8>,
-}
 
 /// Whether this `SkillDef` originated from the new unified format or was
 /// migrated from an old script-template.

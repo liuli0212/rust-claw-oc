@@ -15,8 +15,6 @@ pub struct ActiveSkillState {
     pub answers: BTreeMap<String, SkillAnswer>,
     /// A pending question waiting for user input.
     pub pending_interaction: Option<PendingInteraction>,
-    /// Preamble execution result, if any.
-    pub preamble_result: Option<PreambleState>,
     /// Artifacts produced during skill execution.
     pub artifacts: Vec<SkillArtifact>,
     /// Arguments provided at activation (e.g. from slash command).
@@ -58,14 +56,6 @@ pub struct PendingInteraction {
     pub asked_at: String,
 }
 
-/// Summary of a preamble execution.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct PreambleState {
-    pub ok: bool,
-    pub vars: BTreeMap<String, String>,
-}
-
 /// An artifact produced by the skill.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -84,7 +74,6 @@ impl ActiveSkillState {
             labels: BTreeMap::new(),
             answers: BTreeMap::new(),
             pending_interaction: None,
-            preamble_result: None,
             artifacts: Vec::new(),
             initial_args: None,
             constraints,

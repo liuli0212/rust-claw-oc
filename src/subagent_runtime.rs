@@ -8,6 +8,7 @@ use tracing::Instrument;
 use crate::llm_client::LlmClient;
 use crate::session::factory::{build_subagent_session, BuiltSubagentSession, SubagentBuildMode};
 use crate::tools::protocol::ToolError;
+use futures::FutureExt;
 use crate::tools::subagent::{DispatchSubagentArgs, SubagentResult};
 use crate::tools::{Tool, ToolContext};
 
@@ -326,10 +327,34 @@ impl SubagentRuntime {
         );
         let join_handle = tokio::spawn(
             async move {
-                let _guard = running_guard;
-                runtime
-                    .run_job(handle_for_task, parent_ctx, args, sub_session_id_for_task)
-                    .await;
+                let res = std::panic::AssertUnwindSafe(async {
+                    let _guard = running_guard;
+                    runtime
+                        .run_job(handle_for_task.clone(), parent_ctx, args, sub_session_id_for_task)
+                        .await;
+                })
+                .catch_unwind()
+                .await;
+
+                if let Err(err) = res {
+                    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = err.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+                    tracing::error!(target: "subagent", "[Sub:{}] Task panicked: {}", handle_for_task.meta.job_id, msg);
+                    let mut state = handle_for_task.state.write().await;
+                    if !state.is_terminal() {
+                        *state = SubagentJobState::Failed {
+                            finished_at_unix_ms: unix_ms_now(),
+                            error: format!("Subagent panicked: {}", msg),
+                            partial: None,
+                        };
+                    }
+                    handle_for_task.completion_notify.notify_waiters();
+                }
             }
             .instrument(span),
         );
@@ -595,6 +620,11 @@ impl SubagentRuntime {
             executed_state
         };
 
+        tracing::info!(
+            target: "subagent",
+            "[Sub:{}] Background execution finished with state: {}",
+            handle.meta.job_id, final_state.finish_reason()
+        );
         self.enqueue_notification(&handle.meta, &final_state).await;
         // Only write state if cancel_job() hasn't already set a terminal state.
         let mut state = handle.state.write().await;

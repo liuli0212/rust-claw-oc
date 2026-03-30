@@ -12,7 +12,7 @@
 //! Markdown body...
 //! ```
 
-use super::definition::{SkillConstraints, SkillDef, SkillMeta, SkillPreamble};
+use super::definition::{SkillConstraints, SkillDef, SkillMeta};
 use serde::Deserialize;
 
 /// Raw YAML frontmatter before conversion to `SkillDef`.
@@ -30,17 +30,9 @@ struct RawFrontmatter {
     output_mode: Option<String>,
     #[serde(default)]
     constraints: Option<SkillConstraints>,
-    #[serde(default)]
-    preamble: Option<RawPreamble>,
     // Legacy fields — script-template skills
     #[serde(default)]
     parameters: Option<serde_yaml::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawPreamble {
-    shell: String,
-    tier: Option<u8>,
 }
 
 fn default_version() -> String {
@@ -91,11 +83,6 @@ pub fn parse_skill_md(content: &str) -> Option<SkillDef> {
         _ => None,
     };
 
-    let preamble = raw.preamble.map(|p| SkillPreamble {
-        shell: p.shell,
-        tier: p.tier,
-    });
-
     Some(SkillDef {
         meta: SkillMeta {
             name: raw.name,
@@ -107,7 +94,6 @@ pub fn parse_skill_md(content: &str) -> Option<SkillDef> {
             parameters: parameters_json,
         },
         instructions: body,
-        preamble,
         parameters: raw.parameters.and_then(|p| serde_json::to_value(p).ok()),
         constraints: raw.constraints.unwrap_or_default(),
     })
@@ -131,7 +117,6 @@ Say hello to the user.
         assert_eq!(def.meta.description, "A simple greeting skill");
         assert_eq!(def.meta.version, "0.1.0");
         assert!(def.instructions.contains("Say hello"));
-        assert!(def.preamble.is_none());
         assert!(!def.constraints.forbid_code_write);
     }
 
@@ -149,9 +134,6 @@ constraints:
   allow_subagents: true
   require_question_resume: true
   required_artifact_kind: review_report
-preamble:
-  shell: "echo READY=true"
-  tier: 1
 ---
 # Code Review Instructions
 Review the code carefully.
@@ -166,8 +148,6 @@ Review the code carefully.
         assert_eq!(def.meta.allowed_tools, vec!["read_file", "execute_bash"]);
         assert!(def.constraints.forbid_code_write);
         assert!(def.constraints.allow_subagents);
-        assert!(def.preamble.is_some());
-        assert_eq!(def.preamble.unwrap().tier, Some(1));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::tools::Tool;
 use super::definition::SkillDef;
 use super::policy::SkillToolPolicy;
 use super::registry::SkillRegistry;
-use super::state::{ActiveSkillState, PreambleState, SkillAnswer, SkillExecutionState};
+use super::state::{ActiveSkillState, SkillAnswer, SkillExecutionState};
 
 /// The Skill Runtime — manages the lifecycle of complex skills.
 ///
@@ -62,26 +62,6 @@ impl SkillRuntime {
         let mut state = ActiveSkillState::new(def.meta.name.clone(), def.constraints.clone());
         state.initial_args = initial_args;
 
-        // Execute preamble if present
-        if let Some(preamble) = &def.preamble {
-            tracing::debug!("Executing preamble for skill '{}'", def.meta.name);
-            state.execution_state = SkillExecutionState::Bootstrapping;
-            let result = super::preamble::execute_preamble(&preamble.shell, None).await;
-
-            state.preamble_result = Some(PreambleState {
-                ok: result.ok,
-                vars: result.vars,
-            });
-
-            if !result.ok {
-                tracing::warn!(
-                    "Preamble failed for skill '{}': {}",
-                    def.meta.name,
-                    result.stderr
-                );
-                // Continue anyway — degraded mode
-            }
-        }
 
         state.execution_state = SkillExecutionState::Running;
 
@@ -388,7 +368,6 @@ mod tests {
                 parameters: None,
             },
             instructions: "Do the thing.".to_string(),
-            preamble: None,
             parameters: None,
             constraints: SkillConstraints {
                 forbid_code_write: forbid_code,
