@@ -160,7 +160,7 @@ impl CommandExecutor {
             Command::Cron(args) => {
                 let parts: Vec<&str> = args.split_whitespace().collect();
                 let action = parts.first().copied().unwrap_or("list");
-                
+
                 let scheduler = match self.session_manager.scheduler() {
                     Some(s) => s,
                     None => return Err("Scheduler is not initialized".to_string()),
@@ -295,52 +295,90 @@ impl CommandExecutor {
                 if job_id.is_empty() {
                     return Err("Usage: /trace <job_id>".to_string());
                 }
-                
+
                 let runtime = self.session_manager.subagent_runtime();
-                let snapshot = runtime.get_job_snapshot(job_id, false).await.map_err(|e| e.to_string())?;
-                
+                let snapshot = runtime
+                    .get_job_snapshot(job_id, false)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
                 let sub_session_id = &snapshot.meta.sub_session_id;
-                
+
                 let mut timeline = String::new();
                 timeline.push_str("### 🔗 主子 Agent 交互 (Main-Sub Interaction)\n");
                 timeline.push_str(&format!("- **Job ID**: {}\n", snapshot.meta.job_id));
                 timeline.push_str(&format!("- **目标 (Goal)**: {}\n", snapshot.meta.goal));
-                timeline.push_str(&format!("- **输入上下文 (Input Summary)**: {}\n", snapshot.meta.input_summary));
-                timeline.push_str(&format!("- **允许工具**: {:?}\n\n", snapshot.meta.allowed_tools));
+                timeline.push_str(&format!(
+                    "- **输入上下文 (Input Summary)**: {}\n",
+                    snapshot.meta.input_summary
+                ));
+                timeline.push_str(&format!(
+                    "- **允许工具**: {:?}\n\n",
+                    snapshot.meta.allowed_tools
+                ));
 
                 timeline.push_str("### 🕵️ 子 Agent 执行轨迹 (Execution Timeline)\n");
-                
-                if let Ok(events) = crate::event_log::EventLog::new(sub_session_id).read_all().await {
+
+                if let Ok(events) = crate::event_log::EventLog::new(sub_session_id)
+                    .read_all()
+                    .await
+                {
                     for (i, event) in events.into_iter().enumerate() {
                         match event.event_type.as_str() {
                             "llm_request" => {
-                                timeline.push_str(&format!("{}. 🤖 **[LLM 请求]** {}\n", i+1, event.payload["summary"].as_str().unwrap_or("")));
-                            },
+                                timeline.push_str(&format!(
+                                    "{}. 🤖 **[LLM 请求]** {}\n",
+                                    i + 1,
+                                    event.payload["summary"].as_str().unwrap_or("")
+                                ));
+                            }
                             "llm_response" => {
-                                let summary = event.payload["summary"].as_str().unwrap_or("").replace("\n", " ");
-                                timeline.push_str(&format!("{}. 💡 **[LLM 响应]** {}\n", i+1, summary));
-                            },
+                                let summary = event.payload["summary"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .replace("\n", " ");
+                                timeline.push_str(&format!(
+                                    "{}. 💡 **[LLM 响应]** {}\n",
+                                    i + 1,
+                                    summary
+                                ));
+                            }
                             "subagent_tool_start" => {
-                                let tool_name = event.payload["tool_name"].as_str().unwrap_or("unknown");
+                                let tool_name =
+                                    event.payload["tool_name"].as_str().unwrap_or("unknown");
                                 let args = event.payload["args"].as_str().unwrap_or("");
-                                timeline.push_str(&format!("{}. 🛠️ **[工具调用]** `{}`\n   - 参数: {}\n", i+1, tool_name, args));
-                            },
+                                timeline.push_str(&format!(
+                                    "{}. 🛠️ **[工具调用]** `{}`\n   - 参数: {}\n",
+                                    i + 1,
+                                    tool_name,
+                                    args
+                                ));
+                            }
                             "subagent_tool_end" => {
-                                let tool_name = event.payload["tool_name"].as_str().unwrap_or("unknown");
-                                let result = event.payload["result"].as_str().unwrap_or("").replace("\n", " ");
-                                timeline.push_str(&format!("{}. ✅ **[工具返回]** `{}`\n   - 结果: {}\n", i+1, tool_name, result));
-                            },
+                                let tool_name =
+                                    event.payload["tool_name"].as_str().unwrap_or("unknown");
+                                let result = event.payload["result"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .replace("\n", " ");
+                                timeline.push_str(&format!(
+                                    "{}. ✅ **[工具返回]** `{}`\n   - 结果: {}\n",
+                                    i + 1,
+                                    tool_name,
+                                    result
+                                ));
+                            }
                             "subagent_error" => {
                                 let error = event.payload["error"].as_str().unwrap_or("");
-                                timeline.push_str(&format!("{}. ❌ **[错误]** {}\n", i+1, error));
-                            },
+                                timeline.push_str(&format!("{}. ❌ **[错误]** {}\n", i + 1, error));
+                            }
                             _ => {}
                         }
                     }
                 } else {
                     timeline.push_str("*无法读取事件日志或日志为空*\n");
                 }
-                
+
                 cmd_output.send_trace(timeline);
                 Ok(())
             }

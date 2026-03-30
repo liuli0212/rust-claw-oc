@@ -157,7 +157,11 @@ pub async fn run_headless_command(
                 std::process::exit(1);
             }
             RunExit::EnergyDepleted(msg) => {
-                println!("\n  {} Task paused due to energy depletion:\n{}", style("⚠️").yellow(), msg);
+                println!(
+                    "\n  {} Task paused due to energy depletion:\n{}",
+                    style("⚠️").yellow(),
+                    msg
+                );
                 std::process::exit(1);
             }
             _ => {
@@ -323,7 +327,10 @@ fn print_help() {
     println!("  {} - List all sessions", style("/session").white());
     println!("  {} - Manage scheduled tasks", style("/cron").yellow());
     println!("  {} - Inspect context", style("/context").blue());
-    println!("  {} - Trace subagent execution", style("/trace <job_id>").magenta());
+    println!(
+        "  {} - Trace subagent execution",
+        style("/trace <job_id>").magenta()
+    );
 
     let mut registry = crate::skills::registry::SkillRegistry::new();
     registry.discover(std::path::Path::new("skills"));
@@ -409,7 +416,10 @@ async fn run_cli_agent_step(
                 println!("  👉 Autopilot 未检测到有效进展，已暂停。您可以直接输入指导意见并继续，或输入 /manual 退出自动驾驶。");
             }
             RunExit::EnergyDepleted(ref summary) => {
-                println!("\n  {} 能量耗尽：自动驾驶已暂停", style("⚠").yellow().bold());
+                println!(
+                    "\n  {} 能量耗尽：自动驾驶已暂停",
+                    style("⚠").yellow().bold()
+                );
                 println!("  {}", style(summary).dim());
                 println!("  👉 您可以输入 \"continue\" 补充能量并继续任务，或者指出修正意见。");
             }
