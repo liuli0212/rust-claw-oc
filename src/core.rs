@@ -134,6 +134,7 @@ pub enum RunExit {
     RecoverableFailed(String),
     CriticallyFailed(String),
     AutopilotStalled(String),
+    EnergyDepleted(String),
 }
 
 impl RunExit {
@@ -145,6 +146,7 @@ impl RunExit {
             RunExit::RecoverableFailed(_) => "recoverable_failed",
             RunExit::CriticallyFailed(_) => "critically_failed",
             RunExit::AutopilotStalled(_) => "autopilot_stalled",
+            RunExit::EnergyDepleted(_) => "energy_depleted",
         }
     }
 }

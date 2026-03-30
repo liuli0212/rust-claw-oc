@@ -331,81 +331,103 @@ impl EventHandler for Handler {
         let http = ctx.http.clone();
 
         if let Some(cmd) = Command::parse(&content) {
+            let mut autopilot_goal = None;
+            if let Command::Autopilot(ref goal) = cmd {
+                if !goal.trim().is_empty() {
+                    autopilot_goal = Some(goal.clone());
+                }
+            }
+
             if let Err(e) = executor.execute(&session_id, &session_id, output.clone(), cmd_output.clone(), cmd).await {
                 cmd_output.send_error(&e);
+            }
+            if let Some(goal) = autopilot_goal {
+                dispatch_agent_step(self.session_manager.clone(), session_id, channel_id, http, output, goal);
             }
             return;
         }
 
-        let agent = match self
-            .session_manager
-            .get_or_create_session(&session_id, &session_id, output.clone())
-            .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                let _ = msg
-                    .channel_id
-                    .say(&ctx.http, format!("❌ Error: {}", e))
-                    .await;
-                return;
-            }
-        };
-
-        // Spawn agent execution in background so EventHandler returns immediately
-        tokio::spawn(async move {
-            // Try to acquire the agent lock without blocking indefinitely.
-            // If the previous task is still running, notify the user instead of silently queuing.
-            let mut agent_guard =
-                match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock()).await {
-                    Ok(guard) => guard,
-                    Err(_) => {
-                        let _ = channel_id
-                        .say(
-                            &http,
-                            "⏳ Previous task is still running. Please wait or cancel it first.",
-                        )
-                        .await;
-                        return;
-                    }
-                };
-
-            let _ = output.on_waiting("Processing...").await;
-
-            // Before stepping, flush any previous buffered un-sent text and update the output
-            agent_guard.flush_output().await;
-            agent_guard.update_output(output.clone());
-
-            let result = agent_guard.step(content).await;
-            drop(agent_guard);
-
-            match result {
-                Ok(exit) => match exit {
-                    crate::core::RunExit::RecoverableFailed(ref e)
-                    | crate::core::RunExit::CriticallyFailed(ref e)
-                    | crate::core::RunExit::AutopilotStalled(ref e) => {
-                        let _ = channel_id
-                            .say(
-                                &http,
-                                format!("⚠️ Run stopped: {}\\nReason: {}", exit.label(), e),
-                            )
-                            .await;
-                    }
-                    crate::core::RunExit::StoppedByUser => {
-                        let _ = channel_id.say(&http, "✅ Task stopped by user.").await;
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    let _ = channel_id.say(&http, format!("Error: {}", e)).await;
-                }
-            }
-        });
+        dispatch_agent_step(self.session_manager.clone(), session_id, channel_id, http, output, content);
     }
 
     async fn ready(&self, _: Context, ready: Ready) {
         tracing::info!("Discord Bot {} is connected", ready.user.name);
     }
+}
+
+fn dispatch_agent_step(
+    session_manager: Arc<SessionManager>,
+    session_id: String,
+    channel_id: serenity::model::id::ChannelId,
+    http: Arc<serenity::http::Http>,
+    output: Arc<DiscordOutput>,
+    content: String,
+) {
+    tokio::spawn(async move {
+        let agent = match session_manager
+            .get_or_create_session(&session_id, &session_id, output.clone())
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = channel_id
+                    .say(&http, format!("❌ Error: {}", e))
+                    .await;
+                return;
+            }
+        };
+
+        let mut agent_guard =
+            match tokio::time::timeout(std::time::Duration::from_secs(3), agent.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    let _ = channel_id
+                    .say(
+                        &http,
+                        "⏳ Previous task is still running. Please wait or cancel it first.",
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+        let _ = output.on_waiting("Processing...").await;
+
+        agent_guard.flush_output().await;
+        agent_guard.update_output(output.clone());
+
+        let result = agent_guard.step(content).await;
+        drop(agent_guard);
+
+        match result {
+            Ok(exit) => match exit {
+                crate::core::RunExit::RecoverableFailed(ref e)
+                | crate::core::RunExit::CriticallyFailed(ref e)
+                | crate::core::RunExit::AutopilotStalled(ref e) => {
+                    let _ = channel_id
+                        .say(
+                            &http,
+                            format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), e),
+                        )
+                        .await;
+                }
+                crate::core::RunExit::EnergyDepleted(ref summary) => {
+                    let msg = format!(
+                        "⚠️ **能量耗尽：自动驾驶已暂停**\n\n{}\n\n👉 您可以输入 `continue` 补充能量并继续任务，或者指出修正意见。",
+                        summary
+                    );
+                    let _ = channel_id.say(&http, msg).await;
+                }
+                crate::core::RunExit::StoppedByUser => {
+                    let _ = channel_id.say(&http, "✅ Task stopped by user.").await;
+                }
+                _ => {}
+            },
+            Err(e) => {
+                let _ = channel_id.say(&http, format!("Error: {}", e)).await;
+            }
+        }
+    });
 }
 
 pub async fn run_discord_bot(token: String, session_manager: Arc<SessionManager>) {

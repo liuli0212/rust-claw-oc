@@ -340,29 +340,20 @@ impl AgentLoop {
                     task_state.energy_points = Self::INITIAL_ENERGY;
                     self.autopilot_todos_completed_count = current_completed;
                     return None; // Continue loop
-                } else {
-                    self.output
-                        .on_text("[System] Autopilot 能量耗尽且未检测到任务进展，停止执行。\n")
-                        .await;
-                    return Some(
-                        self.finalize_exit(
-                            RunExit::AutopilotStalled(
-                                "能量耗尽且物理审计未通过：未检测到 TODOS.md 进展".to_string(),
-                            ),
-                            true,
-                        )
-                        .await,
-                    );
                 }
             }
-            tracing::error!("Energy points depleted.");
+
+            tracing::warn!("Energy points depleted. Generating summary for user handoff.");
             self.output
-                .on_text("[System] 能量耗尽，停止执行以防止无限循环。\n")
+                .on_text("[System] 能量耗尽，正在生成阶段性总结并暂停任务...\n")
                 .await;
+
+            let summary = self.generate_rolling_summary().await;
+            
             return Some(
                 self.finalize_exit(
-                    RunExit::CriticallyFailed("Energy depleted".to_string()),
-                    false,
+                    RunExit::EnergyDepleted(summary),
+                    true,
                 )
                 .await,
             );

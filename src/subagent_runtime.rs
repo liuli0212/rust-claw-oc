@@ -730,8 +730,22 @@ impl SubagentRuntime {
                             finished_at_unix_ms,
                             error: message.clone(),
                             partial: Some(SubagentResult {
-                                ok,
+                                ok: false,
                                 summary: message,
+                                findings: tool_outputs,
+                                artifacts,
+                            }),
+                        };
+                    }
+                    crate::core::RunExit::EnergyDepleted(summary) => {
+                        self.record_debug_error(&handle, "energy_depleted", "Sub-agent ran out of energy.", None)
+                            .await;
+                        return SubagentJobState::Failed {
+                            finished_at_unix_ms,
+                            error: "Sub-agent ran out of energy (iteration limit reached).".to_string(),
+                            partial: Some(SubagentResult {
+                                ok: false,
+                                summary,
                                 findings: tool_outputs,
                                 artifacts,
                             }),

@@ -33,6 +33,10 @@ enum Command {
     Cron(String),
     #[command(description = "inspect context: /context <audit|diff|inspect|dump|compact>")]
     Context(String),
+    #[command(description = "enable autopilot mode: /autopilot [goal]")]
+    Autopilot(String),
+    #[command(description = "switch to manual mode")]
+    Manual,
 }
 
 pub struct TelegramOutputRouter {

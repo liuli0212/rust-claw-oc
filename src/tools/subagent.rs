@@ -139,6 +139,7 @@ impl Tool for DispatchSubagentTool {
                     crate::core::RunExit::RecoverableFailed(message)
                     | crate::core::RunExit::CriticallyFailed(message)
                     | crate::core::RunExit::AutopilotStalled(message) => message,
+                    crate::core::RunExit::EnergyDepleted(summary) => summary,
                     crate::core::RunExit::StoppedByUser => {
                         "Sub-agent execution was interrupted.".to_string()
                     }
@@ -324,7 +325,7 @@ mod tests {
         let envelope: crate::tools::protocol::ToolExecutionEnvelope =
             serde_json::from_str(&result).unwrap();
         assert!(!envelope.result.ok);
-        assert!(envelope.result.output.contains("Energy depleted"));
+        assert!(envelope.result.output.contains("Structural summary"));
     }
 
     #[test]

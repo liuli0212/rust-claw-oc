@@ -276,13 +276,168 @@ pub(super) async fn handle_command(
         TgCommand::Model(args) => Command::Model(args),
         TgCommand::Cron(args) => Command::Cron(args),
         TgCommand::Context(args) => Command::Context(args),
+        TgCommand::Autopilot(args) => Command::Autopilot(args),
+        TgCommand::Manual => Command::Manual,
     };
+
+    let mut autopilot_goal = None;
+    if let Command::Autopilot(ref goal) = cmd {
+        if !goal.trim().is_empty() {
+            autopilot_goal = Some(goal.clone());
+        }
+    }
 
     if let Err(e) = executor.execute(&session_id, &session_id, agent_output, cmd_output.clone(), cmd).await {
         cmd_output.send_error(&e);
     }
 
+    if let Some(goal) = autopilot_goal {
+        dispatch_agent_step(bot, chat_id, session_manager, goal).await;
+    }
+
     Ok(())
+}
+
+async fn dispatch_agent_step(
+    bot: Bot,
+    chat_id: ChatId,
+    session_manager: Arc<SessionManager>,
+    text: String,
+) {
+    let session_id = format!("telegram:{}", chat_id);
+    let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
+
+    let agent = match session_manager
+        .get_or_create_session(&session_id, &session_id, output.clone())
+        .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = bot.send_message(chat_id, format!("❌ Error: {}", e)).await;
+            return;
+        }
+    };
+
+    let bot_clone = bot.clone();
+    tokio::spawn(async move {
+        let mut agent_guard = match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            agent.lock(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                let _ = bot_clone
+                        .send_message(
+                            chat_id,
+                            "⏳ 上一个任务仍在执行中，请等待完成后再发送新消息，或使用 /cancel 取消当前任务。",
+                        )
+                        .await;
+                return;
+            }
+        };
+
+        agent_guard.flush_output().await;
+        agent_guard.update_output(output.clone());
+
+        let ts = crate::task_state::TaskStateStore::new(&session_id);
+        if ts.has_active_plan() && text.to_lowercase() != "continue" && !text.starts_with('/') {
+            static LAST_REMINDED: once_cell::sync::Lazy<
+                std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+            > = once_cell::sync::Lazy::new(|| {
+                std::sync::Mutex::new(std::collections::HashMap::new())
+            });
+
+            let mut should_remind = false;
+            {
+                let mut map = LAST_REMINDED.lock().unwrap();
+                if let Some(&last) = map.get(&session_id) {
+                    if last.elapsed() > std::time::Duration::from_secs(3600) {
+                        should_remind = true;
+                        map.insert(session_id.clone(), std::time::Instant::now());
+                    }
+                } else {
+                    should_remind = true;
+                    map.insert(session_id.clone(), std::time::Instant::now());
+                }
+            }
+
+            if should_remind {
+                if let Ok(state) = ts.load() {
+                    let task_msg = format!(
+                        "🎯 *Active Task Reminder*\nTask: {}\n\n💡 You can say \"continue\" to proceed with this task, or use /cancel to abort\\.",
+                        TelegramOutput::escape_markdown_v2(
+                            &state.goal.unwrap_or_else(|| "Unknown".to_string())
+                        )
+                    );
+                    let _ = bot_clone
+                        .send_message(chat_id, task_msg)
+                        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                        .await;
+                }
+            }
+        }
+
+        let bot_typing = bot_clone.clone();
+        let typing_done = Arc::new(tokio::sync::Notify::new());
+        let typing_done_clone = typing_done.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let _ = bot_typing
+                    .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                    .await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
+                    _ = typing_done_clone.notified() => break,
+                }
+            }
+        });
+
+        let _ = output.on_waiting("Processing...").await;
+
+        let result = agent_guard.step(text).await;
+        drop(agent_guard);
+
+        typing_done.notify_one();
+
+        match result {
+            Ok(exit) => match exit {
+                RunExit::RecoverableFailed(ref msg)
+                | RunExit::CriticallyFailed(ref msg)
+                | RunExit::AutopilotStalled(ref msg) => {
+                    let _ = bot_clone
+                        .send_message(
+                            chat_id,
+                            format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), msg),
+                        )
+                        .await;
+                }
+                RunExit::EnergyDepleted(ref summary) => {
+                    let msg = format!(
+                        "⚠️ *能量耗尽：自动驾驶已暂停*\n\n{}\n\n👉 您可以输入 `continue` 补充能量并继续任务，或者指出修正意见。",
+                        TelegramOutput::escape_markdown_v2(summary)
+                    );
+                    let _ = bot_clone
+                        .send_message(chat_id, msg)
+                        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                        .await;
+                }
+                RunExit::StoppedByUser => {
+                    let _ = bot_clone
+                        .send_message(chat_id, "✅ 任务已手动中止。随时可以开始新任务。")
+                        .await;
+                }
+                _ => {}
+            },
+            Err(e) => {
+                let _ = bot_clone
+                    .send_message(chat_id, format!("❌ Error: {}", e))
+                    .await;
+            }
+        }
+    });
 }
 
 pub(super) async fn handle_message(
@@ -332,130 +487,7 @@ pub(super) async fn handle_message(
             return Ok(());
         }
 
-        let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
-
-        let agent = match session_manager
-            .get_or_create_session(&session_id, &session_id, output.clone())
-            .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                bot.send_message(chat_id, format!("❌ Error: {}", e))
-                    .await?;
-                return Ok(());
-            }
-        };
-
-        let bot_clone = bot.clone();
-        tokio::spawn(async move {
-            let mut agent_guard = match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                agent.lock(),
-            )
-            .await
-            {
-                Ok(guard) => guard,
-                Err(_) => {
-                    let _ = bot_clone
-                            .send_message(
-                                chat_id,
-                                "⏳ 上一个任务仍在执行中，请等待完成后再发送新消息，或使用 /cancel 取消当前任务。",
-                            )
-                            .await;
-                    return;
-                }
-            };
-
-            agent_guard.flush_output().await;
-            agent_guard.update_output(output.clone());
-
-            let ts = crate::task_state::TaskStateStore::new(&session_id);
-            if ts.has_active_plan() && text.to_lowercase() != "continue" && !text.starts_with('/') {
-                static LAST_REMINDED: once_cell::sync::Lazy<
-                    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-                > = once_cell::sync::Lazy::new(|| {
-                    std::sync::Mutex::new(std::collections::HashMap::new())
-                });
-
-                let mut should_remind = false;
-                {
-                    let mut map = LAST_REMINDED.lock().unwrap();
-                    if let Some(&last) = map.get(&session_id) {
-                        if last.elapsed() > std::time::Duration::from_secs(3600) {
-                            should_remind = true;
-                            map.insert(session_id.clone(), std::time::Instant::now());
-                        }
-                    } else {
-                        should_remind = true;
-                        map.insert(session_id.clone(), std::time::Instant::now());
-                    }
-                }
-
-                if should_remind {
-                    if let Ok(state) = ts.load() {
-                        let task_msg = format!(
-                            "🎯 *Active Task Reminder*\nTask: {}\n\n💡 You can say \"continue\" to proceed with this task, or use /cancel to abort\\.",
-                            TelegramOutput::escape_markdown_v2(
-                                &state.goal.unwrap_or_else(|| "Unknown".to_string())
-                            )
-                        );
-                        let _ = bot_clone
-                            .send_message(chat_id, task_msg)
-                            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                            .await;
-                    }
-                }
-            }
-
-            let bot_typing = bot_clone.clone();
-            let typing_done = Arc::new(tokio::sync::Notify::new());
-            let typing_done_clone = typing_done.clone();
-
-            tokio::spawn(async move {
-                loop {
-                    let _ = bot_typing
-                        .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
-                        .await;
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
-                        _ = typing_done_clone.notified() => break,
-                    }
-                }
-            });
-
-            let _ = output.on_waiting("Processing...").await;
-
-            let result = agent_guard.step(text).await;
-            drop(agent_guard);
-
-            typing_done.notify_one();
-
-            match result {
-                Ok(exit) => match exit {
-                    RunExit::RecoverableFailed(ref msg)
-                    | RunExit::CriticallyFailed(ref msg)
-                    | RunExit::AutopilotStalled(ref msg) => {
-                        let _ = bot_clone
-                            .send_message(
-                                chat_id,
-                                format!("⚠️ Run stopped: {}\nReason: {}", exit.label(), msg),
-                            )
-                            .await;
-                    }
-                    RunExit::StoppedByUser => {
-                        let _ = bot_clone
-                            .send_message(chat_id, "✅ 任务已手动中止。随时可以开始新任务。")
-                            .await;
-                    }
-                    _ => {}
-                },
-                Err(e) => {
-                    let _ = bot_clone
-                        .send_message(chat_id, format!("❌ Error: {}", e))
-                        .await;
-                }
-            }
-        });
+        dispatch_agent_step(bot, chat_id, session_manager, text).await;
     }
     Ok(())
 }

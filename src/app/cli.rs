@@ -156,6 +156,10 @@ pub async fn run_headless_command(
                 eprintln!("\n  {} Critical Error: {}", style("✖").red(), msg);
                 std::process::exit(1);
             }
+            RunExit::EnergyDepleted(msg) => {
+                println!("\n  {} Task paused due to energy depletion:\n{}", style("⚠️").yellow(), msg);
+                std::process::exit(1);
+            }
             _ => {
                 println!("\n  Execution ended with status: {:?}", exit);
             }
@@ -271,12 +275,24 @@ pub async fn run_cli_repl(
                 continue;
             }
 
+            let mut autopilot_goal = None;
+            if let Command::Autopilot(ref goal) = cmd {
+                if !goal.trim().is_empty() {
+                    autopilot_goal = Some(goal.clone());
+                }
+            }
+
             if let Err(e) = executor
                 .execute("cli", "cli", output.clone(), cmd_output.clone(), cmd)
                 .await
             {
                 cmd_output.send_error(&e);
             }
+
+            if let Some(goal) = autopilot_goal {
+                run_cli_agent_step(session_manager.clone(), output.clone(), goal).await;
+            }
+
             continue;
         }
 
@@ -390,7 +406,12 @@ async fn run_cli_agent_step(
             }
             RunExit::AutopilotStalled(ref msg) => {
                 println!("\n  {} Autopilot 停滞: {}", style("⚠").yellow(), msg);
-                println!("  👉 Autopilot 未检测到有效进展，已暂停。您可以���入指导意见并继续，或输入 /manual 退出自动驾驶。");
+                println!("  👉 Autopilot 未检测到有效进展，已暂停。您可以直接输入指导意见并继续，或输入 /manual 退出自动驾驶。");
+            }
+            RunExit::EnergyDepleted(ref summary) => {
+                println!("\n  {} 能量耗尽：自动驾驶已暂停", style("⚠").yellow().bold());
+                println!("  {}", style(summary).dim());
+                println!("  👉 您可以输入 \"continue\" 补充能量并继续任务，或者指出修正意见。");
             }
         },
         Err(e) => eprintln!("  {} Agent error: {}", style("✖").red(), e),
