@@ -135,8 +135,9 @@ pub async fn run_headless_command(
     output: Arc<dyn AgentOutput>,
     command: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let session_id = format!("cli_headless_{}", uuid::Uuid::new_v4().simple());
     let agent = session_manager
-        .get_or_create_session("headless", "cli", output.clone())
+        .get_or_create_session(&session_id, "cli", output.clone())
         .await?;
 
     let mut agent_guard = agent.lock().await;

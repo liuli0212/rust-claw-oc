@@ -265,17 +265,16 @@ impl SubagentRuntime {
 
         let timeout_sec = args.timeout_sec.unwrap_or(60);
         let max_steps = args.max_steps.unwrap_or(5).max(1);
-        let job_id = format!("subjob_{}", uuid::Uuid::new_v4().simple());
-        let sub_session_id = format!(
+        let unified_id = format!(
             "sub_{}_{}",
             parent_ctx.session_id,
             uuid::Uuid::new_v4().simple()
         );
         let meta = SubagentJobMeta {
-            job_id: job_id.clone(),
+            job_id: unified_id.clone(),
             parent_session_id: parent_ctx.session_id.clone(),
             parent_reply_to: parent_ctx.reply_to.clone(),
-            sub_session_id: sub_session_id.clone(),
+            sub_session_id: unified_id.clone(),
             goal: args.goal.clone(),
             input_summary: args.input_summary.clone(),
             allowed_tools: args.allowed_tools.clone(),
@@ -284,10 +283,10 @@ impl SubagentRuntime {
             timeout_sec,
             max_steps,
             created_at_unix_ms: unix_ms_now(),
-            transcript_path: crate::schema::StoragePaths::session_transcript_file(&sub_session_id)
+            transcript_path: crate::schema::StoragePaths::session_transcript_file(&unified_id)
                 .display()
                 .to_string(),
-            event_log_path: crate::schema::StoragePaths::events_file(&sub_session_id)
+            event_log_path: crate::schema::StoragePaths::events_file(&unified_id)
                 .display()
                 .to_string(),
         };
@@ -311,17 +310,17 @@ impl SubagentRuntime {
         let handle = Arc::new(SubagentJobHandle::new(meta));
         {
             let mut jobs = self.inner.jobs.write().await;
-            jobs.insert(job_id.clone(), handle.clone());
+            jobs.insert(unified_id.clone(), handle.clone());
         }
 
         let runtime = self.clone();
         let counter = self.inner.running_jobs.clone();
         let running_guard = RunningJobGuard::new(counter);
         let handle_for_task = handle.clone();
-        let sub_session_id_for_task = sub_session_id.clone();
+        let sub_session_id_for_task = unified_id.clone();
         let span = tracing::info_span!(
             "subagent_run",
-            job_id = %job_id,
+            job_id = %unified_id,
             parent_session_id = %parent_ctx.session_id,
             sub_session_id = %sub_session_id_for_task
         );
@@ -361,8 +360,8 @@ impl SubagentRuntime {
         *handle.task.lock().await = Some(join_handle);
 
         Ok(SpawnedSubagentJob {
-            job_id,
-            sub_session_id,
+            job_id: unified_id.clone(),
+            sub_session_id: unified_id,
         })
     }
 

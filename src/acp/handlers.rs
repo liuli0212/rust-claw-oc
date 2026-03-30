@@ -54,7 +54,7 @@ pub(super) async fn handle_run(
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let session_id = req
         .session_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .unwrap_or_else(|| format!("acp_{}", uuid::Uuid::new_v4().simple()));
 
     let (tx, rx) = mpsc::unbounded_channel();
     let output = Arc::new(AcpOutput { tx: tx.clone() });
