@@ -50,6 +50,16 @@ impl SkillRuntime {
         }
     }
 
+    fn truncate_for_prompt(input: &str, max_chars: usize) -> String {
+        let mut chars = input.chars();
+        let truncated: String = chars.by_ref().take(max_chars).collect();
+        if chars.next().is_some() {
+            format!("{truncated}...[truncated]")
+        } else {
+            truncated
+        }
+    }
+
     /// Activate a skill for the current session.
     pub async fn activate_skill(
         &self,
@@ -118,7 +128,6 @@ impl SkillRuntime {
             "## Active Skill: {} v{}",
             def.meta.name, def.meta.version
         ));
-        parts.push(format!("State: {:?}", state.execution_state));
         parts.push(format!(
             "Trigger: {}",
             Self::trigger_name(&def.meta.trigger)
@@ -142,19 +151,21 @@ impl SkillRuntime {
             parts.push("⚠️ HARD GATE: Do NOT write code files.".to_string());
         }
 
-        if let Some(pi) = &state.pending_interaction {
+        if !state.constraints.allow_subagents {
+            parts.push("Subagents: disabled for this skill.".to_string());
+        }
+
+        if state.constraints.require_question_resume {
+            parts.push("User input mode: structured question-resume only.".to_string());
+        }
+
+        if let Some(required_artifact_kind) =
+            Self::effective_required_artifact_kind(state, Some(def))
+        {
             parts.push(format!(
-                "⚠️ PENDING QUESTION (must resolve first): {}",
-                pi.question
+                "Required artifact: {}",
+                Self::required_artifact_kind_name(&required_artifact_kind)
             ));
-        }
-
-        if !state.answers.is_empty() {
-            parts.push(format!("Collected answers: {}", state.answers.len()));
-        }
-
-        if !state.artifacts.is_empty() {
-            parts.push(format!("Produced artifacts: {}", state.artifacts.len()));
         }
 
         Some(parts.join("\n"))
@@ -169,6 +180,10 @@ impl SkillRuntime {
         let mut parts = trimmed.splitn(2, ' ');
         let cmd = parts.next().unwrap();
         let skill_name = &cmd[1..];
+
+        if skill_name.is_empty() {
+            return Ok(None);
+        }
 
         let activation_args = parts
             .next()
@@ -188,14 +203,7 @@ impl SkillRuntime {
                     )
                 });
             }
-            return Err(if available.is_empty() {
-                format!("Unknown skill '{}'.", skill_name)
-            } else {
-                format!(
-                    "Unknown skill '{}'. Available skills: {}",
-                    skill_name, available
-                )
-            });
+            return Ok(None);
         };
 
         if matches!(
@@ -336,12 +344,7 @@ impl ExecutionExtension for SkillRuntime {
 
         let def = self.active_def.read().await;
         if let Some(def) = def.as_ref() {
-            // Truncate instructions if very long
-            let instructions = if def.instructions.len() > 4000 {
-                format!("{}...[truncated]", &def.instructions[..4000])
-            } else {
-                def.instructions.clone()
-            };
+            let instructions = Self::truncate_for_prompt(&def.instructions, 4000);
             draft.skill_instructions = Some(instructions);
         }
 
@@ -656,11 +659,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_prompt_build_separates_contract_from_runtime_state() {
+        let rt = SkillRuntime::new();
+        let skill = make_test_skill(false, None);
+        rt.activate_skill(&skill, Some("review this".to_string()))
+            .await
+            .unwrap();
+
+        let draft = rt.before_prompt_build(PromptDraft::default()).await;
+        let contract = draft.skill_contract.unwrap();
+        let summary = draft.skill_state_summary.unwrap();
+
+        assert!(contract.contains("Trigger: manual_only"));
+        assert!(!contract.contains("State:"));
+        assert!(!contract.contains("USER INPUT AT ACTIVATION"));
+        assert!(summary.contains("State: Running"));
+        assert!(summary.contains("USER INPUT AT ACTIVATION: review this"));
+    }
+
+    #[tokio::test]
     async fn test_prompt_build_without_skill_is_noop() {
         let rt = SkillRuntime::new();
         let draft = rt.before_prompt_build(PromptDraft::default()).await;
         assert!(draft.skill_contract.is_none());
         assert!(draft.skill_instructions.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prompt_build_truncates_utf8_instructions_safely() {
+        let rt = SkillRuntime::new();
+        let mut skill = make_test_skill(false, None);
+        skill.instructions = "你".repeat(4001);
+        rt.activate_skill(&skill, None).await.unwrap();
+
+        let draft = rt.before_prompt_build(PromptDraft::default()).await;
+        let instructions = draft.skill_instructions.unwrap();
+
+        assert!(instructions.ends_with("...[truncated]"));
+        assert!(instructions.starts_with('你'));
     }
 
     #[tokio::test]
@@ -923,10 +959,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_before_turn_start_halts_on_unknown_skill() {
+    async fn test_before_turn_start_ignores_unknown_slash_input() {
         let rt = SkillRuntime::with_registry(SkillRegistry::new());
-        let decision = rt.before_turn_start("/missing").await;
-        assert!(matches!(decision, ExtensionDecision::Halt { .. }));
+        let decision = rt.before_turn_start("/tmp/a.txt").await;
+        assert!(matches!(decision, ExtensionDecision::Continue));
+        assert!(!rt.is_active().await);
     }
 
     #[tokio::test]
