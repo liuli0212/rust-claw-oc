@@ -303,9 +303,8 @@ impl AgentOutput for TuiOutput {
             let line = buffer_guard[..pos].to_string();
             *buffer_guard = buffer_guard[pos + 1..].to_string();
 
-            let in_code_guard = self.in_code_block.lock().unwrap();
+            let mut in_code_guard = self.in_code_block.lock().unwrap();
             if line.trim_start().starts_with("```") {
-                let mut in_code_guard = self.in_code_block.lock().unwrap();
                 if in_code_guard.is_none() {
                     let lang = line
                         .trim_start()
