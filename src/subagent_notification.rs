@@ -1,9 +1,7 @@
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::core::extensions::{
-    ExecutionExtension, ExtensionDecision, FinishDecision, PromptDraft, ResumeDecision,
-};
+use crate::core::extensions::{ExecutionExtension, ExtensionDecision, FinishDecision, PromptDraft};
 use crate::subagent_runtime::SubagentRuntime;
 use crate::tools::protocol::ToolExecutionEnvelope;
 use crate::tools::Tool;
@@ -79,10 +77,6 @@ impl ExecutionExtension for SubagentNotificationExtension {
     }
 
     async fn after_tool_result(&self, _result: &ToolExecutionEnvelope) {}
-
-    async fn on_user_resume(&self, _input: &str) -> ResumeDecision {
-        ResumeDecision::PassThrough
-    }
 
     async fn before_finish(&self) -> FinishDecision {
         FinishDecision::Allow

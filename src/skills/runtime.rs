@@ -6,9 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use crate::core::extensions::{
-    ExecutionExtension, ExtensionDecision, FinishDecision, PromptDraft, ResumeDecision,
-};
+use crate::core::extensions::{ExecutionExtension, ExtensionDecision, FinishDecision, PromptDraft};
 use crate::tools::protocol::ToolExecutionEnvelope;
 use crate::tools::Tool;
 
@@ -29,7 +27,6 @@ pub struct SkillRuntime {
     /// Tool policy engine.
     policy: SkillToolPolicy,
     registry: SkillRegistry,
-    allow_next_input_after_resume: RwLock<bool>,
 }
 
 impl SkillRuntime {
@@ -46,7 +43,6 @@ impl SkillRuntime {
             active_def: RwLock::new(None),
             policy: SkillToolPolicy::new(),
             registry,
-            allow_next_input_after_resume: RwLock::new(false),
         }
     }
 
@@ -86,7 +82,6 @@ impl SkillRuntime {
 
         *self.active_def.write().await = Some(def.clone());
         *self.state.write().await = Some(state);
-        *self.allow_next_input_after_resume.write().await = false;
 
         tracing::info!("Skill '{}' activated", def.meta.name);
         Ok(())
@@ -101,7 +96,6 @@ impl SkillRuntime {
         };
         *self.state.write().await = None;
         *self.active_def.write().await = None;
-        *self.allow_next_input_after_resume.write().await = false;
         if let Some(name) = name {
             tracing::info!("Skill '{}' deactivated", name);
         }
@@ -289,6 +283,43 @@ impl SkillRuntime {
     fn is_terminal_subagent_status(status: &str) -> bool {
         matches!(status, "finished" | "failed" | "cancelled" | "timed_out")
     }
+
+    async fn consume_pending_interaction(&self, input: &str) -> bool {
+        let resumed = {
+            let mut state_guard = self.state.write().await;
+            let Some(state) = state_guard.as_mut() else {
+                return false;
+            };
+
+            state.pending_interaction.take().map(|pi| {
+                let skill_name = state.skill_name.clone();
+                let context_key = pi.context_key.clone();
+                let answer = SkillAnswer {
+                    question: pi.question,
+                    answer: input.to_string(),
+                    answered_at: chrono::Utc::now().to_rfc3339(),
+                };
+                state.answers.insert(context_key.clone(), answer);
+                state.execution_state = SkillExecutionState::Running;
+                state
+                    .labels
+                    .insert("phase".to_string(), "running".to_string());
+                state.labels.remove("pending_context_key");
+                (skill_name, context_key)
+            })
+        };
+
+        if let Some((skill_name, context_key)) = resumed {
+            tracing::info!(
+                skill = %skill_name,
+                context_key = %context_key,
+                "Skill resumed from WaitingUser to Running"
+            );
+            return true;
+        }
+
+        false
+    }
 }
 
 impl Default for SkillRuntime {
@@ -301,35 +332,32 @@ impl Default for SkillRuntime {
 impl ExecutionExtension for SkillRuntime {
     async fn before_turn_start(&self, input: &str) -> ExtensionDecision {
         match self.activate_skill_from_command(input).await {
-            Ok(Some(overlay)) => ExtensionDecision::Intercept {
-                prompt_overlay: Some(overlay),
-            },
-            Ok(None) => {
-                let mut allow_next_input = self.allow_next_input_after_resume.write().await;
-                if *allow_next_input {
-                    *allow_next_input = false;
-                    return ExtensionDecision::Continue;
-                }
-                drop(allow_next_input);
-
-                let state = self.state.read().await;
-                if let Some(state) = state.as_ref() {
-                    if state.constraints.require_question_resume
-                        && state.pending_interaction.is_none()
-                    {
-                        return ExtensionDecision::Halt {
-                            message: format!(
-                                "Skill '{}' requires structured question-resume. Wait for the skill to ask via `ask_user_question` before providing additional input.",
-                                state.skill_name
-                            ),
-                        };
-                    }
-                }
-
-                ExtensionDecision::Continue
+            Ok(Some(overlay)) => {
+                return ExtensionDecision::Intercept {
+                    prompt_overlay: Some(overlay),
+                };
             }
-            Err(message) => ExtensionDecision::Halt { message },
+            Ok(None) => {}
+            Err(message) => return ExtensionDecision::Halt { message },
         }
+
+        if self.consume_pending_interaction(input).await {
+            return ExtensionDecision::Continue;
+        }
+
+        let state = self.state.read().await;
+        if let Some(state) = state.as_ref() {
+            if state.constraints.require_question_resume && state.pending_interaction.is_none() {
+                return ExtensionDecision::Halt {
+                    message: format!(
+                        "Skill '{}' requires structured question-resume. Wait for the skill to ask via `ask_user_question` before providing additional input.",
+                        state.skill_name
+                    ),
+                };
+            }
+        }
+
+        ExtensionDecision::Continue
     }
 
     async fn before_prompt_build(&self, mut draft: PromptDraft) -> PromptDraft {
@@ -477,48 +505,6 @@ impl ExecutionExtension for SkillRuntime {
         }
     }
 
-    async fn on_user_resume(&self, input: &str) -> ResumeDecision {
-        let resumed = {
-            let mut state_guard = self.state.write().await;
-            let Some(state) = state_guard.as_mut() else {
-                return ResumeDecision::PassThrough;
-            };
-
-            state.pending_interaction.take().map(|pi| {
-                let skill_name = state.skill_name.clone();
-                let context_key = pi.context_key.clone();
-                let answer = SkillAnswer {
-                    question: pi.question,
-                    answer: input.to_string(),
-                    answered_at: chrono::Utc::now().to_rfc3339(),
-                };
-                state.answers.insert(context_key.clone(), answer);
-                state.execution_state = SkillExecutionState::Running;
-                state
-                    .labels
-                    .insert("phase".to_string(), "running".to_string());
-                state.labels.remove("pending_context_key");
-                (skill_name, context_key)
-            })
-        };
-
-        if let Some((skill_name, context_key)) = resumed {
-            *self.allow_next_input_after_resume.write().await = true;
-            tracing::info!(
-                skill = %skill_name,
-                context_key = %context_key,
-                "Skill resumed from WaitingUser to Running"
-            );
-
-            return ResumeDecision::ResumeSkill {
-                context_key,
-                answer: input.to_string(),
-            };
-        }
-
-        ResumeDecision::PassThrough
-    }
-
     async fn before_finish(&self) -> FinishDecision {
         let active_def = self.active_def.read().await.clone();
         let mut state = self.state.write().await;
@@ -579,9 +565,7 @@ impl ExecutionExtension for SkillRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::extensions::{
-        ExecutionExtension, FinishDecision, PromptDraft, ResumeDecision,
-    };
+    use crate::core::extensions::{ExecutionExtension, FinishDecision, PromptDraft};
     use crate::skills::definition::*;
     use crate::skills::state::PendingInteraction;
 
@@ -811,23 +795,17 @@ mod tests {
             state.execution_state = SkillExecutionState::WaitingUser;
         }
 
-        let decision = rt.on_user_resume("MyProject").await;
-        match decision {
-            ResumeDecision::ResumeSkill {
-                context_key,
-                answer,
-            } => {
-                assert_eq!(context_key, "project_name");
-                assert_eq!(answer, "MyProject");
-            }
-            _ => panic!("Expected ResumeSkill"),
-        }
+        assert!(matches!(
+            rt.before_turn_start("MyProject").await,
+            ExtensionDecision::Continue
+        ));
 
         // Verify answer was stored
         let state = rt.state.read().await;
         let state = state.as_ref().unwrap();
         assert!(state.answers.contains_key("project_name"));
         assert_eq!(state.execution_state, SkillExecutionState::Running);
+        assert!(state.pending_interaction.is_none());
     }
 
     #[tokio::test]
@@ -836,8 +814,14 @@ mod tests {
         let skill = make_test_skill(false, None);
         rt.activate_skill(&skill, None).await.unwrap();
 
-        let decision = rt.on_user_resume("hello").await;
-        assert!(matches!(decision, ResumeDecision::PassThrough));
+        assert!(matches!(
+            rt.before_turn_start("hello").await,
+            ExtensionDecision::Continue
+        ));
+
+        let state = rt.state.read().await;
+        let state = state.as_ref().unwrap();
+        assert!(state.answers.is_empty());
     }
 
     #[tokio::test]
@@ -847,18 +831,19 @@ mod tests {
         skill.constraints.require_question_resume = true;
         rt.activate_skill(&skill, None).await.unwrap();
 
-        let decision = rt.before_turn_start("hello").await;
-        assert!(matches!(decision, ExtensionDecision::Halt { .. }));
+        assert!(matches!(
+            rt.before_turn_start("hello").await,
+            ExtensionDecision::Halt { .. }
+        ));
     }
 
     #[tokio::test]
-    async fn test_require_question_resume_allows_single_resumed_turn() {
+    async fn test_require_question_resume_allows_resumed_turn_and_blocks_followup() {
         let rt = SkillRuntime::new();
         let mut skill = make_test_skill(false, None);
         skill.constraints.require_question_resume = true;
         rt.activate_skill(&skill, None).await.unwrap();
 
-        // Set pending interaction
         {
             let mut state = rt.state.write().await;
             let state = state.as_mut().unwrap();
@@ -873,8 +858,6 @@ mod tests {
             state.execution_state = SkillExecutionState::WaitingUser;
         }
 
-        let decision = rt.on_user_resume("MyProject").await;
-        assert!(matches!(decision, ResumeDecision::ResumeSkill { .. }));
         assert!(matches!(
             rt.before_turn_start("MyProject").await,
             ExtensionDecision::Continue

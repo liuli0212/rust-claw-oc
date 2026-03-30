@@ -10,8 +10,7 @@ use crate::tools::Tool;
 #[async_trait]
 pub trait ExecutionExtension: Send + Sync {
     /// Called at the very start of each turn, before prompt assembly.
-    /// An extension may intercept the turn entirely (e.g. to redirect user
-    /// input as a skill-resume answer).
+    /// An extension may intercept or directly handle the turn entirely.
     async fn before_turn_start(&self, input: &str) -> ExtensionDecision;
 
     /// Called before the system prompt is finalised.
@@ -25,10 +24,6 @@ pub trait ExecutionExtension: Send + Sync {
     /// Called after every successful tool execution.
     /// Extensions may update internal state based on the result.
     async fn after_tool_result(&self, result: &ToolExecutionEnvelope);
-
-    /// Called when a new user message arrives and there may be a pending
-    /// interaction from a previous turn (e.g. `ask_user_question`).
-    async fn on_user_resume(&self, input: &str) -> ResumeDecision;
 
     /// Called before `finish_task` is honoured.
     /// Extensions may deny completion if artifact contracts are unmet.
@@ -67,16 +62,6 @@ pub enum ExtensionDecision {
     Intercept { prompt_overlay: Option<String> },
     /// The extension handled this input directly and the loop should yield.
     Halt { message: String },
-}
-
-/// Returned by `on_user_resume`.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum ResumeDecision {
-    /// The user's input should be treated as a skill-resume answer.
-    ResumeSkill { context_key: String, answer: String },
-    /// No pending interaction; let AgentLoop handle the input normally.
-    PassThrough,
 }
 
 /// Returned by `before_finish`.

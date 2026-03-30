@@ -553,15 +553,6 @@ impl AgentLoop {
         let mut consecutive_empty_responses = 0;
 
         let mut turn_goal = goal.clone();
-        if !turn_goal.starts_with("/skill ") {
-            for ext in &self.extensions {
-                match ext.on_user_resume(&turn_goal).await {
-                    crate::core::extensions::ResumeDecision::ResumeSkill { .. } => break,
-                    crate::core::extensions::ResumeDecision::PassThrough => {}
-                }
-            }
-        }
-
         for ext in &self.extensions {
             match ext.before_turn_start(&turn_goal).await {
                 crate::core::extensions::ExtensionDecision::Continue => {}
