@@ -8,9 +8,9 @@ use tracing::Instrument;
 use crate::llm_client::LlmClient;
 use crate::session::factory::{build_subagent_session, BuiltSubagentSession, SubagentBuildMode};
 use crate::tools::protocol::ToolError;
-use futures::FutureExt;
 use crate::tools::subagent::{DispatchSubagentArgs, SubagentResult};
 use crate::tools::{Tool, ToolContext};
+use futures::FutureExt;
 
 const UNCONSUMED_TERMINAL_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const CONSUMED_TERMINAL_JOB_TTL: Duration = Duration::from_secs(5 * 60);
@@ -553,6 +553,9 @@ impl SubagentRuntime {
             handle.cancel_notify.clone(),
         ) {
             Ok(BuiltSubagentSession {
+                sub_session_id: _,
+                transcript_path: _,
+                event_log_path: _,
                 mut agent_loop,
                 collector,
                 rejected_tools,
@@ -708,6 +711,9 @@ impl SubagentRuntime {
         let tool_outputs = collector.take_tool_outputs().await;
         let artifacts = collector.take_artifacts().await;
         let finished_at_unix_ms = unix_ms_now();
+        let sub_session_id = Some(handle.meta.sub_session_id.clone());
+        let transcript_path = Some(handle.meta.transcript_path.clone());
+        let event_log_path = Some(handle.meta.event_log_path.clone());
 
         match run_result {
             Ok(Ok(exit)) => {
@@ -734,20 +740,32 @@ impl SubagentRuntime {
                                 summary: message,
                                 findings: tool_outputs,
                                 artifacts,
+                                sub_session_id: sub_session_id.clone(),
+                                transcript_path: transcript_path.clone(),
+                                event_log_path: event_log_path.clone(),
                             }),
                         };
                     }
                     crate::core::RunExit::EnergyDepleted(summary) => {
-                        self.record_debug_error(&handle, "energy_depleted", "Sub-agent ran out of energy.", None)
-                            .await;
+                        self.record_debug_error(
+                            &handle,
+                            "energy_depleted",
+                            "Sub-agent ran out of energy.",
+                            None,
+                        )
+                        .await;
                         return SubagentJobState::Failed {
                             finished_at_unix_ms,
-                            error: "Sub-agent ran out of energy (iteration limit reached).".to_string(),
+                            error: "Sub-agent ran out of energy (iteration limit reached)."
+                                .to_string(),
                             partial: Some(SubagentResult {
                                 ok: false,
                                 summary,
                                 findings: tool_outputs,
                                 artifacts,
+                                sub_session_id: sub_session_id.clone(),
+                                transcript_path: transcript_path.clone(),
+                                event_log_path: event_log_path.clone(),
                             }),
                         };
                     }
@@ -766,6 +784,9 @@ impl SubagentRuntime {
                                 summary: "Sub-agent execution was interrupted.".to_string(),
                                 findings: tool_outputs,
                                 artifacts,
+                                sub_session_id: sub_session_id.clone(),
+                                transcript_path: transcript_path.clone(),
+                                event_log_path: event_log_path.clone(),
                             }),
                         };
                     }
@@ -778,6 +799,9 @@ impl SubagentRuntime {
                         summary,
                         findings: tool_outputs,
                         artifacts,
+                        sub_session_id: sub_session_id.clone(),
+                        transcript_path: transcript_path.clone(),
+                        event_log_path: event_log_path.clone(),
                     },
                 }
             }
@@ -792,6 +816,9 @@ impl SubagentRuntime {
                         summary: format!("Sub-agent error: {}", error),
                         findings: tool_outputs,
                         artifacts,
+                        sub_session_id: sub_session_id.clone(),
+                        transcript_path: transcript_path.clone(),
+                        event_log_path: event_log_path.clone(),
                     }),
                 }
             }
@@ -811,6 +838,9 @@ impl SubagentRuntime {
                             summary: "Sub-agent execution was interrupted.".to_string(),
                             findings: tool_outputs,
                             artifacts,
+                            sub_session_id: sub_session_id.clone(),
+                            transcript_path: transcript_path.clone(),
+                            event_log_path: event_log_path.clone(),
                         }),
                     }
                 } else {
@@ -836,6 +866,9 @@ impl SubagentRuntime {
                             ),
                             findings: tool_outputs,
                             artifacts,
+                            sub_session_id,
+                            transcript_path,
+                            event_log_path,
                         }),
                     }
                 }
@@ -1302,6 +1335,17 @@ mod tests {
                     summary: "done".to_string(),
                     findings: Vec::new(),
                     artifacts: Vec::new(),
+                    sub_session_id: Some("sub_consumed".to_string()),
+                    transcript_path: Some(
+                        crate::schema::StoragePaths::session_transcript_file("sub_consumed")
+                            .display()
+                            .to_string(),
+                    ),
+                    event_log_path: Some(
+                        crate::schema::StoragePaths::events_file("sub_consumed")
+                            .display()
+                            .to_string(),
+                    ),
                 },
             };
         }
@@ -1340,6 +1384,17 @@ mod tests {
                     summary: "done".to_string(),
                     findings: Vec::new(),
                     artifacts: Vec::new(),
+                    sub_session_id: Some("sub_unconsumed".to_string()),
+                    transcript_path: Some(
+                        crate::schema::StoragePaths::session_transcript_file("sub_unconsumed")
+                            .display()
+                            .to_string(),
+                    ),
+                    event_log_path: Some(
+                        crate::schema::StoragePaths::events_file("sub_unconsumed")
+                            .display()
+                            .to_string(),
+                    ),
                 },
             };
         }

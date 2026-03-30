@@ -688,6 +688,9 @@ impl AgentLoop {
                 }
                 if allow_finish {
                     let summary = state.summary();
+                    for ext in &self.extensions {
+                        ext.on_finish_committed(&summary).await;
+                    }
                     return Ok(self.finalize_finished_run(summary).await);
                 }
             }

@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::Instrument;
 
 use super::protocol::{clean_schema, StructuredToolOutput, Tool, ToolError};
 
@@ -41,6 +42,9 @@ pub struct SubagentResult {
     pub summary: String,
     pub findings: Vec<String>,
     pub artifacts: Vec<String>,
+    pub sub_session_id: Option<String>,
+    pub transcript_path: Option<String>,
+    pub event_log_path: Option<String>,
 }
 
 impl DispatchSubagentTool {
@@ -85,6 +89,13 @@ impl Tool for DispatchSubagentTool {
         let max_steps = parsed.max_steps.unwrap_or(5).max(1);
         let goal = parsed.goal.clone();
 
+        if parsed.allow_writes || !parsed.claimed_paths.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "dispatch_subagent does not support `allow_writes` or `claimed_paths`; use spawn_subagent for controlled background writes."
+                    .to_string(),
+            ));
+        }
+
         tracing::info!(
             "Dispatching subagent with goal: '{}', timeout: {}s, max_steps: {}",
             goal,
@@ -112,17 +123,32 @@ impl Tool for DispatchSubagentTool {
         )
         .map_err(ToolError::ExecutionFailed)?;
 
+        let crate::session::factory::BuiltSubagentSession {
+            sub_session_id,
+            transcript_path,
+            event_log_path,
+            mut agent_loop,
+            collector,
+            rejected_tools: _,
+        } = built;
+        let span = tracing::info_span!(
+            "subagent_run_sync",
+            parent_session_id = %ctx.session_id,
+            sub_session_id = %sub_session_id,
+            goal = %goal
+        );
+
         let run_result = tokio::time::timeout(Duration::from_secs(timeout_sec), async move {
-            let mut agent_loop = built.agent_loop;
             agent_loop.step(goal).await
         })
+        .instrument(span)
         .await;
 
         tracing::info!("Subagent execution completed.");
 
-        let collected_text = built.collector.take_text().await;
-        let tool_outputs = built.collector.take_tool_outputs().await;
-        let artifacts = built.collector.take_artifacts().await;
+        let collected_text = collector.take_text().await;
+        let tool_outputs = collector.take_tool_outputs().await;
+        let artifacts = collector.take_artifacts().await;
 
         let result = match run_result {
             Ok(Ok(exit)) => {
@@ -153,6 +179,9 @@ impl Tool for DispatchSubagentTool {
                     summary,
                     findings: tool_outputs,
                     artifacts,
+                    sub_session_id: Some(sub_session_id.clone()),
+                    transcript_path: Some(transcript_path.clone()),
+                    event_log_path: Some(event_log_path.clone()),
                 }
             }
             Ok(Err(error)) => {
@@ -162,6 +191,9 @@ impl Tool for DispatchSubagentTool {
                     summary: format!("Sub-agent error: {}", error),
                     findings: tool_outputs,
                     artifacts,
+                    sub_session_id: Some(sub_session_id.clone()),
+                    transcript_path: Some(transcript_path.clone()),
+                    event_log_path: Some(event_log_path.clone()),
                 }
             }
             Err(_) => {
@@ -174,6 +206,9 @@ impl Tool for DispatchSubagentTool {
                     ),
                     findings: tool_outputs,
                     artifacts,
+                    sub_session_id: Some(sub_session_id),
+                    transcript_path: Some(transcript_path),
+                    event_log_path: Some(event_log_path),
                 }
             }
         };
@@ -312,6 +347,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dispatch_subagent_rejects_sync_write_controls() {
+        let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), vec![]);
+        let args = serde_json::json!({
+            "goal": "Edit parser",
+            "input_summary": "repo context",
+            "allow_writes": true,
+            "claimed_paths": ["src/parser.rs"]
+        });
+
+        let result = tool.execute(args, &make_ctx()).await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
     async fn test_dispatch_subagent_reports_energy_exhaustion_when_max_steps_is_one() {
         let tool = DispatchSubagentTool::new(Arc::new(DummyLlm), vec![]);
         let args = serde_json::json!({
@@ -326,6 +375,9 @@ mod tests {
             serde_json::from_str(&result).unwrap();
         assert!(!envelope.result.ok);
         assert!(envelope.result.output.contains("Structural summary"));
+        assert!(envelope.result.output.contains("sub_session_id"));
+        assert!(envelope.result.output.contains("transcript_path"));
+        assert!(envelope.result.output.contains("event_log_path"));
     }
 
     #[test]

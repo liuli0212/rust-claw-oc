@@ -31,8 +31,6 @@ pub struct SkillMeta {
     pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub output_mode: Option<OutputMode>,
-    /// Formal parameter definitions (as seen in YAML).
-    pub parameters: Option<Value>,
 }
 
 /// How a skill can be triggered.

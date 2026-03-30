@@ -91,10 +91,10 @@ pub fn parse_skill_md(content: &str) -> Option<SkillDef> {
             trigger,
             allowed_tools: raw.allowed_tools.unwrap_or_default(),
             output_mode,
-            parameters: parameters_json,
         },
         instructions: body,
-        parameters: raw.parameters.and_then(|p| serde_json::to_value(p).ok()),
+        parameters: parameters_json
+            .or_else(|| raw.parameters.and_then(|p| serde_json::to_value(p).ok())),
         constraints: raw.constraints.unwrap_or_default(),
     })
 }

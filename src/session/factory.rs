@@ -33,6 +33,9 @@ pub enum SubagentBuildMode {
 }
 
 pub struct BuiltSubagentSession {
+    pub sub_session_id: String,
+    pub transcript_path: String,
+    pub event_log_path: String,
     pub agent_loop: AgentLoop,
     pub collector: Arc<CollectorOutput>,
     /// Tools that were explicitly requested in allowed_tools but blocked by the
@@ -187,7 +190,10 @@ impl crate::core::AgentOutput for CollectorOutput {
         )
         .await;
         let truncated = if result.len() > 500 {
-            format!("{}...(truncated)", crate::context::AgentContext::truncate_chars(result, 500))
+            format!(
+                "{}...(truncated)",
+                crate::context::AgentContext::truncate_chars(result, 500)
+            )
         } else {
             result.to_string()
         };
@@ -224,7 +230,8 @@ impl crate::core::AgentOutput for CollectorOutput {
             serde_json::json!({ "summary": prompt_summary }),
             &format!("LLM Request: {}", prompt_summary),
             None,
-        ).await;
+        )
+        .await;
     }
 
     async fn on_llm_response(&self, response_summary: &str) {
@@ -373,6 +380,13 @@ pub fn build_subagent_session(
     agent_loop.cancel_token = cancel_notify;
 
     Ok(BuiltSubagentSession {
+        sub_session_id: sub_session_id.clone(),
+        transcript_path: crate::schema::StoragePaths::session_transcript_file(&sub_session_id)
+            .display()
+            .to_string(),
+        event_log_path: crate::schema::StoragePaths::events_file(&sub_session_id)
+            .display()
+            .to_string(),
         agent_loop,
         collector,
         rejected_tools,

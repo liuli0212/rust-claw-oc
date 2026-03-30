@@ -33,6 +33,10 @@ pub trait ExecutionExtension: Send + Sync {
     /// Called before `finish_task` is honoured.
     /// Extensions may deny completion if artifact contracts are unmet.
     async fn before_finish(&self) -> FinishDecision;
+
+    /// Called after `finish_task` has been accepted by all extensions and the
+    /// run is about to commit its finished state.
+    async fn on_finish_committed(&self, _summary: &str) {}
 }
 
 // ---------------------------------------------------------------------------

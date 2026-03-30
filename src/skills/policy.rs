@@ -32,9 +32,15 @@ impl SkillToolPolicy {
             "ask_user_question".to_string(),
         );
         name_map.insert("spawn_subagent".to_string(), "spawn_subagent".to_string());
-        name_map.insert("get_subagent_result".to_string(), "get_subagent_result".to_string());
+        name_map.insert(
+            "get_subagent_result".to_string(),
+            "get_subagent_result".to_string(),
+        );
         name_map.insert("cancel_subagent".to_string(), "cancel_subagent".to_string());
-        name_map.insert("list_subagent_jobs".to_string(), "list_subagent_jobs".to_string());
+        name_map.insert(
+            "list_subagent_jobs".to_string(),
+            "list_subagent_jobs".to_string(),
+        );
         Self { name_map }
     }
 
@@ -117,7 +123,6 @@ mod tests {
                 trigger: SkillTrigger::ManualOnly,
                 allowed_tools: allowed.into_iter().map(|s| s.to_string()).collect(),
                 output_mode: None,
-                parameters: None,
             },
             instructions: String::new(),
             parameters: None,

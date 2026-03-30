@@ -61,7 +61,29 @@ impl AgentLoop {
         let full_text = loop {
             llm_attempts += 1;
 
-            let prompt_summary = format!("System + {} messages", messages.len());
+            let system_chars = system
+                .as_ref()
+                .map(|message| {
+                    message
+                        .parts
+                        .iter()
+                        .filter_map(|part| part.text.as_ref())
+                        .map(|text| text.len())
+                        .sum::<usize>()
+                })
+                .unwrap_or(0);
+            let message_chars = messages
+                .iter()
+                .flat_map(|message| message.parts.iter())
+                .filter_map(|part| part.text.as_ref())
+                .map(|text| text.len())
+                .sum::<usize>();
+            let prompt_summary = format!(
+                "System + {} messages, {} tools, ~{} chars",
+                messages.len(),
+                current_tools.len(),
+                system_chars + message_chars
+            );
             self.output.on_llm_request(&prompt_summary).await;
 
             let stream_res = tokio::select! {
@@ -349,13 +371,10 @@ impl AgentLoop {
                 .await;
 
             let summary = self.generate_rolling_summary().await;
-            
+
             return Some(
-                self.finalize_exit(
-                    RunExit::EnergyDepleted(summary),
-                    true,
-                )
-                .await,
+                self.finalize_exit(RunExit::EnergyDepleted(summary), true)
+                    .await,
             );
         }
 
