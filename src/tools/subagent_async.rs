@@ -63,8 +63,7 @@ struct GetSubagentResultArgs {
     wait_sec: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct EmptyArgs;
+
 
 fn serialize_output(tool_name: &str, payload: Value) -> Result<String, ToolError> {
     StructuredToolOutput::new(
@@ -262,7 +261,10 @@ impl Tool for ListSubagentJobsTool {
     }
 
     fn parameters_schema(&self) -> Value {
-        clean_schema(serde_json::to_value(schema_for!(EmptyArgs)).unwrap())
+        json!({
+            "type": "object",
+            "properties": {}
+        })
     }
 
     fn has_side_effects(&self) -> bool {
