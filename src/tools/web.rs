@@ -25,6 +25,8 @@ pub struct WebFetchArgs {
     pub max_chars: Option<usize>,
     /// Return raw HTML when true. When false, HTML pages are converted to readable text.
     pub include_html: Option<bool>,
+    /// Optional path to save the content to disk instead of returning it to the LLM.
+    pub output_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -97,13 +99,27 @@ impl Tool for WebFetchTool {
 
         let max_chars = parsed.max_chars.unwrap_or(12_000).clamp(500, 50_000);
 
-        let response = self
+        let mut response = self
             .client
             .get(url)
-            .header(reqwest::header::USER_AGENT, "rusty-claw/0.1")
+            .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7")
             .send()
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            tracing::warn!("429 Too Many Requests for {}, retrying in 2s...", url);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            response = self
+                .client
+                .get(url)
+                .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                .send()
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        }
 
         let status = response.status();
         let raw_body = response
@@ -125,13 +141,46 @@ impl Tool for WebFetchTool {
             );
         }
 
-        let rendered = raw_body;
+        let mut rendered = raw_body;
+        if !parsed.include_html.unwrap_or(false) {
+            // Strip tags: Replace script, style and then all other tags.
+            static RE_SCRIPT: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?is)<script.*?>.*?</script>").unwrap());
+            static RE_STYLE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?is)<style.*?>.*?</style>").unwrap());
+            static RE_TAGS: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"<[^>]*>").unwrap());
+
+            rendered = RE_SCRIPT.replace_all(&rendered, " ").to_string();
+            rendered = RE_STYLE.replace_all(&rendered, " ").to_string();
+            rendered = RE_TAGS.replace_all(&rendered, " ").to_string();
+            
+            // Clean up extra whitespace/newlines
+            static RE_WS: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"\n{3,}").unwrap());
+            rendered = RE_WS.replace_all(&rendered, "\n\n").to_string();
+        }
 
         let (content, truncated) = if rendered.chars().count() > max_chars {
             (rendered.chars().take(max_chars).collect::<String>(), true)
         } else {
             (rendered, false)
         };
+
+        if let Some(path) = &parsed.output_path {
+            let path_buf = std::path::PathBuf::from(path);
+            if let Some(parent) = path_buf.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create directory: {}", e)))?;
+            }
+            std::fs::write(&path_buf, &content)
+                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to write to file {}: {}", path, e)))?;
+
+            return serialize_tool_envelope(
+                "web_fetch",
+                true,
+                format!("Successfully fetched and saved content to {}. Length: {} chars.", path, content.len()),
+                Some(0),
+                Some(start.elapsed().as_millis()),
+                truncated,
+            );
+        }
 
         StructuredToolOutput::new(
             "web_fetch",
@@ -149,7 +198,7 @@ impl Tool for WebFetchTool {
 #[async_trait]
 impl Tool for TavilySearchTool {
     fn name(&self) -> String {
-        "web_search_tavily".to_string()
+        "web_search".to_string()
     }
 
     fn description(&self) -> String {
@@ -175,7 +224,7 @@ impl Tool for TavilySearchTool {
 
         if self.api_key.trim().is_empty() {
             return serialize_tool_envelope(
-                "web_search_tavily",
+                "web_search",
                 false,
                 "TAVILY_API_KEY is not configured.".to_string(),
                 Some(1),
@@ -223,7 +272,7 @@ impl Tool for TavilySearchTool {
 
         if !status.is_success() {
             return serialize_tool_envelope(
-                "web_search_tavily",
+                "web_search",
                 false,
                 format!("Tavily API error: HTTP {} - {}", status, json),
                 Some(1),
@@ -233,7 +282,7 @@ impl Tool for TavilySearchTool {
         }
 
         StructuredToolOutput::new(
-            "web_search_tavily",
+            "web_search",
             true,
             json.to_string(),
             Some(0),

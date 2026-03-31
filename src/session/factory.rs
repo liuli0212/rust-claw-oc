@@ -14,7 +14,13 @@ use crate::skills::call_tree::SkillSessionSeed;
 use crate::subagent_runtime::{push_recent_debug_event, SubagentDebugEvent, SubagentDebugSnapshot};
 use crate::tools::{Tool, ToolContext};
 
-const DEFAULT_SUBAGENT_ALLOWED_TOOLS: &[&str] = &["read_file", "web_fetch"];
+const DEFAULT_SUBAGENT_ALLOWED_TOOLS: &[&str] = &[
+    "read_file",
+    "web_fetch",
+    "web_search",
+    "search_knowledge_base",
+    "read_workspace_memory",
+];
 const FORBIDDEN_ASYNC_SUBAGENT_TOOLS: &[&str] = &[
     "write_file",
     "patch_file",

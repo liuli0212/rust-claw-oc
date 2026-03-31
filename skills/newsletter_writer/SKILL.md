@@ -12,6 +12,7 @@ allowed_tools:
   - spawn_subagent
   - get_subagent_result
   - call_skill
+  - web_search
   - web_fetch
   - write_file
   - ask_user_question
@@ -34,24 +35,32 @@ You are a legendary tech journalist and editor-in-chief compiling a weekly newsl
 ## Subagent Research Phase
 
 This phase protects your token context from messy search results.
-Use the `spawn_subagent` tool to create a background job that finds the top 3 best recent URLs (articles, blog posts, news, or GitHub repos) for the `{{topic}}`.
+Use the `spawn_subagent` tool to create a background job that finds the top 3 best recent URLs (articles, blog posts, news, or GitHub repos) for the `{{topic}}`, make sure `web_search` tool is enabled for the spawned subagent.
 
 **Subagent Goal (example):**
-"Search the web for the latest news and profound articles about '{{topic}}'. Filter out generic SEO spam. Return EXACTLY a JSON array of the top 3 best URLs you found, nothing else."
+"Search the web for the latest news and profound articles about '{{topic}}'.
+- **Output**: Return EXACTLY a JSON array of the top 3 best URLs you found, nothing else."
 
-**Subagent Max Steps:** 8
-**Subagent Timeout:** 60
+**Subagent Max Steps:** 25
+**Subagent Timeout:** 300
 
-After spawning, immediately use a polling loop with `get_subagent_result` (with `wait_sec: 10`) until the status is `finished`. Consume the result and parse the URLs.
+After spawning, immediately use a polling loop with `get_subagent_result` (with `wait_sec: 10`) until the status is `finished`.
+
+**Main Agent Safety Check:**
+- If `get_subagent_result` returns `ok: false` or the summary starts with `!!SUBAGENT_TASK_UNFINISHED_OR_FAILED!!`, do **NOT** attempt to extract URLs. Report that the research phase failed and stop.
+
+If successful (`ok: true`), consume the result and parse the URLs from the JSON array.
 
 ## Content Extraction & Condensation Phase
 
 For each of the URLs the subagent returned:
-1. Extract the raw readable content using the Jina Reader API via `web_fetch("https://r.jina.ai/<URL>")`.
-2. Do NOT paste the raw content into your own context memory. Instead, save the raw content to a temporary text file (e.g., `/tmp/article_1.txt`) using `execute_bash` or `write_file`.
+1. Extract and save the raw readable content using `web_fetch`:
+   - `url`: `https://r.jina.ai/<URL>`
+   - `output_path`: `/tmp/article_{{index}}.txt`
+2. This protects your token context from being flooded by the full text of multiple articles.
 3. Delegate the summarization to the `summarize_info` skill. Use `call_skill`:
    - `target_skill`: `summarize_info`
-   - `args`: `{ "input": "/tmp/article_1.txt", "language": "{{language}}" }`
+   - `args`: `{ "input": "/tmp/article_{{index}}.txt", "language": "{{language}}" }`
    - `input_summary`: "Please summarize this article into 3 punchy, insightful bullet points suitable for a tech newsletter."
 
 Collect the summaries for all URLs.
