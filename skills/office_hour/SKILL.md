@@ -11,7 +11,7 @@ description: |
   Proactively suggest when the user describes a new product idea or is exploring
   whether something is worth building — before any code is written.
   Use before /plan-ceo-review or /plan-eng-review.
-allowed_tools:
+allowed-tools:
   - Bash
   - Read
   - Grep

@@ -26,6 +26,7 @@ struct RawFrontmatter {
     #[serde(default)]
     trigger: Option<String>,
     #[serde(default)]
+    #[serde(alias = "allowed-tools")]
     allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     output_mode: Option<String>,
