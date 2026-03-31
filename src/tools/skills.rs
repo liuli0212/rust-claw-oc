@@ -143,46 +143,53 @@ impl CallSkillTool {
             details,
         }
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
+pub struct SkillFailureContext<'a> {
+    pub tool_ctx: &'a ToolContext,
+    pub skill_name: &'a str,
+    pub lineage: Vec<String>,
+    pub effective_tools: Vec<String>,
+    pub effective_max_steps: usize,
+    pub effective_timeout_sec: u64,
+    pub failure: SkillCallFailure,
+    pub event_type: &'a str,
+}
+
+impl CallSkillTool {
     async fn failure_output(
         &self,
-        ctx: &ToolContext,
-        skill_name: &str,
-        lineage: Vec<String>,
-        effective_tools: Vec<String>,
-        effective_max_steps: usize,
-        effective_timeout_sec: u64,
-        failure: SkillCallFailure,
-        event_type: &str,
+        f_ctx: SkillFailureContext<'_>,
     ) -> Result<String, ToolError> {
         let payload = json!({
-            "skill_name": skill_name,
-            "lineage": lineage,
-            "failure": &failure,
-            "effective_tools": effective_tools,
-            "effective_max_steps": effective_max_steps,
-            "effective_timeout_sec": effective_timeout_sec,
+            "skill_name": f_ctx.skill_name,
+            "lineage": f_ctx.lineage,
+            "failure": &f_ctx.failure,
+            "effective_tools": f_ctx.effective_tools,
+            "effective_max_steps": f_ctx.effective_max_steps,
+            "effective_timeout_sec": f_ctx.effective_timeout_sec,
         });
-        self.append_event(&ctx.session_id, event_type, payload)
+        self.append_event(&f_ctx.tool_ctx.session_id, f_ctx.event_type, payload)
             .await;
+            
+        let summary = f_ctx.failure.message.clone();
         StructuredToolOutput::new(
             "call_skill",
             false,
             serde_json::to_string_pretty(&SkillCallResult {
                 ok: false,
-                skill_name: skill_name.to_string(),
-                summary: failure.message.clone(),
+                skill_name: f_ctx.skill_name.to_string(),
+                summary,
                 findings: Vec::new(),
                 artifacts: Vec::new(),
-                lineage,
-                effective_tools,
-                effective_max_steps,
-                effective_timeout_sec,
+                lineage: f_ctx.lineage,
+                effective_tools: f_ctx.effective_tools,
+                effective_max_steps: f_ctx.effective_max_steps,
+                effective_timeout_sec: f_ctx.effective_timeout_sec,
                 sub_session_id: None,
                 transcript_path: None,
                 event_log_path: None,
-                failure: Some(failure),
+                failure: Some(f_ctx.failure),
             })
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
             None,
@@ -463,8 +470,8 @@ impl Tool for CallSkillTool {
         let target_skill = parsed.skill_name.clone();
         let input_summary = parsed.input_summary.clone();
         let requested_args = parsed.args.clone();
-        let parent_skill = match ctx.active_skill_name.clone() {
-            Some(skill_name) => skill_name,
+        let parent_skill = match &ctx.active_skill_name {
+            Some(skill_name) => skill_name.clone(),
             None => {
                 let failure = self.failure(
                     SkillCallFailureKind::PolicyDenied,
@@ -474,16 +481,16 @@ impl Tool for CallSkillTool {
                     json!({ "target_skill": &target_skill }),
                 );
                 return self
-                    .failure_output(
-                        ctx,
-                        &target_skill,
-                        Vec::new(),
-                        Vec::new(),
-                        1,
-                        parsed.timeout_sec.unwrap_or(120),
+                    .failure_output(SkillFailureContext {
+                        tool_ctx: ctx,
+                        skill_name: &target_skill,
+                        lineage: Vec::new(),
+                        effective_tools: Vec::new(),
+                        effective_max_steps: parsed.max_steps.unwrap_or(20),
+                        effective_timeout_sec: parsed.timeout_sec.unwrap_or(120),
                         failure,
-                        "skill_call_denied_policy",
-                    )
+                        event_type: "skill_call_denied_policy",
+                    })
                     .await;
             }
         };
@@ -522,7 +529,7 @@ impl Tool for CallSkillTool {
         )
         .await;
 
-        if parent_context.contains_skill(&target_skill) || parent_skill == target_skill {
+        if parent_context.contains_skill(&target_skill) {
             let failure = self.failure(
                 SkillCallFailureKind::CycleDetected,
                 format!(
@@ -537,16 +544,16 @@ impl Tool for CallSkillTool {
                 }),
             );
             return self
-                .failure_output(
-                    ctx,
-                    &target_skill,
-                    child_lineage,
-                    Vec::new(),
+                .failure_output(SkillFailureContext {
+                    tool_ctx: ctx,
+                    skill_name: &target_skill,
+                    lineage: child_lineage,
+                    effective_tools: Vec::new(),
                     effective_max_steps,
                     effective_timeout_sec,
                     failure,
-                    "skill_call_denied_cycle",
-                )
+                    event_type: "skill_call_denied_cycle",
+                })
                 .await;
         }
 
@@ -566,16 +573,16 @@ impl Tool for CallSkillTool {
                 }),
             );
             return self
-                .failure_output(
-                    ctx,
-                    &target_skill,
-                    child_lineage,
-                    Vec::new(),
+                .failure_output(SkillFailureContext {
+                    tool_ctx: ctx,
+                    skill_name: &target_skill,
+                    lineage: child_lineage,
+                    effective_tools: Vec::new(),
                     effective_max_steps,
                     effective_timeout_sec,
                     failure,
-                    "skill_call_denied_depth",
-                )
+                    event_type: "skill_call_denied_depth",
+                })
                 .await;
         }
 
@@ -596,16 +603,16 @@ impl Tool for CallSkillTool {
                 }),
             );
             return self
-                .failure_output(
-                    ctx,
-                    &target_skill,
-                    child_lineage,
-                    Vec::new(),
+                .failure_output(SkillFailureContext {
+                    tool_ctx: ctx,
+                    skill_name: &target_skill,
+                    lineage: child_lineage,
+                    effective_tools: Vec::new(),
                     effective_max_steps,
                     effective_timeout_sec,
                     failure,
-                    "skill_call_denied_budget",
-                )
+                    event_type: "skill_call_denied_budget",
+                })
                 .await;
         }
 
@@ -621,16 +628,16 @@ impl Tool for CallSkillTool {
                 }),
             );
             return self
-                .failure_output(
-                    ctx,
-                    &target_skill,
-                    child_lineage,
-                    Vec::new(),
+                .failure_output(SkillFailureContext {
+                    tool_ctx: ctx,
+                    skill_name: &target_skill,
+                    lineage: child_lineage,
+                    effective_tools: Vec::new(),
                     effective_max_steps,
                     effective_timeout_sec,
                     failure,
-                    "skill_call_denied_policy",
-                )
+                    event_type: "skill_call_denied_policy",
+                })
                 .await;
         };
 
@@ -673,6 +680,11 @@ impl Tool for CallSkillTool {
                     .collect()
             }
         };
+        
+        let mut effective_tools = effective_tools;
+        if effective_tools.is_empty() {
+            effective_tools.push("__skill_no_tools__".to_string());
+        }
         let missing_tools: Vec<String> = callee_declared_tools
             .iter()
             .filter(|name| {
@@ -699,16 +711,16 @@ impl Tool for CallSkillTool {
                 }),
             );
             return self
-                .failure_output(
-                    ctx,
-                    &target_skill,
-                    child_lineage,
-                    effective_tools,
+                .failure_output(SkillFailureContext {
+                    tool_ctx: ctx,
+                    skill_name: &target_skill,
+                    lineage: child_lineage,
+                    effective_tools: effective_tools.clone(),
                     effective_max_steps,
                     effective_timeout_sec,
                     failure,
-                    "skill_call_denied_policy",
-                )
+                    event_type: "skill_call_denied_policy",
+                })
                 .await;
         }
 
@@ -731,11 +743,7 @@ impl Tool for CallSkillTool {
 
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_notify = Arc::new(tokio::sync::Notify::new());
-        let session_allowed_tools = if effective_tools.is_empty() {
-            vec!["__skill_no_tools__".to_string()]
-        } else {
-            effective_tools.clone()
-        };
+        let session_allowed_tools = effective_tools.clone();
 
         let built = crate::session::factory::build_subagent_session(
             ctx,
@@ -778,16 +786,16 @@ impl Tool for CallSkillTool {
                     }),
                 );
                 return self
-                    .failure_output(
-                        ctx,
-                        &target_skill,
-                        child_lineage,
-                        effective_tools,
+                    .failure_output(SkillFailureContext {
+                        tool_ctx: ctx,
+                        skill_name: &target_skill,
+                        lineage: child_lineage,
+                        effective_tools: effective_tools.clone(),
                         effective_max_steps,
                         effective_timeout_sec,
                         failure,
-                        "skill_call_finished",
-                    )
+                        event_type: "skill_call_denied",
+                    })
                     .await;
             }
         };
@@ -829,7 +837,7 @@ impl Tool for CallSkillTool {
             sub_session_id = %sub_session_id,
             skill = %target_skill,
             depth = child_context_preview.current_depth(),
-            lineage = %child_context_preview.lineage_names().join(" -> ")
+            lineage = %child_lineage.join(" -> ")
         );
 
         let run_result =
@@ -839,13 +847,13 @@ impl Tool for CallSkillTool {
             .instrument(span)
             .await;
 
-        let _collected_text = collector.take_text().await;
+        let collected_text = collector.take_text().await;
         let tool_outputs = collector.take_tool_outputs().await;
         let artifacts = collector.take_artifacts().await;
 
         let result = match run_result {
             Ok(Ok(exit)) => {
-                let (ok, summary, failure) = match exit {
+                let (ok, mut summary, failure) = match exit {
                     crate::core::RunExit::Finished(summary) => (true, summary, None),
                     crate::core::RunExit::EnergyDepleted(summary) => (
                         false,
@@ -857,7 +865,7 @@ impl Tool for CallSkillTool {
                             Some("Do not retry with the same budget. Reduce scope or summarize the partial result."),
                             json!({
                                 "target_skill": &target_skill,
-                                "lineage": child_context_preview.lineage_names(),
+                                "lineage": &child_lineage,
                                 "effective_max_steps": effective_max_steps,
                             }),
                         )),
@@ -872,7 +880,7 @@ impl Tool for CallSkillTool {
                             Some("Continue in the parent skill instead of retrying the same child immediately."),
                             json!({
                                 "target_skill": &target_skill,
-                                "lineage": child_context_preview.lineage_names(),
+                                "lineage": &child_lineage,
                                 "exit": "yielded_to_user",
                             }),
                         )),
@@ -887,13 +895,12 @@ impl Tool for CallSkillTool {
                             Some("Only retry if the user explicitly asks to resume this delegation."),
                             json!({
                                 "target_skill": &target_skill,
-                                "lineage": child_context_preview.lineage_names(),
+                                "lineage": &child_lineage,
                                 "exit": "stopped_by_user",
                             }),
                         )),
                     ),
                     crate::core::RunExit::RecoverableFailed(message)
-                    | crate::core::RunExit::CriticallyFailed(message)
                     | crate::core::RunExit::AutopilotStalled(message) => (
                         false,
                         message.clone(),
@@ -904,7 +911,23 @@ impl Tool for CallSkillTool {
                             Some("Adjust the plan before retrying the child skill."),
                             json!({
                                 "target_skill": &target_skill,
-                                "lineage": child_context_preview.lineage_names(),
+                                "lineage": &child_lineage,
+                                "effective_max_steps": effective_max_steps,
+                                "effective_timeout_sec": effective_timeout_sec,
+                            }),
+                        )),
+                    ),
+                    crate::core::RunExit::CriticallyFailed(message) => (
+                        false,
+                        message.clone(),
+                        Some(self.failure(
+                            SkillCallFailureKind::ChildExecutionFailed,
+                            message,
+                            false,
+                            Some("Do not retry this child skill. Re-evaluate the strategy entirely."),
+                            json!({
+                                "target_skill": &target_skill,
+                                "lineage": &child_lineage,
                                 "effective_max_steps": effective_max_steps,
                                 "effective_timeout_sec": effective_timeout_sec,
                             }),
@@ -912,13 +935,17 @@ impl Tool for CallSkillTool {
                     ),
                 };
 
+                if !collected_text.is_empty() {
+                    summary.push_str(&format!("\n\n[Skill Output text]:\n{}", collected_text));
+                }
+
                 SkillCallResult {
                     ok,
                     skill_name: target_skill.clone(),
                     summary,
                     findings: tool_outputs,
                     artifacts,
-                    lineage: child_context_preview.lineage_names(),
+                    lineage: child_lineage.clone(),
                     effective_tools: effective_tools.clone(),
                     effective_max_steps,
                     effective_timeout_sec,
@@ -935,7 +962,7 @@ impl Tool for CallSkillTool {
                     summary: format!("Skill error: {}", error),
                     findings: tool_outputs,
                     artifacts,
-                    lineage: child_context_preview.lineage_names(),
+                    lineage: child_lineage.clone(),
                     effective_tools: effective_tools.clone(),
                     effective_max_steps,
                     effective_timeout_sec,

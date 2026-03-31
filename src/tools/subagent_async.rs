@@ -64,7 +64,7 @@ struct GetSubagentResultArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-struct EmptyArgs {}
+struct EmptyArgs;
 
 fn serialize_output(tool_name: &str, payload: Value) -> Result<String, ToolError> {
     StructuredToolOutput::new(
@@ -135,7 +135,7 @@ impl Tool for GetSubagentResultTool {
     }
 
     fn has_side_effects(&self) -> bool {
-        false
+        true
     }
 
     async fn execute(

@@ -342,10 +342,8 @@ impl AgentLoop {
     }
 
     pub fn get_tools_metadata(&self) -> serde_json::Value {
-        let all_tools = self.tools.clone();
-
         serde_json::Value::Array(
-            all_tools
+            self.tools
                 .iter()
                 .map(|t| {
                     serde_json::json!({

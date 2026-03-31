@@ -181,9 +181,9 @@ impl Tool for DispatchSubagentTool {
                     summary,
                     findings: tool_outputs,
                     artifacts,
-                    sub_session_id: Some(sub_session_id.clone()),
-                    transcript_path: Some(transcript_path.clone()),
-                    event_log_path: Some(event_log_path.clone()),
+                    sub_session_id: Some(sub_session_id),
+                    transcript_path: Some(transcript_path),
+                    event_log_path: Some(event_log_path),
                 }
             }
             Ok(Err(error)) => {
@@ -193,9 +193,9 @@ impl Tool for DispatchSubagentTool {
                     summary: format!("Sub-agent error: {}", error),
                     findings: tool_outputs,
                     artifacts,
-                    sub_session_id: Some(sub_session_id.clone()),
-                    transcript_path: Some(transcript_path.clone()),
-                    event_log_path: Some(event_log_path.clone()),
+                    sub_session_id: Some(sub_session_id),
+                    transcript_path: Some(transcript_path),
+                    event_log_path: Some(event_log_path),
                 }
             }
             Err(_) => {
