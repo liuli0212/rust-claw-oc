@@ -223,10 +223,6 @@ impl SkillRuntime {
             parts.push("⚠️ HARD GATE: Do NOT write code files.".to_string());
         }
 
-        if !state.constraints.allow_subagents {
-            parts.push("Subagents: disabled for this skill.".to_string());
-        }
-
         if let Some(required_artifact_kind) =
             Self::effective_required_artifact_kind(state, Some(def))
         {
@@ -464,25 +460,6 @@ impl ExecutionExtension for SkillRuntime {
                 let write_tools = ["write_file", "patch_file"];
                 filtered.retain(|t| !write_tools.contains(&t.name().as_str()));
             }
-
-            if !state.constraints.allow_subagents {
-                let subagent_tools = [
-                    "call_skill",
-                    "dispatch_subagent",
-                    "spawn_subagent",
-                    "get_subagent_result",
-                    "cancel_subagent",
-                    "list_subagent_jobs",
-                ];
-                let original_len = filtered.len();
-                filtered.retain(|t| !subagent_tools.contains(&t.name().as_str()));
-                if filtered.len() != original_len {
-                    tracing::warn!(
-                        skill = %state.skill_name,
-                        "Skill constraint allow_subagents=false: filtered subagent tools from tool set"
-                    );
-                }
-            }
         }
 
         filtered
@@ -667,7 +644,7 @@ mod tests {
             parameters: None,
             constraints: SkillConstraints {
                 forbid_code_write: forbid_code,
-                allow_subagents: false,
+
                 required_artifact_kind: required_artifact,
             },
         }
@@ -815,47 +792,6 @@ mod tests {
         assert!(names.contains(&"finish_task".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_allow_subagents_false_filters_subagent_tools() {
-        let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        struct MockTool(String);
-        #[async_trait]
-        impl Tool for MockTool {
-            fn name(&self) -> String {
-                self.0.clone()
-            }
-            fn description(&self) -> String {
-                String::new()
-            }
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
-            }
-            async fn execute(
-                &self,
-                _: serde_json::Value,
-                _: &crate::tools::protocol::ToolContext,
-            ) -> Result<String, crate::tools::protocol::ToolError> {
-                Ok(String::new())
-            }
-        }
-
-        let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(MockTool("read_file".to_string())),
-            Arc::new(MockTool("spawn_subagent".to_string())),
-            Arc::new(MockTool("get_subagent_result".to_string())),
-            Arc::new(MockTool("finish_task".to_string())),
-        ];
-
-        let filtered = rt.before_tool_resolution(tools).await;
-        let names: Vec<String> = filtered.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"finish_task".to_string()));
-        assert!(!names.contains(&"spawn_subagent".to_string()));
-        assert!(!names.contains(&"get_subagent_result".to_string()));
-    }
 
     #[tokio::test]
     async fn test_resume_with_pending_interaction() {
@@ -1047,8 +983,7 @@ mod tests {
     #[tokio::test]
     async fn test_after_tool_result_tracks_spawned_subagent_state() {
         let rt = SkillRuntime::new();
-        let mut skill = make_test_skill(false, None);
-        skill.constraints.allow_subagents = true;
+        let skill = make_test_skill(false, None);
         rt.activate_skill(&skill, None).await.unwrap();
 
         rt.after_tool_result(&ToolExecutionEnvelope {

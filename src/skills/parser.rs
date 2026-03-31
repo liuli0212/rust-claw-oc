@@ -132,7 +132,6 @@ allowed_tools: [read_file, execute_bash]
 output_mode: review_only
 constraints:
   forbid_code_write: true
-  allow_subagents: true
   required_artifact_kind: review_report
 ---
 # Code Review Instructions
@@ -147,7 +146,21 @@ Review the code carefully.
         );
         assert_eq!(def.meta.allowed_tools, vec!["read_file", "execute_bash"]);
         assert!(def.constraints.forbid_code_write);
-        assert!(def.constraints.allow_subagents);
+    }
+
+    #[test]
+    fn test_parse_skill_with_hyphenated_tools() {
+        let md = r#"---
+name: hyphenated
+description: Test hyphenated allowed-tools
+allowed-tools: [read_file, execute_bash]
+---
+# Instructions
+Test.
+"#;
+        let def = parse_skill_md(md).expect("Should parse successfully");
+        assert_eq!(def.meta.name, "hyphenated");
+        assert_eq!(def.meta.allowed_tools, vec!["read_file", "execute_bash"]);
     }
 
     #[test]

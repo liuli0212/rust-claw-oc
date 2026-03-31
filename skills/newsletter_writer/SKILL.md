@@ -15,8 +15,7 @@ allowed_tools:
   - web_fetch
   - write_file
   - ask_user_question
-constraints:
-  allow_subagents: true
+
 parameters:
   topic:
     type: string

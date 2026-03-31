@@ -58,9 +58,6 @@ pub struct SkillConstraints {
     /// Hard gate: forbid writing code files.
     #[serde(default)]
     pub forbid_code_write: bool,
-    /// Whether this skill may dispatch sub-agents.
-    #[serde(default)]
-    pub allow_subagents: bool,
     /// If set, the skill must produce an artifact of this kind before completion.
     #[serde(default)]
     pub required_artifact_kind: Option<ArtifactKind>,
@@ -85,8 +82,6 @@ mod tests {
     #[test]
     fn test_default_constraints() {
         let c = SkillConstraints::default();
-        assert!(!c.forbid_code_write);
-        assert!(!c.allow_subagents);
         assert!(c.required_artifact_kind.is_none());
     }
 

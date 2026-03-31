@@ -247,7 +247,6 @@ mod tests {
             instructions: "do the thing".to_string(),
             parameters: None,
             constraints: SkillConstraints {
-                allow_subagents: true,
                 ..SkillConstraints::default()
             },
         }
