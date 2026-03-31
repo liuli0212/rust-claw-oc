@@ -10,6 +10,7 @@ use crate::core::extensions::{ExecutionExtension, ExtensionDecision, FinishDecis
 use crate::tools::protocol::ToolExecutionEnvelope;
 use crate::tools::Tool;
 
+use super::call_tree::{SkillCallContext, SkillSessionSeed};
 use super::definition::SkillDef;
 use super::policy::SkillToolPolicy;
 use super::registry::SkillRegistry;
@@ -20,29 +21,64 @@ use super::state::{ActiveSkillState, SkillAnswer, SkillExecutionState};
 /// Ownership model: `ActiveSkillState` is exclusively owned by this struct.
 /// `AgentLoop` accesses skill state only through `ExecutionExtension` hooks.
 pub struct SkillRuntime {
+    session_id: String,
     /// The currently active skill state, if any.
     state: RwLock<Option<ActiveSkillState>>,
     /// The definition of the currently active skill.
     active_def: RwLock<Option<SkillDef>>,
+    active_call_context: RwLock<Option<SkillCallContext>>,
     /// Tool policy engine.
     policy: SkillToolPolicy,
     registry: SkillRegistry,
+    session_seed: SkillSessionSeed,
 }
 
 impl SkillRuntime {
     pub fn new() -> Self {
+        Self::new_for_session("standalone")
+    }
+
+    pub fn new_for_session(session_id: impl Into<String>) -> Self {
         tracing::debug!("Initializing SkillRuntime and discovering skills...");
         let mut registry = SkillRegistry::new();
         registry.discover(Path::new("skills"));
-        Self::with_registry(registry)
+        Self::with_registry_for_session(session_id, registry)
     }
 
     pub fn with_registry(registry: SkillRegistry) -> Self {
+        Self::with_registry_for_session("standalone", registry)
+    }
+
+    pub fn with_registry_for_session(
+        session_id: impl Into<String>,
+        registry: SkillRegistry,
+    ) -> Self {
+        Self::with_registry_and_seed(session_id, registry, SkillSessionSeed::default())
+    }
+
+    pub fn with_session_seed(
+        session_id: impl Into<String>,
+        session_seed: SkillSessionSeed,
+    ) -> Self {
+        tracing::debug!("Initializing SkillRuntime and discovering skills...");
+        let mut registry = SkillRegistry::new();
+        registry.discover(Path::new("skills"));
+        Self::with_registry_and_seed(session_id, registry, session_seed)
+    }
+
+    pub fn with_registry_and_seed(
+        session_id: impl Into<String>,
+        registry: SkillRegistry,
+        session_seed: SkillSessionSeed,
+    ) -> Self {
         Self {
+            session_id: session_id.into(),
             state: RwLock::new(None),
             active_def: RwLock::new(None),
+            active_call_context: RwLock::new(None),
             policy: SkillToolPolicy::new(),
             registry,
+            session_seed,
         }
     }
 
@@ -56,6 +92,18 @@ impl SkillRuntime {
         }
     }
 
+    fn derive_call_context(
+        &self,
+        skill_name: &str,
+        initial_args: Option<&str>,
+    ) -> SkillCallContext {
+        self.session_seed
+            .inherited_call_context
+            .clone()
+            .unwrap_or_else(|| SkillCallContext::new_root(self.session_id.clone()))
+            .append_frame(skill_name, initial_args)
+    }
+
     /// Activate a skill for the current session.
     pub async fn activate_skill(
         &self,
@@ -67,6 +115,8 @@ impl SkillRuntime {
             def.meta.name,
             initial_args
         );
+        let call_context = self.derive_call_context(&def.meta.name, initial_args.as_deref());
+        let lineage_names = call_context.lineage_names();
         let mut state = ActiveSkillState::new(def.meta.name.clone(), def.constraints.clone());
         state.initial_args = initial_args;
         state.execution_state = SkillExecutionState::Running;
@@ -79,8 +129,35 @@ impl SkillRuntime {
                 Self::output_mode_name(output_mode).to_string(),
             );
         }
+        state.labels.insert(
+            "call_depth".to_string(),
+            call_context.current_depth().to_string(),
+        );
+        state
+            .labels
+            .insert("call_lineage".to_string(), lineage_names.join(" -> "));
+        state.labels.insert(
+            "root_session_id".to_string(),
+            call_context.root_session_id.clone(),
+        );
+        if let Some(frame) = call_context.lineage.last() {
+            state
+                .labels
+                .insert("call_id".to_string(), frame.call_id.clone());
+            if let Some(parent_call_id) = frame.parent_call_id.as_ref() {
+                state
+                    .labels
+                    .insert("parent_call_id".to_string(), parent_call_id.clone());
+            }
+            if let Some(args_digest) = frame.args_digest.as_ref() {
+                state
+                    .labels
+                    .insert("args_digest".to_string(), args_digest.clone());
+            }
+        }
 
         *self.active_def.write().await = Some(def.clone());
+        *self.active_call_context.write().await = Some(call_context);
         *self.state.write().await = Some(state);
 
         tracing::info!("Skill '{}' activated", def.meta.name);
@@ -96,6 +173,7 @@ impl SkillRuntime {
         };
         *self.state.write().await = None;
         *self.active_def.write().await = None;
+        *self.active_call_context.write().await = None;
         if let Some(name) = name {
             tracing::info!("Skill '{}' deactivated", name);
         }
@@ -147,10 +225,6 @@ impl SkillRuntime {
 
         if !state.constraints.allow_subagents {
             parts.push("Subagents: disabled for this skill.".to_string());
-        }
-
-        if state.constraints.require_question_resume {
-            parts.push("User input mode: structured question-resume only.".to_string());
         }
 
         if let Some(required_artifact_kind) =
@@ -347,13 +421,9 @@ impl ExecutionExtension for SkillRuntime {
 
         let state = self.state.read().await;
         if let Some(state) = state.as_ref() {
-            if state.constraints.require_question_resume && state.pending_interaction.is_none() {
-                return ExtensionDecision::Halt {
-                    message: format!(
-                        "Skill '{}' requires structured question-resume. Wait for the skill to ask via `ask_user_question` before providing additional input.",
-                        state.skill_name
-                    ),
-                };
+            if state.constraints.forbid_code_write && input.contains("```") {
+                // This is a soft nudge, but we could make it a hard gate if needed.
+                // For now we rely on tool filtering.
             }
         }
 
@@ -397,6 +467,7 @@ impl ExecutionExtension for SkillRuntime {
 
             if !state.constraints.allow_subagents {
                 let subagent_tools = [
+                    "call_skill",
                     "dispatch_subagent",
                     "spawn_subagent",
                     "get_subagent_result",
@@ -415,6 +486,19 @@ impl ExecutionExtension for SkillRuntime {
         }
 
         filtered
+    }
+
+    async fn enrich_tool_context(
+        &self,
+        mut ctx: crate::tools::ToolContext,
+    ) -> crate::tools::ToolContext {
+        if let Some(state) = self.state.read().await.as_ref() {
+            ctx.active_skill_name = Some(state.skill_name.clone());
+        }
+        if let Some(call_context) = self.active_call_context.read().await.as_ref() {
+            ctx.skill_call_context = Some(call_context.clone());
+        }
+        ctx
     }
 
     async fn after_tool_result(&self, result: &ToolExecutionEnvelope) {
@@ -584,7 +668,6 @@ mod tests {
             constraints: SkillConstraints {
                 forbid_code_write: forbid_code,
                 allow_subagents: false,
-                require_question_resume: false,
                 required_artifact_kind: required_artifact,
             },
         }
@@ -825,50 +908,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_require_question_resume_blocks_unstructured_turns() {
-        let rt = SkillRuntime::new();
-        let mut skill = make_test_skill(false, None);
-        skill.constraints.require_question_resume = true;
-        rt.activate_skill(&skill, None).await.unwrap();
 
-        assert!(matches!(
-            rt.before_turn_start("hello").await,
-            ExtensionDecision::Halt { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_require_question_resume_allows_resumed_turn_and_blocks_followup() {
-        let rt = SkillRuntime::new();
-        let mut skill = make_test_skill(false, None);
-        skill.constraints.require_question_resume = true;
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        {
-            let mut state = rt.state.write().await;
-            let state = state.as_mut().unwrap();
-            state.pending_interaction = Some(PendingInteraction {
-                skill_name: "test_skill".to_string(),
-                context_key: "project_name".to_string(),
-                question: "What is the project name?".to_string(),
-                options: vec![],
-                recommendation: None,
-                asked_at: "now".to_string(),
-            });
-            state.execution_state = SkillExecutionState::WaitingUser;
-        }
-
-        assert!(matches!(
-            rt.before_turn_start("MyProject").await,
-            ExtensionDecision::Continue
-        ));
-        assert!(matches!(
-            rt.before_turn_start("one more thing").await,
-            ExtensionDecision::Halt { .. }
-        ));
-    }
-
-    #[tokio::test]
     async fn test_artifact_contract_denies_finish() {
         let rt = SkillRuntime::new();
         let skill = make_test_skill(false, Some(ArtifactKind::DesignDoc));

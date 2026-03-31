@@ -5,6 +5,8 @@ use serde_json::Map;
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::skills::call_tree::{SkillBudget, SkillCallContext};
+
 pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = schema_val.as_object_mut() {
         obj.remove("$schema");
@@ -34,6 +36,23 @@ pub enum ToolError {
 pub struct ToolContext {
     pub session_id: String,
     pub reply_to: String,
+    pub visible_tools: Vec<String>,
+    pub active_skill_name: Option<String>,
+    pub skill_call_context: Option<SkillCallContext>,
+    pub skill_budget: SkillBudget,
+}
+
+impl ToolContext {
+    pub fn new(session_id: impl Into<String>, reply_to: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            reply_to: reply_to.into(),
+            visible_tools: Vec::new(),
+            active_skill_name: None,
+            skill_call_context: None,
+            skill_budget: SkillBudget::default(),
+        }
+    }
 }
 
 #[async_trait]

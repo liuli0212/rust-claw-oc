@@ -114,7 +114,9 @@ impl Tool for DispatchSubagentTool {
             None,
             &parsed.allowed_tools,
             max_steps,
+            timeout_sec,
             &parsed.input_summary,
+            crate::skills::call_tree::SkillSessionSeed::default(),
             std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::subagent_runtime::SubagentDebugSnapshot::default(),
             )),
@@ -232,10 +234,7 @@ mod tests {
     use crate::tools::protocol::ToolContext;
 
     fn make_ctx() -> ToolContext {
-        ToolContext {
-            session_id: "test".to_string(),
-            reply_to: "test".to_string(),
-        }
+        ToolContext::new("test", "test")
     }
 
     struct MockTool(String);

@@ -61,9 +61,6 @@ pub struct SkillConstraints {
     /// Whether this skill may dispatch sub-agents.
     #[serde(default)]
     pub allow_subagents: bool,
-    /// Whether user answers must go through structured question-resume.
-    #[serde(default)]
-    pub require_question_resume: bool,
     /// If set, the skill must produce an artifact of this kind before completion.
     #[serde(default)]
     pub required_artifact_kind: Option<ArtifactKind>,
@@ -90,7 +87,6 @@ mod tests {
         let c = SkillConstraints::default();
         assert!(!c.forbid_code_write);
         assert!(!c.allow_subagents);
-        assert!(!c.require_question_resume);
         assert!(c.required_artifact_kind.is_none());
     }
 

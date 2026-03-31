@@ -4,7 +4,7 @@ use crate::tools::Tool;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 pub mod extensions;
@@ -191,6 +191,7 @@ pub struct AgentLoop {
     autopilot_work_dir: Option<PathBuf>,
     extensions: Vec<Box<dyn extensions::ExecutionExtension>>,
     initial_energy_budget: usize,
+    session_deadline: Option<Instant>,
 }
 
 impl AgentLoop {
@@ -228,6 +229,7 @@ impl AgentLoop {
             autopilot_work_dir: None,
             extensions: Vec::new(),
             initial_energy_budget: Self::INITIAL_ENERGY,
+            session_deadline: None,
         }
     }
 
@@ -238,6 +240,17 @@ impl AgentLoop {
 
     pub fn set_initial_energy_budget(&mut self, energy_budget: usize) {
         self.initial_energy_budget = energy_budget.max(1);
+    }
+
+    pub fn set_session_timeout(&mut self, timeout: Duration) {
+        self.session_deadline = Some(Instant::now() + timeout);
+    }
+
+    pub fn remaining_session_timeout_sec(&self) -> Option<u64> {
+        self.session_deadline.map(|deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            remaining.as_secs().max(1)
+        })
     }
 
     pub fn request_cancel(&self) {
@@ -640,7 +653,12 @@ impl AgentLoop {
 
             let state_before_tools = state.clone();
             let (response_parts, should_yield_to_user) = self
-                .execute_tool_round(tool_calls_accumulated, &current_tools, &mut state)
+                .execute_tool_round(
+                    tool_calls_accumulated,
+                    &current_tools,
+                    &mut state,
+                    task_state.energy_points,
+                )
                 .await;
 
             if !response_parts.is_empty() {

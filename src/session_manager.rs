@@ -880,10 +880,7 @@ mod tests {
             .get_or_create_session(session_id, "test_cli", output)
             .await
             .unwrap();
-        let tool_ctx = ToolContext {
-            session_id: session_id.to_string(),
-            reply_to: "test_cli".to_string(),
-        };
+        let tool_ctx = ToolContext::new(session_id, "test_cli");
 
         let exit = agent
             .lock()

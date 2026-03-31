@@ -23,6 +23,12 @@ pub struct AgentContext {
     pub execution_notices: Option<String>,
 }
 
+impl Default for AgentContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentContext {
     pub fn new() -> Self {
         Self {

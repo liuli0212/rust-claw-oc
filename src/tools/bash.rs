@@ -32,6 +32,12 @@ pub struct BashExecutionResult {
     pub truncated: bool,
 }
 
+impl Default for BashTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BashTool {
     pub fn new() -> Self {
         let work_dir = std::env::current_dir()

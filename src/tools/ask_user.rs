@@ -92,10 +92,7 @@ mod tests {
     use crate::tools::protocol::{ToolContext, ToolExecutionEnvelope};
 
     fn make_ctx() -> ToolContext {
-        ToolContext {
-            session_id: "test".to_string(),
-            reply_to: "test".to_string(),
-        }
+        ToolContext::new("test", "test")
     }
 
     #[tokio::test]

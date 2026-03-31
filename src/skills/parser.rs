@@ -132,7 +132,6 @@ output_mode: review_only
 constraints:
   forbid_code_write: true
   allow_subagents: true
-  require_question_resume: true
   required_artifact_kind: review_report
 ---
 # Code Review Instructions

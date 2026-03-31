@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -9,6 +10,7 @@ use crate::context::AgentContext;
 use crate::core::{AgentLoop, AgentOutput};
 use crate::event_log::{AgentEvent, EventLog};
 use crate::llm_client::LlmClient;
+use crate::skills::call_tree::SkillSessionSeed;
 use crate::subagent_runtime::{push_recent_debug_event, SubagentDebugEvent, SubagentDebugSnapshot};
 use crate::tools::{Tool, ToolContext};
 
@@ -305,7 +307,9 @@ pub fn build_subagent_session(
     sub_session_id: Option<String>,
     allowed_tools: &[String],
     energy_budget: usize,
+    timeout_sec: u64,
     input_summary: &str,
+    skill_session_seed: SkillSessionSeed,
     debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     cancel_notify: Arc<tokio::sync::Notify>,
@@ -332,8 +336,7 @@ pub fn build_subagent_session(
     let mut context = AgentContext::new().with_transcript_path(transcript_path);
 
     let mut prompt = format!(
-        "You are a restricted sub-agent. Complete the assigned goal with the available tools, \
-         then call `finish_task`.\nParent context summary:\n{}\n\nBe concise.",
+        "You are a restricted sub-agent. Complete the assigned goal with the available tools, \\\n         then call `finish_task`.\\nParent context summary:\\n{}\\n\\nBe concise.",
         input_summary
     );
 
@@ -375,7 +378,14 @@ pub fn build_subagent_session(
         task_state_store,
     );
     agent_loop.set_initial_energy_budget(energy_budget.max(1));
+    agent_loop.set_session_timeout(Duration::from_secs(timeout_sec.max(1)));
     agent_loop.is_subagent = true;
+    agent_loop.add_extension(Box::new(
+        crate::skills::runtime::SkillRuntime::with_session_seed(
+            sub_session_id.clone(),
+            skill_session_seed,
+        ),
+    ));
     agent_loop.cancelled = cancelled;
     agent_loop.cancel_token = cancel_notify;
 
@@ -421,6 +431,10 @@ pub fn build_agent_session(
     let subagent_base_tools = session_tools.clone();
     session_tools.push(Arc::new(crate::tools::DispatchSubagentTool::new(
         llm.clone(),
+        subagent_base_tools.clone(),
+    )));
+    session_tools.push(Arc::new(crate::tools::CallSkillTool::new(
+        llm.clone(),
         subagent_base_tools,
     )));
     session_tools.push(Arc::new(crate::tools::SpawnSubagentTool::new(
@@ -446,7 +460,9 @@ pub fn build_agent_session(
         telemetry,
         task_state_store,
     );
-    agent_loop.add_extension(Box::new(crate::skills::runtime::SkillRuntime::new()));
+    agent_loop.add_extension(Box::new(
+        crate::skills::runtime::SkillRuntime::new_for_session(session_id.to_string()),
+    ));
     agent_loop.add_extension(Box::new(
         crate::subagent_notification::SubagentNotificationExtension::new(
             session_id,
@@ -599,6 +615,24 @@ mod tests {
         );
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"write_file".to_string()));
+        assert!(names.contains(&"finish_task".to_string()));
+    }
+
+    #[test]
+    fn test_filter_subagent_tools_sync_compatible_keeps_explicit_call_skill() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool("read_file")),
+            Arc::new(MockTool("call_skill")),
+            Arc::new(MockTool("finish_task")),
+        ];
+
+        let (filtered, _) = filter_subagent_tools(
+            &tools,
+            &["call_skill".to_string()],
+            SubagentBuildMode::SyncCompatible,
+        );
+        let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"call_skill".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
     }
 

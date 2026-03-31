@@ -42,6 +42,12 @@ pub struct TuiOutput {
     last_plan_fingerprint: Arc<Mutex<String>>,
 }
 
+impl Default for TuiOutput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TuiOutput {
     pub fn new() -> Self {
         let mut skin = MadSkin::default();

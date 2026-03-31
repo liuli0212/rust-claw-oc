@@ -352,10 +352,7 @@ mod tests {
     }
 
     fn make_ctx() -> crate::tools::ToolContext {
-        crate::tools::ToolContext {
-            session_id: "parent".to_string(),
-            reply_to: "cli".to_string(),
-        }
+        crate::tools::ToolContext::new("parent", "cli")
     }
 
     #[tokio::test]

@@ -37,6 +37,12 @@ pub struct TavilySearchArgs {
     pub include_raw_content: Option<bool>,
 }
 
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebFetchTool {
     pub fn new() -> Self {
         Self {
@@ -251,10 +257,7 @@ mod tests {
                 serde_json::json!({
                     "url": "ftp://example.com/file.txt"
                 }),
-                &crate::tools::ToolContext {
-                    session_id: "test".into(),
-                    reply_to: "test".into(),
-                },
+                &crate::tools::ToolContext::new("test", "test"),
             )
             .await
             .unwrap_err();

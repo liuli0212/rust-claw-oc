@@ -332,10 +332,7 @@ mod tests {
     use serial_test::serial;
 
     fn test_ctx() -> crate::tools::ToolContext {
-        crate::tools::ToolContext {
-            session_id: "test".into(),
-            reply_to: "test".into(),
-        }
+        crate::tools::ToolContext::new("test", "test")
     }
 
     async fn start_browser_or_skip(tool: &BrowserTool, label: &str) -> bool {

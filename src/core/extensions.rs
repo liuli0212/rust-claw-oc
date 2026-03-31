@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::tools::protocol::ToolExecutionEnvelope;
 use crate::tools::Tool;
+use crate::tools::ToolContext;
 
 /// Lifecycle hooks that allow extensions (such as SkillRuntime) to intercept
 /// and modify AgentLoop behaviour without the main loop knowing about
@@ -20,6 +21,10 @@ pub trait ExecutionExtension: Send + Sync {
     /// Called before the tool list is sent to the model.
     /// Extensions may filter, reorder or augment the visible tool set.
     async fn before_tool_resolution(&self, tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>>;
+
+    async fn enrich_tool_context(&self, ctx: ToolContext) -> ToolContext {
+        ctx
+    }
 
     /// Called after every successful tool execution.
     /// Extensions may update internal state based on the result.

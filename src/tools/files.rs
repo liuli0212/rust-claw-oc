@@ -546,13 +546,7 @@ mod tests {
         });
 
         let result = tool
-            .execute(
-                args,
-                &crate::tools::ToolContext {
-                    session_id: "test".into(),
-                    reply_to: "test".into(),
-                },
-            )
+            .execute(args, &crate::tools::ToolContext::new("test", "test"))
             .await
             .unwrap();
         assert!(result.contains("true"));
@@ -580,10 +574,7 @@ mod tests {
                     "path": file_path,
                     "thought": "inspect large file"
                 }),
-                &crate::tools::ToolContext {
-                    session_id: "test".into(),
-                    reply_to: "test".into(),
-                },
+                &crate::tools::ToolContext::new("test", "test"),
             )
             .await
             .unwrap();
@@ -617,10 +608,7 @@ mod tests {
                 serde_json::json!({
                     "summary": "Refactor complete"
                 }),
-                &crate::tools::ToolContext {
-                    session_id: "test".into(),
-                    reply_to: "test".into(),
-                },
+                &crate::tools::ToolContext::new("test", "test"),
             )
             .await
             .unwrap();

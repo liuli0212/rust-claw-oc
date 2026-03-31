@@ -547,7 +547,9 @@ impl SubagentRuntime {
             Some(sub_session_id),
             &args.allowed_tools,
             args.max_steps.unwrap_or(5).max(1),
+            args.timeout_sec.unwrap_or(60),
             &args.input_summary,
+            crate::skills::call_tree::SkillSessionSeed::default(),
             handle.debug.clone(),
             handle.cancelled.clone(),
             handle.cancel_notify.clone(),
@@ -1078,10 +1080,7 @@ mod tests {
     }
 
     fn make_ctx() -> ToolContext {
-        ToolContext {
-            session_id: "parent".to_string(),
-            reply_to: "cli".to_string(),
-        }
+        ToolContext::new("parent", "cli")
     }
 
     async fn wait_for_terminal_state(runtime: &SubagentRuntime, job_id: &str) -> SubagentJobState {

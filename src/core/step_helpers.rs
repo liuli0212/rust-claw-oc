@@ -440,6 +440,7 @@ impl AgentLoop {
         &self,
         call: &crate::context::FunctionCall,
         current_tools: &[Arc<dyn Tool>],
+        remaining_steps: usize,
     ) -> ToolDispatchOutcome {
         let tool_opt = current_tools.iter().find(|tool| tool.name() == call.name);
 
@@ -461,10 +462,14 @@ impl AgentLoop {
                 };
             }
 
-            let ctx = crate::tools::ToolContext {
-                session_id: self.session_id.clone(),
-                reply_to: self.reply_to.clone(),
-            };
+            let mut ctx =
+                crate::tools::ToolContext::new(self.session_id.clone(), self.reply_to.clone());
+            ctx.visible_tools = current_tools.iter().map(|tool| tool.name()).collect();
+            ctx.skill_budget.remaining_steps = Some(remaining_steps);
+            ctx.skill_budget.remaining_timeout_sec = self.remaining_session_timeout_sec();
+            for ext in &self.extensions {
+                ctx = ext.enrich_tool_context(ctx).await;
+            }
 
             let (result, is_error, stopped) = tokio::select! {
                 exec_res = tokio::time::timeout(
@@ -572,6 +577,7 @@ impl AgentLoop {
         tool_calls_accumulated: Vec<ToolCallRecord>,
         current_tools: &[Arc<dyn Tool>],
         state: &mut crate::task_state::TaskStateSnapshot,
+        remaining_steps: usize,
     ) -> (Vec<Part>, bool) {
         let mut skip_remaining = false;
         let mut should_yield_to_user = false;
@@ -636,7 +642,9 @@ impl AgentLoop {
                 result,
                 is_error,
                 stopped,
-            } = self.dispatch_tool_call(&call, current_tools).await;
+            } = self
+                .dispatch_tool_call(&call, current_tools, remaining_steps)
+                .await;
             if self.is_autopilot {
                 // Use full string key for action dedup (avoids hash collisions)
                 let action_key = format!("{}:{}:{}", call.name, call.args, is_error);

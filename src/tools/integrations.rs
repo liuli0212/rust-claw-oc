@@ -101,10 +101,7 @@ mod tests {
                     "chat_id": "abc123",
                     "text": "hello"
                 }),
-                &crate::tools::ToolContext {
-                    session_id: "test".into(),
-                    reply_to: "test".into(),
-                },
+                &crate::tools::ToolContext::new("test", "test"),
             )
             .await
             .unwrap_err();
@@ -118,10 +115,7 @@ mod tests {
                     "chat_id": "12345",
                     "text": "x".repeat(4097)
                 }),
-                &crate::tools::ToolContext {
-                    session_id: "test".into(),
-                    reply_to: "test".into(),
-                },
+                &crate::tools::ToolContext::new("test", "test"),
             )
             .await
             .unwrap_err();

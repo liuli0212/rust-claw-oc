@@ -7,6 +7,7 @@ pub mod memory;
 pub mod protocol;
 pub mod scheduler;
 pub mod shell;
+pub mod skills;
 pub mod subagent;
 pub mod subagent_async;
 pub mod web;
@@ -24,6 +25,7 @@ pub use lsp::{
 pub use memory::{RagInsertTool, RagSearchTool, ReadMemoryTool, WriteMemoryTool};
 pub use protocol::{clean_schema, Tool, ToolContext, ToolError};
 pub use scheduler::ManageScheduleTool;
+pub use skills::CallSkillTool;
 pub use subagent::DispatchSubagentTool;
 pub use subagent_async::{
     CancelSubagentTool, GetSubagentResultTool, ListSubagentJobsTool, SpawnSubagentTool,
