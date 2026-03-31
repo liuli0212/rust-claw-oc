@@ -336,7 +336,8 @@ pub fn build_subagent_session(
     let mut context = AgentContext::new().with_transcript_path(transcript_path);
 
     let mut prompt = format!(
-        "You are a restricted sub-agent. Complete the assigned goal with the available tools, \\\n         then call `finish_task`.\\nParent context summary:\\n{}\\n\\nBe concise.",
+        "You are a restricted sub-agent. Complete the assigned goal with the available tools, \
+         then call `finish_task`.\nParent context summary:\n{}\n\nBe concise.",
         input_summary
     );
 
@@ -365,6 +366,16 @@ pub fn build_subagent_session(
         tools.push(Arc::new(crate::tools::FinishTaskTool {
             task_state_store: task_state_store.clone(),
         }));
+    }
+    
+    // Support nested skill recursion if explicitly allowed into the child session
+    if (allowed_tools.contains(&"call_skill".to_string()) || mode == SubagentBuildMode::SyncCompatible)
+        && !tools.iter().any(|tool| tool.name() == "call_skill")
+    {
+        tools.push(Arc::new(crate::tools::CallSkillTool::new(
+            llm.clone(),
+            base_tools.to_vec(),
+        )));
     }
 
     let mut agent_loop = AgentLoop::new(

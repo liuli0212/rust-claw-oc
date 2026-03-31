@@ -405,6 +405,10 @@ impl Default for SkillRuntime {
 #[async_trait]
 impl ExecutionExtension for SkillRuntime {
     async fn before_turn_start(&self, input: &str) -> ExtensionDecision {
+        if self.consume_pending_interaction(input).await {
+            return ExtensionDecision::Continue;
+        }
+
         match self.activate_skill_from_command(input).await {
             Ok(Some(overlay)) => {
                 return ExtensionDecision::Intercept {
@@ -413,10 +417,6 @@ impl ExecutionExtension for SkillRuntime {
             }
             Ok(None) => {}
             Err(message) => return ExtensionDecision::Halt { message },
-        }
-
-        if self.consume_pending_interaction(input).await {
-            return ExtensionDecision::Continue;
         }
 
         let state = self.state.read().await;

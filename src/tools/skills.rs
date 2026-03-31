@@ -636,22 +636,42 @@ impl Tool for CallSkillTool {
 
         let parent_visible_tools = self.canonicalize_tools(&ctx.visible_tools);
         let callee_declared_tools = self.canonicalize_tools(&def.meta.allowed_tools);
+        let caller_requested_tools = self.canonicalize_tools(&parsed.allowed_tools);
+        
         let runtime_allowed_tools: Vec<String> = parent_visible_tools
             .iter()
             .filter(|name| Self::runtime_allows_nested_tool(name.as_str()))
             .cloned()
             .collect();
+            
         let effective_tools = if callee_declared_tools.is_empty() {
-            runtime_allowed_tools.clone()
+            if caller_requested_tools.is_empty() {
+                runtime_allowed_tools.clone()
+            } else {
+                caller_requested_tools
+                    .into_iter()
+                    .filter(|name| {
+                        parent_visible_tools.contains(name)
+                            && Self::runtime_allows_nested_tool(name.as_str())
+                    })
+                    .collect()
+            }
         } else {
-            callee_declared_tools
+            let base = callee_declared_tools
                 .iter()
                 .filter(|name| {
                     parent_visible_tools.contains(name)
                         && Self::runtime_allows_nested_tool(name.as_str())
                 })
                 .cloned()
-                .collect()
+                .collect::<Vec<_>>();
+            if caller_requested_tools.is_empty() {
+                base
+            } else {
+                base.into_iter()
+                    .filter(|name| caller_requested_tools.contains(name))
+                    .collect()
+            }
         };
         let missing_tools: Vec<String> = callee_declared_tools
             .iter()
