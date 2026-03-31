@@ -22,17 +22,37 @@ pub struct DispatchSubagentTool {
     base_tools: Vec<Arc<dyn Tool>>,
 }
 
+/// Shared launch parameters for subagent tools.
+///
+/// `dispatch_subagent` waits for the child result synchronously, while
+/// `spawn_subagent` starts a background job and returns immediately.
+/// Tool-specific constraints still apply.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DispatchSubagentArgs {
+    /// The concrete task the subagent should complete.
     pub goal: String,
+    /// A concise summary of the parent context the subagent can rely on.
+    /// The child does not receive the full parent transcript.
     pub input_summary: String,
     #[serde(default)]
+    /// Optional tool whitelist for the child session.
+    /// If omitted, the runtime uses the default read-oriented subagent tools.
     pub allowed_tools: Vec<String>,
     #[serde(default)]
+    /// Paths claimed for exclusive access by a background subagent.
+    /// Required when `spawn_subagent` runs with `allow_writes=true`.
+    /// `dispatch_subagent` rejects this field.
     pub claimed_paths: Vec<String>,
     #[serde(default)]
+    /// Enables controlled-write mode for `spawn_subagent`.
+    /// When true, the caller must also provide non-overlapping `claimed_paths`.
+    /// `dispatch_subagent` rejects this field.
     pub allow_writes: bool,
+    /// Optional wall-clock timeout in seconds for the child session.
+    /// Defaults to 60 seconds when omitted.
     pub timeout_sec: Option<u64>,
+    /// Optional maximum number of agent steps the child may spend.
+    /// Defaults to 5 and is clamped to at least 1.
     pub max_steps: Option<usize>,
 }
 
@@ -60,8 +80,9 @@ impl Tool for DispatchSubagentTool {
     }
 
     fn description(&self) -> String {
-        "Dispatch a restricted sub-agent to perform an isolated task. \
-         The sub-agent runs with limited tools, timeout, and enforced step count."
+        "Dispatch a restricted synchronous sub-agent to perform an isolated task and wait for its result. \
+         Use this when the parent needs the child result before continuing. The sub-agent runs with a limited tool set, timeout, and enforced step budget. \
+         This tool does not support `allow_writes` or `claimed_paths`; use `spawn_subagent` for controlled background writes."
             .to_string()
     }
 

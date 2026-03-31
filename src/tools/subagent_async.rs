@@ -47,23 +47,30 @@ impl ListSubagentJobsTool {
     }
 }
 
+/// Parameters that identify a background subagent job.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct JobIdArgs {
+    /// The background job ID returned by `spawn_subagent`.
     job_id: String,
 }
 
+/// Parameters for fetching the status or final result of a background subagent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct GetSubagentResultArgs {
+    /// The background job ID returned by `spawn_subagent`.
     job_id: String,
+    /// If true, mark a terminal result as consumed when it is returned.
+    /// This is useful when the parent has already incorporated the result and
+    /// wants later polls to show that the terminal output was picked up.
     #[serde(default)]
     consume: bool,
-    /// Optional: block up to this many seconds waiting for the subagent to finish.
-    /// If omitted, returns immediately with current status.
+    /// Optional long-poll timeout in seconds.
+    /// If set, this call waits up to that many seconds for the job to reach a
+    /// terminal state before returning. If omitted, it returns immediately with
+    /// the current status.
     #[serde(default)]
     wait_sec: Option<u64>,
 }
-
-
 
 fn serialize_output(tool_name: &str, payload: Value) -> Result<String, ToolError> {
     StructuredToolOutput::new(
@@ -85,7 +92,7 @@ impl Tool for SpawnSubagentTool {
     }
 
     fn description(&self) -> String {
-        "Start a background subagent and return a job ID immediately. Use this for independent work that can continue while you do other tasks. Background subagents run read-only by default; if you set allow_writes=true, you must also provide non-overlapping claimed_paths and only file mutation tools are enabled."
+        "Start a background subagent and return a job ID immediately. Use this for independent work that can continue while you do other tasks. Background subagents run read-only by default; if you set `allow_writes=true`, you must also provide non-overlapping `claimed_paths`, and only the controlled write tool subset is enabled. Use `get_subagent_result` later to poll or wait for completion."
             .to_string()
     }
 
@@ -125,7 +132,9 @@ impl Tool for GetSubagentResultTool {
     fn description(&self) -> String {
         "Get the current status or final result of a background subagent job. \
          Set `wait_sec` (e.g. 10) to block and wait for completion instead of \
-         polling repeatedly. Do NOT call this tool in a tight loop without wait_sec."
+         polling repeatedly. Set `consume=true` when the parent has already used \
+         a terminal result and wants that fact recorded. Do NOT call this tool in \
+         a tight loop without wait_sec."
             .to_string()
     }
 
@@ -221,7 +230,8 @@ impl Tool for CancelSubagentTool {
     }
 
     fn description(&self) -> String {
-        "Cancel a running background subagent job by job ID.".to_string()
+        "Request cancellation for a running background subagent by job ID. Use the job ID returned by `spawn_subagent`, then call `get_subagent_result` to observe the final cancelled or partial outcome."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
@@ -257,13 +267,16 @@ impl Tool for ListSubagentJobsTool {
     }
 
     fn description(&self) -> String {
-        "List known background subagent jobs and their current states.".to_string()
+        "List known background subagent jobs and their current states. This tool takes no parameters and is useful for discovering job IDs before polling or cancelling a job."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": {}
+            "description": "This tool does not take any parameters.",
+            "properties": {},
+            "additionalProperties": false
         })
     }
 

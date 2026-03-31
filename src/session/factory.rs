@@ -31,7 +31,13 @@ const FORBIDDEN_ASYNC_SUBAGENT_TOOLS: &[&str] = &[
     "manage_schedule",
     "send_telegram_message",
 ];
-const ASYNC_CONTROLLED_WRITE_TOOLS: &[&str] = &["write_file", "patch_file"];
+const ASYNC_CONTROLLED_WRITE_TOOLS: &[&str] = &[
+    "write_file",
+    "patch_file",
+    "execute_bash",
+    "write_memory",
+    "rag_insert",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentBuildMode {
@@ -373,9 +379,10 @@ pub fn build_subagent_session(
             task_state_store: task_state_store.clone(),
         }));
     }
-    
+
     // Support nested skill recursion if explicitly allowed into the child session
-    if (allowed_tools.contains(&"call_skill".to_string()) || mode == SubagentBuildMode::SyncCompatible)
+    if (allowed_tools.contains(&"call_skill".to_string())
+        || mode == SubagentBuildMode::SyncCompatible)
         && !tools.iter().any(|tool| tool.name() == "call_skill")
     {
         tools.push(Arc::new(crate::tools::CallSkillTool::new(
@@ -674,12 +681,15 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_subagent_tools_async_controlled_write_keeps_file_mutation_tools_only() {
+    fn test_filter_subagent_tools_async_controlled_write_keeps_allowed_controlled_write_tools() {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MockTool("read_file")),
             Arc::new(MockTool("write_file")),
             Arc::new(MockTool("patch_file")),
             Arc::new(MockTool("execute_bash")),
+            Arc::new(MockTool("write_memory")),
+            Arc::new(MockTool("rag_insert")),
+            Arc::new(MockTool("send_file")),
             Arc::new(MockTool("finish_task")),
         ];
 
@@ -690,6 +700,9 @@ mod tests {
                 "write_file".to_string(),
                 "patch_file".to_string(),
                 "execute_bash".to_string(),
+                "write_memory".to_string(),
+                "rag_insert".to_string(),
+                "send_file".to_string(),
             ],
             SubagentBuildMode::AsyncControlledWrite,
         );
@@ -697,7 +710,10 @@ mod tests {
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"write_file".to_string()));
         assert!(names.contains(&"patch_file".to_string()));
+        assert!(names.contains(&"execute_bash".to_string()));
+        assert!(names.contains(&"write_memory".to_string()));
+        assert!(names.contains(&"rag_insert".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
-        assert!(!names.contains(&"execute_bash".to_string()));
+        assert!(!names.contains(&"send_file".to_string()));
     }
 }
