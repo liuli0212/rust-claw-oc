@@ -14,6 +14,7 @@ allowed_tools:
   - call_skill
   - web_fetch
   - write_file
+  - ask_user_question
 parameters:
   topic:
     type: string
@@ -54,6 +55,15 @@ For each of the URLs the subagent returned:
 
 Collect the summaries for all URLs.
 
+## Tone Selection & Alignment Phase
+
+Before generating the cover image and writing the final draft, check in with the user.
+Use the `ask_user_question` tool to ask them what tone they prefer for the newsletter:
+- A) Professional & Executive
+- B) Snarky, Witty & Humorous
+- C) Academic & Deep Technical
+Wait for their response. Once they select a tone, keep their preference in mind adjusting the language format in the Final Assembly Phase.
+
 ## Cover Image Generation Phase
 
 Every great newsletter needs a cover image. Formulate a highly creative, evocative text prompt related to `{{topic}}`.
@@ -67,14 +77,14 @@ Wait for the sub-skill to finish and confirm the image was saved to `newsletter_
 ## Final Assembly Phase
 
 Write the final newsletter to `newsletter_{{topic_slug}}.md` using `write_file` or `execute_bash`.
-The newsletter should look like this:
+The newsletter should look like this, but ensure the vocabulary and style strongly reflect the user's chosen Tone from the Interaction Phase:
 
 ```markdown
 # The Weekly Deep Dive: {{topic}}
 
 ![Cover Image](./newsletter_cover.png)
 
-*Welcome to this week's edition! Here is the latest intelligence we gathered for you.*
+*Welcome to this week's edition! (Adjust this intro based on the selected tone)*
 
 ## 1. [Catchy Title based on Article 1](URL_1)
 - Bullet 1 from summarize_info
