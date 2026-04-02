@@ -13,3 +13,4 @@ logs/
 *.orig
 *.rej
 .gstack/
+MEMORY.md
