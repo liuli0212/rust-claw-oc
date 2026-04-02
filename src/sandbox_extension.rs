@@ -34,7 +34,7 @@ impl ExecutionExtension for SandboxExtension {
     }
 
     async fn before_prompt_build(&self, mut draft: PromptDraft) -> PromptDraft {
-        let summary = self.enforcer.default_policy().to_prompt_summary();
+        let summary = self.enforcer.prompt_summary();
         if !summary.is_empty() {
             let sandbox_notice = format!(
                 "<environment_constraints>\n{}\n</environment_constraints>",

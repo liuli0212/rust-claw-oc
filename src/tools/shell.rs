@@ -41,6 +41,12 @@ pub async fn execute_shell_sandboxed(
     sandbox: Option<&super::sandbox::SandboxEnforcer>,
     policy: Option<&super::sandbox::SandboxPolicy>,
 ) -> Result<ShellExecResult, ToolError> {
+    if let (Some(sb), Some(pol)) = (sandbox, policy) {
+        if pol.level != super::sandbox::SandboxLevel::Unrestricted && !sb.is_available() {
+            return Err(ToolError::ExecutionFailed(sb.shell_execution_error()));
+        }
+    }
+
     execute_shell_inner(command, timeout, cwd, sandbox, policy).await
 }
 
@@ -98,6 +104,7 @@ async fn execute_shell_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::sandbox::{SandboxEnforcer, SandboxLevel, SandboxPolicy};
 
     #[tokio::test]
     async fn test_execute_shell_echo() {
@@ -136,5 +143,29 @@ mod tests {
             "unexpected cwd: {}",
             result.stdout.trim()
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_shell_sandboxed_blocks_without_bwrap() {
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Restricted,
+            ..Default::default()
+        };
+        let sandbox = SandboxEnforcer::disabled_with_policy(policy.clone());
+
+        let err = execute_shell_sandboxed(
+            "echo hello",
+            Duration::from_secs(1),
+            None,
+            Some(&sandbox),
+            Some(&policy),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ToolError::ExecutionFailed(_)));
+        assert!(err
+            .to_string()
+            .contains("Bubblewrap (`bwrap`) is unavailable"));
     }
 }

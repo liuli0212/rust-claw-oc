@@ -207,11 +207,16 @@ impl SandboxPolicy {
             lines.push(format!("- Permitted WorkDirs: [{}]", paths.join(", ")));
         }
 
-        if self.isolate_network {
-            lines.push("- Network: Offline (Internet access is disabled)".to_string());
+        if self.isolate_network && !self.allowed_domains.is_empty() {
+            lines.push(format!(
+                "- Network: Shell commands are offline; web tools are restricted to domains [{}]",
+                self.allowed_domains.join(", ")
+            ));
+        } else if self.isolate_network {
+            lines.push("- Network: Shell commands are offline".to_string());
         } else if !self.allowed_domains.is_empty() {
             lines.push(format!(
-                "- Network: Restricted to domains [{}]",
+                "- Network: Web tools are restricted to domains [{}]",
                 self.allowed_domains.join(", ")
             ));
         }
@@ -263,9 +268,13 @@ impl SandboxEnforcer {
     /// Create an enforcer without probing (for tests or when sandbox is
     /// explicitly disabled).
     pub fn disabled() -> Self {
+        Self::disabled_with_policy(SandboxPolicy::default())
+    }
+
+    pub fn disabled_with_policy(default_policy: SandboxPolicy) -> Self {
         Self {
             bwrap_path: None,
-            default_policy: SandboxPolicy::default(),
+            default_policy,
         }
     }
 
@@ -277,6 +286,24 @@ impl SandboxEnforcer {
     /// The global default policy (from config).
     pub fn default_policy(&self) -> &SandboxPolicy {
         &self.default_policy
+    }
+
+    pub fn prompt_summary(&self) -> String {
+        let mut summary = self.default_policy.to_prompt_summary();
+        if self.default_policy.level != SandboxLevel::Unrestricted && !self.is_available() {
+            if !summary.is_empty() {
+                summary.push('\n');
+            }
+            summary.push_str(
+                "- Shell Execution: Disabled because Bubblewrap (`bwrap`) is unavailable. File and web tool restrictions still apply.",
+            );
+        }
+        summary
+    }
+
+    pub fn shell_execution_error(&self) -> String {
+        "Sandbox is enabled, but Bubblewrap (`bwrap`) is unavailable. Shell execution is disabled to avoid running commands outside the sandbox. Install bubblewrap or set sandbox.level = \"off\"."
+            .to_string()
     }
 
     // ── Command wrapping ──────────────────────────────────────────
@@ -434,6 +461,11 @@ impl SandboxEnforcer {
         for hidden in &policy.hidden_paths {
             let hidden_canonical = std::fs::canonicalize(hidden).unwrap_or_else(|_| hidden.clone());
             if canonical.starts_with(&hidden_canonical) {
+                tracing::warn!(
+                    "Sandbox: Blocked {} access to protected path '{}'",
+                    if write { "write" } else { "read" },
+                    path.display()
+                );
                 return Err(SandboxViolation::PathDenied {
                     path: path.to_path_buf(),
                     reason: "This path is in a protected sensitive directory.".to_string(),
@@ -460,6 +492,10 @@ impl SandboxEnforcer {
         if allowed || in_tmp {
             Ok(())
         } else {
+            tracing::warn!(
+                "Sandbox: Blocked write access to '{}' outside writable paths",
+                path.display()
+            );
             Err(SandboxViolation::PathDenied {
                 path: path.to_path_buf(),
                 reason: "This environment is sandboxed. Write access is restricted.".to_string(),
@@ -831,14 +867,30 @@ mod tests {
             level: SandboxLevel::Restricted,
             writable_paths: vec![PathBuf::from("/workspace")],
             isolate_network: true,
+            allowed_domains: vec!["github.com".into()],
             hidden_paths: vec![PathBuf::from("/home/user/.ssh")],
             ..Default::default()
         };
         let summary = policy.to_prompt_summary();
         assert!(summary.contains("Restricted"));
         assert!(summary.contains("/workspace"));
-        assert!(summary.contains("Offline"));
+        assert!(summary.contains("Shell commands are offline"));
+        assert!(summary.contains("web tools are restricted to domains [github.com]"));
         assert!(summary.contains("sensitive directories"));
+    }
+
+    #[test]
+    fn test_enforcer_prompt_summary_mentions_shell_disabled_without_bwrap() {
+        let enforcer = SandboxEnforcer::disabled_with_policy(SandboxPolicy {
+            level: SandboxLevel::Restricted,
+            writable_paths: vec![PathBuf::from("/workspace")],
+            allowed_domains: vec!["github.com".into()],
+            ..Default::default()
+        });
+        let summary = enforcer.prompt_summary();
+        assert!(summary.contains("Shell Execution: Disabled"));
+        assert!(summary.contains("Bubblewrap (`bwrap`) is unavailable"));
+        assert!(summary.contains("github.com"));
     }
 
     #[test]

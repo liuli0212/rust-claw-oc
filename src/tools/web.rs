@@ -78,7 +78,7 @@ impl Tool for WebFetchTool {
     }
 
     fn has_side_effects(&self) -> bool {
-        false
+        true
     }
 
     async fn execute(
@@ -180,6 +180,13 @@ impl Tool for WebFetchTool {
         };
 
         if let Some(path) = &parsed.output_path {
+            if let Some(sandbox) = &ctx.sandbox {
+                let policy = sandbox.default_policy();
+                sandbox
+                    .check_path_access(std::path::Path::new(path), true, policy)
+                    .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
+            }
+
             let path_buf = std::path::PathBuf::from(path);
             if let Some(parent) = path_buf.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -238,7 +245,7 @@ impl Tool for TavilySearchTool {
     async fn execute(
         &self,
         args: Value,
-        _ctx: &crate::tools::protocol::ToolContext,
+        ctx: &crate::tools::protocol::ToolContext,
     ) -> Result<String, ToolError> {
         let start = Instant::now();
         let parsed: TavilySearchArgs =
@@ -260,6 +267,13 @@ impl Tool for TavilySearchTool {
             return Err(ToolError::InvalidArguments(
                 "query cannot be empty".to_string(),
             ));
+        }
+
+        if let Some(sandbox) = &ctx.sandbox {
+            let policy = sandbox.default_policy();
+            sandbox
+                .check_network_access("https://api.tavily.com/search", policy)
+                .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
         }
 
         let max_results = parsed.max_results.unwrap_or(5).clamp(1, 10);
@@ -319,6 +333,10 @@ impl Tool for TavilySearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::sandbox::{SandboxEnforcer, SandboxLevel, SandboxPolicy};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn test_web_fetch_tool_rejects_non_http_url() {
@@ -335,5 +353,76 @@ mod tests {
 
         assert!(matches!(err, ToolError::InvalidArguments(_)));
         assert!(err.to_string().contains("http:// or https://"));
+    }
+
+    #[tokio::test]
+    async fn test_web_fetch_tool_blocks_hidden_output_path_in_sandbox() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nhello world";
+                let _ = socket.write_all(response).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let hidden_dir = dir.path().join("hidden");
+        let output_path = hidden_dir.join("page.txt");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+
+        let tool = WebFetchTool::new();
+        let mut ctx = crate::tools::ToolContext::new("test", "test");
+        ctx.sandbox = Some(Arc::new(SandboxEnforcer::disabled_with_policy(
+            SandboxPolicy {
+                level: SandboxLevel::Restricted,
+                allowed_domains: vec!["127.0.0.1".into()],
+                hidden_paths: vec![hidden_dir.clone()],
+                ..Default::default()
+            },
+        )));
+
+        let err = tool
+            .execute(
+                serde_json::json!({
+                    "url": format!("http://{}/", addr),
+                    "output_path": output_path,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::ExecutionFailed(_)));
+        assert!(err.to_string().contains("Sandbox Violation"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_tool_blocks_non_allowlisted_domain_in_sandbox() {
+        let tool = TavilySearchTool::new("test-key".to_string());
+        let mut ctx = crate::tools::ToolContext::new("test", "test");
+        ctx.sandbox = Some(Arc::new(SandboxEnforcer::disabled_with_policy(
+            SandboxPolicy {
+                level: SandboxLevel::Restricted,
+                allowed_domains: vec!["github.com".into()],
+                ..Default::default()
+            },
+        )));
+
+        let err = tool
+            .execute(
+                serde_json::json!({
+                    "query": "sandbox security",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::ExecutionFailed(_)));
+        assert!(err.to_string().contains("Sandbox Violation"));
+        assert!(err.to_string().contains("api.tavily.com"));
     }
 }

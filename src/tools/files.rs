@@ -199,11 +199,19 @@ impl Tool for ReadFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &crate::tools::ToolContext,
+        ctx: &crate::tools::ToolContext,
     ) -> Result<String, crate::tools::ToolError> {
         let start = Instant::now();
         let parsed: ReadFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        if let Some(sandbox) = &ctx.sandbox {
+            let policy = sandbox.default_policy();
+            sandbox
+                .check_path_access(std::path::Path::new(&parsed.path), false, policy)
+                .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
+        }
+
         match std::fs::read_to_string(&parsed.path) {
             Ok(content) => {
                 let truncated_content = crate::utils::truncate_tool_output(&content);
@@ -542,6 +550,8 @@ impl Tool for FinishTaskTool {
 mod tests {
     use super::*;
     use crate::tools::protocol::ToolExecutionEnvelope;
+    use crate::tools::sandbox::{SandboxEnforcer, SandboxLevel, SandboxPolicy};
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn cleanup_session(session_id: &str) {
@@ -601,6 +611,39 @@ mod tests {
         assert!(envelope.result.truncated);
         assert!(envelope.result.output.contains("line-0000"));
         assert!(envelope.result.output.contains("Truncated"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_tool_blocks_hidden_path_in_sandbox() {
+        let dir = tempdir().unwrap();
+        let hidden_dir = dir.path().join("hidden");
+        let file_path = hidden_dir.join("secret.txt");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        std::fs::write(&file_path, "top-secret").unwrap();
+
+        let tool = ReadFileTool;
+        let mut ctx = crate::tools::ToolContext::new("test", "test");
+        ctx.sandbox = Some(Arc::new(SandboxEnforcer::disabled_with_policy(
+            SandboxPolicy {
+                level: SandboxLevel::Restricted,
+                hidden_paths: vec![hidden_dir.clone()],
+                ..Default::default()
+            },
+        )));
+
+        let err = tool
+            .execute(
+                serde_json::json!({
+                    "path": file_path,
+                    "thought": "inspect hidden file"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::ExecutionFailed(_)));
+        assert!(err.to_string().contains("Sandbox Violation"));
     }
 
     #[tokio::test]
