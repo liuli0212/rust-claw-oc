@@ -133,7 +133,7 @@ impl Tool for BashTool {
     async fn execute(
         &self,
         args: Value,
-        _ctx: &crate::tools::protocol::ToolContext,
+        ctx: &crate::tools::protocol::ToolContext,
     ) -> Result<String, ToolError> {
         let parsed_args: ExecuteCmdArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
@@ -157,13 +157,26 @@ impl Tool for BashTool {
                 ToolError::ExecutionFailed(e.to_string())
             })?;
 
-        let mut cmd = CommandBuilder::new("bash");
-        cmd.cwd(self.work_dir.clone());
+        // ── Sandbox-aware command construction ──
+        let work_dir_path = std::path::Path::new(&self.work_dir);
+        let mut cmd = if let Some(sandbox) = ctx.sandbox.as_ref().filter(|s| s.is_available()) {
+            let policy = sandbox.default_policy();
+            tracing::info!(
+                "BashTool: executing in bwrap sandbox (level={:?})",
+                policy.level
+            );
+            sandbox.build_pty_command(&cmd_str, policy, work_dir_path)
+        } else {
+            let mut c = CommandBuilder::new("bash");
+            c.cwd(self.work_dir.clone());
+            c.arg("-c");
+            c.arg(&cmd_str);
+            c
+        };
+
         cmd.env("GIT_PAGER", "cat");
         cmd.env("PAGER", "cat");
         cmd.env("GIT_TERMINAL_PROMPT", "0");
-        cmd.arg("-c");
-        cmd.arg(&cmd_str);
 
         let child = pair.slave.spawn_command(cmd).map_err(|e| {
             tracing::error!(

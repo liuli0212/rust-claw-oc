@@ -494,6 +494,29 @@ pub fn build_agent_session(
         ),
     ));
 
+    // ── Sandbox extension ──
+    {
+        let config = crate::config::AppConfig::load();
+        let sandbox_config = config.sandbox.unwrap_or_default();
+        let level = sandbox_config.parsed_level();
+        if level != crate::tools::sandbox::SandboxLevel::Unrestricted {
+            let work_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let policy = sandbox_config.build_default_policy(&work_dir);
+            let enforcer = crate::tools::sandbox::SandboxEnforcer::detect(policy);
+
+            if sandbox_config.require_bwrap.unwrap_or(false) && !enforcer.is_available() {
+                return Err("Sandbox: bwrap is required but not found. \
+                     Install with: apt install bubblewrap"
+                    .to_string());
+            }
+
+            agent_loop.add_extension(Box::new(crate::sandbox_extension::SandboxExtension::new(
+                std::sync::Arc::new(enforcer),
+            )));
+            tracing::info!("Sandbox extension registered (level={:?})", level);
+        }
+    }
+
     Ok(Arc::new(AsyncMutex::new(agent_loop)))
 }
 

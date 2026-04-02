@@ -30,18 +30,50 @@ pub async fn execute_shell(
     timeout: Duration,
     cwd: Option<&Path>,
 ) -> Result<ShellExecResult, ToolError> {
+    execute_shell_inner(command, timeout, cwd, None, None).await
+}
+
+/// Execute a shell command with optional sandbox enforcement.
+pub async fn execute_shell_sandboxed(
+    command: &str,
+    timeout: Duration,
+    cwd: Option<&Path>,
+    sandbox: Option<&super::sandbox::SandboxEnforcer>,
+    policy: Option<&super::sandbox::SandboxPolicy>,
+) -> Result<ShellExecResult, ToolError> {
+    execute_shell_inner(command, timeout, cwd, sandbox, policy).await
+}
+
+async fn execute_shell_inner(
+    command: &str,
+    timeout: Duration,
+    cwd: Option<&Path>,
+    sandbox: Option<&super::sandbox::SandboxEnforcer>,
+    policy: Option<&super::sandbox::SandboxPolicy>,
+) -> Result<ShellExecResult, ToolError> {
     let start = Instant::now();
 
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(command);
+    let effective_cwd = cwd.unwrap_or_else(|| Path::new("."));
+
+    let mut cmd = if let (Some(sb), Some(pol)) = (sandbox.filter(|s| s.is_available()), policy) {
+        tracing::info!("shell: executing in bwrap sandbox");
+        sb.build_tokio_command(command, pol, effective_cwd)
+    } else {
+        let mut c = Command::new("bash");
+        c.arg("-c").arg(command);
+        c
+    };
+
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.env("GIT_PAGER", "cat");
     cmd.env("PAGER", "cat");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
 
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
+    if !sandbox.is_some_and(|s| s.is_available()) {
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
     }
 
     let output = tokio::time::timeout(timeout, cmd.output())

@@ -3,6 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Map;
 use serde_json::Value;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::skills::call_tree::{SkillBudget, SkillCallContext};
@@ -40,6 +41,9 @@ pub struct ToolContext {
     pub active_skill_name: Option<String>,
     pub skill_call_context: Option<SkillCallContext>,
     pub skill_budget: SkillBudget,
+    /// Sandbox enforcer for OS-level and application-level isolation.
+    /// `None` means sandbox is disabled (backward compatible).
+    pub sandbox: Option<Arc<super::sandbox::SandboxEnforcer>>,
 }
 
 impl ToolContext {
@@ -51,6 +55,7 @@ impl ToolContext {
             active_skill_name: None,
             skill_call_context: None,
             skill_budget: SkillBudget::default(),
+            sandbox: None,
         }
     }
 }

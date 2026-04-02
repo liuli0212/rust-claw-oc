@@ -84,7 +84,7 @@ impl Tool for WebFetchTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &crate::tools::ToolContext,
+        ctx: &crate::tools::ToolContext,
     ) -> Result<String, crate::tools::ToolError> {
         let start = Instant::now();
         let parsed: WebFetchArgs =
@@ -95,6 +95,14 @@ impl Tool for WebFetchTool {
             return Err(ToolError::InvalidArguments(
                 "url must start with http:// or https://".to_string(),
             ));
+        }
+
+        // Sandbox network guard
+        if let Some(sandbox) = &ctx.sandbox {
+            let policy = sandbox.default_policy();
+            sandbox
+                .check_network_access(url, policy)
+                .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
         }
 
         let max_chars = parsed.max_chars.unwrap_or(12_000).clamp(500, 50_000);
@@ -144,16 +152,24 @@ impl Tool for WebFetchTool {
         let mut rendered = raw_body;
         if !parsed.include_html.unwrap_or(false) {
             // Strip tags: Replace script, style and then all other tags.
-            static RE_SCRIPT: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?is)<script.*?>.*?</script>").unwrap());
-            static RE_STYLE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?is)<style.*?>.*?</style>").unwrap());
-            static RE_TAGS: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"<[^>]*>").unwrap());
+            static RE_SCRIPT: once_cell::sync::Lazy<regex::Regex> =
+                once_cell::sync::Lazy::new(|| {
+                    regex::Regex::new(r"(?is)<script.*?>.*?</script>").unwrap()
+                });
+            static RE_STYLE: once_cell::sync::Lazy<regex::Regex> =
+                once_cell::sync::Lazy::new(|| {
+                    regex::Regex::new(r"(?is)<style.*?>.*?</style>").unwrap()
+                });
+            static RE_TAGS: once_cell::sync::Lazy<regex::Regex> =
+                once_cell::sync::Lazy::new(|| regex::Regex::new(r"<[^>]*>").unwrap());
 
             rendered = RE_SCRIPT.replace_all(&rendered, " ").to_string();
             rendered = RE_STYLE.replace_all(&rendered, " ").to_string();
             rendered = RE_TAGS.replace_all(&rendered, " ").to_string();
-            
+
             // Clean up extra whitespace/newlines
-            static RE_WS: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"\n{3,}").unwrap());
+            static RE_WS: once_cell::sync::Lazy<regex::Regex> =
+                once_cell::sync::Lazy::new(|| regex::Regex::new(r"\n{3,}").unwrap());
             rendered = RE_WS.replace_all(&rendered, "\n\n").to_string();
         }
 
@@ -166,16 +182,22 @@ impl Tool for WebFetchTool {
         if let Some(path) = &parsed.output_path {
             let path_buf = std::path::PathBuf::from(path);
             if let Some(parent) = path_buf.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create directory: {}", e)))?;
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Failed to create directory: {}", e))
+                })?;
             }
-            std::fs::write(&path_buf, &content)
-                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to write to file {}: {}", path, e)))?;
+            std::fs::write(&path_buf, &content).map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to write to file {}: {}", path, e))
+            })?;
 
             return serialize_tool_envelope(
                 "web_fetch",
                 true,
-                format!("Successfully fetched and saved content to {}. Length: {} chars.", path, content.len()),
+                format!(
+                    "Successfully fetched and saved content to {}. Length: {} chars.",
+                    path,
+                    content.len()
+                ),
                 Some(0),
                 Some(start.elapsed().as_millis()),
                 truncated,

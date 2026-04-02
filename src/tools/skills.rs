@@ -157,10 +157,7 @@ pub struct SkillFailureContext<'a> {
 }
 
 impl CallSkillTool {
-    async fn failure_output(
-        &self,
-        f_ctx: SkillFailureContext<'_>,
-    ) -> Result<String, ToolError> {
+    async fn failure_output(&self, f_ctx: SkillFailureContext<'_>) -> Result<String, ToolError> {
         let payload = json!({
             "skill_name": f_ctx.skill_name,
             "lineage": f_ctx.lineage,
@@ -171,7 +168,7 @@ impl CallSkillTool {
         });
         self.append_event(&f_ctx.tool_ctx.session_id, f_ctx.event_type, payload)
             .await;
-            
+
         let summary = f_ctx.failure.message.clone();
         StructuredToolOutput::new(
             "call_skill",
@@ -643,13 +640,13 @@ impl Tool for CallSkillTool {
         let parent_visible_tools = self.canonicalize_tools(&ctx.visible_tools);
         let callee_declared_tools = self.canonicalize_tools(&def.meta.allowed_tools);
         let caller_requested_tools = self.canonicalize_tools(&parsed.allowed_tools);
-        
+
         let runtime_allowed_tools: Vec<String> = parent_visible_tools
             .iter()
             .filter(|name| Self::runtime_allows_nested_tool(name.as_str()))
             .cloned()
             .collect();
-            
+
         let effective_tools = if callee_declared_tools.is_empty() {
             if caller_requested_tools.is_empty() {
                 runtime_allowed_tools.clone()
@@ -679,7 +676,7 @@ impl Tool for CallSkillTool {
                     .collect()
             }
         };
-        
+
         let mut effective_tools = effective_tools;
         if effective_tools.is_empty() {
             effective_tools.push("__skill_no_tools__".to_string());

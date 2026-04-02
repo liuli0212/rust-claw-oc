@@ -5,6 +5,7 @@ pub mod integrations;
 pub mod lsp;
 pub mod memory;
 pub mod protocol;
+pub mod sandbox;
 pub mod scheduler;
 pub mod shell;
 pub mod skills;

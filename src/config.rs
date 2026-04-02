@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct AppConfig {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    #[serde(default)]
+    pub sandbox: Option<crate::tools::sandbox::SandboxConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

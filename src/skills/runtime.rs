@@ -792,7 +792,6 @@ mod tests {
         assert!(names.contains(&"finish_task".to_string()));
     }
 
-
     #[tokio::test]
     async fn test_resume_with_pending_interaction() {
         let rt = SkillRuntime::new();

@@ -13,6 +13,7 @@ pub mod logging;
 pub mod lsp_client;
 pub mod memory;
 pub mod rag;
+pub mod sandbox_extension;
 pub mod scheduler;
 pub mod schema;
 pub mod session;

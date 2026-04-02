@@ -37,11 +37,19 @@ impl Tool for PatchFileTool {
     async fn execute(
         &self,
         args: Value,
-        _ctx: &crate::tools::protocol::ToolContext,
+        ctx: &crate::tools::protocol::ToolContext,
     ) -> Result<String, ToolError> {
         let start = Instant::now();
         let parsed: PatchFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        // Sandbox path guard
+        if let Some(sandbox) = &ctx.sandbox {
+            let policy = sandbox.default_policy();
+            sandbox
+                .check_path_access(std::path::Path::new(&parsed.path), true, policy)
+                .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
+        }
 
         let patch_path = format!("{}.patch", parsed.path);
         std::fs::write(&patch_path, &parsed.patch).map_err(ToolError::IoError)?;
@@ -114,11 +122,20 @@ impl Tool for WriteFileTool {
     async fn execute(
         &self,
         args: serde_json::Value,
-        _ctx: &crate::tools::ToolContext,
+        ctx: &crate::tools::ToolContext,
     ) -> Result<String, crate::tools::ToolError> {
         let start = Instant::now();
         let parsed: WriteFileArgs =
             serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        // Sandbox path guard
+        if let Some(sandbox) = &ctx.sandbox {
+            let policy = sandbox.default_policy();
+            sandbox
+                .check_path_access(std::path::Path::new(&parsed.path), true, policy)
+                .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
+        }
+
         if let Some(parent) = std::path::Path::new(&parsed.path).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
