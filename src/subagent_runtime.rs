@@ -6,9 +6,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::Instrument;
 
 use crate::llm_client::LlmClient;
-use crate::session::factory::{build_subagent_session, BuiltSubagentSession, SubagentBuildMode};
+use crate::session::factory::{build_subagent_session, BuiltSubagentSession};
+use crate::skills::call_tree::SkillSessionSeed;
 use crate::tools::protocol::ToolError;
-use crate::tools::subagent::{DispatchSubagentArgs, SubagentResult};
+use crate::tools::subagent::SubagentResult;
 use crate::tools::{Tool, ToolContext};
 use crate::trace::{shared_bus, TraceActor, TraceContext, TraceSpanHandle, TraceStatus};
 use futures::FutureExt;
@@ -16,6 +17,8 @@ use futures::FutureExt;
 const UNCONSUMED_TERMINAL_JOB_TTL: Duration = Duration::from_secs(30 * 60);
 const CONSUMED_TERMINAL_JOB_TTL: Duration = Duration::from_secs(5 * 60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_SUBAGENT_TIMEOUT_SEC: u64 = 60;
+pub const DEFAULT_SUBAGENT_MAX_STEPS: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct SpawnedSubagentJob {
@@ -30,12 +33,7 @@ pub struct SubagentJobMeta {
     pub parent_reply_to: String,
     pub sub_session_id: String,
     pub goal: String,
-    pub input_summary: String,
-    pub allowed_tools: Vec<String>,
-    pub claimed_paths: Vec<String>,
-    pub allow_writes: bool,
-    pub timeout_sec: u64,
-    pub max_steps: usize,
+    pub context: String,
     pub created_at_unix_ms: u64,
     pub transcript_path: String,
     pub event_log_path: String,
@@ -226,6 +224,16 @@ struct SubagentRuntimeInner {
     base_tools: Vec<Arc<dyn Tool>>,
 }
 
+struct SubagentJobRequest {
+    parent_ctx: ToolContext,
+    goal: String,
+    context: String,
+    timeout_sec: u64,
+    max_steps: usize,
+    skill_session_seed: SkillSessionSeed,
+    sub_session_id: String,
+}
+
 impl SubagentRuntime {
     pub fn new(
         llm: Arc<dyn LlmClient>,
@@ -258,7 +266,28 @@ impl SubagentRuntime {
     pub async fn spawn_job(
         &self,
         parent_ctx: ToolContext,
-        args: DispatchSubagentArgs,
+        goal: String,
+        context: String,
+    ) -> Result<SpawnedSubagentJob, ToolError> {
+        self.spawn_job_with_limits(
+            parent_ctx,
+            goal,
+            context,
+            DEFAULT_SUBAGENT_TIMEOUT_SEC,
+            DEFAULT_SUBAGENT_MAX_STEPS,
+            SkillSessionSeed::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn spawn_job_with_limits(
+        &self,
+        parent_ctx: ToolContext,
+        goal: String,
+        context: String,
+        timeout_sec: u64,
+        max_steps: usize,
+        skill_session_seed: SkillSessionSeed,
     ) -> Result<SpawnedSubagentJob, ToolError> {
         self.cleanup_expired_jobs().await;
 
@@ -268,8 +297,6 @@ impl SubagentRuntime {
             ));
         }
 
-        let timeout_sec = args.timeout_sec.unwrap_or(60);
-        let max_steps = args.max_steps.unwrap_or(5).max(1);
         let unified_id = format!(
             "sub_{}_{}",
             parent_ctx.session_id,
@@ -280,13 +307,8 @@ impl SubagentRuntime {
             parent_session_id: parent_ctx.session_id.clone(),
             parent_reply_to: parent_ctx.reply_to.clone(),
             sub_session_id: unified_id.clone(),
-            goal: args.goal.clone(),
-            input_summary: args.input_summary.clone(),
-            allowed_tools: args.allowed_tools.clone(),
-            claimed_paths: normalize_claimed_paths(&args.claimed_paths),
-            allow_writes: args.allow_writes,
-            timeout_sec,
-            max_steps,
+            goal: goal.clone(),
+            context: context.clone(),
             created_at_unix_ms: unix_ms_now(),
             transcript_path: crate::schema::StoragePaths::session_transcript_file(&unified_id)
                 .display()
@@ -295,22 +317,6 @@ impl SubagentRuntime {
                 .display()
                 .to_string(),
         };
-
-        if meta.allow_writes && meta.claimed_paths.is_empty() {
-            return Err(ToolError::ExecutionFailed(
-                "Background subagents with allow_writes=true must declare at least one claimed path."
-                    .to_string(),
-            ));
-        }
-
-        if let Some((conflicting_job_id, claimed_path)) =
-            self.find_claimed_path_conflict(&meta.claimed_paths).await
-        {
-            return Err(ToolError::ExecutionFailed(format!(
-                "Claimed path conflict for '{}'. Active subagent job '{}' already owns an overlapping path. Wait for it to finish or choose a non-overlapping path range.",
-                claimed_path, conflicting_job_id
-            )));
-        }
 
         let handle = Arc::new(SubagentJobHandle::new(meta));
         {
@@ -341,12 +347,9 @@ impl SubagentRuntime {
                     "parent_reply_to": parent_ctx.reply_to,
                     "sub_session_id": handle.meta.sub_session_id,
                     "goal": handle.meta.goal,
-                    "input_summary": handle.meta.input_summary,
-                    "allowed_tools": handle.meta.allowed_tools,
-                    "claimed_paths": handle.meta.claimed_paths,
-                    "allow_writes": handle.meta.allow_writes,
-                    "timeout_sec": handle.meta.timeout_sec,
-                    "max_steps": handle.meta.max_steps,
+                    "context": handle.meta.context,
+                    "timeout_sec": timeout_sec,
+                    "max_steps": max_steps,
                     "transcript_path": handle.meta.transcript_path,
                     "event_log_path": handle.meta.event_log_path,
                 }),
@@ -376,9 +379,15 @@ impl SubagentRuntime {
                     runtime
                         .run_job(
                             handle_for_task.clone(),
-                            child_parent_ctx,
-                            args,
-                            sub_session_id_for_task,
+                            SubagentJobRequest {
+                                parent_ctx: child_parent_ctx,
+                                goal,
+                                context,
+                                timeout_sec,
+                                max_steps,
+                                skill_session_seed,
+                                sub_session_id: sub_session_id_for_task,
+                            },
                         )
                         .await;
                 })
@@ -547,45 +556,7 @@ impl SubagentRuntime {
         trace
     }
 
-    async fn find_claimed_path_conflict(
-        &self,
-        claimed_paths: &[String],
-    ) -> Option<(String, String)> {
-        if claimed_paths.is_empty() {
-            return None;
-        }
-
-        let handles: Vec<Arc<SubagentJobHandle>> = {
-            let jobs = self.inner.jobs.read().await;
-            jobs.values().cloned().collect()
-        };
-
-        for handle in handles {
-            let state = handle.state.read().await;
-            if state.is_terminal() {
-                continue;
-            }
-            drop(state);
-
-            for existing in &handle.meta.claimed_paths {
-                for incoming in claimed_paths {
-                    if claimed_paths_overlap(existing, incoming) {
-                        return Some((handle.meta.job_id.clone(), incoming.clone()));
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    async fn run_job(
-        &self,
-        handle: Arc<SubagentJobHandle>,
-        parent_ctx: ToolContext,
-        args: DispatchSubagentArgs,
-        sub_session_id: String,
-    ) {
+    async fn run_job(&self, handle: Arc<SubagentJobHandle>, request: SubagentJobRequest) {
         {
             let mut state = handle.state.write().await;
             *state = SubagentJobState::Running {
@@ -593,6 +564,17 @@ impl SubagentRuntime {
             };
         }
         self.set_debug_state_label(&handle, "running").await;
+
+        let SubagentJobRequest {
+            parent_ctx,
+            goal,
+            context,
+            timeout_sec,
+            max_steps,
+            skill_session_seed,
+            sub_session_id,
+        } = request;
+
         if let Some(trace) = &parent_ctx.trace {
             shared_bus().record_event(
                 &TraceContext {
@@ -620,20 +602,18 @@ impl SubagentRuntime {
             &parent_ctx,
             self.inner.llm.clone(),
             &self.inner.base_tools,
-            if handle.meta.allow_writes {
-                SubagentBuildMode::AsyncControlledWrite
-            } else {
-                SubagentBuildMode::AsyncReadonly
+            crate::session::factory::SubagentSessionConfig {
+                sub_session_id: Some(sub_session_id),
+                allowed_tools: Vec::new(),
+                energy_budget: max_steps,
+                timeout_sec,
+                parent_context_text: context,
+                skill_session_seed,
+                debug: handle.debug.clone(),
+                cancelled: handle.cancelled.clone(),
+                cancel_notify: handle.cancel_notify.clone(),
+                allow_subagent_tool: false,
             },
-            Some(sub_session_id),
-            &args.allowed_tools,
-            args.max_steps.unwrap_or(5).max(1),
-            args.timeout_sec.unwrap_or(60),
-            &args.input_summary,
-            crate::skills::call_tree::SkillSessionSeed::default(),
-            handle.debug.clone(),
-            handle.cancelled.clone(),
-            handle.cancel_notify.clone(),
         ) {
             Ok(BuiltSubagentSession {
                 sub_session_id: _,
@@ -641,32 +621,15 @@ impl SubagentRuntime {
                 event_log_path: _,
                 mut agent_loop,
                 collector,
-                rejected_tools,
             }) => {
-                if !rejected_tools.is_empty() {
-                    let err_msg = format!(
-                        "Cannot execute subagent: requested tools [{}] are forbidden \
-                         in background mode. Alter the plan to run synchronously or \
-                         remove these tools from allowed_tools.",
-                        rejected_tools.join(", ")
-                    );
-                    tracing::error!("{}", err_msg);
-                    self.record_debug_error(
-                        &handle,
-                        "build_subagent_session",
-                        &err_msg,
-                        Some("blocked_tools"),
-                    )
-                    .await;
-                    SubagentJobState::Failed {
-                        finished_at_unix_ms: unix_ms_now(),
-                        error: err_msg,
-                        partial: None,
-                    }
-                } else {
-                    self.execute_subagent(handle.clone(), args, collector, &mut agent_loop)
-                        .await
-                }
+                self.execute_subagent(
+                    handle.clone(),
+                    goal,
+                    timeout_sec,
+                    collector,
+                    &mut agent_loop,
+                )
+                .await
             }
             Err(error) => {
                 self.record_debug_error(&handle, "build_subagent_session", &error, None)
@@ -749,7 +712,7 @@ impl SubagentRuntime {
         }
         drop(state);
         self.finalize_debug_state(&handle).await;
-        // Wake up any get_subagent_result calls waiting via long polling.
+        // Wake up any `subagent(action="status")` calls waiting via long polling.
         handle.completion_notify.notify_waiters();
     }
 
@@ -830,13 +793,14 @@ impl SubagentRuntime {
     async fn execute_subagent(
         &self,
         handle: Arc<SubagentJobHandle>,
-        args: DispatchSubagentArgs,
+        goal: String,
+        timeout_sec: u64,
         collector: Arc<crate::session::factory::CollectorOutput>,
         agent_loop: &mut crate::core::AgentLoop,
     ) -> SubagentJobState {
         let run_result = tokio::time::timeout(
-            Duration::from_secs(args.timeout_sec.unwrap_or(60)),
-            agent_loop.step(args.goal.clone()),
+            Duration::from_secs(timeout_sec),
+            agent_loop.step(goal.clone()),
         )
         .await;
 
@@ -988,8 +952,7 @@ impl SubagentRuntime {
                         "timeout",
                         &format!(
                             "Sub-agent timed out after {}s while working on '{}'.",
-                            args.timeout_sec.unwrap_or(60),
-                            args.goal
+                            timeout_sec, goal
                         ),
                         None,
                     )
@@ -1000,8 +963,7 @@ impl SubagentRuntime {
                             ok: false,
                             summary: format!(
                                 "Sub-agent timed out after {}s while working on '{}'.",
-                                args.timeout_sec.unwrap_or(60),
-                                args.goal
+                                timeout_sec, goal
                             ),
                             findings: tool_outputs,
                             artifacts,
@@ -1087,38 +1049,6 @@ pub(crate) fn push_recent_debug_event(
         let excess = debug.recent_events.len() - MAX_RECENT_EVENTS;
         debug.recent_events.drain(0..excess);
     }
-}
-
-fn normalize_claimed_paths(paths: &[String]) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for path in paths {
-        let trimmed = path.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let mut canonical = trimmed.replace('\\', "/");
-        while canonical.ends_with('/') && canonical.len() > 1 {
-            canonical.pop();
-        }
-        if canonical == "." {
-            canonical.clear();
-        }
-        if canonical.is_empty() {
-            continue;
-        }
-        if !normalized.iter().any(|existing| existing == &canonical) {
-            normalized.push(canonical);
-        }
-    }
-    normalized
-}
-
-fn claimed_paths_overlap(left: &str, right: &str) -> bool {
-    let left = left.trim_matches('/');
-    let right = right.trim_matches('/');
-    left == right
-        || left.starts_with(&format!("{right}/"))
-        || right.starts_with(&format!("{left}/"))
 }
 
 #[cfg(test)]
@@ -1220,6 +1150,28 @@ mod tests {
         ToolContext::new("parent", "cli")
     }
 
+    fn make_context() -> String {
+        "summary".to_string()
+    }
+
+    fn make_meta(job_id: &str, sub_session_id: &str) -> SubagentJobMeta {
+        SubagentJobMeta {
+            job_id: job_id.to_string(),
+            parent_session_id: "parent".to_string(),
+            parent_reply_to: "cli".to_string(),
+            sub_session_id: sub_session_id.to_string(),
+            goal: "inspect".to_string(),
+            context: "summary".to_string(),
+            created_at_unix_ms: unix_ms_now(),
+            transcript_path: crate::schema::StoragePaths::session_transcript_file(sub_session_id)
+                .display()
+                .to_string(),
+            event_log_path: crate::schema::StoragePaths::events_file(sub_session_id)
+                .display()
+                .to_string(),
+        }
+    }
+
     async fn wait_for_terminal_state(runtime: &SubagentRuntime, job_id: &str) -> SubagentJobState {
         for _ in 0..400 {
             let snapshot = runtime.get_job_snapshot(job_id, false).await.unwrap();
@@ -1240,18 +1192,7 @@ mod tests {
         );
 
         let spawned = runtime
-            .spawn_job(
-                make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "inspect".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["read_file".to_string()],
-                    claimed_paths: Vec::new(),
-                    allow_writes: false,
-                    timeout_sec: Some(20),
-                    max_steps: Some(4),
-                },
-            )
+            .spawn_job(make_ctx(), "inspect".to_string(), make_context())
             .await
             .unwrap();
 
@@ -1260,6 +1201,11 @@ mod tests {
             SubagentJobState::Completed { result, .. } => {
                 assert!(result.ok);
                 assert!(result.summary.contains("done"));
+                let snapshot = runtime
+                    .get_job_snapshot(&spawned.job_id, false)
+                    .await
+                    .unwrap();
+                assert_eq!(snapshot.meta.context, "summary");
             }
             other => panic!("expected completed state, got {:?}", other),
         }
@@ -1274,34 +1220,12 @@ mod tests {
         );
 
         let first = runtime
-            .spawn_job(
-                make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "hang".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["read_file".to_string()],
-                    claimed_paths: Vec::new(),
-                    allow_writes: false,
-                    timeout_sec: Some(30),
-                    max_steps: Some(4),
-                },
-            )
+            .spawn_job(make_ctx(), "hang".to_string(), make_context())
             .await
             .unwrap();
 
         let second = runtime
-            .spawn_job(
-                make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "blocked".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["read_file".to_string()],
-                    claimed_paths: Vec::new(),
-                    allow_writes: false,
-                    timeout_sec: Some(30),
-                    max_steps: Some(4),
-                },
-            )
+            .spawn_job(make_ctx(), "blocked".to_string(), make_context())
             .await;
 
         assert!(matches!(second, Err(ToolError::ExecutionFailed(_))));
@@ -1320,75 +1244,13 @@ mod tests {
         );
 
         let spawned = runtime
-            .spawn_job(
-                make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "hang".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["read_file".to_string()],
-                    claimed_paths: Vec::new(),
-                    allow_writes: false,
-                    timeout_sec: Some(30),
-                    max_steps: Some(4),
-                },
-            )
+            .spawn_job(make_ctx(), "hang".to_string(), make_context())
             .await
             .unwrap();
 
         runtime.cancel_job(&spawned.job_id).await.unwrap();
         let state = wait_for_terminal_state(&runtime, &spawned.job_id).await;
         assert!(matches!(state, SubagentJobState::Cancelled { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_spawn_job_rejects_overlapping_claimed_paths() {
-        let runtime = SubagentRuntime::new(
-            Arc::new(HangingLlm),
-            vec![Arc::new(MockTool("read_file"))],
-            2,
-        );
-
-        let first = runtime
-            .spawn_job(
-                make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "own parser".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["read_file".to_string()],
-                    claimed_paths: vec!["src/parser".to_string()],
-                    allow_writes: false,
-                    timeout_sec: Some(30),
-                    max_steps: Some(4),
-                },
-            )
-            .await
-            .unwrap();
-
-        let second = runtime
-            .spawn_job(
-                make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "touch parser child".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["read_file".to_string()],
-                    claimed_paths: vec!["src/parser/ast".to_string()],
-                    allow_writes: false,
-                    timeout_sec: Some(30),
-                    max_steps: Some(4),
-                },
-            )
-            .await;
-
-        match second {
-            Err(ToolError::ExecutionFailed(message)) => {
-                assert!(message.contains("Claimed path conflict"));
-                assert!(message.contains(&first.job_id));
-            }
-            other => panic!("expected claimed path conflict, got {:?}", other),
-        }
-
-        runtime.cancel_job(&first.job_id).await.unwrap();
-        let _ = wait_for_terminal_state(&runtime, &first.job_id).await;
     }
 
     #[tokio::test]
@@ -1400,18 +1262,7 @@ mod tests {
         );
 
         let spawned = runtime
-            .spawn_job(
-                make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "inspect".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["read_file".to_string()],
-                    claimed_paths: Vec::new(),
-                    allow_writes: false,
-                    timeout_sec: Some(20),
-                    max_steps: Some(4),
-                },
-            )
+            .spawn_job(make_ctx(), "inspect".to_string(), make_context())
             .await
             .unwrap();
 
@@ -1441,26 +1292,10 @@ mod tests {
             2,
         );
 
-        let consumed_job = Arc::new(SubagentJobHandle::new(SubagentJobMeta {
-            job_id: "consumed".to_string(),
-            parent_session_id: "parent".to_string(),
-            parent_reply_to: "cli".to_string(),
-            sub_session_id: "sub_consumed".to_string(),
-            goal: "inspect".to_string(),
-            input_summary: "summary".to_string(),
-            allowed_tools: vec!["read_file".to_string()],
-            claimed_paths: Vec::new(),
-            allow_writes: false,
-            timeout_sec: 5,
-            max_steps: 4,
-            created_at_unix_ms: unix_ms_now(),
-            transcript_path: crate::schema::StoragePaths::session_transcript_file("sub_consumed")
-                .display()
-                .to_string(),
-            event_log_path: crate::schema::StoragePaths::events_file("sub_consumed")
-                .display()
-                .to_string(),
-        }));
+        let consumed_job = Arc::new(SubagentJobHandle::new(make_meta(
+            "consumed",
+            "sub_consumed",
+        )));
         {
             let mut state = consumed_job.state.write().await;
             *state = SubagentJobState::Completed {
@@ -1490,26 +1325,10 @@ mod tests {
             *consumed_at = Some(unix_ms_now());
         }
 
-        let unconsumed_job = Arc::new(SubagentJobHandle::new(SubagentJobMeta {
-            job_id: "unconsumed".to_string(),
-            parent_session_id: "parent".to_string(),
-            parent_reply_to: "cli".to_string(),
-            sub_session_id: "sub_unconsumed".to_string(),
-            goal: "inspect".to_string(),
-            input_summary: "summary".to_string(),
-            allowed_tools: vec!["read_file".to_string()],
-            claimed_paths: Vec::new(),
-            allow_writes: false,
-            timeout_sec: 5,
-            max_steps: 4,
-            created_at_unix_ms: unix_ms_now(),
-            transcript_path: crate::schema::StoragePaths::session_transcript_file("sub_unconsumed")
-                .display()
-                .to_string(),
-            event_log_path: crate::schema::StoragePaths::events_file("sub_unconsumed")
-                .display()
-                .to_string(),
-        }));
+        let unconsumed_job = Arc::new(SubagentJobHandle::new(make_meta(
+            "unconsumed",
+            "sub_unconsumed",
+        )));
         {
             let mut state = unconsumed_job.state.write().await;
             *state = SubagentJobState::Completed {
@@ -1548,40 +1367,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_job_rejects_allow_writes_without_claimed_paths() {
-        let runtime = SubagentRuntime::new(
-            Arc::new(FinishImmediatelyLlm),
-            vec![
-                Arc::new(MockTool("read_file")),
-                Arc::new(MockTool("write_file")),
-            ],
-            2,
-        );
-
-        let result = runtime
-            .spawn_job(
-                make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "edit parser".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["write_file".to_string()],
-                    claimed_paths: Vec::new(),
-                    allow_writes: true,
-                    timeout_sec: Some(20),
-                    max_steps: Some(4),
-                },
-            )
-            .await;
-
-        match result {
-            Err(ToolError::ExecutionFailed(message)) => {
-                assert!(message.contains("allow_writes=true"));
-            }
-            other => panic!("expected allow_writes validation error, got {:?}", other),
-        }
-    }
-
-    #[tokio::test]
     async fn test_job_snapshot_includes_debug_details_and_artifact_paths() {
         let runtime = SubagentRuntime::new(
             Arc::new(FinishImmediatelyLlm),
@@ -1590,18 +1375,7 @@ mod tests {
         );
 
         let spawned = runtime
-            .spawn_job(
-                make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "inspect cargo".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["read_file".to_string()],
-                    claimed_paths: Vec::new(),
-                    allow_writes: false,
-                    timeout_sec: Some(20),
-                    max_steps: Some(4),
-                },
-            )
+            .spawn_job(make_ctx(), "inspect cargo".to_string(), make_context())
             .await
             .unwrap();
 
@@ -1639,28 +1413,30 @@ mod tests {
         );
 
         let spawned = runtime
-            .spawn_job(
+            .spawn_job_with_limits(
                 make_ctx(),
-                DispatchSubagentArgs {
-                    goal: "hang".to_string(),
-                    input_summary: "summary".to_string(),
-                    allowed_tools: vec!["read_file".to_string()],
-                    claimed_paths: Vec::new(),
-                    allow_writes: false,
-                    timeout_sec: Some(1),
-                    max_steps: Some(4),
-                },
+                "hang".to_string(),
+                make_context(),
+                1,
+                4,
+                SkillSessionSeed::default(),
             )
             .await
             .unwrap();
 
-        let _ = wait_for_terminal_state(&runtime, &spawned.job_id).await;
+        let state = wait_for_terminal_state(&runtime, &spawned.job_id).await;
+        assert!(matches!(state, SubagentJobState::TimedOut { .. }));
+
         let snapshot = runtime
             .get_job_snapshot(&spawned.job_id, false)
             .await
             .unwrap();
-        assert_eq!(snapshot.state.finish_reason(), "timed_out");
-        assert_eq!(snapshot.debug.failure_stage.as_deref(), Some("timeout"));
         assert_eq!(snapshot.debug.state_label, "timed_out");
+        assert_eq!(snapshot.debug.failure_stage.as_deref(), Some("timeout"));
+        let partial = match snapshot.state {
+            SubagentJobState::TimedOut { partial, .. } => partial.expect("partial timeout result"),
+            other => panic!("expected timed out state, got {:?}", other),
+        };
+        assert!(partial.summary.contains("timed out after 1s"));
     }
 }

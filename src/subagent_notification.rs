@@ -36,7 +36,7 @@ impl ExecutionExtension for SubagentNotificationExtension {
                 .to_string(),
         );
         lines.push(
-            "If you need the final output, call `get_subagent_result` with the relevant `job_id` before finishing this turn."
+            "If you need the final output, call `subagent` with `action=\"status\"` and the relevant `job_id` before finishing this turn."
                 .to_string(),
         );
         for notification in &notifications {
@@ -55,7 +55,7 @@ impl ExecutionExtension for SubagentNotificationExtension {
                 notification.summary
             ));
             lines.push(format!(
-                "  Suggested next step: call `get_subagent_result` with `{{\"job_id\":\"{}\"}}` to inspect the final result.",
+                "  Suggested next step: call `subagent` with `{{\"action\": \"status\", \"job_id\":\"{}\"}}` to inspect the final result.",
                 notification.job_id
             ));
         }
@@ -138,8 +138,8 @@ mod tests {
         let draft = extension.before_prompt_build(PromptDraft::default()).await;
         let notices = draft.execution_notices.unwrap();
         assert!(notices.contains("job `job-1`"));
-        assert!(notices.contains("Completed parser analysis"));
-        assert!(notices.contains("get_subagent_result"));
+        assert!(notices.contains("subagent"));
+        assert!(notices.contains("\"action\": \"status\""));
         assert!(notices.contains("\"job_id\":\"job-1\""));
 
         let next_draft = extension.before_prompt_build(PromptDraft::default()).await;

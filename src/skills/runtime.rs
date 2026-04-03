@@ -350,10 +350,6 @@ impl SkillRuntime {
             })
     }
 
-    fn is_terminal_subagent_status(status: &str) -> bool {
-        matches!(status, "finished" | "failed" | "cancelled" | "timed_out")
-    }
-
     async fn consume_pending_interaction(&self, input: &str) -> bool {
         let resumed = {
             let mut state_guard = self.state.write().await;
@@ -474,6 +470,29 @@ impl ExecutionExtension for SkillRuntime {
         }
         if let Some(call_context) = self.active_call_context.read().await.as_ref() {
             ctx.skill_call_context = Some(call_context.clone());
+        } else if let Some(call_context) = self.session_seed.inherited_call_context.as_ref() {
+            ctx.skill_call_context = Some(call_context.clone());
+        }
+
+        if let Some(inherited_steps) = self.session_seed.inherited_budget.remaining_steps {
+            ctx.skill_budget.remaining_steps = Some(
+                ctx.skill_budget
+                    .remaining_steps
+                    .unwrap_or(inherited_steps)
+                    .min(inherited_steps)
+                    .max(1),
+            );
+        }
+        if let Some(inherited_timeout_sec) =
+            self.session_seed.inherited_budget.remaining_timeout_sec
+        {
+            ctx.skill_budget.remaining_timeout_sec = Some(
+                ctx.skill_budget
+                    .remaining_timeout_sec
+                    .unwrap_or(inherited_timeout_sec)
+                    .min(inherited_timeout_sec)
+                    .max(1),
+            );
         }
         ctx
     }
@@ -519,49 +538,39 @@ impl ExecutionExtension for SkillRuntime {
 
         if result.result.ok {
             let payload = serde_json::from_str::<serde_json::Value>(&result.result.output).ok();
-            match result.result.tool_name.as_str() {
-                "spawn_subagent" => {
-                    state.execution_state = SkillExecutionState::WaitingSubagent;
-                    state
-                        .labels
-                        .insert("phase".to_string(), "waiting_subagent".to_string());
-                    if let Some(job_id) = payload
-                        .as_ref()
-                        .and_then(|value| value.get("job_id"))
-                        .and_then(|value| value.as_str())
-                    {
+            if result.result.tool_name.as_str() == "subagent" {
+                let status = payload
+                    .as_ref()
+                    .and_then(|value| value.get("status"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+
+                match status {
+                    "spawned" | "pending" | "running" => {
+                        state.execution_state = SkillExecutionState::WaitingSubagent;
                         state
                             .labels
-                            .insert("waiting_on_subagent_job_id".to_string(), job_id.to_string());
+                            .insert("phase".to_string(), "waiting_subagent".to_string());
+                        if let Some(job_id) = payload
+                            .as_ref()
+                            .and_then(|value| value.get("job_id"))
+                            .and_then(|value| value.as_str())
+                        {
+                            state.labels.insert(
+                                "waiting_on_subagent_job_id".to_string(),
+                                job_id.to_string(),
+                            );
+                        }
                     }
-                }
-                "get_subagent_result" => {
-                    let status = payload
-                        .as_ref()
-                        .and_then(|value| value.get("status"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default();
-                    if Self::is_terminal_subagent_status(status) {
+                    "finished" | "failed" | "cancelled" | "timed_out" | "cancelling" => {
                         state.execution_state = SkillExecutionState::Running;
                         state
                             .labels
                             .insert("phase".to_string(), "running".to_string());
                         state.labels.remove("waiting_on_subagent_job_id");
-                    } else if !status.is_empty() {
-                        state.execution_state = SkillExecutionState::WaitingSubagent;
-                        state
-                            .labels
-                            .insert("phase".to_string(), "waiting_subagent".to_string());
                     }
+                    _ => {}
                 }
-                "cancel_subagent" => {
-                    state.execution_state = SkillExecutionState::Running;
-                    state
-                        .labels
-                        .insert("phase".to_string(), "running".to_string());
-                    state.labels.remove("waiting_on_subagent_job_id");
-                }
-                _ => {}
             }
         }
     }
@@ -627,8 +636,10 @@ impl ExecutionExtension for SkillRuntime {
 mod tests {
     use super::*;
     use crate::core::extensions::{ExecutionExtension, FinishDecision, PromptDraft};
+    use crate::skills::call_tree::{SkillBudget, SkillSessionSeed};
     use crate::skills::definition::*;
     use crate::skills::state::PendingInteraction;
+    use std::sync::atomic::Ordering;
 
     fn make_test_skill(forbid_code: bool, required_artifact: Option<ArtifactKind>) -> SkillDef {
         SkillDef {
@@ -843,6 +854,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_enrich_tool_context_inherits_seeded_context_and_budget_without_active_skill() {
+        let inherited_context = SkillCallContext::new_root("root").append_frame("planner", None);
+        inherited_context
+            .total_skill_calls
+            .store(2, Ordering::SeqCst);
+        let rt = SkillRuntime::with_registry_and_seed(
+            "seeded-session",
+            SkillRegistry::new(),
+            SkillSessionSeed {
+                inherited_call_context: Some(inherited_context.clone()),
+                inherited_budget: SkillBudget {
+                    remaining_steps: Some(3),
+                    remaining_timeout_sec: Some(7),
+                },
+            },
+        );
+
+        let mut ctx = crate::tools::ToolContext::new("seeded-session", "cli");
+        ctx.skill_budget = SkillBudget {
+            remaining_steps: Some(9),
+            remaining_timeout_sec: Some(15),
+        };
+
+        let enriched = rt.enrich_tool_context(ctx).await;
+        let propagated = enriched
+            .skill_call_context
+            .expect("inherited call context should be present");
+
+        assert!(enriched.active_skill_name.is_none());
+        assert_eq!(propagated.lineage_names(), vec!["planner".to_string()]);
+        assert_eq!(propagated.root_session_id, "root");
+        assert_eq!(enriched.skill_budget.remaining_steps, Some(3));
+        assert_eq!(enriched.skill_budget.remaining_timeout_sec, Some(7));
+
+        propagated.total_skill_calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(inherited_context.total_skill_calls_used(), 3);
+    }
+
+    #[tokio::test]
 
     async fn test_artifact_contract_denies_finish() {
         let rt = SkillRuntime::new();
@@ -988,7 +1038,7 @@ mod tests {
         rt.after_tool_result(&ToolExecutionEnvelope {
             result: crate::tools::protocol::ToolResultData {
                 ok: true,
-                tool_name: "spawn_subagent".to_string(),
+                tool_name: "subagent".to_string(),
                 output: serde_json::json!({
                     "job_id": "job-123",
                     "status": "spawned"
@@ -1012,6 +1062,52 @@ mod tests {
                 .map(String::as_str),
             Some("job-123")
         );
+    }
+
+    #[tokio::test]
+    async fn test_after_tool_result_clears_waiting_state_when_subagent_finishes() {
+        let rt = SkillRuntime::new();
+        let skill = make_test_skill(false, None);
+        rt.activate_skill(&skill, None).await.unwrap();
+
+        {
+            let mut state = rt.state.write().await;
+            let state = state.as_mut().unwrap();
+            state.execution_state = SkillExecutionState::WaitingSubagent;
+            state
+                .labels
+                .insert("phase".to_string(), "waiting_subagent".to_string());
+            state.labels.insert(
+                "waiting_on_subagent_job_id".to_string(),
+                "job-123".to_string(),
+            );
+        }
+
+        rt.after_tool_result(&ToolExecutionEnvelope {
+            result: crate::tools::protocol::ToolResultData {
+                ok: true,
+                tool_name: "subagent".to_string(),
+                output: serde_json::json!({
+                    "job_id": "job-123",
+                    "status": "finished"
+                })
+                .to_string(),
+                exit_code: None,
+                duration_ms: None,
+                truncated: false,
+            },
+            effects: crate::tools::protocol::ToolEffects::default(),
+        })
+        .await;
+
+        let state = rt.state.read().await;
+        let state = state.as_ref().unwrap();
+        assert_eq!(state.execution_state, SkillExecutionState::Running);
+        assert_eq!(
+            state.labels.get("phase").map(String::as_str),
+            Some("running")
+        );
+        assert!(!state.labels.contains_key("waiting_on_subagent_job_id"));
     }
 
     #[tokio::test]

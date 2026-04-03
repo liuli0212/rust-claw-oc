@@ -348,7 +348,7 @@ mod tests {
                 })
                 .unwrap_or_default();
 
-            if tool_names.iter().any(|name| name == "spawn_subagent") {
+            if tool_names.iter().any(|name| name == "subagent") {
                 parent_stream(user_text, &messages, system_text)
             } else {
                 subagent_stream(user_text)
@@ -384,28 +384,47 @@ mod tests {
                 let Some(envelope) = ToolExecutionEnvelope::from_json_str(result_json) else {
                     continue;
                 };
-                if envelope.result.tool_name != "spawn_subagent" {
+                if envelope.result.tool_name != "subagent" {
                     continue;
                 }
                 let Ok(payload) = serde_json::from_str::<Value>(&envelope.result.output) else {
                     continue;
                 };
-                if let Some(job_id) = payload.get("job_id").and_then(Value::as_str) {
-                    job_ids.push(job_id.to_string());
+                if payload.get("status").and_then(Value::as_str) == Some("spawned") {
+                    if let Some(job_id) = payload.get("job_id").and_then(Value::as_str) {
+                        job_ids.push(job_id.to_string());
+                    }
                 }
             }
         }
         job_ids
     }
 
-    fn count_tool_responses(messages: &[Message], tool_name: &str) -> usize {
+    fn count_tool_responses(messages: &[Message], expected_status_or_key: &str) -> usize {
         messages
             .iter()
             .flat_map(|message| message.parts.iter())
             .filter_map(|part| part.function_response.as_ref())
             .filter_map(|response| response.response.get("result").and_then(Value::as_str))
             .filter_map(ToolExecutionEnvelope::from_json_str)
-            .filter(|envelope| envelope.result.tool_name == tool_name)
+            .filter(|envelope| envelope.result.tool_name == "subagent")
+            .filter(|envelope| {
+                if let Ok(payload) = serde_json::from_str::<Value>(&envelope.result.output) {
+                    if expected_status_or_key == "jobs" {
+                        payload.get("jobs").is_some()
+                    } else if expected_status_or_key == "debug" {
+                        payload.get("debug").is_some()
+                    } else if expected_status_or_key == "spawned" {
+                        payload.get("status").and_then(Value::as_str) == Some("spawned")
+                    } else if expected_status_or_key == "cancelling" {
+                        payload.get("status").and_then(Value::as_str) == Some("cancelling")
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            })
             .count()
     }
 
@@ -416,16 +435,18 @@ mod tests {
     ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
         let (tx, rx) = mpsc::channel(16);
         let job_ids = extract_job_ids_from_messages(messages);
-        let spawned_count = count_tool_responses(messages, "spawn_subagent");
-        let collected_count = count_tool_responses(messages, "get_subagent_result");
-        let listed_count = count_tool_responses(messages, "list_subagent_jobs");
-        let cancelled_count = count_tool_responses(messages, "cancel_subagent");
+        let spawned_count = count_tool_responses(messages, "spawned");
+        let collected_count = count_tool_responses(messages, "debug");
+        let listed_count = count_tool_responses(messages, "jobs");
+        let cancelled_count = count_tool_responses(messages, "cancelling");
 
         let events = if user_text.contains("spawn one background job") {
             if spawned_count == 0 {
                 vec![make_tool_call(
-                    "spawn_subagent",
+                    "subagent",
                     json!({
+                        "action": "run",
+                        "run_in_background": true,
                         "goal": "inspect alpha module",
                         "input_summary": "Inspect alpha module and report findings.",
                         "allowed_tools": ["read_file"],
@@ -445,8 +466,8 @@ mod tests {
             if collected_count < job_ids.len() {
                 let next_job_id = &job_ids[collected_count];
                 vec![make_tool_call(
-                    "get_subagent_result",
-                    json!({ "job_id": next_job_id }),
+                    "subagent",
+                    json!({ "action": "status", "job_id": next_job_id }),
                     &format!("parent_get_{}", collected_count + 1),
                 )]
             } else {
@@ -459,8 +480,10 @@ mod tests {
         } else if user_text.contains("spawn failing background job") {
             if spawned_count == 0 {
                 vec![make_tool_call(
-                    "spawn_subagent",
+                    "subagent",
                     json!({
+                        "action": "run",
+                        "run_in_background": true,
                         "goal": "force fail module",
                         "input_summary": "This subagent should fail immediately.",
                         "allowed_tools": ["read_file"],
@@ -480,8 +503,8 @@ mod tests {
             if collected_count < job_ids.len() {
                 let next_job_id = &job_ids[collected_count];
                 vec![make_tool_call(
-                    "get_subagent_result",
-                    json!({ "job_id": next_job_id }),
+                    "subagent",
+                    json!({ "action": "status", "job_id": next_job_id }),
                     &format!("mixed_get_{}", collected_count + 1),
                 )]
             } else {
@@ -494,8 +517,10 @@ mod tests {
         } else if user_text.contains("spawn two background jobs") {
             if spawned_count == 0 {
                 vec![make_tool_call(
-                    "spawn_subagent",
+                    "subagent",
                     json!({
+                        "action": "run",
+                        "run_in_background": true,
                         "goal": "inspect alpha module",
                         "input_summary": "Inspect alpha module and report findings.",
                         "allowed_tools": ["read_file"],
@@ -506,8 +531,10 @@ mod tests {
                 )]
             } else if spawned_count == 1 {
                 vec![make_tool_call(
-                    "spawn_subagent",
+                    "subagent",
                     json!({
+                        "action": "run",
+                        "run_in_background": true,
                         "goal": "inspect beta module",
                         "input_summary": "Inspect beta module and report findings.",
                         "allowed_tools": ["read_file"],
@@ -526,15 +553,15 @@ mod tests {
         } else if user_text.contains("collect two background jobs") {
             if listed_count == 0 {
                 vec![make_tool_call(
-                    "list_subagent_jobs",
-                    json!({}),
+                    "subagent",
+                    json!({ "action": "list" }),
                     "parent_list_jobs",
                 )]
             } else if collected_count < job_ids.len() {
                 let next_job_id = &job_ids[collected_count];
                 vec![make_tool_call(
-                    "get_subagent_result",
-                    json!({ "job_id": next_job_id }),
+                    "subagent",
+                    json!({ "action": "status", "job_id": next_job_id }),
                     &format!("parent_get_{}", collected_count + 1),
                 )]
             } else {
@@ -547,8 +574,10 @@ mod tests {
         } else if user_text.contains("spawn success and fail jobs") {
             if spawned_count == 0 {
                 vec![make_tool_call(
-                    "spawn_subagent",
+                    "subagent",
                     json!({
+                        "action": "run",
+                        "run_in_background": true,
                         "goal": "inspect success module",
                         "input_summary": "Return a successful summary.",
                         "allowed_tools": ["read_file"],
@@ -559,8 +588,10 @@ mod tests {
                 )]
             } else if spawned_count == 1 {
                 vec![make_tool_call(
-                    "spawn_subagent",
+                    "subagent",
                     json!({
+                        "action": "run",
+                        "run_in_background": true,
                         "goal": "force fail module",
                         "input_summary": "This subagent should fail immediately.",
                         "allowed_tools": ["read_file"],
@@ -580,8 +611,8 @@ mod tests {
             if collected_count < job_ids.len() {
                 let next_job_id = &job_ids[collected_count];
                 vec![make_tool_call(
-                    "get_subagent_result",
-                    json!({ "job_id": next_job_id }),
+                    "subagent",
+                    json!({ "action": "status", "job_id": next_job_id }),
                     &format!("mixed_get_{}", collected_count + 1),
                 )]
             } else {
@@ -594,8 +625,10 @@ mod tests {
         } else if user_text.contains("spawn hanging job") {
             if spawned_count == 0 {
                 vec![make_tool_call(
-                    "spawn_subagent",
+                    "subagent",
                     json!({
+                        "action": "run",
+                        "run_in_background": true,
                         "goal": "hang forever",
                         "input_summary": "This subagent should hang until cancelled.",
                         "allowed_tools": ["read_file"],
@@ -615,8 +648,8 @@ mod tests {
             let first_job = job_ids.first().cloned().unwrap_or_default();
             if cancelled_count == 0 {
                 vec![make_tool_call(
-                    "cancel_subagent",
-                    json!({ "job_id": first_job }),
+                    "subagent",
+                    json!({ "action": "cancel", "job_id": first_job }),
                     "hang_cancel",
                 )]
             } else {
@@ -703,6 +736,14 @@ mod tests {
 
     fn cleanup_session_artifacts(session_id: &str) {
         let _ = std::fs::remove_dir_all(session_dir(session_id));
+        // Also remove the transcript .jsonl file which lives alongside the session dir
+        let transcript = std::path::PathBuf::from("rusty_claw")
+            .join("sessions")
+            .join(format!("{}.jsonl", session_id));
+        let _ = std::fs::remove_file(&transcript);
+        // Remove task state
+        let task_state = crate::schema::StoragePaths::task_state_file(session_id);
+        let _ = std::fs::remove_file(&task_state);
     }
 
     async fn wait_for_jobs(runtime: &crate::subagent_runtime::SubagentRuntime, expected: usize) {
@@ -712,7 +753,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        panic!("timed out waiting for {} jobs", expected);
+        let jobs = runtime.list_jobs().await;
+        panic!(
+            "timed out waiting for {} jobs. Current jobs: {:?}",
+            expected, jobs
+        );
     }
 
     async fn wait_for_all_terminal(runtime: &crate::subagent_runtime::SubagentRuntime) {
@@ -796,11 +841,15 @@ mod tests {
         }
 
         let tool_results = output.tool_results();
-        let result_payloads = extract_tool_payloads(&tool_results, "get_subagent_result");
-        assert_eq!(result_payloads.len(), 1);
-        assert!(result_payloads
-            .iter()
-            .all(|payload| { payload.get("status").and_then(Value::as_str) == Some("finished") }));
+        let result_payloads = extract_tool_payloads(&tool_results, "subagent");
+        assert!(result_payloads.len() >= 1);
+        assert!(
+            result_payloads
+                .iter()
+                .filter(|p| p.get("status").and_then(Value::as_str) == Some("finished"))
+                .count()
+                >= 1
+        );
 
         cleanup_session_artifacts(session_id);
     }
@@ -851,12 +900,12 @@ mod tests {
             other => panic!("expected finished exit, got {:?}", other),
         }
 
-        let result_payloads = extract_tool_payloads(&output.tool_results(), "get_subagent_result");
-        assert_eq!(result_payloads.len(), 1);
-        assert_eq!(
-            result_payloads[0].get("status").and_then(Value::as_str),
-            Some("failed")
-        );
+        let tool_results = output.tool_results();
+        let result_payloads = extract_tool_payloads(&tool_results, "subagent");
+        assert!(result_payloads.len() >= 1);
+        assert!(result_payloads
+            .iter()
+            .any(|p| p.get("status").and_then(Value::as_str) == Some("failed")));
 
         cleanup_session_artifacts(session_id);
     }
@@ -898,12 +947,19 @@ mod tests {
         let spawned_job_id = runtime.list_jobs().await[0].meta.job_id.clone();
 
         let start = Instant::now();
-        let cancel_result = crate::tools::CancelSubagentTool::new(runtime.clone())
-            .execute(json!({ "job_id": spawned_job_id }), &tool_ctx)
-            .await
-            .unwrap();
+        let cancel_result = crate::tools::SubagentTool::new(
+            Arc::new(AsyncSubagentScenarioLlm),
+            vec![],
+            runtime.clone(),
+        )
+        .execute(
+            json!({ "action": "cancel", "job_id": spawned_job_id }),
+            &tool_ctx,
+        )
+        .await
+        .unwrap();
         let cancel_envelope = ToolExecutionEnvelope::from_json_str(&cancel_result).unwrap();
-        assert_eq!(cancel_envelope.result.tool_name, "cancel_subagent");
+        assert_eq!(cancel_envelope.result.tool_name, "subagent");
         assert!(cancel_envelope.result.ok);
         wait_for_cancelled(&runtime, &spawned_job_id).await;
 

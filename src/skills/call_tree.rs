@@ -3,6 +3,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+pub const MAX_DELEGATION_CALLS_PER_ROOT_REQUEST: usize = 6;
+
 #[derive(Debug, Clone)]
 pub struct SkillCallFrame {
     pub skill_name: String,

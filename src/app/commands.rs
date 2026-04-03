@@ -321,12 +321,8 @@ impl CommandExecutor {
                 }
                 timeline.push_str(&format!("- **目标 (Goal)**: {}\n", snapshot.meta.goal));
                 timeline.push_str(&format!(
-                    "- **输入上下文 (Input Summary)**: {}\n",
-                    snapshot.meta.input_summary
-                ));
-                timeline.push_str(&format!(
-                    "- **允许工具**: {:?}\n\n",
-                    snapshot.meta.allowed_tools
+                    "- **上下文 (Context)**: {}\n\n",
+                    snapshot.meta.context
                 ));
 
                 timeline.push_str("### 🕵️ 子 Agent 执行轨迹 (Execution Timeline)\n");

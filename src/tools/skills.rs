@@ -12,7 +12,9 @@ use tracing::Instrument;
 
 use super::protocol::{clean_schema, StructuredToolOutput, Tool, ToolContext, ToolError};
 use crate::event_log::{AgentEvent, EventLog};
-use crate::skills::call_tree::{SkillBudget, SkillCallContext, SkillSessionSeed};
+use crate::skills::call_tree::{
+    SkillBudget, SkillCallContext, SkillSessionSeed, MAX_DELEGATION_CALLS_PER_ROOT_REQUEST,
+};
 use crate::skills::policy::SkillToolPolicy;
 use crate::skills::registry::SkillRegistry;
 
@@ -24,7 +26,6 @@ pub struct CallSkillTool {
 }
 
 const MAX_SKILL_CALL_DEPTH: usize = 3;
-const MAX_SKILL_CALLS_PER_ROOT_REQUEST: usize = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CallSkillArgs {
@@ -137,17 +138,6 @@ impl CallSkillTool {
                 );
             }
         }
-    }
-
-    fn runtime_allows_nested_tool(name: &str) -> bool {
-        !matches!(
-            name,
-            "dispatch_subagent"
-                | "spawn_subagent"
-                | "get_subagent_result"
-                | "cancel_subagent"
-                | "list_subagent_jobs"
-        )
     }
 
     fn canonicalize_tools(&self, tools: &[String]) -> Vec<String> {
@@ -267,6 +257,59 @@ mod tests {
         }
     }
 
+    struct FinishImmediatelyLlm;
+
+    #[async_trait]
+    impl LlmClient for FinishImmediatelyLlm {
+        fn model_name(&self) -> &str {
+            "finish-immediately"
+        }
+
+        fn provider_name(&self) -> &str {
+            "dummy"
+        }
+
+        async fn stream(
+            &self,
+            _: Vec<crate::context::Message>,
+            _: Option<crate::context::Message>,
+            _: Vec<Arc<dyn Tool>>,
+        ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
+            let (tx, rx) = mpsc::channel(4);
+            let _ = tx.try_send(StreamEvent::ToolCall(
+                crate::context::FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: json!({ "summary": "done" }),
+                    id: Some("tc_finish".to_string()),
+                },
+                None,
+            ));
+            let _ = tx.try_send(StreamEvent::Done);
+            Ok(rx)
+        }
+    }
+
+    struct MockTool(&'static str);
+
+    #[async_trait]
+    impl Tool for MockTool {
+        fn name(&self) -> String {
+            self.0.to_string()
+        }
+
+        fn description(&self) -> String {
+            String::new()
+        }
+
+        fn parameters_schema(&self) -> Value {
+            json!({})
+        }
+
+        async fn execute(&self, _args: Value, _ctx: &ToolContext) -> Result<String, ToolError> {
+            Ok(String::new())
+        }
+    }
+
     fn make_skill(name: &str, allowed_tools: &[&str]) -> SkillDef {
         SkillDef {
             meta: SkillMeta {
@@ -288,13 +331,32 @@ mod tests {
         }
     }
 
-    fn make_tool(registry: SkillRegistry) -> CallSkillTool {
+    fn make_tool_with_base_tools(
+        registry: SkillRegistry,
+        llm: Arc<dyn LlmClient>,
+        base_tools: Vec<Arc<dyn Tool>>,
+    ) -> CallSkillTool {
         CallSkillTool {
-            llm: Arc::new(DummyLlm),
-            base_tools: Vec::new(),
+            llm,
+            base_tools,
             registry,
             policy: SkillToolPolicy::new(),
         }
+    }
+
+    fn make_tool_with_llm(registry: SkillRegistry, llm: Arc<dyn LlmClient>) -> CallSkillTool {
+        make_tool_with_base_tools(
+            registry,
+            llm,
+            vec![
+                Arc::new(MockTool("read_file")),
+                Arc::new(MockTool("call_skill")),
+            ],
+        )
+    }
+
+    fn make_tool(registry: SkillRegistry) -> CallSkillTool {
+        make_tool_with_llm(registry, Arc::new(DummyLlm))
     }
 
     fn make_ctx(
@@ -330,8 +392,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_call_skill_requires_active_parent_skill() {
-        let tool = make_tool(SkillRegistry::new());
+    async fn test_call_skill_allows_non_skill_parent_sessions() {
+        let mut registry = SkillRegistry::new();
+        registry.insert(make_skill("child_skill", &[]));
+        let tool = make_tool_with_llm(registry, Arc::new(FinishImmediatelyLlm));
         let ctx = make_ctx(None, &[], &["call_skill"], 8, 20);
 
         let output = tool
@@ -346,10 +410,9 @@ mod tests {
             .unwrap();
 
         let payload = parse_result(&output);
-        assert!(!payload.ok);
-        let failure = payload.failure.unwrap();
-        assert!(matches!(failure.kind, SkillCallFailureKind::PolicyDenied));
-        assert!(failure.message.contains("requires an active parent skill"));
+        assert!(payload.ok);
+        assert_eq!(payload.skill_name, "child_skill");
+        assert_eq!(payload.lineage, vec!["child_skill"]);
     }
 
     #[tokio::test]
@@ -449,7 +512,7 @@ mod tests {
             .as_ref()
             .unwrap()
             .total_skill_calls
-            .store(MAX_SKILL_CALLS_PER_ROOT_REQUEST, Ordering::SeqCst);
+            .store(MAX_DELEGATION_CALLS_PER_ROOT_REQUEST, Ordering::SeqCst);
 
         let output = tool
             .execute(
@@ -469,6 +532,74 @@ mod tests {
         assert!(failure
             .message
             .contains("max total nested skill calls exceeded"));
+    }
+
+    #[tokio::test]
+    async fn test_call_skill_allows_child_that_requests_subagent_when_available() {
+        let mut registry = SkillRegistry::new();
+        registry.insert(make_skill("child_skill", &["spawn_subagent"]));
+        let tool = make_tool_with_base_tools(
+            registry,
+            Arc::new(FinishImmediatelyLlm),
+            vec![
+                Arc::new(MockTool("read_file")),
+                Arc::new(MockTool("call_skill")),
+                Arc::new(MockTool("subagent")),
+            ],
+        );
+        let ctx = make_ctx(
+            Some("planner"),
+            &["planner"],
+            &["subagent", "call_skill"],
+            12,
+            20,
+        );
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "skill_name": "child_skill",
+                    "input_summary": "summary"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let payload = parse_result(&output);
+        assert!(payload.ok);
+        assert!(payload.effective_tools.contains(&"subagent".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_call_skill_denies_child_that_requests_unavailable_subagent_tool() {
+        let mut registry = SkillRegistry::new();
+        registry.insert(make_skill("child_skill", &["spawn_subagent"]));
+        let tool = make_tool(registry);
+        let ctx = make_ctx(
+            Some("planner"),
+            &["planner"],
+            &["subagent", "call_skill"],
+            12,
+            20,
+        );
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "skill_name": "child_skill",
+                    "input_summary": "summary"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let payload = parse_result(&output);
+        assert!(!payload.ok);
+        let failure = payload.failure.unwrap();
+        assert!(matches!(failure.kind, SkillCallFailureKind::MissingTools));
+        assert!(failure.message.contains("subagent"));
     }
 }
 
@@ -505,34 +636,15 @@ impl Tool for CallSkillTool {
         let target_skill = parsed.skill_name.clone();
         let input_summary = parsed.input_summary.clone();
         let requested_args = parsed.args.clone();
-        let parent_skill = match &ctx.active_skill_name {
-            Some(skill_name) => skill_name.clone(),
-            None => {
-                let failure = self.failure(
-                    SkillCallFailureKind::PolicyDenied,
-                    "Denied skill call: call_skill requires an active parent skill.",
-                    false,
-                    Some("Activate or continue a parent skill before delegating to another skill."),
-                    json!({ "target_skill": &target_skill }),
-                );
-                return self
-                    .failure_output(SkillFailureContext {
-                        tool_ctx: ctx,
-                        skill_name: &target_skill,
-                        lineage: Vec::new(),
-                        effective_tools: Vec::new(),
-                        effective_max_steps: parsed.max_steps.unwrap_or(20),
-                        effective_timeout_sec: parsed.timeout_sec.unwrap_or(120),
-                        failure,
-                        event_type: "skill_call_denied_policy",
-                    })
-                    .await;
-            }
-        };
+        let caller_label = ctx
+            .active_skill_name
+            .clone()
+            .unwrap_or_else(|| ctx.session_id.clone());
 
-        let parent_context = ctx.skill_call_context.clone().unwrap_or_else(|| {
-            SkillCallContext::new_root(ctx.session_id.clone()).append_frame(&parent_skill, None)
-        });
+        let parent_context = ctx
+            .skill_call_context
+            .clone()
+            .unwrap_or_else(|| SkillCallContext::new_root(ctx.session_id.clone()));
         let requested_timeout_sec = parsed.timeout_sec.unwrap_or(120).max(1);
         let parent_remaining_steps = ctx.skill_budget.remaining_steps.unwrap_or(1).max(1);
         let requested_steps = parsed.max_steps.unwrap_or(parent_remaining_steps).max(1);
@@ -554,7 +666,7 @@ impl Tool for CallSkillTool {
             &ctx.session_id,
             "skill_call_requested",
             json!({
-                "parent_skill": &parent_skill,
+                "caller": &caller_label,
                 "target_skill": &target_skill,
                 "lineage": &child_lineage,
                 "requested_max_steps": requested_steps,
@@ -622,12 +734,12 @@ impl Tool for CallSkillTool {
                 .await;
         }
 
-        if parent_context.total_skill_calls_used() >= MAX_SKILL_CALLS_PER_ROOT_REQUEST {
+        if parent_context.total_skill_calls_used() >= MAX_DELEGATION_CALLS_PER_ROOT_REQUEST {
             let failure = self.failure(
                 SkillCallFailureKind::BudgetExceeded,
                 format!(
                     "Denied skill call: max total nested skill calls exceeded ({})",
-                    MAX_SKILL_CALLS_PER_ROOT_REQUEST
+                    MAX_DELEGATION_CALLS_PER_ROOT_REQUEST
                 ),
                 false,
                 Some("Do not spawn more child skills. Summarize findings or finish with the work already completed."),
@@ -635,7 +747,7 @@ impl Tool for CallSkillTool {
                     "target_skill": &target_skill,
                     "lineage": &child_lineage,
                     "total_skill_calls_used": parent_context.total_skill_calls_used(),
-                    "max_total_skill_calls": MAX_SKILL_CALLS_PER_ROOT_REQUEST,
+                    "max_total_skill_calls": MAX_DELEGATION_CALLS_PER_ROOT_REQUEST,
                 }),
             );
             return self
@@ -677,44 +789,19 @@ impl Tool for CallSkillTool {
                 .await;
         };
 
-        let parent_visible_tools = self.canonicalize_tools(&ctx.visible_tools);
         let callee_declared_tools = self.canonicalize_tools(&def.meta.allowed_tools);
-        let caller_requested_tools = self.canonicalize_tools(&parsed.allowed_tools);
-
-        let runtime_allowed_tools: Vec<String> = parent_visible_tools
-            .iter()
-            .filter(|name| Self::runtime_allows_nested_tool(name.as_str()))
-            .cloned()
-            .collect();
+        let runtime_available_tools: Vec<String> =
+            self.base_tools.iter().map(|tool| tool.name()).collect();
+        let runtime_available_tools = self.canonicalize_tools(&runtime_available_tools);
 
         let effective_tools = if callee_declared_tools.is_empty() {
-            if caller_requested_tools.is_empty() {
-                runtime_allowed_tools.clone()
-            } else {
-                caller_requested_tools
-                    .into_iter()
-                    .filter(|name| {
-                        parent_visible_tools.contains(name)
-                            && Self::runtime_allows_nested_tool(name.as_str())
-                    })
-                    .collect()
-            }
+            runtime_available_tools.clone()
         } else {
-            let base = callee_declared_tools
+            callee_declared_tools
                 .iter()
-                .filter(|name| {
-                    parent_visible_tools.contains(name)
-                        && Self::runtime_allows_nested_tool(name.as_str())
-                })
+                .filter(|name| runtime_available_tools.contains(name))
                 .cloned()
-                .collect::<Vec<_>>();
-            if caller_requested_tools.is_empty() {
-                base
-            } else {
-                base.into_iter()
-                    .filter(|name| caller_requested_tools.contains(name))
-                    .collect()
-            }
+                .collect::<Vec<_>>()
         };
 
         let mut effective_tools = effective_tools;
@@ -723,10 +810,7 @@ impl Tool for CallSkillTool {
         }
         let missing_tools: Vec<String> = callee_declared_tools
             .iter()
-            .filter(|name| {
-                !parent_visible_tools.contains(name)
-                    || !Self::runtime_allows_nested_tool(name.as_str())
-            })
+            .filter(|name| !runtime_available_tools.contains(name))
             .cloned()
             .collect();
 
@@ -734,16 +818,16 @@ impl Tool for CallSkillTool {
             let failure = self.failure(
                 SkillCallFailureKind::MissingTools,
                 format!(
-                    "Denied skill call: child requires tools missing in parent context: [{}]",
+                    "Denied skill call: child requires tools unavailable in the current runtime: [{}]",
                     missing_tools.join(", ")
                 ),
                 false,
-                Some("Do not retry this child skill with the same parent context. Choose a different skill or continue without those tools."),
+                Some("Do not retry this child skill until those tools are available, or choose a different skill."),
                 json!({
                     "target_skill": &target_skill,
                     "lineage": &child_lineage,
                     "missing_tools": &missing_tools,
-                    "parent_visible_tools": &parent_visible_tools,
+                    "runtime_available_tools": &runtime_available_tools,
                 }),
             );
             return self
@@ -780,29 +864,34 @@ impl Tool for CallSkillTool {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_notify = Arc::new(tokio::sync::Notify::new());
         let session_allowed_tools = effective_tools.clone();
+        let allow_subagent_tool = session_allowed_tools
+            .iter()
+            .any(|tool_name| tool_name == "subagent");
 
         let built = crate::session::factory::build_subagent_session(
             ctx,
             self.llm.clone(),
             &self.base_tools,
-            crate::session::factory::SubagentBuildMode::SyncCompatible,
-            None,
-            &session_allowed_tools,
-            effective_max_steps,
-            effective_timeout_sec,
-            &input_summary,
-            SkillSessionSeed {
-                inherited_call_context: Some(parent_context.clone()),
-                inherited_budget: SkillBudget {
-                    remaining_steps: Some(effective_max_steps),
-                    remaining_timeout_sec: Some(effective_timeout_sec),
+            crate::session::factory::SubagentSessionConfig {
+                sub_session_id: None,
+                allowed_tools: session_allowed_tools,
+                energy_budget: effective_max_steps,
+                timeout_sec: effective_timeout_sec,
+                parent_context_text: input_summary.clone(),
+                skill_session_seed: SkillSessionSeed {
+                    inherited_call_context: Some(parent_context.clone()),
+                    inherited_budget: SkillBudget {
+                        remaining_steps: Some(effective_max_steps),
+                        remaining_timeout_sec: Some(effective_timeout_sec),
+                    },
                 },
+                debug: std::sync::Arc::new(tokio::sync::RwLock::new(
+                    crate::subagent_runtime::SubagentDebugSnapshot::default(),
+                )),
+                cancelled,
+                cancel_notify,
+                allow_subagent_tool,
             },
-            std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::subagent_runtime::SubagentDebugSnapshot::default(),
-            )),
-            cancelled,
-            cancel_notify,
         );
 
         let built = match built {
@@ -846,7 +935,6 @@ impl Tool for CallSkillTool {
             event_log_path,
             mut agent_loop,
             collector,
-            rejected_tools: _,
         } = built;
 
         self.append_event(

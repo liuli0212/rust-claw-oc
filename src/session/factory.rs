@@ -14,47 +14,25 @@ use crate::skills::call_tree::SkillSessionSeed;
 use crate::subagent_runtime::{push_recent_debug_event, SubagentDebugEvent, SubagentDebugSnapshot};
 use crate::tools::{Tool, ToolContext};
 
-const DEFAULT_SUBAGENT_ALLOWED_TOOLS: &[&str] = &[
-    "read_file",
-    "web_fetch",
-    "web_search",
-    "search_knowledge_base",
-    "read_workspace_memory",
-];
-const FORBIDDEN_ASYNC_SUBAGENT_TOOLS: &[&str] = &[
-    "write_file",
-    "patch_file",
-    "execute_bash",
-    "send_file",
-    "write_memory",
-    "rag_insert",
-    "manage_schedule",
-    "send_telegram_message",
-];
-const ASYNC_CONTROLLED_WRITE_TOOLS: &[&str] = &[
-    "write_file",
-    "patch_file",
-    "execute_bash",
-    "write_memory",
-    "rag_insert",
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubagentBuildMode {
-    AsyncReadonly,
-    AsyncControlledWrite,
-    SyncCompatible,
-}
-
 pub struct BuiltSubagentSession {
     pub sub_session_id: String,
     pub transcript_path: String,
     pub event_log_path: String,
     pub agent_loop: AgentLoop,
     pub collector: Arc<CollectorOutput>,
-    /// Tools that were explicitly requested in allowed_tools but blocked by the
-    /// security policy for the current SubagentBuildMode.
-    pub rejected_tools: Vec<String>,
+}
+
+pub struct SubagentSessionConfig {
+    pub sub_session_id: Option<String>,
+    pub allowed_tools: Vec<String>,
+    pub energy_budget: usize,
+    pub timeout_sec: u64,
+    pub parent_context_text: String,
+    pub skill_session_seed: SkillSessionSeed,
+    pub debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
+    pub cancel_notify: Arc<tokio::sync::Notify>,
+    pub allow_subagent_tool: bool,
 }
 
 pub struct CollectorOutput {
@@ -261,71 +239,48 @@ impl crate::core::AgentOutput for CollectorOutput {
 pub fn filter_subagent_tools(
     base_tools: &[Arc<dyn Tool>],
     allowed: &[String],
-    mode: SubagentBuildMode,
-) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
-    let effective_allowed: Vec<String> = if allowed.is_empty() {
-        DEFAULT_SUBAGENT_ALLOWED_TOOLS
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect()
-    } else {
-        allowed.to_vec()
-    };
-
+    allow_subagent_tool: bool,
+) -> Vec<Arc<dyn Tool>> {
     let runtime_tools = ["finish_task", "task_plan"];
+    let restrict_to_whitelist = !allowed.is_empty();
     let mut accepted = Vec::new();
-    let mut rejected = Vec::new();
 
     for tool in base_tools {
         let name = tool.name();
-        if name == "dispatch_subagent" {
+        if name == "subagent" && !allow_subagent_tool {
             continue;
         }
 
-        let blocked_by_policy = match mode {
-            SubagentBuildMode::AsyncReadonly => {
-                FORBIDDEN_ASYNC_SUBAGENT_TOOLS.contains(&name.as_str())
-            }
-            SubagentBuildMode::AsyncControlledWrite => {
-                FORBIDDEN_ASYNC_SUBAGENT_TOOLS.contains(&name.as_str())
-                    && !ASYNC_CONTROLLED_WRITE_TOOLS.contains(&name.as_str())
-            }
-            SubagentBuildMode::SyncCompatible => false,
-        };
-
-        if blocked_by_policy {
-            // Only track rejection if the user explicitly requested this tool
-            if allowed.contains(&name) {
-                tracing::info!("Tool '{}' blocked by policy in mode {:?}", name, mode);
-                rejected.push(name);
-            }
-            continue;
-        }
-
-        if runtime_tools.contains(&name.as_str()) || effective_allowed.contains(&name) {
+        if !restrict_to_whitelist
+            || runtime_tools.contains(&name.as_str())
+            || allowed.contains(&name)
+        {
             accepted.push(tool.clone());
         }
     }
 
-    (accepted, rejected)
+    accepted
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build_subagent_session(
     parent_ctx: &ToolContext,
     llm: Arc<dyn LlmClient>,
     base_tools: &[Arc<dyn Tool>],
-    mode: SubagentBuildMode,
-    sub_session_id: Option<String>,
-    allowed_tools: &[String],
-    energy_budget: usize,
-    timeout_sec: u64,
-    input_summary: &str,
-    skill_session_seed: SkillSessionSeed,
-    debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
-    cancel_notify: Arc<tokio::sync::Notify>,
+    config: SubagentSessionConfig,
 ) -> Result<BuiltSubagentSession, String> {
+    let SubagentSessionConfig {
+        sub_session_id,
+        allowed_tools,
+        energy_budget,
+        timeout_sec,
+        parent_context_text,
+        skill_session_seed,
+        debug,
+        cancelled,
+        cancel_notify,
+        allow_subagent_tool,
+    } = config;
+
     let sub_session_id = sub_session_id.unwrap_or_else(|| {
         format!(
             "sub_{}_{}",
@@ -348,9 +303,9 @@ pub fn build_subagent_session(
     let mut context = AgentContext::new().with_transcript_path(transcript_path);
 
     let mut prompt = format!(
-        "You are a restricted sub-agent. Complete the assigned goal with the available tools, \
-         then call `finish_task`.\nParent context summary:\n{}\n\nBe concise.",
-        input_summary
+        "You are a delegated sub-agent. Complete the assigned goal with the available tools, \
+         then call `finish_task`.\nParent context:\n{}\n\nBe concise.",
+        parent_context_text
     );
 
     if let Ok(memory) = std::fs::read_to_string("MEMORY.md") {
@@ -367,7 +322,7 @@ pub fn build_subagent_session(
     let telemetry = Arc::new(telemetry);
     let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(&sub_session_id));
 
-    let (mut tools, rejected_tools) = filter_subagent_tools(base_tools, allowed_tools, mode);
+    let mut tools = filter_subagent_tools(base_tools, &allowed_tools, allow_subagent_tool);
     if !tools.iter().any(|tool| tool.name() == "task_plan") {
         tools.push(Arc::new(crate::tools::TaskPlanTool::new(
             sub_session_id.clone(),
@@ -380,9 +335,7 @@ pub fn build_subagent_session(
         }));
     }
 
-    // Support nested skill recursion if explicitly allowed into the child session
-    if (allowed_tools.contains(&"call_skill".to_string())
-        || mode == SubagentBuildMode::SyncCompatible)
+    if (allowed_tools.is_empty() || allowed_tools.contains(&"call_skill".to_string()))
         && !tools.iter().any(|tool| tool.name() == "call_skill")
     {
         tools.push(Arc::new(crate::tools::CallSkillTool::new(
@@ -432,7 +385,6 @@ pub fn build_subagent_session(
             .to_string(),
         agent_loop,
         collector,
-        rejected_tools,
     })
 }
 
@@ -462,25 +414,14 @@ pub fn build_agent_session(
     }));
     session_tools.push(Arc::new(crate::tools::AskUserQuestionTool::new()));
     let subagent_base_tools = session_tools.clone();
-    session_tools.push(Arc::new(crate::tools::DispatchSubagentTool::new(
+    session_tools.push(Arc::new(crate::tools::SubagentTool::new(
         llm.clone(),
         subagent_base_tools.clone(),
+        subagent_runtime.clone(),
     )));
     session_tools.push(Arc::new(crate::tools::CallSkillTool::new(
         llm.clone(),
         subagent_base_tools,
-    )));
-    session_tools.push(Arc::new(crate::tools::SpawnSubagentTool::new(
-        subagent_runtime.clone(),
-    )));
-    session_tools.push(Arc::new(crate::tools::GetSubagentResultTool::new(
-        subagent_runtime.clone(),
-    )));
-    session_tools.push(Arc::new(crate::tools::CancelSubagentTool::new(
-        subagent_runtime.clone(),
-    )));
-    session_tools.push(Arc::new(crate::tools::ListSubagentJobsTool::new(
-        subagent_runtime.clone(),
     )));
 
     let mut agent_loop = AgentLoop::new(
@@ -573,6 +514,7 @@ mod tests {
 
     struct InspectingLlm {
         pub last_system: std::sync::Mutex<Option<String>>,
+        pub last_tools: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -589,13 +531,14 @@ mod tests {
             &self,
             _messages: Vec<crate::context::Message>,
             system_instruction: Option<crate::context::Message>,
-            _tools: Vec<Arc<dyn Tool>>,
+            tools: Vec<Arc<dyn Tool>>,
         ) -> Result<mpsc::Receiver<crate::llm_client::StreamEvent>, crate::llm_client::LlmError>
         {
             let text = system_instruction
                 .and_then(|message| message.parts.into_iter().find_map(|part| part.text))
                 .unwrap_or_default();
             *self.last_system.lock().unwrap() = Some(text);
+            *self.last_tools.lock().unwrap() = tools.into_iter().map(|tool| tool.name()).collect();
 
             let (tx, rx) = mpsc::channel(4);
             tokio::spawn(async move {
@@ -630,6 +573,7 @@ mod tests {
 
         let llm = Arc::new(InspectingLlm {
             last_system: std::sync::Mutex::new(None),
+            last_tools: std::sync::Mutex::new(Vec::new()),
         });
         let output = Arc::new(CaptureOutput);
         let agent = build_agent_session(
@@ -656,96 +600,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp_root);
     }
 
+    #[tokio::test]
+    async fn test_build_subagent_session_exposes_call_skill_for_default_subagents() {
+        let session_id = "test-subagent-call-skill";
+        cleanup_session(session_id);
+        let llm = Arc::new(InspectingLlm {
+            last_system: std::sync::Mutex::new(None),
+            last_tools: std::sync::Mutex::new(Vec::new()),
+        });
+        let parent_ctx = crate::tools::ToolContext::new(session_id, "cli");
+        let base_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool("read_file"))];
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_notify = Arc::new(tokio::sync::Notify::new());
+
+        let built = build_subagent_session(
+            &parent_ctx,
+            llm.clone(),
+            &base_tools,
+            SubagentSessionConfig {
+                sub_session_id: Some(format!("sub_{session_id}")),
+                allowed_tools: Vec::new(),
+                energy_budget: 3,
+                timeout_sec: 3,
+                parent_context_text: "repo context".to_string(),
+                skill_session_seed: SkillSessionSeed::default(),
+                debug: Arc::new(tokio::sync::RwLock::new(SubagentDebugSnapshot::default())),
+                cancelled,
+                cancel_notify,
+                allow_subagent_tool: false,
+            },
+        )
+        .expect("subagent session should build");
+
+        let mut agent = built.agent_loop;
+        let _ = agent.step("inspect".to_string()).await.unwrap();
+
+        let tool_names = llm.last_tools.lock().unwrap().clone();
+        assert!(tool_names.contains(&"call_skill".to_string()));
+        assert!(!tool_names.contains(&"subagent".to_string()));
+
+        cleanup_session(session_id);
+    }
+
     #[test]
-    fn test_filter_subagent_tools_sync_compatible_keeps_explicit_write_tools() {
+    fn test_filter_subagent_tools_defaults_to_all_non_recursive_tools() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool("read_file")),
+            Arc::new(MockTool("web_fetch")),
+            Arc::new(MockTool("write_file")),
+            Arc::new(MockTool("execute_bash")),
+            Arc::new(MockTool("subagent")),
+            Arc::new(MockTool("finish_task")),
+        ];
+
+        let filtered = filter_subagent_tools(&tools, &[], false);
+        let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"web_fetch".to_string()));
+        assert!(names.contains(&"write_file".to_string()));
+        assert!(names.contains(&"execute_bash".to_string()));
+        assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"subagent".to_string()));
+    }
+
+    #[test]
+    fn test_filter_subagent_tools_honors_explicit_whitelist() {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MockTool("read_file")),
             Arc::new(MockTool("write_file")),
             Arc::new(MockTool("finish_task")),
         ];
 
-        let (filtered, _) = filter_subagent_tools(
-            &tools,
-            &["write_file".to_string()],
-            SubagentBuildMode::SyncCompatible,
-        );
+        let filtered = filter_subagent_tools(&tools, &["write_file".to_string()], false);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"write_file".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"read_file".to_string()));
     }
 
     #[test]
-    fn test_filter_subagent_tools_sync_compatible_keeps_explicit_call_skill() {
+    fn test_filter_subagent_tools_whitelist_keeps_runtime_tools() {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MockTool("read_file")),
             Arc::new(MockTool("call_skill")),
             Arc::new(MockTool("finish_task")),
+            Arc::new(MockTool("task_plan")),
         ];
 
-        let (filtered, _) = filter_subagent_tools(
-            &tools,
-            &["call_skill".to_string()],
-            SubagentBuildMode::SyncCompatible,
-        );
+        let filtered = filter_subagent_tools(&tools, &["call_skill".to_string()], false);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"call_skill".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
+        assert!(names.contains(&"task_plan".to_string()));
+        assert!(!names.contains(&"read_file".to_string()));
     }
 
     #[test]
-    fn test_filter_subagent_tools_async_readonly_blocks_explicit_write_tools() {
+    fn test_filter_subagent_tools_can_opt_in_to_subagent_for_skill_sessions() {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MockTool("read_file")),
-            Arc::new(MockTool("write_file")),
-            Arc::new(MockTool("patch_file")),
+            Arc::new(MockTool("subagent")),
             Arc::new(MockTool("finish_task")),
         ];
 
-        let (filtered, _) = filter_subagent_tools(
-            &tools,
-            &["write_file".to_string(), "patch_file".to_string()],
-            SubagentBuildMode::AsyncReadonly,
-        );
+        let filtered = filter_subagent_tools(&tools, &["subagent".to_string()], true);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
-        assert!(!names.contains(&"write_file".to_string()));
-        assert!(!names.contains(&"patch_file".to_string()));
+        assert!(names.contains(&"subagent".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
-    }
-
-    #[test]
-    fn test_filter_subagent_tools_async_controlled_write_keeps_allowed_controlled_write_tools() {
-        let tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(MockTool("read_file")),
-            Arc::new(MockTool("write_file")),
-            Arc::new(MockTool("patch_file")),
-            Arc::new(MockTool("execute_bash")),
-            Arc::new(MockTool("write_memory")),
-            Arc::new(MockTool("rag_insert")),
-            Arc::new(MockTool("send_file")),
-            Arc::new(MockTool("finish_task")),
-        ];
-
-        let (filtered, _) = filter_subagent_tools(
-            &tools,
-            &[
-                "read_file".to_string(),
-                "write_file".to_string(),
-                "patch_file".to_string(),
-                "execute_bash".to_string(),
-                "write_memory".to_string(),
-                "rag_insert".to_string(),
-                "send_file".to_string(),
-            ],
-            SubagentBuildMode::AsyncControlledWrite,
-        );
-        let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
-        assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"write_file".to_string()));
-        assert!(names.contains(&"patch_file".to_string()));
-        assert!(names.contains(&"execute_bash".to_string()));
-        assert!(names.contains(&"write_memory".to_string()));
-        assert!(names.contains(&"rag_insert".to_string()));
-        assert!(names.contains(&"finish_task".to_string()));
-        assert!(!names.contains(&"send_file".to_string()));
+        assert!(!names.contains(&"read_file".to_string()));
     }
 }

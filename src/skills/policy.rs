@@ -31,16 +31,11 @@ impl SkillToolPolicy {
             "AskUserQuestion".to_string(),
             "ask_user_question".to_string(),
         );
-        name_map.insert("spawn_subagent".to_string(), "spawn_subagent".to_string());
-        name_map.insert(
-            "get_subagent_result".to_string(),
-            "get_subagent_result".to_string(),
-        );
-        name_map.insert("cancel_subagent".to_string(), "cancel_subagent".to_string());
-        name_map.insert(
-            "list_subagent_jobs".to_string(),
-            "list_subagent_jobs".to_string(),
-        );
+        name_map.insert("subagent".to_string(), "subagent".to_string());
+        name_map.insert("spawn_subagent".to_string(), "subagent".to_string());
+        name_map.insert("get_subagent_result".to_string(), "subagent".to_string());
+        name_map.insert("cancel_subagent".to_string(), "subagent".to_string());
+        name_map.insert("list_subagent_jobs".to_string(), "subagent".to_string());
         Self { name_map }
     }
 
@@ -160,6 +155,8 @@ mod tests {
         let policy = SkillToolPolicy::new();
         assert_eq!(policy.canonical_name("Bash"), "execute_bash");
         assert_eq!(policy.canonical_name("Read"), "read_file");
+        assert_eq!(policy.canonical_name("spawn_subagent"), "subagent");
+        assert_eq!(policy.canonical_name("get_subagent_result"), "subagent");
         assert_eq!(policy.canonical_name("unknown_tool"), "unknown_tool");
     }
 }
