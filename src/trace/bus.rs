@@ -21,6 +21,19 @@ pub fn unix_ms_now() -> u64 {
         .as_millis() as u64
 }
 
+pub struct RecordPayload {
+    pub status: TraceStatus,
+    pub summary: Option<String>,
+    pub attrs: Value,
+}
+
+pub struct RecordTiming {
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
+    pub ts_unix_ms: u64,
+    pub duration_ms: Option<u64>,
+}
+
 #[derive(Clone)]
 pub struct TraceBus {
     inner: Arc<TraceBusInner>,
@@ -30,6 +43,12 @@ struct TraceBusInner {
     live_tx: broadcast::Sender<TraceRecord>,
     file_writers: Mutex<HashMap<String, File>>,
     summary_cache: Mutex<HashMap<String, RunSummary>>,
+}
+
+impl Default for TraceBus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TraceBus {
@@ -63,13 +82,17 @@ impl TraceBus {
             actor.clone(),
             TraceKind::SpanStart,
             name.to_string(),
-            TraceStatus::Running,
-            Some(span_id.clone()),
-            ctx.parent_span_id.clone(),
-            started_at_unix_ms,
-            None,
-            None,
-            attrs,
+            RecordPayload {
+                status: TraceStatus::Running,
+                summary: None,
+                attrs,
+            },
+            RecordTiming {
+                span_id: Some(span_id.clone()),
+                parent_span_id: ctx.parent_span_id.clone(),
+                ts_unix_ms: started_at_unix_ms,
+                duration_ms: None,
+            },
         );
         self.publish(record);
 
@@ -96,13 +119,13 @@ impl TraceBus {
             actor,
             TraceKind::Event,
             name.into(),
-            status,
-            None,
-            ctx.parent_span_id.clone(),
-            unix_ms_now(),
-            None,
-            summary,
-            attrs,
+            RecordPayload { status, summary, attrs },
+            RecordTiming {
+                span_id: None,
+                parent_span_id: ctx.parent_span_id.clone(),
+                ts_unix_ms: unix_ms_now(),
+                duration_ms: None,
+            },
         );
         self.publish(record);
     }
@@ -113,22 +136,17 @@ impl TraceBus {
         actor: TraceActor,
         kind: TraceKind,
         name: String,
-        status: TraceStatus,
-        span_id: Option<String>,
-        parent_span_id: Option<String>,
-        ts_unix_ms: u64,
-        duration_ms: Option<u64>,
-        summary: Option<String>,
-        attrs: Value,
+        payload: RecordPayload,
+        timing: RecordTiming,
     ) -> TraceRecord {
-        let attrs = inject_root_session(attrs, &ctx.root_session_id);
+        let attrs = inject_root_session(payload.attrs, &ctx.root_session_id);
         TraceRecord {
             schema_version: CURRENT_SCHEMA_VERSION,
             record_id: format!("trc_{}", Uuid::new_v4().simple()),
             trace_id: ctx.trace_id.clone(),
             run_id: ctx.run_id.clone(),
-            span_id,
-            parent_span_id,
+            span_id: timing.span_id,
+            parent_span_id: timing.parent_span_id,
             session_id: ctx.session_id.clone(),
             task_id: ctx.task_id.clone(),
             turn_id: ctx.turn_id.clone(),
@@ -136,11 +154,11 @@ impl TraceBus {
             actor,
             kind,
             name,
-            status,
-            ts_unix_ms,
-            duration_ms,
+            status: payload.status,
+            ts_unix_ms: timing.ts_unix_ms,
+            duration_ms: timing.duration_ms,
             level: TraceLevel::Normal,
-            summary,
+            summary: payload.summary,
             attrs,
         }
     }
@@ -342,13 +360,13 @@ impl TraceSpanHandle {
             self.actor,
             TraceKind::SpanEnd,
             end_name.into(),
-            status,
-            Some(self.span_id),
-            self.ctx.parent_span_id.clone(),
-            ended_at_unix_ms,
-            Some(ended_at_unix_ms.saturating_sub(self.started_at_unix_ms)),
-            summary,
-            attrs,
+            RecordPayload { status, summary, attrs },
+            RecordTiming {
+                span_id: Some(self.span_id),
+                parent_span_id: self.ctx.parent_span_id.clone(),
+                ts_unix_ms: ended_at_unix_ms,
+                duration_ms: Some(ended_at_unix_ms.saturating_sub(self.started_at_unix_ms)),
+            },
         );
         self.bus.publish(record);
     }
