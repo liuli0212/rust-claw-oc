@@ -43,7 +43,15 @@ impl TraceBus {
             }),
         }
     }
+}
 
+impl Default for TraceBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TraceBus {
     pub fn subscribe(&self) -> broadcast::Receiver<TraceRecord> {
         self.inner.live_tx.subscribe()
     }
@@ -107,6 +115,7 @@ impl TraceBus {
         self.publish(record);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_record(
         &self,
         ctx: &TraceContext,

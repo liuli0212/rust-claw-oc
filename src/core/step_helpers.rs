@@ -1137,6 +1137,226 @@ impl AgentLoop {
         fallback
     }
 
+    pub(super) async fn execute_iteration(
+        &mut self,
+        task_state: &mut TaskState,
+        compaction_checked: &mut bool,
+        consecutive_empty_responses: &mut usize,
+        state: &mut crate::task_state::TaskStateSnapshot,
+    ) -> Result<Option<RunExit>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(exit) = self.check_loop_guards(task_state).await {
+            return Ok(Some(exit));
+        }
+
+        if !*compaction_checked {
+            let _ = self.maybe_compact_history(false).await;
+            *compaction_checked = true;
+        }
+
+        // Update status dashboard
+        let (tokens, max_tokens, _, _, _) = self.context.get_context_status();
+        self.output
+            .on_status_update(
+                tokens,
+                max_tokens,
+                task_state.energy_points,
+                self.llm.provider_name(),
+                self.llm.model_name(),
+            )
+            .await;
+
+        let current_tools = self.load_current_tools().await;
+        let iteration = task_state.iterations as u32;
+        let iteration_ctx =
+            self.trace_context_with_parent(self.turn_span_id(), Some(iteration));
+        let mut iteration_span = iteration_ctx.as_ref().map(|ctx| {
+            self.trace_bus.start_span(
+                ctx,
+                self.trace_actor(),
+                "iteration_started",
+                serde_json::json!({
+                    "energy_remaining": task_state.energy_points,
+                    "tool_count": current_tools.len(),
+                }),
+            )
+        });
+        let iteration_child_ctx = iteration_span
+            .as_ref()
+            .map(TraceSpanHandle::child_context)
+            .or_else(|| iteration_ctx.clone());
+
+        let (full_text, tool_calls_accumulated) = match self
+            .collect_iteration_response(state, &current_tools, iteration_child_ctx.clone())
+            .await?
+        {
+            StreamCollectionOutcome::Completed {
+                full_text,
+                tool_calls,
+            } => (full_text, tool_calls),
+            StreamCollectionOutcome::Exit(exit) => {
+                if let Some(span) = iteration_span.take() {
+                    span.finish(
+                        "iteration_finished",
+                        TraceStatus::Cancelled,
+                        Some(exit.label().to_string()),
+                        serde_json::json!({}),
+                    );
+                }
+                return Ok(Some(exit));
+            }
+        };
+
+        if let Some(exit) = self
+            .handle_empty_iteration_response(
+                &full_text,
+                &tool_calls_accumulated,
+                consecutive_empty_responses,
+            )
+            .await
+        {
+            if matches!(exit, RunExit::RecoverableFailed(_)) {
+                if let Some(span) = iteration_span.take() {
+                    span.finish(
+                        "iteration_finished",
+                        TraceStatus::Retrying,
+                        Some(exit.label().to_string()),
+                        serde_json::json!({}),
+                    );
+                }
+                return Ok(None);
+            }
+            if let Some(span) = iteration_span.take() {
+                span.finish(
+                    "iteration_finished",
+                    TraceStatus::Error,
+                    Some(exit.label().to_string()),
+                    serde_json::json!({}),
+                );
+            }
+            return Ok(Some(exit));
+        }
+
+        if let Some(exit) = self
+            .record_model_turn_and_maybe_yield(&full_text, &tool_calls_accumulated)
+            .await
+        {
+            if let Some(span) = iteration_span.take() {
+                span.finish(
+                    "iteration_finished",
+                    TraceStatus::Yielded,
+                    Some(exit.label().to_string()),
+                    serde_json::json!({
+                        "tool_calls": tool_calls_accumulated.len(),
+                    }),
+                );
+            }
+            return Ok(Some(exit));
+        }
+
+        let state_before_tools = state.clone();
+        let (response_parts, should_yield_to_user) = self
+            .execute_tool_round(
+                tool_calls_accumulated,
+                &current_tools,
+                iteration_child_ctx.clone(),
+                state,
+                task_state.energy_points,
+            )
+            .await;
+        let response_parts_len = response_parts.len();
+
+        if !response_parts.is_empty() {
+            for part in &response_parts {
+                if let Some(res) = &part.function_response {
+                    if res.response.get("signal").and_then(|s| s.as_str())
+                        == Some("autopilot_meltdown")
+                    {
+                        return Ok(Some(RunExit::AutopilotStalled(
+                            "检测到深度死循环，反思无效，交还控制权".to_string(),
+                        )));
+                    }
+                }
+            }
+
+            self.context.add_message_to_current_turn(Message {
+                role: "function".to_string(),
+                parts: response_parts,
+            });
+        }
+
+        if state.status == "finished" {
+            // Extension hook: before_finish — let extensions validate completion
+            let mut allow_finish = true;
+            for ext in &self.extensions {
+                if let crate::core::extensions::FinishDecision::Deny { reason } =
+                    ext.before_finish().await
+                {
+                    tracing::warn!("Extension denied finish: {}", reason);
+                    self.output.on_text(&format!("[System] {}", reason)).await;
+                    allow_finish = false;
+                    state.status = "in_progress".to_string();
+                    let _ = self.task_state_store.save(state);
+                    break;
+                }
+            }
+            if allow_finish {
+                let summary = state.summary();
+                for ext in &self.extensions {
+                    ext.on_finish_committed(&summary).await;
+                }
+                if let Some(span) = iteration_span.take() {
+                    span.finish(
+                        "iteration_finished",
+                        TraceStatus::Ok,
+                        Some("finished".to_string()),
+                        serde_json::json!({}),
+                    );
+                }
+                return Ok(Some(self.finalize_finished_run(summary).await));
+            }
+        }
+
+        if should_yield_to_user {
+            self.record_trace_event(
+                TraceActor::System,
+                "yielded_to_user",
+                TraceStatus::Yielded,
+                Some("Tool requested user input".to_string()),
+                serde_json::json!({}),
+                self.turn_span_id(),
+                Some(iteration),
+            );
+            if let Some(span) = iteration_span.take() {
+                span.finish(
+                    "iteration_finished",
+                    TraceStatus::Yielded,
+                    Some("awaiting user input".to_string()),
+                    serde_json::json!({}),
+                );
+            }
+            self.output.flush().await;
+            self.context.end_turn();
+            self.telemetry.end_span("agent_step");
+            return Ok(Some(RunExit::YieldedToUser));
+        }
+
+        *state = self
+            .reconcile_after_tool_calls(&state_before_tools, iteration_child_ctx.clone())
+            .await;
+        if let Some(span) = iteration_span.take() {
+            span.finish(
+                "iteration_finished",
+                TraceStatus::Ok,
+                None,
+                serde_json::json!({
+                    "tool_responses": response_parts_len,
+                }),
+            );
+        }
+
+        Ok(None)
+    }
+
     pub(super) async fn reconcile_after_tool_calls(
         &mut self,
         state_before_tools: &crate::task_state::TaskStateSnapshot,
