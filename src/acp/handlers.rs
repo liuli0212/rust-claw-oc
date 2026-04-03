@@ -5,16 +5,42 @@ use super::{
 };
 #[cfg(feature = "acp")]
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
+    http::StatusCode,
     response::sse::{Event, Sse},
     Json,
 };
+#[cfg(feature = "acp")]
+use serde::Deserialize;
 #[cfg(feature = "acp")]
 use std::sync::Arc;
 #[cfg(feature = "acp")]
 use tokio::sync::mpsc;
 #[cfg(feature = "acp")]
-use tokio_stream::StreamExt;
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+
+#[cfg(feature = "acp")]
+#[derive(Debug, Deserialize)]
+pub(super) struct TraceRunsQuery {
+    session_id: Option<String>,
+    task_id: Option<String>,
+    status: Option<String>,
+    tool_name: Option<String>,
+    query: Option<String>,
+    from: Option<u64>,
+    to: Option<u64>,
+    min_duration_ms: Option<u64>,
+}
+
+#[cfg(feature = "acp")]
+#[derive(Debug, Deserialize)]
+pub(super) struct TraceRecordsQuery {
+    actor: Option<String>,
+    name: Option<String>,
+    status: Option<String>,
+    turn_id: Option<String>,
+    iteration: Option<u32>,
+}
 
 #[cfg(feature = "acp")]
 pub(super) async fn handle_capabilities(
@@ -107,6 +133,88 @@ pub(super) async fn handle_run(
             Event::default().data(serde_json::to_string(&event).unwrap()),
         )
     });
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+#[cfg(feature = "acp")]
+pub(super) async fn handle_trace_runs(
+    Query(query): Query<TraceRunsQuery>,
+) -> Json<Vec<crate::trace::RunSummary>> {
+    Json(crate::trace::list_runs(&crate::trace::RunQuery {
+        session_id: query.session_id,
+        task_id: query.task_id,
+        status: query.status,
+        tool_name: query.tool_name,
+        query: query.query,
+        from_unix_ms: query.from,
+        to_unix_ms: query.to,
+        min_duration_ms: query.min_duration_ms,
+    }))
+}
+
+#[cfg(feature = "acp")]
+pub(super) async fn handle_trace_run(
+    Path(run_id): Path<String>,
+) -> Result<Json<crate::trace::RunOverview>, StatusCode> {
+    crate::trace::get_run_overview(&run_id)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[cfg(feature = "acp")]
+pub(super) async fn handle_trace_records(
+    Path(run_id): Path<String>,
+    Query(query): Query<TraceRecordsQuery>,
+) -> Json<Vec<crate::trace::TraceRecord>> {
+    Json(crate::trace::get_records(
+        &run_id,
+        &crate::trace::RecordQuery {
+            actor: query.actor,
+            name: query.name,
+            status: query.status,
+            turn_id: query.turn_id,
+            iteration: query.iteration,
+        },
+    ))
+}
+
+#[cfg(feature = "acp")]
+pub(super) async fn handle_trace_tree(
+    Path(run_id): Path<String>,
+) -> Json<Vec<crate::trace::TraceTreeNode>> {
+    Json(crate::trace::get_tree(&run_id))
+}
+
+#[cfg(feature = "acp")]
+pub(super) async fn handle_trace_artifacts(
+    Path(run_id): Path<String>,
+) -> Json<crate::trace::TraceArtifacts> {
+    Json(crate::trace::get_artifacts(&run_id))
+}
+
+#[cfg(feature = "acp")]
+pub(super) async fn handle_live_trace(
+    Path(session_id): Path<String>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream =
+        BroadcastStream::new(crate::trace::shared_bus().subscribe()).filter_map(move |result| {
+            let Ok(record) = result else {
+                return None;
+            };
+            let matches_session = record.session_id == session_id
+                || record
+                    .attrs
+                    .get("root_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(session_id.as_str());
+            if !matches_session {
+                return None;
+            }
+            Some(Ok(
+                Event::default().data(serde_json::to_string(&record).unwrap())
+            ))
+        });
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }

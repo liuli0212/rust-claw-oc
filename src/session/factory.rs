@@ -404,6 +404,15 @@ pub fn build_subagent_session(
     agent_loop.set_initial_energy_budget(energy_budget.max(1));
     agent_loop.set_session_timeout(Duration::from_secs(timeout_sec.max(1)));
     agent_loop.is_subagent = true;
+    if let Some(trace) = &parent_ctx.trace {
+        agent_loop.set_trace_seed(crate::trace::TraceSeed {
+            trace_id: trace.trace_id.clone(),
+            run_id: trace.run_id.clone(),
+            root_session_id: trace.root_session_id.clone(),
+            task_id: trace.task_id.clone(),
+            parent_span_id: trace.parent_span_id.clone(),
+        });
+    }
     agent_loop.add_extension(Box::new(
         crate::skills::runtime::SkillRuntime::with_session_seed(
             sub_session_id.clone(),

@@ -10,6 +10,7 @@ use crate::session::factory::{build_subagent_session, BuiltSubagentSession, Suba
 use crate::tools::protocol::ToolError;
 use crate::tools::subagent::{DispatchSubagentArgs, SubagentResult};
 use crate::tools::{Tool, ToolContext};
+use crate::trace::{shared_bus, TraceActor, TraceContext, TraceSpanHandle, TraceStatus};
 use futures::FutureExt;
 
 const UNCONSUMED_TERMINAL_JOB_TTL: Duration = Duration::from_secs(30 * 60);
@@ -156,6 +157,8 @@ pub struct SubagentJobHandle {
     /// Separate from cancel_notify to avoid conflating cancellation and completion semantics.
     pub completion_notify: Arc<tokio::sync::Notify>,
     pub task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub trace_span: std::sync::Mutex<Option<TraceSpanHandle>>,
+    pub trace_context: std::sync::Mutex<Option<crate::tools::protocol::ToolTraceContext>>,
 }
 
 impl SubagentJobHandle {
@@ -169,6 +172,8 @@ impl SubagentJobHandle {
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
             completion_notify: Arc::new(tokio::sync::Notify::new()),
             task: tokio::sync::Mutex::new(None),
+            trace_span: std::sync::Mutex::new(None),
+            trace_context: std::sync::Mutex::new(None),
         }
     }
 }
@@ -313,6 +318,46 @@ impl SubagentRuntime {
             jobs.insert(unified_id.clone(), handle.clone());
         }
 
+        let mut child_parent_ctx = parent_ctx.clone();
+        if let Some(trace) = parent_ctx.trace.clone() {
+            *handle.trace_context.lock().unwrap() = Some(trace.clone());
+            let subagent_ctx = TraceContext {
+                trace_id: trace.trace_id.clone(),
+                run_id: trace.run_id.clone(),
+                session_id: unified_id.clone(),
+                root_session_id: trace.root_session_id.clone(),
+                task_id: trace.task_id.clone(),
+                turn_id: trace.turn_id.clone(),
+                iteration: trace.iteration,
+                parent_span_id: trace.parent_span_id.clone(),
+            };
+            let subagent_span = shared_bus().start_span(
+                &subagent_ctx,
+                TraceActor::Subagent,
+                "subagent_spawned",
+                serde_json::json!({
+                    "job_id": unified_id,
+                    "parent_session_id": parent_ctx.session_id,
+                    "parent_reply_to": parent_ctx.reply_to,
+                    "sub_session_id": handle.meta.sub_session_id,
+                    "goal": handle.meta.goal,
+                    "input_summary": handle.meta.input_summary,
+                    "allowed_tools": handle.meta.allowed_tools,
+                    "claimed_paths": handle.meta.claimed_paths,
+                    "allow_writes": handle.meta.allow_writes,
+                    "timeout_sec": handle.meta.timeout_sec,
+                    "max_steps": handle.meta.max_steps,
+                    "transcript_path": handle.meta.transcript_path,
+                    "event_log_path": handle.meta.event_log_path,
+                }),
+            );
+            let subagent_span_id = subagent_span.span_id().to_string();
+            *handle.trace_span.lock().unwrap() = Some(subagent_span);
+            if let Some(child_trace) = child_parent_ctx.trace.as_mut() {
+                child_trace.parent_span_id = Some(subagent_span_id);
+            }
+        }
+
         let runtime = self.clone();
         let counter = self.inner.running_jobs.clone();
         let running_guard = RunningJobGuard::new(counter);
@@ -329,7 +374,12 @@ impl SubagentRuntime {
                 let res = std::panic::AssertUnwindSafe(async {
                     let _guard = running_guard;
                     runtime
-                        .run_job(handle_for_task.clone(), parent_ctx, args, sub_session_id_for_task)
+                        .run_job(
+                            handle_for_task.clone(),
+                            child_parent_ctx,
+                            args,
+                            sub_session_id_for_task,
+                        )
                         .await;
                 })
                 .catch_unwind()
@@ -488,6 +538,15 @@ impl SubagentRuntime {
         jobs.get(job_id).cloned()
     }
 
+    async fn get_job_trace_context(
+        &self,
+        job_id: &str,
+    ) -> Option<crate::tools::protocol::ToolTraceContext> {
+        let handle = self.get_job_handle(job_id).await?;
+        let trace = handle.trace_context.lock().unwrap().clone();
+        trace
+    }
+
     async fn find_claimed_path_conflict(
         &self,
         claimed_paths: &[String],
@@ -534,6 +593,28 @@ impl SubagentRuntime {
             };
         }
         self.set_debug_state_label(&handle, "running").await;
+        if let Some(trace) = &parent_ctx.trace {
+            shared_bus().record_event(
+                &TraceContext {
+                    trace_id: trace.trace_id.clone(),
+                    run_id: trace.run_id.clone(),
+                    session_id: handle.meta.sub_session_id.clone(),
+                    root_session_id: trace.root_session_id.clone(),
+                    task_id: trace.task_id.clone(),
+                    turn_id: trace.turn_id.clone(),
+                    iteration: trace.iteration,
+                    parent_span_id: trace.parent_span_id.clone(),
+                },
+                TraceActor::Subagent,
+                "subagent_state_changed",
+                TraceStatus::Running,
+                Some("running".to_string()),
+                serde_json::json!({
+                    "job_id": handle.meta.job_id,
+                    "state": "running",
+                }),
+            );
+        }
 
         let executed_state = match build_subagent_session(
             &parent_ctx,
@@ -629,6 +710,37 @@ impl SubagentRuntime {
             "[Sub:{}] Background execution finished with state: {}",
             handle.meta.job_id, final_state.finish_reason()
         );
+        if let Some(span) = handle.trace_span.lock().unwrap().take() {
+            let (status, summary) = match &final_state {
+                SubagentJobState::Completed { result, .. } => {
+                    (TraceStatus::Ok, Some(result.summary.clone()))
+                }
+                SubagentJobState::Failed { error, .. } => (TraceStatus::Error, Some(error.clone())),
+                SubagentJobState::Cancelled { partial, .. } => (
+                    TraceStatus::Cancelled,
+                    partial.as_ref().map(|result| result.summary.clone()),
+                ),
+                SubagentJobState::TimedOut { partial, .. } => (
+                    TraceStatus::TimedOut,
+                    partial.as_ref().map(|result| result.summary.clone()),
+                ),
+                SubagentJobState::Pending | SubagentJobState::Running { .. } => {
+                    (TraceStatus::Running, None)
+                }
+            };
+            span.finish(
+                "subagent_finished",
+                status,
+                summary,
+                serde_json::json!({
+                    "job_id": handle.meta.job_id,
+                    "sub_session_id": handle.meta.sub_session_id,
+                    "status": final_state.finish_reason(),
+                    "transcript_path": handle.meta.transcript_path,
+                    "event_log_path": handle.meta.event_log_path,
+                }),
+            );
+        }
         self.enqueue_notification(&handle.meta, &final_state).await;
         // Only write state if cancel_job() hasn't already set a terminal state.
         let mut state = handle.state.write().await;
@@ -675,6 +787,31 @@ impl SubagentRuntime {
             .entry(meta.parent_session_id.clone())
             .or_default()
             .push(notification);
+        drop(notifications);
+        if let Some(trace) = self.get_job_trace_context(&meta.job_id).await {
+            shared_bus().record_event(
+                &TraceContext {
+                    trace_id: trace.trace_id.clone(),
+                    run_id: trace.run_id.clone(),
+                    session_id: meta.sub_session_id.clone(),
+                    root_session_id: trace.root_session_id.clone(),
+                    task_id: trace.task_id.clone(),
+                    turn_id: trace.turn_id.clone(),
+                    iteration: trace.iteration,
+                    parent_span_id: trace.parent_span_id.clone(),
+                },
+                TraceActor::Subagent,
+                "subagent_notification_enqueued",
+                TraceStatus::Ok,
+                Some(final_state.finish_reason().to_string()),
+                serde_json::json!({
+                    "job_id": meta.job_id,
+                    "parent_session_id": meta.parent_session_id,
+                    "sub_session_id": meta.sub_session_id,
+                    "status": final_state.finish_reason(),
+                }),
+            );
+        }
     }
 
     #[cfg(test)]

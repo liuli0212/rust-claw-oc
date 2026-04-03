@@ -25,5 +25,6 @@ pub mod task_state;
 pub mod telegram;
 pub mod telemetry;
 pub mod tools;
+pub mod trace;
 pub mod ui;
 pub mod utils;

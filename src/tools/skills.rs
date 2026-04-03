@@ -93,16 +93,50 @@ impl CallSkillTool {
         }
     }
 
-    async fn append_event(&self, session_id: &str, event_type: &str, payload: serde_json::Value) {
+    async fn append_event(
+        &self,
+        tool_ctx: Option<&ToolContext>,
+        session_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) {
         let _ = EventLog::new(session_id)
             .append(AgentEvent::new(
                 event_type,
                 session_id.to_string(),
                 None,
                 None,
-                payload,
+                payload.clone(),
             ))
             .await;
+        if let Some(tool_ctx) = tool_ctx {
+            if let Some(trace) = &tool_ctx.trace {
+                let status = if event_type.contains("denied") {
+                    crate::trace::TraceStatus::Skipped
+                } else if event_type.contains("finished") {
+                    crate::trace::TraceStatus::Ok
+                } else {
+                    crate::trace::TraceStatus::Running
+                };
+                crate::trace::shared_bus().record_event(
+                    &crate::trace::TraceContext {
+                        trace_id: trace.trace_id.clone(),
+                        run_id: trace.run_id.clone(),
+                        session_id: tool_ctx.session_id.clone(),
+                        root_session_id: trace.root_session_id.clone(),
+                        task_id: trace.task_id.clone(),
+                        turn_id: trace.turn_id.clone(),
+                        iteration: trace.iteration,
+                        parent_span_id: trace.parent_span_id.clone(),
+                    },
+                    crate::trace::TraceActor::Skill,
+                    event_type,
+                    status,
+                    Some(event_type.to_string()),
+                    payload,
+                );
+            }
+        }
     }
 
     fn runtime_allows_nested_tool(name: &str) -> bool {
@@ -166,8 +200,13 @@ impl CallSkillTool {
             "effective_max_steps": f_ctx.effective_max_steps,
             "effective_timeout_sec": f_ctx.effective_timeout_sec,
         });
-        self.append_event(&f_ctx.tool_ctx.session_id, f_ctx.event_type, payload)
-            .await;
+        self.append_event(
+            Some(f_ctx.tool_ctx),
+            &f_ctx.tool_ctx.session_id,
+            f_ctx.event_type,
+            payload,
+        )
+        .await;
 
         let summary = f_ctx.failure.message.clone();
         StructuredToolOutput::new(
@@ -511,6 +550,7 @@ impl Tool for CallSkillTool {
         let child_lineage = child_context_preview.lineage_names();
 
         self.append_event(
+            Some(ctx),
             &ctx.session_id,
             "skill_call_requested",
             json!({
@@ -810,6 +850,7 @@ impl Tool for CallSkillTool {
         } = built;
 
         self.append_event(
+            Some(ctx),
             &ctx.session_id,
             "skill_call_started",
             json!({
@@ -1010,6 +1051,7 @@ impl Tool for CallSkillTool {
         };
 
         self.append_event(
+            Some(ctx),
             &ctx.session_id,
             "skill_call_finished",
             json!({

@@ -1,336 +1,1185 @@
-
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>JaviRust ACP 控制面板</title>
+    <title>Rusty Claw Trace Center</title>
     <style>
         :root {
-            --primary: #00d2ff;
-            --bg: #0f172a;
-            --card: #1e293b;
-            --text: #f8fafc;
-            --accent: #38bdf8;
+            --bg: #09111f;
+            --panel: rgba(13, 24, 44, 0.82);
+            --panel-strong: rgba(9, 17, 31, 0.96);
+            --line: rgba(133, 186, 255, 0.18);
+            --text: #eff6ff;
+            --muted: #99abc7;
+            --accent: #4dd9b3;
+            --accent-2: #6ab7ff;
+            --danger: #ff7c7c;
+            --warn: #ffc76a;
+            --ok: #7bf0a8;
+            --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
         }
+
+        * { box-sizing: border-box; }
+
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: var(--bg);
-            color: var(--text);
             margin: 0;
-            padding: 20px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
+            min-height: 100vh;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(77, 217, 179, 0.16), transparent 30%),
+                radial-gradient(circle at top right, rgba(106, 183, 255, 0.2), transparent 28%),
+                linear-gradient(180deg, #06101d 0%, #0b1425 45%, #0a1322 100%);
+            font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
         }
-        .container {
-            width: 100%;
-            max-width: 900px;
-        }
-        header {
-            text-align: center;
-            margin-bottom: 40px;
-        }
-        h1 {
-            color: var(--primary);
-            font-size: 2.5em;
-            margin-bottom: 10px;
-            text-shadow: 0 0 10px rgba(0, 210, 255, 0.3);
-        }
-        .status-badge {
-            background: rgba(56, 189, 248, 0.2);
-            color: var(--accent);
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 0.9em;
-            border: 1px solid var(--accent);
-        }
-        .card {
-            background: var(--card);
-            border-radius: 12px;
-            padding: 24px;
-            margin-bottom: 24px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.05);
-        }
-        .section-title {
-            font-size: 1.2em;
-            font-weight: bold;
-            margin-bottom: 16px;
-            display: flex;
-            align-items: center;
-            color: var(--accent);
-        }
-        .capability-list {
+
+        .shell {
+            width: min(1480px, calc(100vw - 32px));
+            margin: 20px auto 28px;
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-            gap: 16px;
+            grid-template-columns: 1.2fr 0.9fr;
+            gap: 18px;
         }
-        .capability-item {
-            background: rgba(15, 23, 42, 0.5);
-            padding: 12px;
-            border-radius: 8px;
-            border-left: 4px solid var(--primary);
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 22px;
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(18px);
         }
-        .capability-name {
-            font-weight: bold;
-            display: block;
-            margin-bottom: 4px;
+
+        .left-stack, .right-stack {
+            display: grid;
+            gap: 18px;
         }
-        .capability-desc {
-            font-size: 0.85em;
-            color: #94a3b8;
-            margin-bottom: 8px;
+
+        .hero {
+            padding: 26px 28px 20px;
+            position: relative;
+            overflow: hidden;
         }
-        .capability-schema {
-            font-size: 0.8em;
-            color: #64748b;
-            background: rgba(0, 0, 0, 0.3);
-            padding: 8px;
-            border-radius: 4px;
-            font-family: 'Courier New', Courier, monospace;
-            white-space: pre-wrap;
-            border: 1px solid rgba(56, 189, 248, 0.2);
-            margin-top: 4px;
+
+        .hero::after {
+            content: "";
+            position: absolute;
+            inset: auto -80px -100px auto;
+            width: 240px;
+            height: 240px;
+            background: radial-gradient(circle, rgba(77, 217, 179, 0.3), transparent 70%);
         }
-        textarea {
-            width: 100%;
-            height: 120px;
-            background: #0f172a;
-            border: 1px solid #334155;
-            border-radius: 8px;
-            color: white;
-            padding: 12px;
-            font-size: 1em;
-            resize: vertical;
-            box-sizing: border-box;
+
+        h1, h2, h3, p {
+            margin: 0;
+        }
+
+        .eyebrow {
+            color: var(--accent);
+            letter-spacing: 0.22em;
+            text-transform: uppercase;
+            font-size: 12px;
+            margin-bottom: 12px;
+        }
+
+        .hero-grid {
+            display: grid;
+            grid-template-columns: 1.4fr 0.8fr;
+            gap: 20px;
+            align-items: end;
+        }
+
+        .hero h1 {
+            font-size: clamp(34px, 5vw, 56px);
+            line-height: 0.96;
+            font-weight: 700;
+            letter-spacing: -0.04em;
+            margin-bottom: 14px;
+        }
+
+        .hero p {
+            color: var(--muted);
+            max-width: 740px;
+            line-height: 1.55;
+        }
+
+        .stat-strip {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-top: 18px;
+        }
+
+        .stat {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            padding: 14px 16px;
+        }
+
+        .stat .label {
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .stat .value {
+            margin-top: 8px;
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        .section {
+            padding: 22px 24px;
+        }
+
+        .section-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
             margin-bottom: 16px;
         }
+
+        .section-head h2 {
+            font-size: 18px;
+            letter-spacing: -0.02em;
+        }
+
+        .section-tools {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .muted {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        textarea, input, select {
+            width: 100%;
+            color: var(--text);
+            background: rgba(3, 10, 20, 0.72);
+            border: 1px solid rgba(130, 170, 230, 0.2);
+            border-radius: 16px;
+            padding: 14px 16px;
+            font: inherit;
+        }
+
+        textarea {
+            min-height: 132px;
+            resize: vertical;
+        }
+
+        .row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
         button {
-            background: var(--primary);
-            color: #0f172a;
             border: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            font-weight: bold;
+            border-radius: 999px;
+            padding: 12px 18px;
             cursor: pointer;
-            transition: all 0.2s;
-            font-size: 1em;
+            font: inherit;
+            font-weight: 700;
+            transition: transform 0.18s ease, opacity 0.18s ease, box-shadow 0.18s ease;
         }
+
         button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0, 210, 255, 0.4);
+            transform: translateY(-1px);
         }
+
         button:disabled {
-            background: #475569;
+            opacity: 0.65;
             cursor: not-allowed;
             transform: none;
         }
-        #output {
-            background: #000;
-            color: #10b981;
-            padding: 16px;
-            border-radius: 8px;
-            font-family: 'Courier New', Courier, monospace;
-            white-space: pre-wrap;
-            min-height: 200px;
-            max-height: 600px;
-            overflow-y: auto;
-            border: 1px solid #064e3b;
-            position: relative;
+
+        .primary {
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
+            color: #07121f;
+            box-shadow: 0 12px 30px rgba(77, 217, 179, 0.24);
         }
-        .output-controls {
+
+        .ghost {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .toolbar {
             display: flex;
-            justify-content: flex-end;
-            margin-bottom: 8px;
+            gap: 10px;
+            align-items: center;
+            margin-top: 14px;
         }
-        .btn-small {
+
+        .filters {
+            display: grid;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .scroll {
+            max-height: 420px;
+            overflow: auto;
+            padding-right: 4px;
+        }
+
+        .run-list {
+            display: grid;
+            gap: 10px;
+        }
+
+        .run-item {
+            background: rgba(255, 255, 255, 0.025);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 18px;
+            padding: 16px;
+            cursor: pointer;
+            transition: border-color 0.18s ease, transform 0.18s ease, background 0.18s ease;
+        }
+
+        .run-item:hover, .run-item.active {
+            border-color: rgba(106, 183, 255, 0.36);
+            background: rgba(106, 183, 255, 0.08);
+            transform: translateY(-1px);
+        }
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border-radius: 999px;
             padding: 4px 10px;
-            font-size: 0.8em;
-            background: #334155;
-            color: #f8fafc;
-            border: 1px solid #475569;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
         }
-        .btn-small:hover {
-            background: #475569;
+
+        .pill.running { background: rgba(106, 183, 255, 0.12); color: var(--accent-2); }
+        .pill.finished { background: rgba(123, 240, 168, 0.12); color: var(--ok); }
+        .pill.failed, .pill.cancelled { background: rgba(255, 124, 124, 0.12); color: var(--danger); }
+
+        .run-title {
+            margin: 10px 0 8px;
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.35;
         }
+
+        .meta-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            margin-top: 10px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        #output, #timeline, #artifacts {
+            background: var(--panel-strong);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 18px;
+            padding: 16px;
+        }
+
+        #output {
+            min-height: 220px;
+            max-height: 340px;
+            overflow: auto;
+            white-space: pre-wrap;
+            line-height: 1.55;
+        }
+
+        .event-list {
+            display: grid;
+            gap: 10px;
+        }
+
+        .event-card {
+            border-left: 3px solid rgba(106, 183, 255, 0.4);
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .event-card.tool { border-left-color: var(--accent); }
+        .event-card.error { border-left-color: var(--danger); }
+        .event-card.context { border-left-color: var(--warn); }
+
+        .event-head {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: baseline;
+        }
+
+        .event-name {
+            font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+            font-size: 13px;
+        }
+
+        .event-meta {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .event-summary {
+            margin-top: 8px;
+            color: #d9e7ff;
+            white-space: pre-wrap;
+        }
+
+        .event-attrs {
+            margin-top: 8px;
+            color: var(--muted);
+            font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+
         .loader {
-            display: none;
-            margin-left: 15px;
-            vertical-align: middle;
             color: var(--accent);
-            font-size: 0.9em;
-            animation: pulse 1.5s infinite;
+            font-size: 13px;
         }
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
+
+        .segmented {
+            display: inline-flex;
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 999px;
+            padding: 4px;
         }
-        .thinking { color: #94a3b8; font-style: italic; border-left: 2px solid #334155; padding-left: 10px; margin: 5px 0; }
-        .tool { color: #38bdf8; font-weight: bold; }
-        .error { color: #ef4444; background: rgba(239, 68, 68, 0.1); padding: 8px; border-radius: 4px; margin: 10px 0; }
-        .finish { color: #00d2ff; background: rgba(0, 210, 255, 0.1); border: 1px solid rgba(0, 210, 255, 0.2); margin-top: 15px; padding: 12px; border-radius: 8px; }
+
+        .segmented button {
+            padding: 8px 12px;
+            font-size: 12px;
+            border-radius: 999px;
+        }
+
+        .segmented button.active {
+            background: linear-gradient(135deg, rgba(77, 217, 179, 0.18), rgba(106, 183, 255, 0.2));
+            color: var(--text);
+            border: 1px solid rgba(106, 183, 255, 0.16);
+        }
+
+        .tree-node {
+            padding-left: 12px;
+            border-left: 1px dashed rgba(255, 255, 255, 0.1);
+            margin: 10px 0;
+        }
+
+        .tree-card {
+            padding: 10px 12px;
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        #run-overview {
+            display: grid;
+            gap: 12px;
+        }
+
+        .overview-card {
+            background: var(--panel-strong);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 18px;
+            padding: 16px;
+        }
+
+        .overview-grid {
+            display: grid;
+            gap: 12px;
+        }
+
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .metric {
+            padding: 12px;
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .metric .label {
+            color: var(--muted);
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        .metric .value {
+            margin-top: 8px;
+            font-size: 17px;
+            font-weight: 700;
+            line-height: 1.25;
+        }
+
+        .list-block {
+            display: grid;
+            gap: 10px;
+            margin-top: 14px;
+        }
+
+        .list-item {
+            padding: 12px 14px;
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .mono {
+            font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+        }
+
+        @media (max-width: 1100px) {
+            .shell {
+                grid-template-columns: 1fr;
+            }
+            .hero-grid, .row, .stat-strip, .metric-grid {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <header {
-            text-align: center;
-            margin-bottom: 40px;
-        }>
-            <h1>JaviRust <span style="font-weight: 300">ACP Console</span></h1>
-            <span class="status-badge">● Agent Communication Protocol Enabled</span>
-        </header>
+    <div class="shell">
+        <div class="left-stack">
+            <section class="panel hero">
+                <div class="hero-grid">
+                    <div>
+                        <div class="eyebrow">Trace Center</div>
+                        <h1>把主代理、子代理、工具和上下文变化放到一张时间线上。</h1>
+                        <p>这个面板同时看实时执行和历史回放。左侧负责发起任务和阅读运行输出，右侧负责筛选 run、展开时间线、检查 artifacts。</p>
+                    </div>
+                    <div class="stat-strip">
+                        <div class="stat">
+                            <div class="label">当前 Session</div>
+                            <div class="value" id="current-session">ACP</div>
+                        </div>
+                        <div class="stat">
+                            <div class="label">活跃 Run</div>
+                            <div class="value" id="active-run-count">0</div>
+                        </div>
+                        <div class="stat">
+                            <div class="label">最近状态</div>
+                            <div class="value" id="latest-status">idle</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
 
-        <div class="card">
-            <div class="section-title">🛠️ 代理能力 (Capabilities)</div>
-            <div id="capability-list" class="capability-list">
-                正在获取能力列表...
-            </div>
+            <section class="panel section">
+                <div class="section-head">
+                    <h2>执行任务</h2>
+                    <div class="muted">提交后会自动订阅 live trace</div>
+                </div>
+                <textarea id="task-input" placeholder="例如：阅读当前 Rust tracing 改造并解释为什么会重试、哪个工具最慢、context 在哪里被压缩。"></textarea>
+                <div class="row" style="margin-top: 12px;">
+                    <input id="session-input" placeholder="session_id，留空则自动生成">
+                    <div class="muted" style="display:flex; align-items:center; padding: 0 6px;">
+                        Run Explorer 的过滤器已移动到右侧，可按 session、task、tool 和慢 run 检索。
+                    </div>
+                </div>
+                <div class="toolbar">
+                    <button class="primary" id="run-btn">运行任务</button>
+                    <button class="ghost" id="refresh-btn">刷新 Run 列表</button>
+                    <button class="ghost" id="clear-output-btn">清空输出</button>
+                    <div class="loader" id="loader" style="display:none;">正在执行并订阅 live trace...</div>
+                </div>
+            </section>
+
+            <section class="panel section">
+                <div class="section-head">
+                    <h2>任务输出</h2>
+                    <div class="muted" id="output-hint">等待任务开始</div>
+                </div>
+                <div id="output">等待指令...</div>
+            </section>
         </div>
 
-        <div class="card">
-            <div class="section-title">🚀 执行任务 (Execute Task)</div>
-            <textarea id="task-input" placeholder="输入您想让 JaviRust 执行的任务，例如：'帮我写一个 Rust 的 Hello World'"></textarea>
-            <div style="display: flex; align-items: center;">
-                <button id="run-btn">运行任务 (Run)</button>
-                <div id="loader" class="loader">⚙️ 处理中...</div>
-            </div>
-        </div>
+        <div class="right-stack">
+            <section class="panel section">
+                <div class="section-head">
+                    <h2>Run Explorer</h2>
+                    <div class="section-tools">
+                        <div class="muted" id="run-count">0 runs</div>
+                        <button class="ghost" id="clear-filters-btn" style="padding: 8px 12px;">清空过滤</button>
+                    </div>
+                </div>
+                <div class="filters">
+                    <div class="row">
+                        <input id="run-query" placeholder="搜索 goal / error / provider / run_id">
+                        <select id="status-filter">
+                            <option value="">全部状态</option>
+                            <option value="running">running</option>
+                            <option value="finished">finished</option>
+                            <option value="failed">failed</option>
+                            <option value="cancelled">cancelled</option>
+                        </select>
+                    </div>
+                    <div class="row">
+                        <input id="task-filter" placeholder="task_id">
+                        <input id="tool-filter" placeholder="tool_name">
+                    </div>
+                    <div class="row">
+                        <input id="session-filter" placeholder="session_id">
+                        <input id="duration-filter" type="number" min="0" placeholder="最小耗时 ms">
+                    </div>
+                </div>
+                <div class="scroll">
+                    <div id="run-list" class="run-list"></div>
+                </div>
+            </section>
 
-        <div class="card">
-            <div class="output-controls">
-                <button id="clear-btn" class="btn-small">清空输出 (Clear)</button>
-            </div>
-            <div class="section-title">📄 执行结果 (Output)</div>
-            <div id="output">等待指令...</div>
+            <section class="panel section">
+                <div class="section-head">
+                    <h2>Run Overview</h2>
+                    <div class="muted" id="overview-hint">选择一个 run 查看概览</div>
+                </div>
+                <div id="run-overview"></div>
+            </section>
+
+            <section class="panel section">
+                <div class="section-head">
+                    <h2>Run Detail</h2>
+                    <div style="display:flex; gap: 12px; align-items: center;">
+                        <div class="segmented" id="detail-modes">
+                            <button class="ghost active" data-mode="timeline">Timeline</button>
+                            <button class="ghost" data-mode="tree">Call Tree</button>
+                            <button class="ghost" data-mode="context">Context</button>
+                        </div>
+                        <div class="muted" id="timeline-hint">选择一个 run 查看详情</div>
+                    </div>
+                </div>
+                <div id="timeline" class="scroll">
+                    <div class="event-list" id="timeline-list"></div>
+                </div>
+            </section>
+
+            <section class="panel section">
+                <div class="section-head">
+                    <h2>Artifacts</h2>
+                    <div class="muted" id="artifacts-hint">文件、evidence、subagent 链路</div>
+                </div>
+                <div id="artifacts" class="scroll"></div>
+            </section>
         </div>
     </div>
 
     <script>
-        async function fetchCapabilities() {
-            try {
-                const res = await fetch('/capabilities');
-                const data = await res.json();
-                const list = document.getElementById('capability-list');
-                list.innerHTML = data.capabilities.map(cap => `
-                    <div class="capability-item">
-                        <span class="capability-name">${cap.name}</span>
-                        <span class="capability-desc">${cap.description}</span>
-                        <div class="capability-schema"><strong>Request Schema:</strong><br>${JSON.stringify(cap.parameters_schema, null, 2)}</div>
-                    </div>
-                `).join('');
-            } catch (err) {
-                document.getElementById('capability-list').innerText = '获取能力失败: ' + err;
-            }
+        const state = {
+            currentSessionId: null,
+            selectedRunId: null,
+            liveSource: null,
+            runs: [],
+            selectedOverview: null,
+            detailMode: 'timeline',
+            selectedRecords: [],
+            selectedTree: [],
+            selectedArtifacts: null,
+            runLoadTimer: null,
+            runRequestSeq: 0,
+            selectedRunRefreshTimer: null,
+            selectedRunRequestSeq: 0,
+        };
+
+        const runBtn = document.getElementById('run-btn');
+        const loader = document.getElementById('loader');
+        const output = document.getElementById('output');
+        const outputHint = document.getElementById('output-hint');
+
+        function formatTs(unixMs) {
+            if (!unixMs) return '-';
+            return new Date(unixMs).toLocaleString();
         }
 
-        document.getElementById('clear-btn').addEventListener('click', () => {
-            document.getElementById('output').innerHTML = '输出已清空。<br>';
-        });
+        function formatDuration(durationMs, startedAtUnixMs) {
+            if (durationMs !== null && durationMs !== undefined) {
+                return `${durationMs} ms`;
+            }
+            if (startedAtUnixMs) {
+                return `${Math.max(Date.now() - startedAtUnixMs, 0)} ms`;
+            }
+            return '-';
+        }
 
-        document.getElementById('run-btn').addEventListener('click', async () => {
-            const task = document.getElementById('task-input').value.trim();
-            if (!task) return;
+        function truncate(text, max = 180) {
+            if (!text) return '';
+            return text.length > max ? text.slice(0, max) + '…' : text;
+        }
 
-            const btn = document.getElementById('run-btn');
-            const loader = document.getElementById('loader');
-            const output = document.getElementById('output');
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;',
+            })[char]);
+        }
 
-            btn.disabled = true;
-            loader.style.display = 'inline-block';
-            if (output.innerText === '等待指令...' || output.innerText === '输出已清空。') {
-                output.innerHTML = '正在启动 Agent...<br>';
-            } else {
-                output.innerHTML += '<hr style="border:0;border-top:1px solid #334155;margin:20px 0">';
+        function statusClass(status) {
+            if (!status) return 'running';
+            if (status.includes('fail')) return 'failed';
+            if (status.includes('cancel')) return 'cancelled';
+            if (status.includes('finish')) return 'finished';
+            return status;
+        }
+
+        function appendOutput(text) {
+            if (output.innerText === '等待指令...') {
+                output.innerText = '';
+            }
+            output.append(text);
+            output.scrollTop = output.scrollHeight;
+        }
+
+        function renderRuns() {
+            const list = document.getElementById('run-list');
+            const runs = [...state.runs];
+            document.getElementById('run-count').innerText = `${runs.length} runs`;
+            document.getElementById('active-run-count').innerText = String(
+                state.runs.filter(run => run.status === 'running').length
+            );
+
+            if (!runs.length) {
+                list.innerHTML = '<div class="muted">还没有 trace run。</div>';
+                return;
             }
 
-            try {
-                const response = await fetch('/run', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ task: task })
-                });
+            list.innerHTML = runs.map(run => `
+                <div class="run-item ${run.run_id === state.selectedRunId ? 'active' : ''}" data-run-id="${run.run_id}">
+                    <span class="pill ${statusClass(run.status)}">${escapeHtml(run.status)}</span>
+                    <div class="run-title">${escapeHtml(truncate(run.root_goal || run.run_id, 120))}</div>
+                    <div class="muted">${escapeHtml(truncate(run.last_error_summary || `${run.provider || '-'} / ${run.model || '-'}`, 120))}</div>
+                    <div class="meta-grid">
+                        <div>工具 ${run.total_tool_calls || 0}</div>
+                        <div>LLM ${run.total_llm_calls || 0}</div>
+                        <div>子代理 ${run.total_subagents || 0}</div>
+                    </div>
+                    <div class="meta-grid">
+                        <div>${escapeHtml(formatTs(run.started_at_unix_ms))}</div>
+                        <div>${escapeHtml(formatDuration(run.duration_ms, run.started_at_unix_ms))}</div>
+                        <div>${escapeHtml(run.session_id)}</div>
+                    </div>
+                </div>
+            `).join('');
 
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-
-                let buffer = '';
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    
-                    buffer += decoder.decode(value, { stream: true });
-                    const lines = buffer.split('\n');
-                    buffer = lines.pop();
-
-                    for (const line of lines) {
-                        if (line.startsWith('data: ')) {
-                            try {
-                                const event = JSON.parse(line.substring(6));
-                                // 收到 Finish 或 Error 立即停止转圈，不等待连接完全关闭
-                                if (event.type === 'Finish' || event.type === 'Error') {
-                                    btn.disabled = false;
-                                    loader.style.display = 'none';
-                                }
-                                handleEvent(event, output);
-                            } catch (e) {
-                                console.error("Error parsing event", e, line);
-                            }
-                        }
-                    }
-                }
-            } catch (err) {
-                output.innerHTML += `<div class="error">执行出错: ${err}</div>`;
-                btn.disabled = false;
-                loader.style.display = 'none';
-            }
-        });
-
-        const MAX_LOG_SIZE = 50000; // 50KB 缓冲区限制
-        function handleEvent(event, output) {
-            const div = document.createElement('div');
-            
-            // 鲁棒性：限制输出区域大小，防止内存溢出
-            if (output.innerHTML.length > MAX_LOG_SIZE) {
-                output.innerHTML = '... (由于内容过长，较旧的日志已自动清除) ...<br>' + 
-                                 output.innerHTML.substring(MAX_LOG_SIZE / 2);
-            }
-
-            switch (event.type) {
-                case 'Text':
-                    output.appendChild(document.createTextNode(event.data));
-                    break;
-                case 'Thinking':
-                    div.className = 'thinking';
-                    div.innerText = event.data;
-                    output.appendChild(div);
-                    break;
-                case 'Error':
-                    div.className = 'error';
-                    div.innerText = `❌ [Error] ${event.data}`;
-                    output.appendChild(div);
-                    break;
-                case 'Finish':
-                    div.className = 'finish';
-                    div.innerHTML = `<strong>[任务状态: ${event.data.status}]</strong><br>${event.data.summary}`;
-                    output.appendChild(div);
-                    break;
-            }
-            
-            // 平滑滚动
-            output.scrollTo({
-                top: output.scrollHeight,
-                behavior: 'smooth'
+            list.querySelectorAll('.run-item').forEach(item => {
+                item.addEventListener('click', () => selectRun(item.dataset.runId));
             });
         }
 
-        fetchCapabilities();
+        function eventCardClass(record) {
+            if (record.actor === 'tool') return 'event-card tool';
+            if (record.actor === 'context') return 'event-card context';
+            if (record.status === 'error' || record.status === 'timed_out' || record.status === 'cancelled') return 'event-card error';
+            return 'event-card';
+        }
+
+        function renderArtifacts() {
+            const root = document.getElementById('artifacts');
+            const artifacts = state.selectedArtifacts;
+            if (!artifacts) {
+                root.innerHTML = '<div class="muted">选择一个 run 查看 artifacts。</div>';
+                return;
+            }
+
+            const renderTextList = (values, emptyText = '无') => {
+                if (!values || !values.length) {
+                    return `<div class="muted">${emptyText}</div>`;
+                }
+                return values.map(value => `<div>${escapeHtml(value)}</div>`).join('');
+            };
+
+            const renderJsonList = (values, emptyText = '无') => {
+                if (!values || !values.length) {
+                    return `<div class="muted">${emptyText}</div>`;
+                }
+                return values.map(value => `
+                    <div class="list-item">
+                        <div class="event-attrs">${escapeHtml(JSON.stringify(value, null, 2))}</div>
+                    </div>
+                `).join('');
+            };
+
+            root.innerHTML = `
+                <div class="event-list">
+                    <div class="event-card context">
+                        <div class="event-name">files</div>
+                        <div class="event-summary">${renderTextList(artifacts.files)}</div>
+                    </div>
+                    <div class="event-card">
+                        <div class="event-name">evidence</div>
+                        <div class="list-block">${renderJsonList(artifacts.evidence)}</div>
+                    </div>
+                    <div class="event-card tool">
+                        <div class="event-name">subagent sessions</div>
+                        <div class="list-block">${renderJsonList(artifacts.subagent_sessions)}</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderOverview() {
+            const root = document.getElementById('run-overview');
+            const hint = document.getElementById('overview-hint');
+            const overview = state.selectedOverview;
+
+            if (!overview) {
+                hint.innerText = '选择一个 run 查看概览';
+                root.innerHTML = '<div class="muted">这里会展示运行摘要、context 信号和最慢链路。</div>';
+                return;
+            }
+
+            const summary = overview.summary;
+            hint.innerText = summary.run_id;
+
+            const renderMetric = (label, value) => `
+                <div class="metric">
+                    <div class="label">${escapeHtml(label)}</div>
+                    <div class="value">${escapeHtml(value)}</div>
+                </div>
+            `;
+
+            const renderSpanList = (spans, emptyText) => {
+                if (!spans.length) {
+                    return `<div class="muted">${emptyText}</div>`;
+                }
+                return `<div class="list-block">${spans.map(span => `
+                    <div class="list-item">
+                        <div class="event-head">
+                            <div class="event-name">${escapeHtml(span.name)}</div>
+                            <div class="event-meta">${escapeHtml(span.actor)} · ${escapeHtml(span.status)}</div>
+                        </div>
+                        <div class="event-meta">${escapeHtml(formatDuration(span.duration_ms, span.started_at_unix_ms))}${span.turn_id ? ` · ${escapeHtml(span.turn_id)}` : ''}${span.iteration !== null && span.iteration !== undefined ? ` · iter ${span.iteration}` : ''}</div>
+                        ${span.summary ? `<div class="event-summary">${escapeHtml(truncate(span.summary, 220))}</div>` : ''}
+                    </div>
+                `).join('')}</div>`;
+            };
+
+            const renderHotspots = (hotspots) => {
+                if (!hotspots.length) {
+                    return '<div class="muted">暂无热点聚合。</div>';
+                }
+                return `<div class="list-block">${hotspots.map(item => `
+                    <div class="list-item">
+                        <div class="event-head">
+                            <div class="event-name">${escapeHtml(item.name)}</div>
+                            <div class="event-meta">${escapeHtml(item.actor)} · ${item.count}x</div>
+                        </div>
+                        <div class="event-meta">累计 ${item.total_duration_ms} ms · 峰值 ${item.max_duration_ms} ms${item.error_count ? ` · error ${item.error_count}` : ''}</div>
+                    </div>
+                `).join('')}</div>`;
+            };
+
+            root.innerHTML = `
+                <div class="overview-grid">
+                    <div class="overview-card">
+                        <div class="event-head">
+                            <div>
+                                <div class="event-name">${escapeHtml(truncate(summary.root_goal || summary.run_id, 180))}</div>
+                                <div class="event-meta mono">${escapeHtml(summary.run_id)}</div>
+                            </div>
+                            <span class="pill ${statusClass(summary.status)}">${escapeHtml(summary.status)}</span>
+                        </div>
+                        <div class="event-summary">${escapeHtml(summary.last_error_summary || `${summary.provider || '-'} / ${summary.model || '-'}`)}</div>
+                        <div class="metric-grid">
+                            ${renderMetric('Session', summary.session_id || '-')}
+                            ${renderMetric('Task', summary.task_id || '-')}
+                            ${renderMetric('Started', formatTs(summary.started_at_unix_ms))}
+                            ${renderMetric('Duration', formatDuration(summary.duration_ms, summary.started_at_unix_ms))}
+                        </div>
+                    </div>
+                    <div class="overview-card">
+                        <div class="event-name">Key Metrics</div>
+                        <div class="metric-grid">
+                            ${renderMetric('Turns', String(overview.turn_count))}
+                            ${renderMetric('Iterations', String(overview.iteration_count))}
+                            ${renderMetric('Tools', String(summary.total_tool_calls || 0))}
+                            ${renderMetric('Subagents', String(summary.total_subagents || 0))}
+                            ${renderMetric('Prompt Peak', summary.peak_prompt_tokens !== null && summary.peak_prompt_tokens !== undefined ? String(summary.peak_prompt_tokens) : '-')}
+                            ${renderMetric('History Peak', summary.peak_history_tokens !== null && summary.peak_history_tokens !== undefined ? String(summary.peak_history_tokens) : '-')}
+                            ${renderMetric('Provider', summary.provider || '-')}
+                            ${renderMetric('Model', summary.model || '-')}
+                        </div>
+                    </div>
+                    <div class="overview-card">
+                        <div class="event-name">Context Signals</div>
+                        <div class="metric-grid">
+                            ${renderMetric('Context Events', String(overview.context.total_events))}
+                            ${renderMetric('Plan Updates', String(overview.context.plan_updates))}
+                            ${renderMetric('State Changes', String(overview.context.task_state_updates))}
+                            ${renderMetric('Compactions', String(overview.context.compactions))}
+                            ${renderMetric('Truncations', String(overview.context.truncations))}
+                            ${renderMetric('Yields', String(overview.context.yields))}
+                        </div>
+                    </div>
+                    <div class="overview-card">
+                        <div class="event-name">Slowest Spans</div>
+                        ${renderSpanList(overview.slowest_spans || [], '暂无 span 数据。')}
+                    </div>
+                    <div class="overview-card">
+                        <div class="event-name">Hotspots</div>
+                        ${renderHotspots(overview.hotspots || [])}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderTreeNode(node) {
+            return `
+                <div class="tree-node">
+                    <div class="tree-card">
+                        <div class="event-head">
+                            <div class="event-name">${escapeHtml(node.name)}</div>
+                            <div class="event-meta">${escapeHtml(node.actor)} · ${escapeHtml(node.status)}</div>
+                        </div>
+                        <div class="event-meta">${escapeHtml(formatTs(node.started_at_unix_ms))}${node.duration_ms ? ` · ${node.duration_ms} ms` : ''}</div>
+                        ${node.summary ? `<div class="event-summary">${escapeHtml(node.summary)}</div>` : ''}
+                    </div>
+                    ${(node.children || []).map(renderTreeNode).join('')}
+                </div>
+            `;
+        }
+
+        function renderDetail() {
+            const timeline = document.getElementById('timeline-list');
+
+            if (state.detailMode === 'tree') {
+                if (!state.selectedTree.length) {
+                    timeline.innerHTML = '<div class="muted">该 run 暂无 span tree。</div>';
+                    return;
+                }
+                timeline.innerHTML = state.selectedTree.map(renderTreeNode).join('');
+                return;
+            }
+
+            const records = state.detailMode === 'context'
+                ? state.selectedRecords.filter(record => record.actor === 'context' || record.name.includes('context') || record.name.includes('plan') || record.name.includes('truncate'))
+                : state.selectedRecords;
+
+            if (!records.length) {
+                timeline.innerHTML = state.detailMode === 'context'
+                    ? '<div class="muted">该 run 暂无 context 相关事件。</div>'
+                    : '<div class="muted">该 run 还没有 record。</div>';
+                return;
+            }
+
+            timeline.innerHTML = records.map(record => `
+                <div class="${eventCardClass(record)}">
+                    <div class="event-head">
+                        <div class="event-name">${escapeHtml(record.name)}</div>
+                        <div class="event-meta">${escapeHtml(record.actor)} · ${escapeHtml(record.kind)} · ${escapeHtml(record.status)}</div>
+                    </div>
+                    <div class="event-meta">${escapeHtml(formatTs(record.ts_unix_ms))}${record.duration_ms ? ` · ${record.duration_ms} ms` : ''}${record.turn_id ? ` · ${escapeHtml(record.turn_id)}` : ''}${record.iteration !== null && record.iteration !== undefined ? ` · iter ${record.iteration}` : ''}</div>
+                    ${record.summary ? `<div class="event-summary">${escapeHtml(record.summary)}</div>` : ''}
+                    <div class="event-attrs">${escapeHtml(truncate(JSON.stringify(record.attrs, null, 2), 700))}</div>
+                </div>
+            `).join('');
+        }
+
+        function mergeSelectedArtifactsFromRecord(record) {
+            if (state.selectedRunId !== record.run_id) {
+                return;
+            }
+            if (!state.selectedArtifacts) {
+                state.selectedArtifacts = { files: [], evidence: [], subagent_sessions: [] };
+            }
+
+            const artifacts = state.selectedArtifacts;
+            const filePath = record.attrs?.file_path;
+            if (filePath && !(artifacts.files || []).includes(filePath)) {
+                artifacts.files = [...(artifacts.files || []), filePath];
+            }
+
+            const evidenceKind = record.attrs?.evidence_kind;
+            if (evidenceKind) {
+                const payload = {
+                    kind: evidenceKind,
+                    source_path: record.attrs?.evidence_source_path,
+                    summary: record.attrs?.evidence_summary,
+                };
+                const encoded = JSON.stringify(payload);
+                const exists = (artifacts.evidence || []).some(item => JSON.stringify(item) === encoded);
+                if (!exists) {
+                    artifacts.evidence = [...(artifacts.evidence || []), payload];
+                }
+            }
+
+            if (record.attrs?.sub_session_id) {
+                const payload = {
+                    sub_session_id: record.attrs.sub_session_id,
+                    job_id: record.attrs.job_id,
+                    transcript_path: record.attrs.transcript_path,
+                    event_log_path: record.attrs.event_log_path,
+                };
+                const encoded = JSON.stringify(payload);
+                const exists = (artifacts.subagent_sessions || []).some(item => JSON.stringify(item) === encoded);
+                if (!exists) {
+                    artifacts.subagent_sessions = [...(artifacts.subagent_sessions || []), payload];
+                }
+            }
+        }
+
+        async function refreshSelectedRun(runId) {
+            const requestSeq = ++state.selectedRunRequestSeq;
+            document.getElementById('timeline-hint').innerText = runId;
+
+            const [overviewRes, recordsRes, artifactsRes, treeRes] = await Promise.all([
+                fetch(`/trace/run/${runId}`),
+                fetch(`/trace/run/${runId}/records`),
+                fetch(`/trace/run/${runId}/artifacts`),
+                fetch(`/trace/run/${runId}/tree`),
+            ]);
+
+            if (requestSeq !== state.selectedRunRequestSeq || state.selectedRunId !== runId) {
+                return;
+            }
+
+            state.selectedOverview = overviewRes.ok ? await overviewRes.json() : null;
+            state.selectedRecords = await recordsRes.json();
+            state.selectedArtifacts = await artifactsRes.json();
+            state.selectedTree = await treeRes.json();
+            renderOverview();
+            renderDetail();
+            renderArtifacts();
+        }
+
+        function scheduleSelectedRunRefresh(runId) {
+            if (!runId) return;
+            if (state.selectedRunRefreshTimer) {
+                clearTimeout(state.selectedRunRefreshTimer);
+            }
+            state.selectedRunRefreshTimer = setTimeout(() => {
+                state.selectedRunRefreshTimer = null;
+                refreshSelectedRun(runId);
+            }, 350);
+        }
+
+        async function selectRun(runId) {
+            state.selectedRunId = runId;
+            renderRuns();
+            await refreshSelectedRun(runId);
+        }
+
+        async function loadRuns() {
+            const requestSeq = ++state.runRequestSeq;
+            const query = new URLSearchParams();
+            const sessionId = document.getElementById('session-filter').value.trim();
+            const taskId = document.getElementById('task-filter').value.trim();
+            const toolName = document.getElementById('tool-filter').value.trim();
+            const status = document.getElementById('status-filter').value.trim();
+            const search = document.getElementById('run-query').value.trim();
+            const minDurationMs = document.getElementById('duration-filter').value.trim();
+
+            if (sessionId) query.set('session_id', sessionId);
+            if (taskId) query.set('task_id', taskId);
+            if (toolName) query.set('tool_name', toolName);
+            if (status) query.set('status', status);
+            if (search) query.set('query', search);
+            if (minDurationMs) query.set('min_duration_ms', minDurationMs);
+            const res = await fetch(`/trace/runs?${query.toString()}`);
+            const runs = await res.json();
+            if (requestSeq !== state.runRequestSeq) {
+                return;
+            }
+            state.runs = runs;
+            renderRuns();
+            const selectedStillVisible = state.selectedRunId
+                && state.runs.some(run => run.run_id === state.selectedRunId);
+
+            if (!selectedStillVisible) {
+                state.selectedRunId = null;
+                state.selectedOverview = null;
+                state.selectedRecords = [];
+                state.selectedTree = [];
+                state.selectedArtifacts = null;
+                renderOverview();
+                renderDetail();
+                renderArtifacts();
+            }
+
+            if (!state.selectedRunId && state.runs.length) {
+                await selectRun(state.runs[0].run_id);
+            }
+        }
+
+        function scheduleLoadRuns() {
+            if (state.runLoadTimer) {
+                clearTimeout(state.runLoadTimer);
+            }
+            state.runLoadTimer = setTimeout(() => {
+                state.runLoadTimer = null;
+                loadRuns();
+            }, 220);
+        }
+
+        function closeLiveTrace() {
+            if (state.liveSource) {
+                state.liveSource.close();
+                state.liveSource = null;
+            }
+        }
+
+        function startLiveTrace(sessionId) {
+            closeLiveTrace();
+            state.currentSessionId = sessionId;
+            document.getElementById('current-session').innerText = sessionId;
+            const source = new EventSource(`/trace/live/${encodeURIComponent(sessionId)}`);
+            source.onmessage = async (message) => {
+                const record = JSON.parse(message.data);
+                document.getElementById('latest-status').innerText = record.status;
+
+                if (
+                    record.name === 'run_started' ||
+                    record.name === 'run_finished' ||
+                    record.name === 'run_failed' ||
+                    record.name === 'run_cancelled'
+                ) {
+                    scheduleLoadRuns();
+                }
+
+                if (state.selectedRunId && record.run_id === state.selectedRunId) {
+                    if (!state.selectedRecords.some(item => item.record_id === record.record_id)) {
+                        state.selectedRecords = [...state.selectedRecords, record].sort((left, right) => left.ts_unix_ms - right.ts_unix_ms);
+                        renderDetail();
+                    }
+                    mergeSelectedArtifactsFromRecord(record);
+                    renderArtifacts();
+                    scheduleSelectedRunRefresh(state.selectedRunId);
+                }
+            };
+            source.onerror = () => {
+                document.getElementById('timeline-hint').innerText = 'live trace 已断开，保留历史回放';
+            };
+            state.liveSource = source;
+        }
+
+        function handleRunEvent(event) {
+            switch (event.type) {
+                case 'Text':
+                    appendOutput(event.data);
+                    break;
+                case 'Thinking':
+                    appendOutput(`\n[thinking] ${event.data}\n`);
+                    break;
+                case 'ToolStart':
+                    appendOutput(`\n[tool:start] ${event.data.name}\n${truncate(event.data.args, 500)}\n`);
+                    break;
+                case 'ToolEnd':
+                    appendOutput(`\n[tool:end]\n${truncate(event.data.result, 500)}\n`);
+                    break;
+                case 'PlanUpdate':
+                    appendOutput(`\n[plan:${event.data.status}]\n${event.data.summary}\n`);
+                    break;
+                case 'Error':
+                    appendOutput(`\n[error] ${event.data}\n`);
+                    break;
+                case 'Finish':
+                    appendOutput(`\n[finish:${event.data.status}] ${event.data.summary}\n`);
+                    loader.style.display = 'none';
+                    runBtn.disabled = false;
+                    outputHint.innerText = '任务已结束';
+                    break;
+            }
+        }
+
+        async function runTask() {
+            const task = document.getElementById('task-input').value.trim();
+            if (!task) return;
+
+            const sessionId = document.getElementById('session-input').value.trim() || `acp_${Date.now()}`;
+            state.currentSessionId = sessionId;
+            document.getElementById('session-input').value = sessionId;
+            output.innerText = '';
+            outputHint.innerText = `Session: ${sessionId}`;
+            loader.style.display = 'inline-block';
+            runBtn.disabled = true;
+            startLiveTrace(sessionId);
+
+            const response = await fetch('/run', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ task, session_id: sessionId }),
+            });
+
+            if (!response.ok) {
+                appendOutput(`[error] HTTP ${response.status}\n`);
+                loader.style.display = 'none';
+                runBtn.disabled = false;
+                return;
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+
+                for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    try {
+                        handleRunEvent(JSON.parse(line.slice(6)));
+                    } catch (error) {
+                        appendOutput(`[error] ${error}\n`);
+                    }
+                }
+            }
+
+            loader.style.display = 'none';
+            runBtn.disabled = false;
+            await loadRuns();
+        }
+
+        document.getElementById('run-btn').addEventListener('click', runTask);
+        document.getElementById('refresh-btn').addEventListener('click', loadRuns);
+        document.getElementById('clear-output-btn').addEventListener('click', () => {
+            output.innerText = '输出已清空。\n';
+        });
+        document.getElementById('clear-filters-btn').addEventListener('click', async () => {
+            ['run-query', 'status-filter', 'task-filter', 'tool-filter', 'session-filter', 'duration-filter']
+                .forEach(id => {
+                    document.getElementById(id).value = '';
+                });
+            await loadRuns();
+        });
+        ['run-query', 'task-filter', 'tool-filter', 'session-filter', 'duration-filter'].forEach(id => {
+            document.getElementById(id).addEventListener('input', scheduleLoadRuns);
+        });
+        document.getElementById('status-filter').addEventListener('change', scheduleLoadRuns);
+        document.querySelectorAll('#detail-modes button').forEach(button => {
+            button.addEventListener('click', () => {
+                state.detailMode = button.dataset.mode;
+                document.querySelectorAll('#detail-modes button').forEach(item => item.classList.remove('active'));
+                button.classList.add('active');
+                renderDetail();
+            });
+        });
+
+        renderOverview();
+        renderDetail();
+        renderArtifacts();
+        loadRuns();
     </script>
 </body>
 </html>

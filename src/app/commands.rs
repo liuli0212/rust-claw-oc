@@ -303,10 +303,22 @@ impl CommandExecutor {
                     .map_err(|e| e.to_string())?;
 
                 let sub_session_id = &snapshot.meta.sub_session_id;
+                let run = crate::trace::find_run_for_subsession(
+                    &snapshot.meta.parent_session_id,
+                    sub_session_id,
+                );
 
                 let mut timeline = String::new();
                 timeline.push_str("### 🔗 主子 Agent 交互 (Main-Sub Interaction)\n");
                 timeline.push_str(&format!("- **Job ID**: {}\n", snapshot.meta.job_id));
+                timeline.push_str(&format!(
+                    "- **Parent Session**: {}\n",
+                    snapshot.meta.parent_session_id
+                ));
+                if let Some(run) = &run {
+                    timeline.push_str(&format!("- **Run ID**: `{}`\n", run.run_id));
+                    timeline.push_str(&format!("- **Run Status**: {}\n", run.status));
+                }
                 timeline.push_str(&format!("- **目标 (Goal)**: {}\n", snapshot.meta.goal));
                 timeline.push_str(&format!(
                     "- **输入上下文 (Input Summary)**: {}\n",
@@ -319,64 +331,65 @@ impl CommandExecutor {
 
                 timeline.push_str("### 🕵️ 子 Agent 执行轨迹 (Execution Timeline)\n");
 
-                if let Ok(events) = crate::event_log::EventLog::new(sub_session_id)
-                    .read_all()
-                    .await
-                {
-                    for (i, event) in events.into_iter().enumerate() {
-                        match event.event_type.as_str() {
-                            "llm_request" => {
-                                timeline.push_str(&format!(
-                                    "{}. 🤖 **[LLM 请求]** {}\n",
-                                    i + 1,
-                                    event.payload["summary"].as_str().unwrap_or("")
-                                ));
-                            }
-                            "llm_response" => {
-                                let summary = event.payload["summary"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .replace("\n", " ");
-                                timeline.push_str(&format!(
-                                    "{}. 💡 **[LLM 响应]** {}\n",
-                                    i + 1,
-                                    summary
-                                ));
-                            }
-                            "subagent_tool_start" => {
-                                let tool_name =
-                                    event.payload["tool_name"].as_str().unwrap_or("unknown");
-                                let args = event.payload["args"].as_str().unwrap_or("");
-                                timeline.push_str(&format!(
-                                    "{}. 🛠️ **[工具调用]** `{}`\n   - 参数: {}\n",
-                                    i + 1,
-                                    tool_name,
-                                    args
-                                ));
-                            }
-                            "subagent_tool_end" => {
-                                let tool_name =
-                                    event.payload["tool_name"].as_str().unwrap_or("unknown");
-                                let result = event.payload["result"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .replace("\n", " ");
-                                timeline.push_str(&format!(
-                                    "{}. ✅ **[工具返回]** `{}`\n   - 结果: {}\n",
-                                    i + 1,
-                                    tool_name,
-                                    result
-                                ));
-                            }
-                            "subagent_error" => {
-                                let error = event.payload["error"].as_str().unwrap_or("");
-                                timeline.push_str(&format!("{}. ❌ **[错误]** {}\n", i + 1, error));
-                            }
-                            _ => {}
+                if let Some(run) = run {
+                    let records = crate::trace::get_records(
+                        &run.run_id,
+                        &crate::trace::RecordQuery::default(),
+                    );
+                    let filtered: Vec<_> = records
+                        .into_iter()
+                        .filter(|record| {
+                            record.session_id == *sub_session_id
+                                || record
+                                    .attrs
+                                    .get("sub_session_id")
+                                    .and_then(|value| value.as_str())
+                                    == Some(sub_session_id.as_str())
+                                || record.attrs.get("job_id").and_then(|value| value.as_str())
+                                    == Some(job_id)
+                        })
+                        .collect();
+
+                    for (i, record) in filtered.iter().enumerate() {
+                        timeline.push_str(&format!(
+                            "{}. **[{} / {}]** `{}`\n",
+                            i + 1,
+                            record.actor.as_str(),
+                            record.status.as_str(),
+                            record.name
+                        ));
+                        if let Some(summary) = &record.summary {
+                            timeline
+                                .push_str(&format!("   - 摘要: {}\n", summary.replace('\n', " ")));
+                        }
+                        if let Some(tool_name) = record
+                            .attrs
+                            .get("tool_name")
+                            .and_then(|value| value.as_str())
+                        {
+                            timeline.push_str(&format!("   - 工具: `{}`\n", tool_name));
+                        }
+                        if let Some(duration_ms) = record.duration_ms {
+                            timeline.push_str(&format!("   - 耗时: {} ms\n", duration_ms));
                         }
                     }
                 } else {
-                    timeline.push_str("*无法读取事件日志或日志为空*\n");
+                    timeline.push_str("*未找到关联 trace run，回退到旧 event log*\n");
+                    if let Ok(events) = crate::event_log::EventLog::new(sub_session_id)
+                        .read_all()
+                        .await
+                    {
+                        for (i, event) in events.into_iter().enumerate() {
+                            timeline.push_str(&format!(
+                                "{}. **[legacy]** `{}`\n   - {}\n",
+                                i + 1,
+                                event.event_type,
+                                event.payload
+                            ));
+                        }
+                    } else {
+                        timeline.push_str("*无法读取事件日志或日志为空*\n");
+                    }
                 }
 
                 cmd_output.send_trace(timeline);

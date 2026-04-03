@@ -34,6 +34,17 @@ pub enum ToolError {
 }
 
 #[derive(Debug, Clone)]
+pub struct ToolTraceContext {
+    pub trace_id: String,
+    pub run_id: String,
+    pub root_session_id: String,
+    pub task_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub iteration: Option<u32>,
+    pub parent_span_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ToolContext {
     pub session_id: String,
     pub reply_to: String,
@@ -41,6 +52,7 @@ pub struct ToolContext {
     pub active_skill_name: Option<String>,
     pub skill_call_context: Option<SkillCallContext>,
     pub skill_budget: SkillBudget,
+    pub trace: Option<ToolTraceContext>,
     /// Sandbox enforcer for OS-level and application-level isolation.
     /// `None` means sandbox is disabled (backward compatible).
     pub sandbox: Option<Arc<super::sandbox::SandboxEnforcer>>,
@@ -55,6 +67,7 @@ impl ToolContext {
             active_skill_name: None,
             skill_call_context: None,
             skill_budget: SkillBudget::default(),
+            trace: None,
             sandbox: None,
         }
     }

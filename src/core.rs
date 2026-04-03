@@ -1,6 +1,7 @@
 use crate::context::{AgentContext, ContextDiff, FunctionResponse, Message, Part};
 use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;
+use crate::trace::{shared_bus, TraceActor, TraceContext, TraceSeed, TraceSpanHandle, TraceStatus};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -172,6 +173,12 @@ struct ToolDispatchOutcome {
     stopped: bool,
 }
 
+struct ActiveTrace {
+    base_ctx: TraceContext,
+    run_span: Option<TraceSpanHandle>,
+    turn_span: Option<TraceSpanHandle>,
+}
+
 pub struct AgentLoop {
     session_id: String,
     pub reply_to: String,
@@ -192,6 +199,9 @@ pub struct AgentLoop {
     extensions: Vec<Box<dyn extensions::ExecutionExtension>>,
     initial_energy_budget: usize,
     session_deadline: Option<Instant>,
+    trace_bus: Arc<crate::trace::TraceBus>,
+    trace_seed: Option<TraceSeed>,
+    active_trace: Option<ActiveTrace>,
 }
 
 impl AgentLoop {
@@ -230,6 +240,9 @@ impl AgentLoop {
             extensions: Vec::new(),
             initial_energy_budget: Self::INITIAL_ENERGY,
             session_deadline: None,
+            trace_bus: shared_bus(),
+            trace_seed: None,
+            active_trace: None,
         }
     }
 
@@ -244,6 +257,10 @@ impl AgentLoop {
 
     pub fn set_session_timeout(&mut self, timeout: Duration) {
         self.session_deadline = Some(Instant::now() + timeout);
+    }
+
+    pub fn set_trace_seed(&mut self, trace_seed: TraceSeed) {
+        self.trace_seed = Some(trace_seed);
     }
 
     pub fn remaining_session_timeout_sec(&self) -> Option<u64> {
@@ -268,6 +285,154 @@ impl AgentLoop {
     }
     pub fn update_output(&mut self, output: Arc<dyn AgentOutput>) {
         self.output = output;
+    }
+
+    pub(crate) fn trace_actor(&self) -> TraceActor {
+        if self.is_subagent {
+            TraceActor::Subagent
+        } else {
+            TraceActor::MainAgent
+        }
+    }
+
+    pub(crate) fn trace_context_with_parent(
+        &self,
+        parent_span_id: Option<String>,
+        iteration: Option<u32>,
+    ) -> Option<TraceContext> {
+        self.active_trace.as_ref().map(|active| {
+            active
+                .base_ctx
+                .with_parent_span_id(parent_span_id)
+                .with_iteration(iteration)
+        })
+    }
+
+    pub(crate) fn turn_span_id(&self) -> Option<String> {
+        self.active_trace.as_ref().and_then(|active| {
+            active
+                .turn_span
+                .as_ref()
+                .map(|span| span.span_id().to_string())
+        })
+    }
+
+    fn begin_trace_run(&mut self, goal: &str, task_id: Option<String>) {
+        let turn_id = self
+            .context
+            .current_turn
+            .as_ref()
+            .map(|turn| turn.turn_id.clone());
+        let inherited_seed = if self.is_subagent {
+            self.trace_seed.clone()
+        } else {
+            None
+        };
+
+        let mut base_ctx = if let Some(seed) = inherited_seed.clone() {
+            crate::trace::trace_ctx_from_seed(&seed, &self.session_id)
+        } else {
+            let run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
+            TraceContext {
+                trace_id: run_id.clone(),
+                run_id,
+                session_id: self.session_id.clone(),
+                root_session_id: self.session_id.clone(),
+                task_id: task_id.clone(),
+                turn_id: None,
+                iteration: None,
+                parent_span_id: None,
+            }
+        };
+        base_ctx.task_id = task_id;
+        base_ctx.turn_id = turn_id.clone();
+
+        let run_span = if inherited_seed.is_none() {
+            let run_ctx = base_ctx.with_parent_span_id(None);
+            Some(self.trace_bus.start_span(
+                &run_ctx,
+                self.trace_actor(),
+                "run_started",
+                serde_json::json!({
+                    "goal": goal,
+                    "provider": self.llm.provider_name(),
+                    "model": self.llm.model_name(),
+                    "is_subagent": self.is_subagent,
+                }),
+            ))
+        } else {
+            None
+        };
+
+        let turn_parent_span_id = run_span
+            .as_ref()
+            .map(|span| span.span_id().to_string())
+            .or_else(|| base_ctx.parent_span_id.clone());
+        let turn_ctx = base_ctx.with_parent_span_id(turn_parent_span_id);
+        let turn_span = Some(self.trace_bus.start_span(
+            &turn_ctx,
+            self.trace_actor(),
+            "turn_started",
+            serde_json::json!({
+                "goal": goal,
+                "turn_id": turn_id,
+                "is_subagent": self.is_subagent,
+            }),
+        ));
+
+        self.active_trace = Some(ActiveTrace {
+            base_ctx,
+            run_span,
+            turn_span,
+        });
+    }
+
+    pub(crate) fn finish_active_trace(
+        &mut self,
+        end_name: &str,
+        status: TraceStatus,
+        summary: Option<String>,
+    ) {
+        let Some(active) = self.active_trace.take() else {
+            return;
+        };
+
+        if let Some(turn_span) = active.turn_span {
+            turn_span.finish(
+                "turn_finished",
+                status.clone(),
+                summary.clone(),
+                serde_json::json!({}),
+            );
+        }
+
+        if let Some(run_span) = active.run_span {
+            run_span.finish(
+                end_name,
+                status,
+                summary,
+                serde_json::json!({
+                    "provider": self.llm.provider_name(),
+                    "model": self.llm.model_name(),
+                }),
+            );
+        }
+    }
+
+    pub(crate) fn record_trace_event(
+        &self,
+        actor: TraceActor,
+        name: &str,
+        status: TraceStatus,
+        summary: Option<String>,
+        attrs: serde_json::Value,
+        parent_span_id: Option<String>,
+        iteration: Option<u32>,
+    ) {
+        if let Some(ctx) = self.trace_context_with_parent(parent_span_id, iteration) {
+            self.trace_bus
+                .record_event(&ctx, actor, name, status, summary, attrs);
+        }
     }
 
     /// Enable autopilot mode. MUST be called BEFORE the first `step()` call,
@@ -444,6 +609,20 @@ impl AgentLoop {
 
         if let Some(reason) = self.context.rule_based_compact(num_to_compact) {
             self.output.on_text(&format!("[System] {}\n", reason)).await;
+            self.record_trace_event(
+                TraceActor::Context,
+                "context_compacted",
+                TraceStatus::Ok,
+                Some(reason.clone()),
+                serde_json::json!({
+                    "compacted_turns": num_to_compact,
+                    "usage_tokens": current_usage as u64,
+                    "threshold_tokens": threshold as u64,
+                    "history_tokens": current_usage as u64,
+                }),
+                self.turn_span_id(),
+                None,
+            );
         }
 
         Ok(())
@@ -583,9 +762,21 @@ impl AgentLoop {
 
         self.context.start_turn(turn_goal.clone());
 
-        let (mut state, c_ids) = self.initialize_task_state(&turn_goal);
-
-        let _run_id = format!("run_{}", uuid::Uuid::new_v4().simple());
+        let (mut state, mut c_ids) = self.initialize_task_state(&turn_goal);
+        self.begin_trace_run(&turn_goal, state.task_id.clone());
+        c_ids.run_id = self
+            .active_trace
+            .as_ref()
+            .map(|active| active.base_ctx.run_id.clone());
+        self.record_trace_event(
+            TraceActor::Context,
+            "context_snapshot_taken",
+            TraceStatus::Ok,
+            None,
+            serde_json::json!({}),
+            self.turn_span_id(),
+            None,
+        );
         self.telemetry.start_span("agent_step", c_ids.clone());
 
         let output_clone = Arc::clone(&self.output);
@@ -616,16 +807,44 @@ impl AgentLoop {
                 .await;
 
             let current_tools = self.load_current_tools().await;
+            let iteration = task_state.iterations as u32;
+            let iteration_ctx =
+                self.trace_context_with_parent(self.turn_span_id(), Some(iteration));
+            let mut iteration_span = iteration_ctx.as_ref().map(|ctx| {
+                self.trace_bus.start_span(
+                    ctx,
+                    self.trace_actor(),
+                    "iteration_started",
+                    serde_json::json!({
+                        "energy_remaining": task_state.energy_points,
+                        "tool_count": current_tools.len(),
+                    }),
+                )
+            });
+            let iteration_child_ctx = iteration_span
+                .as_ref()
+                .map(TraceSpanHandle::child_context)
+                .or_else(|| iteration_ctx.clone());
 
             let (full_text, tool_calls_accumulated) = match self
-                .collect_iteration_response(&state, &current_tools)
+                .collect_iteration_response(&state, &current_tools, iteration_child_ctx.clone())
                 .await?
             {
                 StreamCollectionOutcome::Completed {
                     full_text,
                     tool_calls,
                 } => (full_text, tool_calls),
-                StreamCollectionOutcome::Exit(exit) => return Ok(exit),
+                StreamCollectionOutcome::Exit(exit) => {
+                    if let Some(span) = iteration_span.take() {
+                        span.finish(
+                            "iteration_finished",
+                            TraceStatus::Cancelled,
+                            Some(exit.label().to_string()),
+                            serde_json::json!({}),
+                        );
+                    }
+                    return Ok(exit);
+                }
             };
 
             if let Some(exit) = self
@@ -637,7 +856,23 @@ impl AgentLoop {
                 .await
             {
                 if matches!(exit, RunExit::RecoverableFailed(_)) {
+                    if let Some(span) = iteration_span.take() {
+                        span.finish(
+                            "iteration_finished",
+                            TraceStatus::Retrying,
+                            Some(exit.label().to_string()),
+                            serde_json::json!({}),
+                        );
+                    }
                     continue;
+                }
+                if let Some(span) = iteration_span.take() {
+                    span.finish(
+                        "iteration_finished",
+                        TraceStatus::Error,
+                        Some(exit.label().to_string()),
+                        serde_json::json!({}),
+                    );
                 }
                 return Ok(exit);
             }
@@ -646,6 +881,16 @@ impl AgentLoop {
                 .record_model_turn_and_maybe_yield(&full_text, &tool_calls_accumulated)
                 .await
             {
+                if let Some(span) = iteration_span.take() {
+                    span.finish(
+                        "iteration_finished",
+                        TraceStatus::Yielded,
+                        Some(exit.label().to_string()),
+                        serde_json::json!({
+                            "tool_calls": tool_calls_accumulated.len(),
+                        }),
+                    );
+                }
                 return Ok(exit);
             }
 
@@ -654,10 +899,12 @@ impl AgentLoop {
                 .execute_tool_round(
                     tool_calls_accumulated,
                     &current_tools,
+                    iteration_child_ctx.clone(),
                     &mut state,
                     task_state.energy_points,
                 )
                 .await;
+            let response_parts_len = response_parts.len();
 
             if !response_parts.is_empty() {
                 for part in &response_parts {
@@ -698,18 +945,55 @@ impl AgentLoop {
                     for ext in &self.extensions {
                         ext.on_finish_committed(&summary).await;
                     }
+                    if let Some(span) = iteration_span.take() {
+                        span.finish(
+                            "iteration_finished",
+                            TraceStatus::Ok,
+                            Some("finished".to_string()),
+                            serde_json::json!({}),
+                        );
+                    }
                     return Ok(self.finalize_finished_run(summary).await);
                 }
             }
 
             if should_yield_to_user {
+                self.record_trace_event(
+                    TraceActor::System,
+                    "yielded_to_user",
+                    TraceStatus::Yielded,
+                    Some("Tool requested user input".to_string()),
+                    serde_json::json!({}),
+                    self.turn_span_id(),
+                    Some(iteration),
+                );
+                if let Some(span) = iteration_span.take() {
+                    span.finish(
+                        "iteration_finished",
+                        TraceStatus::Yielded,
+                        Some("awaiting user input".to_string()),
+                        serde_json::json!({}),
+                    );
+                }
                 self.output.flush().await;
                 self.context.end_turn();
                 self.telemetry.end_span("agent_step");
                 return Ok(RunExit::YieldedToUser);
             }
 
-            state = self.reconcile_after_tool_calls(&state_before_tools).await;
+            state = self
+                .reconcile_after_tool_calls(&state_before_tools, iteration_child_ctx.clone())
+                .await;
+            if let Some(span) = iteration_span.take() {
+                span.finish(
+                    "iteration_finished",
+                    TraceStatus::Ok,
+                    None,
+                    serde_json::json!({
+                        "tool_responses": response_parts_len,
+                    }),
+                );
+            }
         }
     }
 }

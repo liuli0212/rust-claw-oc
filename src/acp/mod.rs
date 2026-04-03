@@ -19,7 +19,10 @@ mod handlers;
 mod output;
 
 #[cfg(feature = "acp")]
-use handlers::{handle_capabilities, handle_run};
+use handlers::{
+    handle_capabilities, handle_live_trace, handle_run, handle_trace_artifacts,
+    handle_trace_records, handle_trace_run, handle_trace_runs, handle_trace_tree,
+};
 
 #[cfg(feature = "acp")]
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,6 +65,12 @@ impl AcpServer {
             .route("/", get(handle_index))
             .route("/capabilities", get(handle_capabilities))
             .route("/run", post(handle_run))
+            .route("/trace/runs", get(handle_trace_runs))
+            .route("/trace/run/:run_id", get(handle_trace_run))
+            .route("/trace/run/:run_id/records", get(handle_trace_records))
+            .route("/trace/run/:run_id/tree", get(handle_trace_tree))
+            .route("/trace/run/:run_id/artifacts", get(handle_trace_artifacts))
+            .route("/trace/live/:session_id", get(handle_live_trace))
             .with_state(Arc::new(self));
 
         tracing::info!("ACP Server listening on {}", addr);

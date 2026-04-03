@@ -13,6 +13,9 @@ use tokio::sync::mpsc;
 pub(super) enum AcpEvent {
     Text(String),
     Thinking(String),
+    ToolStart { name: String, args: String },
+    ToolEnd { result: String },
+    PlanUpdate { summary: String, status: String },
     Error(String),
     Finish { summary: String, status: String },
 }
@@ -33,10 +36,25 @@ impl AgentOutput for AcpOutput {
     async fn on_thinking(&self, text: &str) {
         let _ = self.tx.send(AcpEvent::Thinking(text.to_string()));
     }
-    async fn on_tool_start(&self, _name: &str, _args: &str) {}
-    async fn on_tool_end(&self, _result: &str) {}
+    async fn on_tool_start(&self, name: &str, args: &str) {
+        let _ = self.tx.send(AcpEvent::ToolStart {
+            name: name.to_string(),
+            args: args.to_string(),
+        });
+    }
+    async fn on_tool_end(&self, result: &str) {
+        let _ = self.tx.send(AcpEvent::ToolEnd {
+            result: result.to_string(),
+        });
+    }
     async fn on_error(&self, error: &str) {
         let _ = self.tx.send(AcpEvent::Error(error.to_string()));
+    }
+    async fn on_plan_update(&self, state: &crate::task_state::TaskStateSnapshot) {
+        let _ = self.tx.send(AcpEvent::PlanUpdate {
+            summary: state.summary(),
+            status: state.status.clone(),
+        });
     }
     async fn on_task_finish(&self, summary: &str) {
         let _ = self.tx.send(AcpEvent::Finish {

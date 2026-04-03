@@ -30,6 +30,7 @@ impl TelemetryExporter {
                             span_name = %name,
                             session_id = %ids.session_id,
                             task_id = ?ids.task_id,
+                            run_id = ?ids.run_id,
                             turn_id = ?ids.turn_id,
                             event_id = ?ids.event_id,
                             start_ts = %ts
