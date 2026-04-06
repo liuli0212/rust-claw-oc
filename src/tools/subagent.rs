@@ -23,6 +23,7 @@ use crate::subagent_runtime::{
     SubagentExecutionRequest, SubagentRuntime, DEFAULT_SUBAGENT_MAX_STEPS,
     DEFAULT_SUBAGENT_TIMEOUT_SEC,
 };
+use crate::trace::{shared_bus, TraceActor, TraceContext, TraceSeed, TraceSpanHandle, TraceStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -290,6 +291,45 @@ impl SubagentTool {
         }
     }
 
+    fn start_sync_trace_span(
+        ctx: &super::protocol::ToolContext,
+        request: &SubagentExecutionRequest,
+        sub_session_id: &str,
+        transcript_path: &str,
+        event_log_path: &str,
+    ) -> Option<TraceSpanHandle> {
+        let trace = ctx.trace.as_ref()?;
+        let subagent_ctx = TraceContext {
+            trace_id: trace.trace_id.clone(),
+            run_id: trace.run_id.clone(),
+            session_id: sub_session_id.to_string(),
+            root_session_id: trace.root_session_id.clone(),
+            task_id: trace.task_id.clone(),
+            turn_id: trace.turn_id.clone(),
+            iteration: trace.iteration,
+            parent_span_id: trace.parent_span_id.clone(),
+        };
+        Some(shared_bus().start_span(
+            &subagent_ctx,
+            TraceActor::Subagent,
+            "subagent_spawned",
+            json!({
+                "job_id": Value::Null,
+                "parent_session_id": ctx.session_id,
+                "parent_reply_to": ctx.reply_to,
+                "sub_session_id": sub_session_id,
+                "goal": request.display_goal,
+                "context": request.context,
+                "timeout_sec": request.timeout_sec,
+                "max_steps": request.max_steps,
+                "skill_name": request.skill_name,
+                "transcript_path": transcript_path,
+                "event_log_path": event_log_path,
+                "background": false,
+            }),
+        ))
+    }
+
     async fn execute_sync_request(
         &self,
         ctx: &super::protocol::ToolContext,
@@ -334,6 +374,22 @@ impl SubagentTool {
             mut agent_loop,
             collector,
         } = built;
+        let sync_trace_span = Self::start_sync_trace_span(
+            ctx,
+            &request,
+            &sub_session_id,
+            &transcript_path,
+            &event_log_path,
+        );
+        if let (Some(trace), Some(span)) = (ctx.trace.as_ref(), sync_trace_span.as_ref()) {
+            agent_loop.set_trace_seed(TraceSeed {
+                trace_id: trace.trace_id.clone(),
+                run_id: trace.run_id.clone(),
+                root_session_id: trace.root_session_id.clone(),
+                task_id: trace.task_id.clone(),
+                parent_span_id: Some(span.span_id().to_string()),
+            });
+        }
         let span = tracing::info_span!(
             "subagent_run_sync",
             parent_session_id = %ctx.session_id,
@@ -352,114 +408,150 @@ impl SubagentTool {
         let tool_outputs = collector.take_tool_outputs().await;
         let artifacts = collector.take_artifacts().await;
 
-        let result = match run_result {
+        let (result, trace_status) = match run_result {
             Ok(Ok(exit)) => match exit {
-                crate::core::RunExit::Finished(summary) => SubagentResult {
-                    ok: true,
-                    summary,
-                    findings: tool_outputs,
-                    artifacts,
-                    sub_session_id: Some(sub_session_id),
-                    transcript_path: Some(transcript_path),
-                    event_log_path: Some(event_log_path),
-                    skill_name: request.skill_name.clone(),
-                    lineage: request.lineage.clone(),
-                    effective_tools: request.effective_tools.clone(),
-                    effective_max_steps: request.effective_max_steps,
-                    effective_timeout_sec: request.effective_timeout_sec,
-                    failure: None,
-                },
-                crate::core::RunExit::YieldedToUser => SubagentResult {
-                    ok: false,
-                    summary: if let Some(skill_name) = request.skill_name.as_ref() {
-                        format!(
+                crate::core::RunExit::Finished(summary) => (
+                    SubagentResult {
+                        ok: true,
+                        summary,
+                        findings: tool_outputs,
+                        artifacts,
+                        sub_session_id: Some(sub_session_id),
+                        transcript_path: Some(transcript_path),
+                        event_log_path: Some(event_log_path),
+                        skill_name: request.skill_name.clone(),
+                        lineage: request.lineage.clone(),
+                        effective_tools: request.effective_tools.clone(),
+                        effective_max_steps: request.effective_max_steps,
+                        effective_timeout_sec: request.effective_timeout_sec,
+                        failure: None,
+                    },
+                    TraceStatus::Ok,
+                ),
+                crate::core::RunExit::YieldedToUser => (
+                    SubagentResult {
+                        ok: false,
+                        summary: if let Some(skill_name) = request.skill_name.as_ref() {
+                            format!(
                             "Delegated skill '{}' attempted to wait for user input, which is not allowed in subagents.",
                             skill_name
                         )
-                    } else if collected_text.trim().is_empty() {
-                        "Sub-agent yielded without visible output.".to_string()
-                    } else {
-                        format!("Sub-agent yielded with output: {}", collected_text.trim())
+                        } else if collected_text.trim().is_empty() {
+                            "Sub-agent yielded without visible output.".to_string()
+                        } else {
+                            format!("Sub-agent yielded with output: {}", collected_text.trim())
+                        },
+                        findings: tool_outputs,
+                        artifacts,
+                        sub_session_id: Some(sub_session_id),
+                        transcript_path: Some(transcript_path),
+                        event_log_path: Some(event_log_path),
+                        skill_name: request.skill_name.clone(),
+                        lineage: request.lineage.clone(),
+                        effective_tools: request.effective_tools.clone(),
+                        effective_max_steps: request.effective_max_steps,
+                        effective_timeout_sec: request.effective_timeout_sec,
+                        failure: None,
                     },
-                    findings: tool_outputs,
-                    artifacts,
-                    sub_session_id: Some(sub_session_id),
-                    transcript_path: Some(transcript_path),
-                    event_log_path: Some(event_log_path),
-                    skill_name: request.skill_name.clone(),
-                    lineage: request.lineage.clone(),
-                    effective_tools: request.effective_tools.clone(),
-                    effective_max_steps: request.effective_max_steps,
-                    effective_timeout_sec: request.effective_timeout_sec,
-                    failure: None,
-                },
+                    TraceStatus::Yielded,
+                ),
                 crate::core::RunExit::RecoverableFailed(message)
                 | crate::core::RunExit::CriticallyFailed(message)
                 | crate::core::RunExit::AutopilotStalled(message)
-                | crate::core::RunExit::EnergyDepleted(message) => SubagentResult {
-                    ok: false,
-                    summary: message,
-                    findings: tool_outputs,
-                    artifacts,
-                    sub_session_id: Some(sub_session_id),
-                    transcript_path: Some(transcript_path),
-                    event_log_path: Some(event_log_path),
-                    skill_name: request.skill_name.clone(),
-                    lineage: request.lineage.clone(),
-                    effective_tools: request.effective_tools.clone(),
-                    effective_max_steps: request.effective_max_steps,
-                    effective_timeout_sec: request.effective_timeout_sec,
-                    failure: None,
-                },
-                crate::core::RunExit::StoppedByUser => SubagentResult {
-                    ok: false,
-                    summary: "Sub-agent execution was interrupted.".to_string(),
-                    findings: tool_outputs,
-                    artifacts,
-                    sub_session_id: Some(sub_session_id),
-                    transcript_path: Some(transcript_path),
-                    event_log_path: Some(event_log_path),
-                    skill_name: request.skill_name.clone(),
-                    lineage: request.lineage.clone(),
-                    effective_tools: request.effective_tools.clone(),
-                    effective_max_steps: request.effective_max_steps,
-                    effective_timeout_sec: request.effective_timeout_sec,
-                    failure: None,
-                },
-            },
-            Ok(Err(error)) => SubagentResult {
-                ok: false,
-                summary: format!("Sub-agent error: {}", error),
-                findings: tool_outputs,
-                artifacts,
-                sub_session_id: Some(sub_session_id),
-                transcript_path: Some(transcript_path),
-                event_log_path: Some(event_log_path),
-                skill_name: request.skill_name.clone(),
-                lineage: request.lineage.clone(),
-                effective_tools: request.effective_tools.clone(),
-                effective_max_steps: request.effective_max_steps,
-                effective_timeout_sec: request.effective_timeout_sec,
-                failure: None,
-            },
-            Err(_) => SubagentResult {
-                ok: false,
-                summary: format!(
-                    "Sub-agent timed out after {}s while working on '{}'.",
-                    request.timeout_sec, request.display_goal
+                | crate::core::RunExit::EnergyDepleted(message) => (
+                    SubagentResult {
+                        ok: false,
+                        summary: message,
+                        findings: tool_outputs,
+                        artifacts,
+                        sub_session_id: Some(sub_session_id),
+                        transcript_path: Some(transcript_path),
+                        event_log_path: Some(event_log_path),
+                        skill_name: request.skill_name.clone(),
+                        lineage: request.lineage.clone(),
+                        effective_tools: request.effective_tools.clone(),
+                        effective_max_steps: request.effective_max_steps,
+                        effective_timeout_sec: request.effective_timeout_sec,
+                        failure: None,
+                    },
+                    TraceStatus::Error,
                 ),
-                findings: tool_outputs,
-                artifacts,
-                sub_session_id: Some(sub_session_id),
-                transcript_path: Some(transcript_path),
-                event_log_path: Some(event_log_path),
-                skill_name: request.skill_name.clone(),
-                lineage: request.lineage.clone(),
-                effective_tools: request.effective_tools.clone(),
-                effective_max_steps: request.effective_max_steps,
-                effective_timeout_sec: request.effective_timeout_sec,
-                failure: None,
+                crate::core::RunExit::StoppedByUser => (
+                    SubagentResult {
+                        ok: false,
+                        summary: "Sub-agent execution was interrupted.".to_string(),
+                        findings: tool_outputs,
+                        artifacts,
+                        sub_session_id: Some(sub_session_id),
+                        transcript_path: Some(transcript_path),
+                        event_log_path: Some(event_log_path),
+                        skill_name: request.skill_name.clone(),
+                        lineage: request.lineage.clone(),
+                        effective_tools: request.effective_tools.clone(),
+                        effective_max_steps: request.effective_max_steps,
+                        effective_timeout_sec: request.effective_timeout_sec,
+                        failure: None,
+                    },
+                    TraceStatus::Cancelled,
+                ),
             },
+            Ok(Err(error)) => (
+                SubagentResult {
+                    ok: false,
+                    summary: format!("Sub-agent error: {}", error),
+                    findings: tool_outputs,
+                    artifacts,
+                    sub_session_id: Some(sub_session_id),
+                    transcript_path: Some(transcript_path),
+                    event_log_path: Some(event_log_path),
+                    skill_name: request.skill_name.clone(),
+                    lineage: request.lineage.clone(),
+                    effective_tools: request.effective_tools.clone(),
+                    effective_max_steps: request.effective_max_steps,
+                    effective_timeout_sec: request.effective_timeout_sec,
+                    failure: None,
+                },
+                TraceStatus::Error,
+            ),
+            Err(_) => (
+                SubagentResult {
+                    ok: false,
+                    summary: format!(
+                        "Sub-agent timed out after {}s while working on '{}'.",
+                        request.timeout_sec, request.display_goal
+                    ),
+                    findings: tool_outputs,
+                    artifacts,
+                    sub_session_id: Some(sub_session_id),
+                    transcript_path: Some(transcript_path),
+                    event_log_path: Some(event_log_path),
+                    skill_name: request.skill_name.clone(),
+                    lineage: request.lineage.clone(),
+                    effective_tools: request.effective_tools.clone(),
+                    effective_max_steps: request.effective_max_steps,
+                    effective_timeout_sec: request.effective_timeout_sec,
+                    failure: None,
+                },
+                TraceStatus::TimedOut,
+            ),
+        };
+        if let Some(span) = sync_trace_span {
+            span.finish(
+                "subagent_finished",
+                trace_status,
+                Some(result.summary.clone()),
+                json!({
+                    "job_id": Value::Null,
+                    "parent_session_id": ctx.session_id,
+                    "parent_reply_to": ctx.reply_to,
+                    "sub_session_id": result.sub_session_id,
+                    "status": if result.ok { "finished" } else { "failed" },
+                    "skill_name": request.skill_name,
+                    "transcript_path": result.transcript_path,
+                    "event_log_path": result.event_log_path,
+                    "background": false,
+                }),
+            );
         };
 
         StructuredToolOutput::new(
@@ -631,12 +723,15 @@ impl Tool for SubagentTool {
 mod tests {
     use super::*;
 
+    use serial_test::serial;
     use tokio::sync::mpsc;
 
     use crate::context::{FunctionCall, Message};
     use crate::llm_client::{LlmClient, LlmError, StreamEvent};
+    use crate::schema::StoragePaths;
     use crate::skills::call_tree::SkillCallContext;
     use crate::tools::protocol::{ToolContext, ToolExecutionEnvelope};
+    use crate::trace::{find_run_for_subsession, get_records, get_run, RecordQuery, RunSummary};
 
     fn make_ctx() -> ToolContext {
         ToolContext::new("parent", "cli")
@@ -663,6 +758,23 @@ mod tests {
     fn parse_payload(result: &str) -> Value {
         let envelope = ToolExecutionEnvelope::from_json_str(result).expect("valid tool envelope");
         serde_json::from_str(&envelope.result.output).expect("valid subagent payload")
+    }
+
+    fn unique_run_id(prefix: &str) -> String {
+        format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+    }
+
+    fn write_trace_summary(summary: &RunSummary) {
+        let path = StoragePaths::trace_run_summary_file(&summary.run_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, serde_json::to_string(summary).unwrap()).unwrap();
+    }
+
+    fn cleanup_trace_run(run_id: &str) {
+        let _ = std::fs::remove_file(StoragePaths::trace_run_summary_file(run_id));
+        let _ = std::fs::remove_file(StoragePaths::trace_run_records_file(run_id));
     }
 
     struct FinishImmediatelyLlm;
@@ -799,6 +911,68 @@ mod tests {
         assert_eq!(payload["ok"], Value::Bool(true));
         assert!(payload["summary"].as_str().unwrap().contains("done"));
         assert!(payload["skill_name"].is_null());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_subagent_sync_run_emits_trace_lifecycle_records() {
+        let tool = make_tool();
+        let run_id = unique_run_id("sync_subagent_trace_test");
+        cleanup_trace_run(&run_id);
+
+        let mut summary = RunSummary::new(
+            &run_id,
+            &run_id,
+            "parent_trace_session",
+            "parent_trace_session",
+        );
+        summary.started_at_unix_ms = 1;
+        write_trace_summary(&summary);
+
+        let mut ctx = ToolContext::new("parent_trace_session", "cli");
+        ctx.trace = Some(crate::tools::protocol::ToolTraceContext {
+            trace_id: run_id.clone(),
+            run_id: run_id.clone(),
+            root_session_id: "parent_trace_session".to_string(),
+            task_id: None,
+            turn_id: Some("turn_sync_trace".to_string()),
+            iteration: Some(1),
+            parent_span_id: Some("tool_span_sync_trace".to_string()),
+        });
+
+        let output = tool
+            .execute(
+                json!({
+                    "action": "run",
+                    "goal": "inspect parser"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let payload = parse_payload(&output);
+        let sub_session_id = payload["sub_session_id"]
+            .as_str()
+            .expect("sub_session_id")
+            .to_string();
+
+        let run = get_run(&run_id).expect("trace run should exist");
+        assert_eq!(run.total_subagents, 1);
+
+        let records = get_records(&run_id, &RecordQuery::default());
+        assert!(records.iter().any(|record| {
+            record.name == "subagent_spawned"
+                && record.attrs.get("sub_session_id").and_then(Value::as_str)
+                    == Some(sub_session_id.as_str())
+        }));
+        assert!(records.iter().any(|record| {
+            record.name == "subagent_finished"
+                && record.attrs.get("sub_session_id").and_then(Value::as_str)
+                    == Some(sub_session_id.as_str())
+        }));
+        assert!(find_run_for_subsession("parent_trace_session", &sub_session_id).is_some());
+
+        cleanup_trace_run(&run_id);
     }
 
     #[tokio::test]
