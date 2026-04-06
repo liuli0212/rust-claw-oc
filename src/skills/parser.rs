@@ -83,6 +83,25 @@ pub fn parse_skill_md(content: &str) -> Option<SkillDef> {
         Some("freeform") => Some(super::definition::OutputMode::Freeform),
         _ => None,
     };
+    if output_mode.is_some() {
+        tracing::warn!(
+            "Skill '{}' uses deprecated frontmatter field `output_mode`",
+            raw.name
+        );
+    }
+    if raw
+        .constraints
+        .as_ref()
+        .map(|constraints| {
+            constraints.forbid_code_write || constraints.required_artifact_kind.is_some()
+        })
+        .unwrap_or(false)
+    {
+        tracing::warn!(
+            "Skill '{}' uses deprecated legacy `constraints` runtime fields",
+            raw.name
+        );
+    }
 
     Some(SkillDef {
         meta: SkillMeta {

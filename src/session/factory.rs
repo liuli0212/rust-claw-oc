@@ -25,6 +25,7 @@ pub struct BuiltSubagentSession {
 pub struct SubagentSessionConfig {
     pub sub_session_id: Option<String>,
     pub allowed_tools: Vec<String>,
+    pub restrict_to_allowed_tools: bool,
     pub energy_budget: usize,
     pub timeout_sec: u64,
     pub parent_context_text: String,
@@ -239,19 +240,22 @@ impl crate::core::AgentOutput for CollectorOutput {
 pub fn filter_subagent_tools(
     base_tools: &[Arc<dyn Tool>],
     allowed: &[String],
+    restrict_to_allowed_tools: bool,
     allow_subagent_tool: bool,
 ) -> Vec<Arc<dyn Tool>> {
     let runtime_tools = ["finish_task", "task_plan"];
-    let restrict_to_whitelist = !allowed.is_empty();
     let mut accepted = Vec::new();
 
     for tool in base_tools {
         let name = tool.name();
+        if name == "ask_user_question" {
+            continue;
+        }
         if name == "subagent" && !allow_subagent_tool {
             continue;
         }
 
-        if !restrict_to_whitelist
+        if !restrict_to_allowed_tools
             || runtime_tools.contains(&name.as_str())
             || allowed.contains(&name)
         {
@@ -271,6 +275,7 @@ pub fn build_subagent_session(
     let SubagentSessionConfig {
         sub_session_id,
         allowed_tools,
+        restrict_to_allowed_tools,
         energy_budget,
         timeout_sec,
         parent_context_text,
@@ -302,10 +307,15 @@ pub fn build_subagent_session(
     let transcript_path = session_dir.join("transcript.json");
     let mut context = AgentContext::new().with_transcript_path(transcript_path);
 
-    let mut prompt = format!(
-        "You are a delegated sub-agent. Complete the assigned goal with the available tools, \
-         then call `finish_task`.\nParent context:\n{}\n\nBe concise.",
-        parent_context_text
+    let mut prompt = "You are a delegated sub-agent. Complete the assigned goal with the available tools, then call `finish_task`.".to_string();
+    if !parent_context_text.trim().is_empty() {
+        prompt.push_str(&format!(
+            "\nParent context:\n{}",
+            parent_context_text.trim()
+        ));
+    }
+    prompt.push_str(
+        "\n\nDelegated sub-agents must not ask the user questions directly.\nBe concise.",
     );
 
     if let Ok(memory) = std::fs::read_to_string("MEMORY.md") {
@@ -322,7 +332,12 @@ pub fn build_subagent_session(
     let telemetry = Arc::new(telemetry);
     let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(&sub_session_id));
 
-    let mut tools = filter_subagent_tools(base_tools, &allowed_tools, allow_subagent_tool);
+    let mut tools = filter_subagent_tools(
+        base_tools,
+        &allowed_tools,
+        restrict_to_allowed_tools,
+        allow_subagent_tool,
+    );
     if !tools.iter().any(|tool| tool.name() == "task_plan") {
         tools.push(Arc::new(crate::tools::TaskPlanTool::new(
             sub_session_id.clone(),
@@ -333,15 +348,6 @@ pub fn build_subagent_session(
         tools.push(Arc::new(crate::tools::FinishTaskTool {
             task_state_store: task_state_store.clone(),
         }));
-    }
-
-    if (allowed_tools.is_empty() || allowed_tools.contains(&"call_skill".to_string()))
-        && !tools.iter().any(|tool| tool.name() == "call_skill")
-    {
-        tools.push(Arc::new(crate::tools::CallSkillTool::new(
-            llm.clone(),
-            base_tools.to_vec(),
-        )));
     }
 
     let mut agent_loop = AgentLoop::new(
@@ -418,10 +424,6 @@ pub fn build_agent_session(
         llm.clone(),
         subagent_base_tools.clone(),
         subagent_runtime.clone(),
-    )));
-    session_tools.push(Arc::new(crate::tools::CallSkillTool::new(
-        llm.clone(),
-        subagent_base_tools,
     )));
 
     let mut agent_loop = AgentLoop::new(
@@ -601,15 +603,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_subagent_session_exposes_call_skill_for_default_subagents() {
-        let session_id = "test-subagent-call-skill";
+    async fn test_build_subagent_session_excludes_interactive_tools_for_default_subagents() {
+        let session_id = "test-subagent-noninteractive";
         cleanup_session(session_id);
         let llm = Arc::new(InspectingLlm {
             last_system: std::sync::Mutex::new(None),
             last_tools: std::sync::Mutex::new(Vec::new()),
         });
         let parent_ctx = crate::tools::ToolContext::new(session_id, "cli");
-        let base_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool("read_file"))];
+        let base_tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool("read_file")),
+            Arc::new(MockTool("ask_user_question")),
+        ];
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_notify = Arc::new(tokio::sync::Notify::new());
 
@@ -620,6 +625,7 @@ mod tests {
             SubagentSessionConfig {
                 sub_session_id: Some(format!("sub_{session_id}")),
                 allowed_tools: Vec::new(),
+                restrict_to_allowed_tools: false,
                 energy_budget: 3,
                 timeout_sec: 3,
                 parent_context_text: "repo context".to_string(),
@@ -636,7 +642,8 @@ mod tests {
         let _ = agent.step("inspect".to_string()).await.unwrap();
 
         let tool_names = llm.last_tools.lock().unwrap().clone();
-        assert!(tool_names.contains(&"call_skill".to_string()));
+        assert!(tool_names.contains(&"read_file".to_string()));
+        assert!(!tool_names.contains(&"ask_user_question".to_string()));
         assert!(!tool_names.contains(&"subagent".to_string()));
 
         cleanup_session(session_id);
@@ -649,17 +656,19 @@ mod tests {
             Arc::new(MockTool("web_fetch")),
             Arc::new(MockTool("write_file")),
             Arc::new(MockTool("execute_bash")),
+            Arc::new(MockTool("ask_user_question")),
             Arc::new(MockTool("subagent")),
             Arc::new(MockTool("finish_task")),
         ];
 
-        let filtered = filter_subagent_tools(&tools, &[], false);
+        let filtered = filter_subagent_tools(&tools, &[], false, false);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"web_fetch".to_string()));
         assert!(names.contains(&"write_file".to_string()));
         assert!(names.contains(&"execute_bash".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"ask_user_question".to_string()));
         assert!(!names.contains(&"subagent".to_string()));
     }
 
@@ -671,7 +680,7 @@ mod tests {
             Arc::new(MockTool("finish_task")),
         ];
 
-        let filtered = filter_subagent_tools(&tools, &["write_file".to_string()], false);
+        let filtered = filter_subagent_tools(&tools, &["write_file".to_string()], true, false);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"write_file".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
@@ -682,14 +691,14 @@ mod tests {
     fn test_filter_subagent_tools_whitelist_keeps_runtime_tools() {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MockTool("read_file")),
-            Arc::new(MockTool("call_skill")),
+            Arc::new(MockTool("subagent")),
             Arc::new(MockTool("finish_task")),
             Arc::new(MockTool("task_plan")),
         ];
 
-        let filtered = filter_subagent_tools(&tools, &["call_skill".to_string()], false);
+        let filtered = filter_subagent_tools(&tools, &["subagent".to_string()], true, true);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
-        assert!(names.contains(&"call_skill".to_string()));
+        assert!(names.contains(&"subagent".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
         assert!(names.contains(&"task_plan".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
@@ -703,7 +712,7 @@ mod tests {
             Arc::new(MockTool("finish_task")),
         ];
 
-        let filtered = filter_subagent_tools(&tools, &["subagent".to_string()], true);
+        let filtered = filter_subagent_tools(&tools, &["subagent".to_string()], true, true);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"subagent".to_string()));
         assert!(names.contains(&"finish_task".to_string()));

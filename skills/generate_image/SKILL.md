@@ -28,10 +28,11 @@ Provide a text prompt describing the desired image and an output file path.
 
 ## Execution
 
-Use `execute_bash` to run:
+Read the injected `Skill Arguments (JSON)` block to get `prompt` and `output_path`.
+Then use `execute_bash` to run the generator script with those exact values, quoting safely for the shell:
 
 ```bash
-python3 skills/scripts/generate_image.py "{{prompt}}" "{{output_path}}"
+python3 skills/scripts/generate_image.py "<prompt>" "<output_path>"
 ```
 
-Then confirm where the image was written.
+After the command completes, confirm where the image was written.

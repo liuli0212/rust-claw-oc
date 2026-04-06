@@ -1,4 +1,4 @@
-//! SkillRuntime — implements `ExecutionExtension` to manage active skill lifecycle.
+//! Minimal skill runtime for top-level skill invocation and interactive resume.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -7,27 +7,24 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::core::extensions::{ExecutionExtension, ExtensionDecision, FinishDecision, PromptDraft};
+use crate::delegation::{canonicalize_tools, DelegationContext};
 use crate::tools::protocol::ToolExecutionEnvelope;
 use crate::tools::Tool;
 
-use super::call_tree::{SkillCallContext, SkillSessionSeed};
-use super::definition::SkillDef;
+use super::arguments::{
+    format_prompt_argument_sections, parse_invocation_args, validate_json_args,
+};
+use super::call_tree::SkillSessionSeed;
+use super::definition::{SkillDef, SkillTrigger};
 use super::policy::SkillToolPolicy;
 use super::registry::SkillRegistry;
-use super::state::{ActiveSkillState, SkillAnswer, SkillExecutionState};
+use super::state::{PendingInteraction, SkillInvocation, SkillInvocationState};
 
-/// The Skill Runtime — manages the lifecycle of complex skills.
-///
-/// Ownership model: `ActiveSkillState` is exclusively owned by this struct.
-/// `AgentLoop` accesses skill state only through `ExecutionExtension` hooks.
+const RUNTIME_TOOLS: &[&str] = &["finish_task", "task_plan"];
+
 pub struct SkillRuntime {
     session_id: String,
-    /// The currently active skill state, if any.
-    state: RwLock<Option<ActiveSkillState>>,
-    /// The definition of the currently active skill.
-    active_def: RwLock<Option<SkillDef>>,
-    active_call_context: RwLock<Option<SkillCallContext>>,
-    /// Tool policy engine.
+    invocation: RwLock<Option<SkillInvocation>>,
     policy: SkillToolPolicy,
     registry: SkillRegistry,
     session_seed: SkillSessionSeed,
@@ -39,7 +36,7 @@ impl SkillRuntime {
     }
 
     pub fn new_for_session(session_id: impl Into<String>) -> Self {
-        tracing::debug!("Initializing SkillRuntime and discovering skills...");
+        tracing::debug!("Initializing minimal SkillRuntime and discovering skills...");
         let mut registry = SkillRegistry::new();
         registry.discover(Path::new("skills"));
         Self::with_registry_for_session(session_id, registry)
@@ -60,7 +57,7 @@ impl SkillRuntime {
         session_id: impl Into<String>,
         session_seed: SkillSessionSeed,
     ) -> Self {
-        tracing::debug!("Initializing SkillRuntime and discovering skills...");
+        tracing::debug!("Initializing minimal SkillRuntime and discovering skills...");
         let mut registry = SkillRegistry::new();
         registry.discover(Path::new("skills"));
         Self::with_registry_and_seed(session_id, registry, session_seed)
@@ -73,9 +70,7 @@ impl SkillRuntime {
     ) -> Self {
         Self {
             session_id: session_id.into(),
-            state: RwLock::new(None),
-            active_def: RwLock::new(None),
-            active_call_context: RwLock::new(None),
+            invocation: RwLock::new(None),
             policy: SkillToolPolicy::new(),
             registry,
             session_seed,
@@ -95,140 +90,133 @@ impl SkillRuntime {
     fn derive_call_context(
         &self,
         skill_name: &str,
-        initial_args: Option<&str>,
-    ) -> SkillCallContext {
+        serialized_args: Option<&str>,
+    ) -> DelegationContext {
         self.session_seed
-            .inherited_call_context
+            .inherited_context
             .clone()
-            .unwrap_or_else(|| SkillCallContext::new_root(self.session_id.clone()))
-            .append_frame(skill_name, initial_args)
+            .unwrap_or_else(|| DelegationContext::new_root(self.session_id.clone()))
+            .append_frame(skill_name, serialized_args)
     }
 
-    /// Activate a skill for the current session.
+    fn compatibility_notes(def: &SkillDef) -> Vec<String> {
+        let mut notes = Vec::new();
+        if def.meta.output_mode.is_some() {
+            notes.push(
+                "Legacy `output_mode` is ignored at runtime; rely on instructions and finish_task."
+                    .to_string(),
+            );
+        }
+        if def.constraints.forbid_code_write {
+            notes.push(
+                "Legacy `constraints.forbid_code_write` is ignored at runtime; use allowed_tools instead."
+                    .to_string(),
+            );
+        }
+        if def.constraints.required_artifact_kind.is_some() {
+            notes.push(
+                "Legacy `constraints.required_artifact_kind` is ignored at runtime; enforce outputs in instructions."
+                    .to_string(),
+            );
+        }
+        notes
+    }
+
     pub async fn activate_skill(
         &self,
         def: &SkillDef,
-        initial_args: Option<String>,
+        raw_args: Option<String>,
+        json_args: Option<serde_json::Value>,
     ) -> Result<(), String> {
-        tracing::info!(
-            "Activating skill '{}' with args: {:?}",
-            def.meta.name,
-            initial_args
-        );
-        let call_context = self.derive_call_context(&def.meta.name, initial_args.as_deref());
-        let lineage_names = call_context.lineage_names();
-        let mut state = ActiveSkillState::new(def.meta.name.clone(), def.constraints.clone());
-        state.initial_args = initial_args;
-        state.execution_state = SkillExecutionState::Running;
-        state
-            .labels
-            .insert("phase".to_string(), "running".to_string());
-        if let Some(output_mode) = def.meta.output_mode.as_ref() {
-            state.labels.insert(
-                "output_mode".to_string(),
-                Self::output_mode_name(output_mode).to_string(),
-            );
-        }
-        state.labels.insert(
-            "call_depth".to_string(),
-            call_context.current_depth().to_string(),
-        );
-        state
-            .labels
-            .insert("call_lineage".to_string(), lineage_names.join(" -> "));
-        state.labels.insert(
-            "root_session_id".to_string(),
-            call_context.root_session_id.clone(),
-        );
-        if let Some(frame) = call_context.lineage.last() {
-            state
-                .labels
-                .insert("call_id".to_string(), frame.call_id.clone());
-            if let Some(parent_call_id) = frame.parent_call_id.as_ref() {
-                state
-                    .labels
-                    .insert("parent_call_id".to_string(), parent_call_id.clone());
-            }
-            if let Some(args_digest) = frame.args_digest.as_ref() {
-                state
-                    .labels
-                    .insert("args_digest".to_string(), args_digest.clone());
-            }
+        if let Some(json_args) = json_args.as_ref() {
+            validate_json_args(def.parameters.as_ref(), json_args)
+                .map_err(|error| error.to_string())?;
         }
 
-        *self.active_def.write().await = Some(def.clone());
-        *self.active_call_context.write().await = Some(call_context);
-        *self.state.write().await = Some(state);
+        let serialized_args = json_args
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .or_else(|| raw_args.clone());
+        let compatibility_notes = Self::compatibility_notes(def);
+        for note in &compatibility_notes {
+            tracing::warn!(skill = %def.meta.name, "{note}");
+        }
 
+        let invocation = SkillInvocation {
+            skill_name: def.meta.name.clone(),
+            version: def.meta.version.clone(),
+            instructions: def.instructions.clone(),
+            allowed_tools: canonicalize_tools(&self.policy, &def.meta.allowed_tools),
+            raw_args,
+            json_args,
+            delegated_context: self
+                .session_seed
+                .delegated_context
+                .clone()
+                .filter(|value| !value.trim().is_empty()),
+            pending_interaction: None,
+            state: SkillInvocationState::Running,
+            delegation_context: self
+                .derive_call_context(&def.meta.name, serialized_args.as_deref()),
+            compatibility_notes,
+        };
+
+        *self.invocation.write().await = Some(invocation);
         tracing::info!("Skill '{}' activated", def.meta.name);
         Ok(())
     }
 
-    /// Deactivate the current skill and clean up state.
-    #[allow(dead_code)]
     pub async fn deactivate_skill(&self) {
-        let name = {
-            let state = self.state.read().await;
-            state.as_ref().map(|s| s.skill_name.clone())
-        };
-        *self.state.write().await = None;
-        *self.active_def.write().await = None;
-        *self.active_call_context.write().await = None;
-        if let Some(name) = name {
-            tracing::info!("Skill '{}' deactivated", name);
+        let skill_name = self
+            .invocation
+            .read()
+            .await
+            .as_ref()
+            .map(|invocation| invocation.skill_name.clone());
+        *self.invocation.write().await = None;
+        if let Some(skill_name) = skill_name {
+            tracing::info!("Skill '{}' deactivated", skill_name);
         }
     }
 
-    /// Whether a skill is currently active.
-    #[allow(dead_code)]
     pub async fn is_active(&self) -> bool {
-        self.state.read().await.is_some()
+        self.invocation.read().await.is_some()
     }
 
-    /// Generate the skill contract for prompt injection.
     async fn build_contract(&self) -> Option<String> {
-        let state = self.state.read().await;
-        let def = self.active_def.read().await;
-
-        let (state, def) = match (state.as_ref(), def.as_ref()) {
-            (Some(s), Some(d)) => (s, d),
-            _ => return None,
-        };
+        let invocation = self.invocation.read().await;
+        let invocation = invocation.as_ref()?;
 
         let mut parts = Vec::new();
         parts.push(format!(
             "## Active Skill: {} v{}",
-            def.meta.name, def.meta.version
+            invocation.skill_name, invocation.version
         ));
-        parts.push(format!(
-            "Trigger: {}",
-            Self::trigger_name(&def.meta.trigger)
-        ));
-
-        if let Some(output_mode) = def.meta.output_mode.as_ref() {
-            parts.push(format!(
-                "Output mode: {}",
-                Self::output_mode_name(output_mode)
-            ));
-        }
-
-        if !def.meta.allowed_tools.is_empty() {
+        if invocation.allowed_tools.is_empty() {
+            parts.push("Allowed tools: all top-level tools".to_string());
+        } else {
             parts.push(format!(
                 "Allowed tools: {}",
-                def.meta.allowed_tools.join(", ")
+                invocation.allowed_tools.join(", ")
             ));
         }
+        parts.push(format!(
+            "Interactive: {}",
+            if invocation
+                .allowed_tools
+                .iter()
+                .any(|tool| tool == "ask_user_question")
+            {
+                "yes"
+            } else {
+                "no"
+            }
+        ));
 
-        if state.constraints.forbid_code_write {
-            parts.push("⚠️ HARD GATE: Do NOT write code files.".to_string());
-        }
-
-        if let Some(required_artifact_kind) =
-            Self::effective_required_artifact_kind(state, Some(def))
-        {
+        if !invocation.compatibility_notes.is_empty() {
             parts.push(format!(
-                "Required artifact: {}",
-                Self::required_artifact_kind_name(&required_artifact_kind)
+                "Compatibility: {}",
+                invocation.compatibility_notes.join(" | ")
             ));
         }
 
@@ -242,14 +230,14 @@ impl SkillRuntime {
         }
 
         let mut parts = trimmed.splitn(2, ' ');
-        let cmd = parts.next().unwrap();
+        let cmd = parts.next().unwrap_or_default();
         let skill_name = &cmd[1..];
 
         if skill_name.is_empty() {
             return Ok(None);
         }
 
-        let activation_args = parts
+        let raw_args = parts
             .next()
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -270,121 +258,44 @@ impl SkillRuntime {
             return Ok(None);
         };
 
-        if matches!(
-            def.meta.trigger,
-            super::definition::SkillTrigger::SuggestOnly
-        ) {
+        if matches!(def.meta.trigger, SkillTrigger::SuggestOnly) {
             return Err(format!(
                 "Skill '{}' is suggest_only and cannot be activated manually.",
                 def.meta.name
             ));
         }
 
-        self.activate_skill(&def, activation_args.clone()).await?;
+        let parsed_args =
+            parse_invocation_args(raw_args.as_deref()).map_err(|error| error.to_string())?;
+        self.activate_skill(&def, parsed_args.raw.clone(), parsed_args.json.clone())
+            .await?;
 
         let mut message = format!(
-            "Activated skill '{}'. Follow the active skill contract for this turn.",
+            "Activated skill '{}'. Follow the active skill instructions for this turn.",
             def.meta.name
         );
-        if let Some(args) = activation_args {
-            message.push_str(&format!("\nActivation args: {}", args));
+        if let Some(raw_args) = parsed_args.raw {
+            message.push_str(&format!("\nActivation args: {}", raw_args));
+        }
+        if let Some(json_args) = parsed_args.json {
+            message.push_str(&format!("\nActivation args (json): {}", json_args));
         }
         Ok(Some(message))
     }
 
-    fn required_artifact_kind_name(
-        required_kind: &super::definition::ArtifactKind,
-    ) -> &'static str {
-        match required_kind {
-            super::definition::ArtifactKind::DesignDoc => "design_doc",
-            super::definition::ArtifactKind::ReviewReport => "review_report",
-        }
-    }
-
-    fn trigger_name(trigger: &super::definition::SkillTrigger) -> &'static str {
-        match trigger {
-            super::definition::SkillTrigger::ManualOnly => "manual_only",
-            super::definition::SkillTrigger::SuggestOnly => "suggest_only",
-            super::definition::SkillTrigger::ManualOrSuggested => "manual_or_suggested",
-        }
-    }
-
-    fn output_mode_name(output_mode: &super::definition::OutputMode) -> &'static str {
-        match output_mode {
-            super::definition::OutputMode::Freeform => "freeform",
-            super::definition::OutputMode::DesignDocOnly => "design_doc_only",
-            super::definition::OutputMode::ReviewOnly => "review_only",
-        }
-    }
-
-    fn artifact_kind_for_output_mode(
-        output_mode: &super::definition::OutputMode,
-    ) -> Option<super::definition::ArtifactKind> {
-        match output_mode {
-            super::definition::OutputMode::Freeform => None,
-            super::definition::OutputMode::DesignDocOnly => {
-                Some(super::definition::ArtifactKind::DesignDoc)
-            }
-            super::definition::OutputMode::ReviewOnly => {
-                Some(super::definition::ArtifactKind::ReviewReport)
-            }
-        }
-    }
-
-    fn effective_required_artifact_kind(
-        state: &ActiveSkillState,
-        def: Option<&SkillDef>,
-    ) -> Option<super::definition::ArtifactKind> {
-        state
-            .constraints
-            .required_artifact_kind
-            .clone()
-            .or_else(|| {
-                def.and_then(|definition| {
-                    definition
-                        .meta
-                        .output_mode
-                        .as_ref()
-                        .and_then(Self::artifact_kind_for_output_mode)
-                })
-            })
-    }
-
-    async fn consume_pending_interaction(&self, input: &str) -> bool {
-        let resumed = {
-            let mut state_guard = self.state.write().await;
-            let Some(state) = state_guard.as_mut() else {
-                return false;
-            };
-
-            state.pending_interaction.take().map(|pi| {
-                let skill_name = state.skill_name.clone();
-                let context_key = pi.context_key.clone();
-                let answer = SkillAnswer {
-                    question: pi.question,
-                    answer: input.to_string(),
-                    answered_at: chrono::Utc::now().to_rfc3339(),
-                };
-                state.answers.insert(context_key.clone(), answer);
-                state.execution_state = SkillExecutionState::Running;
-                state
-                    .labels
-                    .insert("phase".to_string(), "running".to_string());
-                state.labels.remove("pending_context_key");
-                (skill_name, context_key)
-            })
+    async fn consume_pending_interaction(&self) -> bool {
+        let mut invocation = self.invocation.write().await;
+        let Some(invocation) = invocation.as_mut() else {
+            return false;
         };
-
-        if let Some((skill_name, context_key)) = resumed {
-            tracing::info!(
-                skill = %skill_name,
-                context_key = %context_key,
-                "Skill resumed from WaitingUser to Running"
-            );
-            return true;
+        if invocation.pending_interaction.is_some() {
+            invocation.pending_interaction = None;
+            invocation.state = SkillInvocationState::Running;
+            tracing::info!(skill = %invocation.skill_name, "Skill resumed after user reply");
+            true
+        } else {
+            false
         }
-
-        false
     }
 }
 
@@ -397,29 +308,17 @@ impl Default for SkillRuntime {
 #[async_trait]
 impl ExecutionExtension for SkillRuntime {
     async fn before_turn_start(&self, input: &str) -> ExtensionDecision {
-        if self.consume_pending_interaction(input).await {
+        if self.consume_pending_interaction().await {
             return ExtensionDecision::Continue;
         }
 
         match self.activate_skill_from_command(input).await {
-            Ok(Some(overlay)) => {
-                return ExtensionDecision::Intercept {
-                    prompt_overlay: Some(overlay),
-                };
-            }
-            Ok(None) => {}
-            Err(message) => return ExtensionDecision::Halt { message },
+            Ok(Some(overlay)) => ExtensionDecision::Intercept {
+                prompt_overlay: Some(overlay),
+            },
+            Ok(None) => ExtensionDecision::Continue,
+            Err(message) => ExtensionDecision::Halt { message },
         }
-
-        let state = self.state.read().await;
-        if let Some(state) = state.as_ref() {
-            if state.constraints.forbid_code_write && input.contains("```") {
-                // This is a soft nudge, but we could make it a hard gate if needed.
-                // For now we rely on tool filtering.
-            }
-        }
-
-        ExtensionDecision::Continue
     }
 
     async fn before_prompt_build(&self, mut draft: PromptDraft) -> PromptDraft {
@@ -427,51 +326,61 @@ impl ExecutionExtension for SkillRuntime {
             draft.skill_contract = Some(contract);
         }
 
-        let state = self.state.read().await;
-        if let Some(state) = state.as_ref() {
-            draft.skill_state_summary = Some(state.state_summary());
-        }
+        let invocation = self.invocation.read().await;
+        if let Some(invocation) = invocation.as_ref() {
+            draft.skill_state_summary = Some(invocation.state_summary());
 
-        let def = self.active_def.read().await;
-        if let Some(def) = def.as_ref() {
-            let instructions = Self::truncate_for_prompt(&def.instructions, 4000);
-            draft.skill_instructions = Some(instructions);
+            let mut blocks = vec![Self::truncate_for_prompt(&invocation.instructions, 4_000)];
+            if let Some(args_section) = format_prompt_argument_sections(
+                invocation.raw_args.as_deref(),
+                invocation.json_args.as_ref(),
+            ) {
+                blocks.push(args_section);
+            }
+            if let Some(delegated_context) = invocation
+                .delegated_context
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                blocks.push(format!(
+                    "## Skill Delegation Context\n{}",
+                    Self::truncate_for_prompt(delegated_context, 2_000)
+                ));
+            }
+            draft.skill_instructions = Some(blocks.join("\n\n"));
         }
 
         draft
     }
 
     async fn before_tool_resolution(&self, tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
-        let def = self.active_def.read().await;
-        let state = self.state.read().await;
-
-        let mut filtered = match def.as_ref() {
-            Some(def) => self.policy.filter_tools(tools, def),
-            None => return tools,
+        let invocation = self.invocation.read().await;
+        let Some(invocation) = invocation.as_ref() else {
+            return tools;
         };
 
-        // Enforce forbid_code_write hard gate
-        if let Some(state) = state.as_ref() {
-            if state.constraints.forbid_code_write {
-                let write_tools = ["write_file", "patch_file"];
-                filtered.retain(|t| !write_tools.contains(&t.name().as_str()));
-            }
+        if invocation.allowed_tools.is_empty() {
+            return tools;
         }
 
-        filtered
+        tools
+            .into_iter()
+            .filter(|tool| {
+                let name = tool.name();
+                RUNTIME_TOOLS.contains(&name.as_str()) || invocation.allowed_tools.contains(&name)
+            })
+            .collect()
     }
 
     async fn enrich_tool_context(
         &self,
         mut ctx: crate::tools::ToolContext,
     ) -> crate::tools::ToolContext {
-        if let Some(state) = self.state.read().await.as_ref() {
-            ctx.active_skill_name = Some(state.skill_name.clone());
-        }
-        if let Some(call_context) = self.active_call_context.read().await.as_ref() {
-            ctx.skill_call_context = Some(call_context.clone());
-        } else if let Some(call_context) = self.session_seed.inherited_call_context.as_ref() {
-            ctx.skill_call_context = Some(call_context.clone());
+        if let Some(invocation) = self.invocation.read().await.as_ref() {
+            ctx.active_skill_name = Some(invocation.skill_name.clone());
+            ctx.skill_call_context = Some(invocation.delegation_context.clone());
+        } else if let Some(inherited_context) = self.session_seed.inherited_context.as_ref() {
+            ctx.skill_call_context = Some(inherited_context.clone());
         }
 
         if let Some(inherited_steps) = self.session_seed.inherited_budget.remaining_steps {
@@ -498,136 +407,30 @@ impl ExecutionExtension for SkillRuntime {
     }
 
     async fn after_tool_result(&self, result: &ToolExecutionEnvelope) {
-        let active_def = self.active_def.read().await.clone();
-        let mut state = self.state.write().await;
-        let Some(state) = state.as_mut() else {
+        let Some(request) = result.effects.await_user.as_ref() else {
             return;
         };
 
-        if let Some(request) = &result.effects.await_user {
-            state.pending_interaction = Some(super::state::PendingInteraction {
-                skill_name: state.skill_name.clone(),
-                context_key: request.context_key.clone(),
-                question: request.question.clone(),
-                options: request.options.clone(),
-                recommendation: request.recommendation.clone(),
-                asked_at: chrono::Utc::now().to_rfc3339(),
-            });
-            state.execution_state = SkillExecutionState::WaitingUser;
-            state
-                .labels
-                .insert("phase".to_string(), "waiting_user".to_string());
-            state.labels.insert(
-                "pending_context_key".to_string(),
-                request.context_key.clone(),
-            );
-        }
+        let mut invocation = self.invocation.write().await;
+        let Some(invocation) = invocation.as_mut() else {
+            return;
+        };
 
-        if let Some(path) = &result.effects.file_path {
-            let kind = Self::effective_required_artifact_kind(state, active_def.as_ref())
-                .as_ref()
-                .map(Self::required_artifact_kind_name)
-                .unwrap_or("file")
-                .to_string();
-            state.artifacts.push(super::state::SkillArtifact {
-                kind,
-                path: path.clone(),
-                summary: Some(format!("Produced by {}", result.result.tool_name)),
-            });
-        }
-
-        if result.result.ok {
-            let payload = serde_json::from_str::<serde_json::Value>(&result.result.output).ok();
-            if result.result.tool_name.as_str() == "subagent" {
-                let status = payload
-                    .as_ref()
-                    .and_then(|value| value.get("status"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default();
-
-                match status {
-                    "spawned" | "pending" | "running" => {
-                        state.execution_state = SkillExecutionState::WaitingSubagent;
-                        state
-                            .labels
-                            .insert("phase".to_string(), "waiting_subagent".to_string());
-                        if let Some(job_id) = payload
-                            .as_ref()
-                            .and_then(|value| value.get("job_id"))
-                            .and_then(|value| value.as_str())
-                        {
-                            state.labels.insert(
-                                "waiting_on_subagent_job_id".to_string(),
-                                job_id.to_string(),
-                            );
-                        }
-                    }
-                    "finished" | "failed" | "cancelled" | "timed_out" | "cancelling" => {
-                        state.execution_state = SkillExecutionState::Running;
-                        state
-                            .labels
-                            .insert("phase".to_string(), "running".to_string());
-                        state.labels.remove("waiting_on_subagent_job_id");
-                    }
-                    _ => {}
-                }
-            }
-        }
+        invocation.pending_interaction = Some(PendingInteraction {
+            context_key: request.context_key.clone(),
+            question: request.question.clone(),
+            options: request.options.clone(),
+            recommendation: request.recommendation.clone(),
+            asked_at: chrono::Utc::now().to_rfc3339(),
+        });
+        invocation.state = SkillInvocationState::WaitingUser;
     }
 
     async fn before_finish(&self) -> FinishDecision {
-        let active_def = self.active_def.read().await.clone();
-        let mut state = self.state.write().await;
-        let state = match state.as_mut() {
-            Some(s) => s,
-            None => return FinishDecision::Allow,
-        };
-
-        state.execution_state = SkillExecutionState::ValidatingArtifacts;
-        state
-            .labels
-            .insert("phase".to_string(), "validating_artifacts".to_string());
-
-        // Check artifact contract
-        if let Some(required_kind) =
-            Self::effective_required_artifact_kind(state, active_def.as_ref())
-        {
-            let required_name = Self::required_artifact_kind_name(&required_kind);
-            let has_required_artifact = state
-                .artifacts
-                .iter()
-                .any(|artifact| artifact.kind == required_name);
-            if !has_required_artifact {
-                state.execution_state = SkillExecutionState::Running;
-                state
-                    .labels
-                    .insert("phase".to_string(), "running".to_string());
-                return FinishDecision::Deny {
-                    reason: format!(
-                        "Skill '{}' requires a {:?} artifact before completion.",
-                        state.skill_name, required_kind
-                    ),
-                };
-            }
-        }
-
         FinishDecision::Allow
     }
 
     async fn on_finish_committed(&self, _summary: &str) {
-        let skill_name = {
-            let mut state = self.state.write().await;
-            let Some(state) = state.as_mut() else {
-                return;
-            };
-            state.execution_state = SkillExecutionState::Completed;
-            state
-                .labels
-                .insert("phase".to_string(), "completed".to_string());
-            state.skill_name.clone()
-        };
-
-        tracing::info!(skill = %skill_name, "Skill finished; cleaning up active state");
         self.deactivate_skill().await;
     }
 }
@@ -635,29 +438,27 @@ impl ExecutionExtension for SkillRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::extensions::{ExecutionExtension, FinishDecision, PromptDraft};
-    use crate::skills::call_tree::{SkillBudget, SkillSessionSeed};
-    use crate::skills::definition::*;
-    use crate::skills::state::PendingInteraction;
+    use crate::core::extensions::{ExecutionExtension, PromptDraft};
+    use crate::skills::call_tree::SkillBudget;
+    use crate::skills::definition::{ArtifactKind, OutputMode, SkillConstraints, SkillMeta};
     use std::sync::atomic::Ordering;
 
-    fn make_test_skill(forbid_code: bool, required_artifact: Option<ArtifactKind>) -> SkillDef {
+    fn make_test_skill(allowed_tools: &[&str]) -> SkillDef {
         SkillDef {
             meta: SkillMeta {
                 name: "test_skill".to_string(),
                 version: "1.0".to_string(),
                 description: "Test skill".to_string(),
                 trigger: SkillTrigger::ManualOnly,
-                allowed_tools: vec!["read_file".to_string(), "execute_bash".to_string()],
+                allowed_tools: allowed_tools
+                    .iter()
+                    .map(|tool| (*tool).to_string())
+                    .collect(),
                 output_mode: None,
             },
             instructions: "Do the thing.".to_string(),
             parameters: None,
-            constraints: SkillConstraints {
-                forbid_code_write: forbid_code,
-
-                required_artifact_kind: required_artifact,
-            },
+            constraints: SkillConstraints::default(),
         }
     }
 
@@ -666,8 +467,8 @@ mod tests {
         let rt = SkillRuntime::new();
         assert!(!rt.is_active().await);
 
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, None).await.unwrap();
+        let skill = make_test_skill(&["read_file"]);
+        rt.activate_skill(&skill, None, None).await.unwrap();
         assert!(rt.is_active().await);
 
         rt.deactivate_skill().await;
@@ -675,61 +476,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_activate_with_args_injects_into_prompt() {
+    async fn test_activate_with_raw_and_json_args_injects_prompt_sections() {
         let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, Some("a space cat".to_string()))
-            .await
-            .unwrap();
+        let mut skill = make_test_skill(&["read_file"]);
+        skill.parameters = Some(serde_json::json!({
+            "path": { "type": "string", "required": true }
+        }));
+        rt.activate_skill(
+            &skill,
+            Some("src/lib.rs".to_string()),
+            Some(serde_json::json!({ "path": "src/lib.rs" })),
+        )
+        .await
+        .unwrap();
 
         let draft = rt.before_prompt_build(PromptDraft::default()).await;
         let summary = draft.skill_state_summary.unwrap();
-        assert!(summary.contains("USER INPUT AT ACTIVATION: a space cat"));
+        let instructions = draft.skill_instructions.unwrap();
+        assert!(summary.contains("Activation args (raw): src/lib.rs"));
+        assert!(summary.contains("\"path\":\"src/lib.rs\""));
+        assert!(instructions.contains("## Skill Arguments (JSON)"));
+        assert!(instructions.contains("## Skill Arguments (Raw)"));
     }
 
     #[tokio::test]
-    async fn test_prompt_build_injects_output_mode_into_contract() {
+    async fn test_activate_skill_rejects_invalid_json_args() {
         let rt = SkillRuntime::new();
-        let mut skill = make_test_skill(false, None);
+        let mut skill = make_test_skill(&["read_file"]);
+        skill.parameters = Some(serde_json::json!({
+            "path": { "type": "string", "required": true }
+        }));
+
+        let error = rt
+            .activate_skill(&skill, None, Some(serde_json::json!({ "path": 42 })))
+            .await
+            .unwrap_err();
+        assert!(error.contains("parameter 'path' must be of type string"));
+    }
+
+    #[tokio::test]
+    async fn test_prompt_build_injects_contract_and_compatibility_notes() {
+        let rt = SkillRuntime::new();
+        let mut skill = make_test_skill(&["read_file"]);
         skill.meta.output_mode = Some(OutputMode::ReviewOnly);
-        rt.activate_skill(&skill, None).await.unwrap();
+        skill.constraints = SkillConstraints {
+            forbid_code_write: true,
+            required_artifact_kind: Some(ArtifactKind::ReviewReport),
+        };
+        rt.activate_skill(&skill, None, None).await.unwrap();
 
         let draft = rt.before_prompt_build(PromptDraft::default()).await;
         let contract = draft.skill_contract.unwrap();
-        assert!(contract.contains("Output mode: review_only"));
-        assert!(contract.contains("Trigger: manual_only"));
-    }
-
-    #[tokio::test]
-    async fn test_prompt_build_injects_contract() {
-        let rt = SkillRuntime::new();
-        let skill = make_test_skill(true, None);
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        let draft = rt.before_prompt_build(PromptDraft::default()).await;
-        assert!(draft.skill_contract.is_some());
-        let contract = draft.skill_contract.unwrap();
-        assert!(contract.contains("test_skill"));
-        assert!(contract.contains("HARD GATE"));
-    }
-
-    #[tokio::test]
-    async fn test_prompt_build_separates_contract_from_runtime_state() {
-        let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, Some("review this".to_string()))
-            .await
-            .unwrap();
-
-        let draft = rt.before_prompt_build(PromptDraft::default()).await;
-        let contract = draft.skill_contract.unwrap();
-        let summary = draft.skill_state_summary.unwrap();
-
-        assert!(contract.contains("Trigger: manual_only"));
-        assert!(!contract.contains("State:"));
-        assert!(!contract.contains("USER INPUT AT ACTIVATION"));
-        assert!(summary.contains("State: Running"));
-        assert!(summary.contains("USER INPUT AT ACTIVATION: review this"));
+        assert!(contract.contains("Allowed tools: read_file"));
+        assert!(contract.contains("Compatibility:"));
     }
 
     #[tokio::test]
@@ -743,24 +542,22 @@ mod tests {
     #[tokio::test]
     async fn test_prompt_build_truncates_utf8_instructions_safely() {
         let rt = SkillRuntime::new();
-        let mut skill = make_test_skill(false, None);
-        skill.instructions = "你".repeat(4001);
-        rt.activate_skill(&skill, None).await.unwrap();
+        let mut skill = make_test_skill(&["read_file"]);
+        skill.instructions = "你".repeat(4_001);
+        rt.activate_skill(&skill, None, None).await.unwrap();
 
         let draft = rt.before_prompt_build(PromptDraft::default()).await;
         let instructions = draft.skill_instructions.unwrap();
-
         assert!(instructions.ends_with("...[truncated]"));
         assert!(instructions.starts_with('你'));
     }
 
     #[tokio::test]
-    async fn test_forbid_code_write_filters_tools() {
+    async fn test_allowed_tools_filtering_only_keeps_whitelist_and_runtime_tools() {
         let rt = SkillRuntime::new();
-        let skill = make_test_skill(true, None);
-        rt.activate_skill(&skill, None).await.unwrap();
+        let skill = make_test_skill(&["read_file", "ask_user_question"]);
+        rt.activate_skill(&skill, None, None).await.unwrap();
 
-        // Create mock tools
         struct MockTool(String);
         #[async_trait]
         impl Tool for MockTool {
@@ -785,43 +582,35 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MockTool("read_file".to_string())),
             Arc::new(MockTool("write_file".to_string())),
-            Arc::new(MockTool("patch_file".to_string())),
-            Arc::new(MockTool("execute_bash".to_string())),
+            Arc::new(MockTool("ask_user_question".to_string())),
             Arc::new(MockTool("finish_task".to_string())),
         ];
 
         let filtered = rt.before_tool_resolution(tools).await;
-        let names: Vec<String> = filtered.iter().map(|t| t.name()).collect();
-
-        // write_file and patch_file should be removed by forbid_code_write
-        assert!(!names.contains(&"write_file".to_string()));
-        assert!(!names.contains(&"patch_file".to_string()));
-        // Allowed tools should remain
+        let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"execute_bash".to_string()));
-        // Runtime tools always allowed
+        assert!(names.contains(&"ask_user_question".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
     }
 
     #[tokio::test]
     async fn test_resume_with_pending_interaction() {
         let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, None).await.unwrap();
+        let skill = make_test_skill(&["read_file", "ask_user_question"]);
+        rt.activate_skill(&skill, None, None).await.unwrap();
 
-        // Set pending interaction
         {
-            let mut state = rt.state.write().await;
-            let state = state.as_mut().unwrap();
-            state.pending_interaction = Some(PendingInteraction {
-                skill_name: "test_skill".to_string(),
+            let mut invocation = rt.invocation.write().await;
+            let invocation = invocation.as_mut().unwrap();
+            invocation.pending_interaction = Some(PendingInteraction {
                 context_key: "project_name".to_string(),
                 question: "What is the project name?".to_string(),
                 options: vec![],
                 recommendation: None,
                 asked_at: "now".to_string(),
             });
-            state.execution_state = SkillExecutionState::WaitingUser;
+            invocation.state = SkillInvocationState::WaitingUser;
         }
 
         assert!(matches!(
@@ -829,45 +618,28 @@ mod tests {
             ExtensionDecision::Continue
         ));
 
-        // Verify answer was stored
-        let state = rt.state.read().await;
-        let state = state.as_ref().unwrap();
-        assert!(state.answers.contains_key("project_name"));
-        assert_eq!(state.execution_state, SkillExecutionState::Running);
-        assert!(state.pending_interaction.is_none());
+        let invocation = rt.invocation.read().await;
+        let invocation = invocation.as_ref().unwrap();
+        assert_eq!(invocation.state, SkillInvocationState::Running);
+        assert!(invocation.pending_interaction.is_none());
     }
 
     #[tokio::test]
-    async fn test_resume_without_pending_passes_through() {
-        let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        assert!(matches!(
-            rt.before_turn_start("hello").await,
-            ExtensionDecision::Continue
-        ));
-
-        let state = rt.state.read().await;
-        let state = state.as_ref().unwrap();
-        assert!(state.answers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_enrich_tool_context_inherits_seeded_context_and_budget_without_active_skill() {
-        let inherited_context = SkillCallContext::new_root("root").append_frame("planner", None);
+    async fn test_enrich_tool_context_inherits_seeded_context_and_budget() {
+        let inherited_context = DelegationContext::new_root("root").append_frame("planner", None);
         inherited_context
-            .total_skill_calls
+            .total_delegations
             .store(2, Ordering::SeqCst);
         let rt = SkillRuntime::with_registry_and_seed(
             "seeded-session",
             SkillRegistry::new(),
             SkillSessionSeed {
-                inherited_call_context: Some(inherited_context.clone()),
+                inherited_context: Some(inherited_context.clone()),
                 inherited_budget: SkillBudget {
                     remaining_steps: Some(3),
                     remaining_timeout_sec: Some(7),
                 },
+                delegated_context: Some("Inspect parser flow.".to_string()),
             },
         );
 
@@ -888,78 +660,36 @@ mod tests {
         assert_eq!(enriched.skill_budget.remaining_steps, Some(3));
         assert_eq!(enriched.skill_budget.remaining_timeout_sec, Some(7));
 
-        propagated.total_skill_calls.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(inherited_context.total_skill_calls_used(), 3);
+        propagated.total_delegations.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(inherited_context.total_delegations_used(), 3);
     }
 
     #[tokio::test]
-
-    async fn test_artifact_contract_denies_finish() {
+    async fn test_before_finish_always_allows() {
         let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, Some(ArtifactKind::DesignDoc));
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        let decision = rt.before_finish().await;
-        match decision {
-            FinishDecision::Deny { reason } => {
-                assert!(reason.contains("DesignDoc"));
-            }
-            _ => panic!("Expected Deny"),
-        }
+        let skill = make_test_skill(&["read_file"]);
+        rt.activate_skill(&skill, None, None).await.unwrap();
+        assert!(matches!(rt.before_finish().await, FinishDecision::Allow));
     }
 
     #[tokio::test]
-    async fn test_artifact_contract_allows_finish_with_artifact() {
-        let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, Some(ArtifactKind::DesignDoc));
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        // Add an artifact
-        {
-            let mut state = rt.state.write().await;
-            let state = state.as_mut().unwrap();
-            state.artifacts.push(crate::skills::state::SkillArtifact {
-                kind: "design_doc".to_string(),
-                path: "/tmp/design.md".to_string(),
-                summary: Some("Design doc".to_string()),
-            });
-        }
-
-        let decision = rt.before_finish().await;
-        assert!(matches!(decision, FinishDecision::Allow));
-    }
-
-    #[tokio::test]
-    async fn test_output_mode_review_only_denies_finish_without_artifact() {
-        let rt = SkillRuntime::new();
-        let mut skill = make_test_skill(false, None);
-        skill.meta.output_mode = Some(OutputMode::ReviewOnly);
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        let decision = rt.before_finish().await;
-        assert!(matches!(decision, FinishDecision::Deny { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_no_skill_allows_finish() {
-        let rt = SkillRuntime::new();
-        let decision = rt.before_finish().await;
-        assert!(matches!(decision, FinishDecision::Allow));
-    }
-
-    #[tokio::test]
-    async fn test_before_turn_start_activates_skill_from_command() {
+    async fn test_before_turn_start_activates_skill_from_command_with_json_args() {
         let mut registry = SkillRegistry::new();
-        registry.insert(make_test_skill(false, None));
+        let mut skill = make_test_skill(&["read_file"]);
+        skill.parameters = Some(serde_json::json!({
+            "path": { "type": "string", "required": true }
+        }));
+        registry.insert(skill);
         let rt = SkillRuntime::with_registry(registry);
 
         let decision = rt
-            .before_turn_start("/test_skill collect requirements")
+            .before_turn_start(r#"/test_skill {"path":"src/lib.rs"}"#)
             .await;
         match decision {
             ExtensionDecision::Intercept { prompt_overlay } => {
                 let overlay = prompt_overlay.expect("expected overlay");
                 assert!(overlay.contains("Activated skill 'test_skill'"));
+                assert!(overlay.contains("Activation args (json)"));
                 assert!(rt.is_active().await);
             }
             other => panic!("expected intercept, got {:?}", other),
@@ -967,17 +697,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_before_turn_start_ignores_unknown_slash_input() {
-        let rt = SkillRuntime::with_registry(SkillRegistry::new());
-        let decision = rt.before_turn_start("/tmp/a.txt").await;
-        assert!(matches!(decision, ExtensionDecision::Continue));
-        assert!(!rt.is_active().await);
+    async fn test_before_turn_start_rejects_invalid_json_args() {
+        let mut registry = SkillRegistry::new();
+        let mut skill = make_test_skill(&["read_file"]);
+        skill.parameters = Some(serde_json::json!({
+            "path": { "type": "string", "required": true }
+        }));
+        registry.insert(skill);
+        let rt = SkillRuntime::with_registry(registry);
+
+        let decision = rt.before_turn_start(r#"/test_skill {"path":42}"#).await;
+        assert!(matches!(decision, ExtensionDecision::Halt { .. }));
     }
 
     #[tokio::test]
     async fn test_before_turn_start_rejects_manual_activation_of_suggest_only_skill() {
         let mut registry = SkillRegistry::new();
-        let mut skill = make_test_skill(false, None);
+        let mut skill = make_test_skill(&["read_file"]);
         skill.meta.name = "suggested_only".to_string();
         skill.meta.trigger = SkillTrigger::SuggestOnly;
         registry.insert(skill);
@@ -990,8 +726,8 @@ mod tests {
     #[tokio::test]
     async fn test_after_tool_result_sets_pending_interaction() {
         let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, None).await.unwrap();
+        let skill = make_test_skill(&["read_file", "ask_user_question"]);
+        rt.activate_skill(&skill, None, None).await.unwrap();
 
         rt.after_tool_result(&ToolExecutionEnvelope {
             result: crate::tools::protocol::ToolResultData {
@@ -1014,131 +750,24 @@ mod tests {
         })
         .await;
 
-        let state = rt.state.read().await;
-        let state = state.as_ref().unwrap();
-        assert!(matches!(
-            state.execution_state,
-            SkillExecutionState::WaitingUser
-        ));
+        let invocation = rt.invocation.read().await;
+        let invocation = invocation.as_ref().unwrap();
+        assert_eq!(invocation.state, SkillInvocationState::WaitingUser);
         assert_eq!(
-            state
+            invocation
                 .pending_interaction
                 .as_ref()
-                .map(|pi| pi.context_key.as_str()),
+                .map(|pending| pending.context_key.as_str()),
             Some("goal")
         );
     }
 
     #[tokio::test]
-    async fn test_after_tool_result_tracks_spawned_subagent_state() {
-        let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        rt.after_tool_result(&ToolExecutionEnvelope {
-            result: crate::tools::protocol::ToolResultData {
-                ok: true,
-                tool_name: "subagent".to_string(),
-                output: serde_json::json!({
-                    "job_id": "job-123",
-                    "status": "spawned"
-                })
-                .to_string(),
-                exit_code: None,
-                duration_ms: None,
-                truncated: false,
-            },
-            effects: crate::tools::protocol::ToolEffects::default(),
-        })
-        .await;
-
-        let state = rt.state.read().await;
-        let state = state.as_ref().unwrap();
-        assert_eq!(state.execution_state, SkillExecutionState::WaitingSubagent);
-        assert_eq!(
-            state
-                .labels
-                .get("waiting_on_subagent_job_id")
-                .map(String::as_str),
-            Some("job-123")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_after_tool_result_clears_waiting_state_when_subagent_finishes() {
-        let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        {
-            let mut state = rt.state.write().await;
-            let state = state.as_mut().unwrap();
-            state.execution_state = SkillExecutionState::WaitingSubagent;
-            state
-                .labels
-                .insert("phase".to_string(), "waiting_subagent".to_string());
-            state.labels.insert(
-                "waiting_on_subagent_job_id".to_string(),
-                "job-123".to_string(),
-            );
-        }
-
-        rt.after_tool_result(&ToolExecutionEnvelope {
-            result: crate::tools::protocol::ToolResultData {
-                ok: true,
-                tool_name: "subagent".to_string(),
-                output: serde_json::json!({
-                    "job_id": "job-123",
-                    "status": "finished"
-                })
-                .to_string(),
-                exit_code: None,
-                duration_ms: None,
-                truncated: false,
-            },
-            effects: crate::tools::protocol::ToolEffects::default(),
-        })
-        .await;
-
-        let state = rt.state.read().await;
-        let state = state.as_ref().unwrap();
-        assert_eq!(state.execution_state, SkillExecutionState::Running);
-        assert_eq!(
-            state.labels.get("phase").map(String::as_str),
-            Some("running")
-        );
-        assert!(!state.labels.contains_key("waiting_on_subagent_job_id"));
-    }
-
-    #[tokio::test]
     async fn test_on_finish_committed_deactivates_skill() {
         let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, None);
-        rt.activate_skill(&skill, None).await.unwrap();
-
+        let skill = make_test_skill(&["read_file"]);
+        rt.activate_skill(&skill, None, None).await.unwrap();
         rt.on_finish_committed("done").await;
         assert!(!rt.is_active().await);
-    }
-
-    #[tokio::test]
-    async fn test_artifact_contract_denies_finish_with_wrong_artifact_kind() {
-        let rt = SkillRuntime::new();
-        let skill = make_test_skill(false, Some(ArtifactKind::DesignDoc));
-        rt.activate_skill(&skill, None).await.unwrap();
-
-        {
-            let mut state = rt.state.write().await;
-            let state = state.as_mut().unwrap();
-            state.artifacts.push(crate::skills::state::SkillArtifact {
-                kind: "review_report".to_string(),
-                path: "/tmp/review.md".to_string(),
-                summary: None,
-            });
-        }
-
-        assert!(matches!(
-            rt.before_finish().await,
-            FinishDecision::Deny { .. }
-        ));
     }
 }

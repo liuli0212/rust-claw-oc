@@ -8,7 +8,6 @@ pub mod protocol;
 pub mod sandbox;
 pub mod scheduler;
 pub mod shell;
-pub mod skills;
 pub mod subagent;
 pub mod web;
 
@@ -25,6 +24,5 @@ pub use lsp::{
 pub use memory::{RagInsertTool, RagSearchTool, ReadMemoryTool, WriteMemoryTool};
 pub use protocol::{clean_schema, Tool, ToolContext, ToolError};
 pub use scheduler::ManageScheduleTool;
-pub use skills::CallSkillTool;
 pub use subagent::SubagentTool;
 pub use web::{TavilySearchTool, WebFetchTool};

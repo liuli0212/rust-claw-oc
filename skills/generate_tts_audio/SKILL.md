@@ -29,10 +29,11 @@ This skill generates high-quality TTS audio from text using the Gemini 2.5 Flash
 
 ## Execution
 
-Use `execute_bash` to run:
+Read the injected `Skill Arguments (JSON)` block to get `text`, `output_path`, and optional `voice`.
+Use `execute_bash` to run the script with the provided values, quoting safely for the shell:
 
 ```bash
-python3 skills/scripts/generate_tts.py "{{text}}" "{{output_path}}" "{{voice}}"
+python3 skills/scripts/generate_tts.py "<text>" "<output_path>" "<voice>"
 ```
 
-If `voice` is omitted, let the script use its default behavior.
+If `voice` is omitted or empty, let the script use its default behavior instead of inventing one.

@@ -107,6 +107,7 @@ impl TraceBus {
         self.publish(record);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_record(
         &self,
         ctx: &TraceContext,
@@ -309,6 +310,12 @@ impl TraceBus {
 
         persist_summary(summary);
         super::sqlite::persist_run(summary);
+    }
+}
+
+impl Default for TraceBus {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

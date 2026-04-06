@@ -26,6 +26,24 @@ pub struct SpawnedSubagentJob {
     pub sub_session_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SubagentExecutionRequest {
+    pub initial_input: String,
+    pub display_goal: String,
+    pub context: String,
+    pub timeout_sec: u64,
+    pub max_steps: usize,
+    pub allowed_tools: Vec<String>,
+    pub restrict_to_allowed_tools: bool,
+    pub allow_subagent_tool: bool,
+    pub skill_name: Option<String>,
+    pub lineage: Option<Vec<String>>,
+    pub effective_tools: Option<Vec<String>>,
+    pub effective_max_steps: Option<usize>,
+    pub effective_timeout_sec: Option<u64>,
+    pub skill_session_seed: SkillSessionSeed,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SubagentJobMeta {
     pub job_id: String,
@@ -34,6 +52,7 @@ pub struct SubagentJobMeta {
     pub sub_session_id: String,
     pub goal: String,
     pub context: String,
+    pub skill_name: Option<String>,
     pub created_at_unix_ms: u64,
     pub transcript_path: String,
     pub event_log_path: String,
@@ -226,11 +245,7 @@ struct SubagentRuntimeInner {
 
 struct SubagentJobRequest {
     parent_ctx: ToolContext,
-    goal: String,
-    context: String,
-    timeout_sec: u64,
-    max_steps: usize,
-    skill_session_seed: SkillSessionSeed,
+    execution: SubagentExecutionRequest,
     sub_session_id: String,
 }
 
@@ -271,11 +286,22 @@ impl SubagentRuntime {
     ) -> Result<SpawnedSubagentJob, ToolError> {
         self.spawn_job_with_limits(
             parent_ctx,
-            goal,
-            context,
-            DEFAULT_SUBAGENT_TIMEOUT_SEC,
-            DEFAULT_SUBAGENT_MAX_STEPS,
-            SkillSessionSeed::default(),
+            SubagentExecutionRequest {
+                initial_input: goal.clone(),
+                display_goal: goal,
+                context,
+                timeout_sec: DEFAULT_SUBAGENT_TIMEOUT_SEC,
+                max_steps: DEFAULT_SUBAGENT_MAX_STEPS,
+                allowed_tools: Vec::new(),
+                restrict_to_allowed_tools: false,
+                allow_subagent_tool: false,
+                skill_name: None,
+                lineage: None,
+                effective_tools: None,
+                effective_max_steps: None,
+                effective_timeout_sec: None,
+                skill_session_seed: SkillSessionSeed::default(),
+            },
         )
         .await
     }
@@ -283,11 +309,7 @@ impl SubagentRuntime {
     pub(crate) async fn spawn_job_with_limits(
         &self,
         parent_ctx: ToolContext,
-        goal: String,
-        context: String,
-        timeout_sec: u64,
-        max_steps: usize,
-        skill_session_seed: SkillSessionSeed,
+        execution: SubagentExecutionRequest,
     ) -> Result<SpawnedSubagentJob, ToolError> {
         self.cleanup_expired_jobs().await;
 
@@ -307,8 +329,9 @@ impl SubagentRuntime {
             parent_session_id: parent_ctx.session_id.clone(),
             parent_reply_to: parent_ctx.reply_to.clone(),
             sub_session_id: unified_id.clone(),
-            goal: goal.clone(),
-            context: context.clone(),
+            goal: execution.display_goal.clone(),
+            context: execution.context.clone(),
+            skill_name: execution.skill_name.clone(),
             created_at_unix_ms: unix_ms_now(),
             transcript_path: crate::schema::StoragePaths::session_transcript_file(&unified_id)
                 .display()
@@ -348,8 +371,9 @@ impl SubagentRuntime {
                     "sub_session_id": handle.meta.sub_session_id,
                     "goal": handle.meta.goal,
                     "context": handle.meta.context,
-                    "timeout_sec": timeout_sec,
-                    "max_steps": max_steps,
+                    "timeout_sec": execution.timeout_sec,
+                    "max_steps": execution.max_steps,
+                    "skill_name": handle.meta.skill_name,
                     "transcript_path": handle.meta.transcript_path,
                     "event_log_path": handle.meta.event_log_path,
                 }),
@@ -381,11 +405,7 @@ impl SubagentRuntime {
                             handle_for_task.clone(),
                             SubagentJobRequest {
                                 parent_ctx: child_parent_ctx,
-                                goal,
-                                context,
-                                timeout_sec,
-                                max_steps,
-                                skill_session_seed,
+                                execution,
                                 sub_session_id: sub_session_id_for_task,
                             },
                         )
@@ -567,11 +587,7 @@ impl SubagentRuntime {
 
         let SubagentJobRequest {
             parent_ctx,
-            goal,
-            context,
-            timeout_sec,
-            max_steps,
-            skill_session_seed,
+            execution,
             sub_session_id,
         } = request;
 
@@ -604,15 +620,16 @@ impl SubagentRuntime {
             &self.inner.base_tools,
             crate::session::factory::SubagentSessionConfig {
                 sub_session_id: Some(sub_session_id),
-                allowed_tools: Vec::new(),
-                energy_budget: max_steps,
-                timeout_sec,
-                parent_context_text: context,
-                skill_session_seed,
+                allowed_tools: execution.allowed_tools.clone(),
+                restrict_to_allowed_tools: execution.restrict_to_allowed_tools,
+                energy_budget: execution.max_steps,
+                timeout_sec: execution.timeout_sec,
+                parent_context_text: execution.context.clone(),
+                skill_session_seed: execution.skill_session_seed.clone(),
                 debug: handle.debug.clone(),
                 cancelled: handle.cancelled.clone(),
                 cancel_notify: handle.cancel_notify.clone(),
-                allow_subagent_tool: false,
+                allow_subagent_tool: execution.allow_subagent_tool,
             },
         ) {
             Ok(BuiltSubagentSession {
@@ -622,14 +639,8 @@ impl SubagentRuntime {
                 mut agent_loop,
                 collector,
             }) => {
-                self.execute_subagent(
-                    handle.clone(),
-                    goal,
-                    timeout_sec,
-                    collector,
-                    &mut agent_loop,
-                )
-                .await
+                self.execute_subagent(handle.clone(), execution, collector, &mut agent_loop)
+                    .await
             }
             Err(error) => {
                 self.record_debug_error(&handle, "build_subagent_session", &error, None)
@@ -793,14 +804,13 @@ impl SubagentRuntime {
     async fn execute_subagent(
         &self,
         handle: Arc<SubagentJobHandle>,
-        goal: String,
-        timeout_sec: u64,
+        execution: SubagentExecutionRequest,
         collector: Arc<crate::session::factory::CollectorOutput>,
         agent_loop: &mut crate::core::AgentLoop,
     ) -> SubagentJobState {
         let run_result = tokio::time::timeout(
-            Duration::from_secs(timeout_sec),
-            agent_loop.step(goal.clone()),
+            Duration::from_secs(execution.timeout_sec),
+            agent_loop.step(execution.initial_input.clone()),
         )
         .await;
 
@@ -817,6 +827,11 @@ impl SubagentRuntime {
         let sub_session_id = Some(handle.meta.sub_session_id.clone());
         let transcript_path = Some(handle.meta.transcript_path.clone());
         let event_log_path = Some(handle.meta.event_log_path.clone());
+        let skill_name = execution.skill_name.clone();
+        let lineage = execution.lineage.clone();
+        let effective_tools = execution.effective_tools.clone();
+        let effective_max_steps = execution.effective_max_steps;
+        let effective_timeout_sec = execution.effective_timeout_sec;
 
         match run_result {
             Ok(Ok(exit)) => {
@@ -824,11 +839,37 @@ impl SubagentRuntime {
                 let summary = match exit {
                     crate::core::RunExit::Finished(summary) => summary,
                     crate::core::RunExit::YieldedToUser => {
-                        if collected_text.trim().is_empty() {
+                        let message = if let Some(skill_name) = execution.skill_name.as_ref() {
+                            format!(
+                                "Delegated skill '{}' attempted to wait for user input, which is not allowed in subagents.",
+                                skill_name
+                            )
+                        } else if collected_text.trim().is_empty() {
                             "Sub-agent yielded without visible output.".to_string()
                         } else {
                             format!("Sub-agent yielded with output: {}", collected_text.trim())
-                        }
+                        };
+                        self.record_debug_error(&handle, "yielded_to_user", &message, None)
+                            .await;
+                        return SubagentJobState::Failed {
+                            finished_at_unix_ms,
+                            error: message.clone(),
+                            partial: Some(SubagentResult {
+                                ok: false,
+                                summary: message,
+                                findings: tool_outputs,
+                                artifacts,
+                                sub_session_id: sub_session_id.clone(),
+                                transcript_path: transcript_path.clone(),
+                                event_log_path: event_log_path.clone(),
+                                skill_name,
+                                lineage,
+                                effective_tools,
+                                effective_max_steps,
+                                effective_timeout_sec,
+                                failure: None,
+                            }),
+                        };
                     }
                     crate::core::RunExit::RecoverableFailed(message)
                     | crate::core::RunExit::CriticallyFailed(message)
@@ -846,6 +887,12 @@ impl SubagentRuntime {
                                 sub_session_id: sub_session_id.clone(),
                                 transcript_path: transcript_path.clone(),
                                 event_log_path: event_log_path.clone(),
+                                skill_name,
+                                lineage,
+                                effective_tools,
+                                effective_max_steps,
+                                effective_timeout_sec,
+                                failure: None,
                             }),
                         };
                     }
@@ -869,6 +916,12 @@ impl SubagentRuntime {
                                 sub_session_id: sub_session_id.clone(),
                                 transcript_path: transcript_path.clone(),
                                 event_log_path: event_log_path.clone(),
+                                skill_name,
+                                lineage,
+                                effective_tools,
+                                effective_max_steps,
+                                effective_timeout_sec,
+                                failure: None,
                             }),
                         };
                     }
@@ -890,6 +943,12 @@ impl SubagentRuntime {
                                 sub_session_id: sub_session_id.clone(),
                                 transcript_path: transcript_path.clone(),
                                 event_log_path: event_log_path.clone(),
+                                skill_name,
+                                lineage,
+                                effective_tools,
+                                effective_max_steps,
+                                effective_timeout_sec,
+                                failure: None,
                             }),
                         };
                     }
@@ -905,6 +964,12 @@ impl SubagentRuntime {
                         sub_session_id: sub_session_id.clone(),
                         transcript_path: transcript_path.clone(),
                         event_log_path: event_log_path.clone(),
+                        skill_name,
+                        lineage,
+                        effective_tools,
+                        effective_max_steps,
+                        effective_timeout_sec,
+                        failure: None,
                     },
                 }
             }
@@ -922,6 +987,12 @@ impl SubagentRuntime {
                         sub_session_id: sub_session_id.clone(),
                         transcript_path: transcript_path.clone(),
                         event_log_path: event_log_path.clone(),
+                        skill_name,
+                        lineage,
+                        effective_tools,
+                        effective_max_steps,
+                        effective_timeout_sec,
+                        failure: None,
                     }),
                 }
             }
@@ -944,6 +1015,12 @@ impl SubagentRuntime {
                             sub_session_id: sub_session_id.clone(),
                             transcript_path: transcript_path.clone(),
                             event_log_path: event_log_path.clone(),
+                            skill_name,
+                            lineage,
+                            effective_tools,
+                            effective_max_steps,
+                            effective_timeout_sec,
+                            failure: None,
                         }),
                     }
                 } else {
@@ -952,7 +1029,7 @@ impl SubagentRuntime {
                         "timeout",
                         &format!(
                             "Sub-agent timed out after {}s while working on '{}'.",
-                            timeout_sec, goal
+                            execution.timeout_sec, execution.display_goal
                         ),
                         None,
                     )
@@ -963,13 +1040,19 @@ impl SubagentRuntime {
                             ok: false,
                             summary: format!(
                                 "Sub-agent timed out after {}s while working on '{}'.",
-                                timeout_sec, goal
+                                execution.timeout_sec, execution.display_goal
                             ),
                             findings: tool_outputs,
                             artifacts,
                             sub_session_id,
                             transcript_path,
                             event_log_path,
+                            skill_name,
+                            lineage,
+                            effective_tools,
+                            effective_max_steps,
+                            effective_timeout_sec,
+                            failure: None,
                         }),
                     }
                 }
@@ -1162,6 +1245,7 @@ mod tests {
             sub_session_id: sub_session_id.to_string(),
             goal: "inspect".to_string(),
             context: "summary".to_string(),
+            skill_name: None,
             created_at_unix_ms: unix_ms_now(),
             transcript_path: crate::schema::StoragePaths::session_transcript_file(sub_session_id)
                 .display()
@@ -1317,6 +1401,12 @@ mod tests {
                             .display()
                             .to_string(),
                     ),
+                    skill_name: None,
+                    lineage: None,
+                    effective_tools: None,
+                    effective_max_steps: None,
+                    effective_timeout_sec: None,
+                    failure: None,
                 },
             };
         }
@@ -1350,6 +1440,12 @@ mod tests {
                             .display()
                             .to_string(),
                     ),
+                    skill_name: None,
+                    lineage: None,
+                    effective_tools: None,
+                    effective_max_steps: None,
+                    effective_timeout_sec: None,
+                    failure: None,
                 },
             };
         }
@@ -1415,11 +1511,22 @@ mod tests {
         let spawned = runtime
             .spawn_job_with_limits(
                 make_ctx(),
-                "hang".to_string(),
-                make_context(),
-                1,
-                4,
-                SkillSessionSeed::default(),
+                SubagentExecutionRequest {
+                    initial_input: "hang".to_string(),
+                    display_goal: "hang".to_string(),
+                    context: make_context(),
+                    timeout_sec: 1,
+                    max_steps: 4,
+                    allowed_tools: Vec::new(),
+                    restrict_to_allowed_tools: false,
+                    allow_subagent_tool: false,
+                    skill_name: None,
+                    lineage: None,
+                    effective_tools: None,
+                    effective_max_steps: Some(4),
+                    effective_timeout_sec: Some(1),
+                    skill_session_seed: SkillSessionSeed::default(),
+                },
             )
             .await
             .unwrap();

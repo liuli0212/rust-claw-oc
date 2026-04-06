@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod context_assembler;
 pub mod core;
+pub mod delegation;
 pub mod discord;
 pub mod event_log;
 pub mod evidence;

@@ -24,10 +24,12 @@ parameters:
 
 ## Execution
 
-使用 `execute_bash` 运行：
+先阅读注入到 prompt 里的 `Skill Arguments (JSON)`，从中获取 `input` 和可选的 `language`。
+
+然后使用 `execute_bash` 运行：
 
 ```bash
-summarize "{{input}}" --model free --language "{{language}}"
+summarize "<input>" --model free --language "<language>"
 ```
 
-如果 `language` 为空，则省略该参数并使用默认语言。
+如果 `language` 为空，则省略 `--language` 参数并使用工具默认语言。不要自己做模板替换，直接根据参数块里的值构造命令。

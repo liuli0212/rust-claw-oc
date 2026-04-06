@@ -419,6 +419,7 @@ impl AgentLoop {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_trace_event(
         &self,
         actor: TraceActor,

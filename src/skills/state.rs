@@ -1,53 +1,17 @@
-//! Skill execution state — runtime data for an active skill session.
+//! Runtime data for an active skill invocation.
 
-use std::collections::BTreeMap;
+use serde_json::Value;
 
-use super::definition::SkillConstraints;
+use crate::delegation::DelegationContext;
 
-/// The state of a currently active skill within a session.
-#[derive(Debug, Clone)]
-pub struct ActiveSkillState {
-    pub skill_name: String,
-    pub execution_state: SkillExecutionState,
-    /// Arbitrary labels for skill-specific business phases.
-    pub labels: BTreeMap<String, String>,
-    /// Collected user answers keyed by context_key.
-    pub answers: BTreeMap<String, SkillAnswer>,
-    /// A pending question waiting for user input.
-    pub pending_interaction: Option<PendingInteraction>,
-    /// Artifacts produced during skill execution.
-    pub artifacts: Vec<SkillArtifact>,
-    /// Arguments provided at activation (e.g. from slash command).
-    pub initial_args: Option<String>,
-    /// Constraints inherited from the SkillDef.
-    pub constraints: SkillConstraints,
-}
-
-/// Generic execution state — controlled by the runtime, not the skill.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SkillExecutionState {
+pub enum SkillInvocationState {
     Running,
     WaitingUser,
-    WaitingSubagent,
-    ValidatingArtifacts,
-    Completed,
 }
 
-/// A user's answer to a structured question.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct SkillAnswer {
-    pub question: String,
-    pub answer: String,
-    pub answered_at: String,
-}
-
-/// A pending structured question awaiting user response.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PendingInteraction {
-    pub skill_name: String,
     pub context_key: String,
     pub question: String,
     pub options: Vec<String>,
@@ -55,59 +19,54 @@ pub struct PendingInteraction {
     pub asked_at: String,
 }
 
-/// An artifact produced by the skill.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
-pub struct SkillArtifact {
-    pub kind: String,
-    pub path: String,
-    pub summary: Option<String>,
+pub struct SkillInvocation {
+    pub skill_name: String,
+    pub version: String,
+    pub instructions: String,
+    pub allowed_tools: Vec<String>,
+    pub raw_args: Option<String>,
+    pub json_args: Option<Value>,
+    pub delegated_context: Option<String>,
+    pub pending_interaction: Option<PendingInteraction>,
+    pub state: SkillInvocationState,
+    pub delegation_context: DelegationContext,
+    pub compatibility_notes: Vec<String>,
 }
 
-impl ActiveSkillState {
-    /// Create a new state for the given skill.
-    pub fn new(skill_name: String, constraints: SkillConstraints) -> Self {
-        Self {
-            skill_name,
-            execution_state: SkillExecutionState::Running,
-            labels: BTreeMap::new(),
-            answers: BTreeMap::new(),
-            pending_interaction: None,
-            artifacts: Vec::new(),
-            initial_args: None,
-            constraints,
-        }
-    }
-
-    /// Generate a concise summary for prompt injection.
+impl SkillInvocation {
     pub fn state_summary(&self) -> String {
         let mut parts = Vec::new();
         parts.push(format!("Skill: {}", self.skill_name));
-        parts.push(format!("State: {:?}", self.execution_state));
+        parts.push(format!("State: {:?}", self.state));
 
-        if !self.labels.is_empty() {
-            let labels: Vec<String> = self
-                .labels
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
-            parts.push(format!("Labels: {}", labels.join(", ")));
+        if !self.allowed_tools.is_empty() {
+            parts.push(format!("Allowed tools: {}", self.allowed_tools.join(", ")));
+        } else {
+            parts.push("Allowed tools: all top-level tools".to_string());
         }
 
-        if !self.answers.is_empty() {
-            parts.push(format!("Answers collected: {}", self.answers.len()));
+        if let Some(raw_args) = &self.raw_args {
+            parts.push(format!("Activation args (raw): {}", raw_args));
         }
 
-        if let Some(pi) = &self.pending_interaction {
-            parts.push(format!("PENDING QUESTION: {}", pi.question));
+        if let Some(json_args) = &self.json_args {
+            parts.push(format!("Activation args (json): {}", json_args));
         }
 
-        if !self.artifacts.is_empty() {
-            parts.push(format!("Artifacts: {}", self.artifacts.len()));
+        if let Some(delegated_context) = &self.delegated_context {
+            parts.push(format!("Delegation context: {}", delegated_context));
         }
 
-        if let Some(args) = &self.initial_args {
-            parts.push(format!("USER INPUT AT ACTIVATION: {}", args));
+        if let Some(pending) = &self.pending_interaction {
+            parts.push(format!("Pending question: {}", pending.question));
+        }
+
+        if !self.compatibility_notes.is_empty() {
+            parts.push(format!(
+                "Compatibility notes: {}",
+                self.compatibility_notes.join(" | ")
+            ));
         }
 
         parts.join("\n")
@@ -119,24 +78,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_state() {
-        let state = ActiveSkillState::new("test".to_string(), SkillConstraints::default());
-        assert_eq!(state.skill_name, "test");
-        assert_eq!(state.execution_state, SkillExecutionState::Running);
-        assert!(state.answers.is_empty());
-    }
+    fn test_state_summary_includes_raw_and_json_args() {
+        let invocation = SkillInvocation {
+            skill_name: "review".to_string(),
+            version: "1.0".to_string(),
+            instructions: "test".to_string(),
+            allowed_tools: vec!["read_file".to_string()],
+            raw_args: Some("src/lib.rs".to_string()),
+            json_args: Some(serde_json::json!({ "path": "src/lib.rs" })),
+            delegated_context: Some("Please focus on parsing.".to_string()),
+            pending_interaction: None,
+            state: SkillInvocationState::Running,
+            delegation_context: DelegationContext::new_root("root"),
+            compatibility_notes: Vec::new(),
+        };
 
-    #[test]
-    fn test_state_summary() {
-        let mut state = ActiveSkillState::new("review".to_string(), SkillConstraints::default());
-        state.execution_state = SkillExecutionState::Running;
-        state
-            .labels
-            .insert("phase".to_string(), "questioning".to_string());
-
-        let summary = state.state_summary();
-        assert!(summary.contains("review"));
-        assert!(summary.contains("Running"));
-        assert!(summary.contains("phase=questioning"));
+        let summary = invocation.state_summary();
+        assert!(summary.contains("Activation args (raw): src/lib.rs"));
+        assert!(summary.contains("\"path\":\"src/lib.rs\""));
+        assert!(summary.contains("Delegation context: Please focus on parsing."));
     }
 }

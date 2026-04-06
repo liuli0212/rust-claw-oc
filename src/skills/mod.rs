@@ -3,6 +3,7 @@
 //! This module provides the new General Skill Runtime data model
 //! (`SkillDef`).
 
+pub mod arguments;
 pub mod call_tree;
 pub mod definition;
 pub mod parser;

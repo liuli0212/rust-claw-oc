@@ -24,10 +24,11 @@ This skill uses the Google Gemini API to analyze and understand an image file.
 
 ## Execution
 
-Use `execute_bash` to run:
+Read the injected `Skill Arguments (JSON)` block to get `image_path` and `prompt`.
+Then use `execute_bash` to run:
 
 ```bash
-python3 skills/scripts/vision.py "{{image_path}}" "{{prompt}}"
+python3 skills/scripts/vision.py "<image_path>" "<prompt>"
 ```
 
 Summarize the result in plain language after the command completes.
