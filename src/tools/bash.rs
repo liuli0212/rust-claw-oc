@@ -84,42 +84,6 @@ impl BashTool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tools::sandbox::{SandboxEnforcer, SandboxLevel, SandboxPolicy};
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn test_execute_bash_blocks_without_bwrap_when_sandbox_enabled() {
-        let tool = BashTool::new();
-        let mut ctx = crate::tools::ToolContext::new("test", "test");
-        ctx.sandbox = Some(Arc::new(SandboxEnforcer::disabled_with_policy(
-            SandboxPolicy {
-                level: SandboxLevel::Restricted,
-                ..Default::default()
-            },
-        )));
-
-        let err = tool
-            .execute(
-                serde_json::json!({
-                    "command": "echo hello",
-                    "timeout": 1,
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, ToolError::ExecutionFailed(_)));
-        assert!(err
-            .to_string()
-            .contains("Bubblewrap (`bwrap`) is unavailable"));
-    }
-}
-
-/// RAII guard that ensures both the child process and PTY master are cleaned up
 /// when the execution future is dropped (e.g., by `tokio::time::timeout` or task abort).
 /// Dropping the master PTY causes the reader thread to receive EOF and exit.
 struct BashExecutionGuard {
@@ -333,5 +297,40 @@ impl Tool for BashTool {
                 Err(ToolError::Timeout)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::sandbox::{SandboxEnforcer, SandboxLevel, SandboxPolicy};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_execute_bash_blocks_without_bwrap_when_sandbox_enabled() {
+        let tool = BashTool::new();
+        let mut ctx = crate::tools::ToolContext::new("test", "test");
+        ctx.sandbox = Some(Arc::new(SandboxEnforcer::disabled_with_policy(
+            SandboxPolicy {
+                level: SandboxLevel::Restricted,
+                ..Default::default()
+            },
+        )));
+
+        let err = tool
+            .execute(
+                serde_json::json!({
+                    "command": "echo hello",
+                    "timeout": 1,
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::ExecutionFailed(_)));
+        assert!(err
+            .to_string()
+            .contains("Bubblewrap (`bwrap`) is unavailable"));
     }
 }
