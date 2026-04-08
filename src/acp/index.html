@@ -1264,6 +1264,31 @@
             `;
         }
 
+        function getRecordToolName(record) {
+            const attrsToolName = record.attrs?.tool_name;
+            if (attrsToolName) {
+                return attrsToolName;
+            }
+
+            if (record.name === 'llm_tool_call_emitted' && record.summary) {
+                return record.summary.trim();
+            }
+
+            return null;
+        }
+
+        function getRecordDisplayName(record) {
+            const toolName = getRecordToolName(record);
+            if (toolName && (
+                record.actor === 'tool'
+                || record.name === 'llm_tool_call_emitted'
+            )) {
+                return `${record.name} · ${toolName}`;
+            }
+
+            return record.name;
+        }
+
         function renderRecordCard(record, depthMap) {
             const depth = Math.min(depthMap.get(record.span_id) || 0, 5);
             const summary = record.summary
@@ -1273,7 +1298,7 @@
             return `
                 <div class="${eventCardClass(record)}" style="--depth:${depth};">
                     <div class="event-head">
-                        <div class="event-name">${escapeHtml(record.name)}</div>
+                        <div class="event-name">${escapeHtml(getRecordDisplayName(record))}</div>
                         <div class="event-meta">${escapeHtml(actorLabel(record.actor))} · ${escapeHtml(record.kind)} · ${escapeHtml(record.status)}</div>
                     </div>
                     <div class="event-meta">${escapeHtml(formatTs(record.ts_unix_ms))}${record.duration_ms ? ` · ${record.duration_ms} ms` : ''}${record.turn_id ? ` · ${escapeHtml(record.turn_id)}` : ''}${record.iteration !== null && record.iteration !== undefined ? ` · iter ${record.iteration}` : ''}</div>
