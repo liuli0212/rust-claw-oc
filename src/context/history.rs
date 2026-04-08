@@ -566,7 +566,25 @@ fn sanitize_message(msg: &super::model::Message) -> Option<super::model::Message
     }
 
     if cleaned_parts.is_empty() {
-        return None;
+        if role == "user" {
+            cleaned_parts.push(super::model::Part {
+                text: Some("[Acknowledged]".to_string()),
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+                file_data: None,
+            });
+        } else if role == "model" {
+            cleaned_parts.push(super::model::Part {
+                text: Some("[Thought process hidden]".to_string()),
+                function_call: None,
+                function_response: None,
+                thought_signature: None,
+                file_data: None,
+            });
+        } else {
+            return None;
+        }
     }
 
     Some(super::model::Message {
@@ -728,11 +746,16 @@ fn reconstruct_turn_for_history(turn: &Turn) -> (Turn, usize) {
                             cleaned_text = cleaned_text.replace(marker, "").trim().to_string();
                         }
                     }
+                    if cleaned_text.is_empty() {
+                        cleaned_text = "[Acknowledged]".to_string();
+                    }
                     new_part.text = Some(cleaned_text);
                 } else if msg.role == "model" && new_part.function_call.is_none() {
                     let cleaned = AgentContext::strip_thinking_tags(text);
                     if !cleaned.is_empty() {
                         new_part.text = Some(cleaned);
+                    } else {
+                        new_part.text = Some("[Thought process hidden]".to_string());
                     }
                 }
             }
