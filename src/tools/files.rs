@@ -4,10 +4,18 @@ use super::protocol::{
 use async_trait::async_trait;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+
 use std::time::Instant;
 
 pub struct PatchFileTool;
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct FileEdit {
+    /// The exact text to find in the file. Must be unique.
+    pub search: String,
+    /// The text to replace it with.
+    pub replace: String,
+}
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct PatchFileArgs {
@@ -15,8 +23,8 @@ pub struct PatchFileArgs {
     pub thought: Option<String>,
     /// Absolute or relative path to the file to edit
     pub path: String,
-    /// The unified diff patch content to apply
-    pub patch: String,
+    /// List of edits to apply to the file sequentially.
+    pub edits: Vec<FileEdit>,
 }
 
 #[async_trait]
@@ -26,69 +34,94 @@ impl Tool for PatchFileTool {
     }
 
     fn description(&self) -> String {
-        "Applies a unified diff patch to a file. This is the preferred way to edit existing files."
+        "Replaces exact text blocks in a file. This is the preferred way to edit existing files. Provide enough context in `search` to make it unique. You can provide multiple edits."
             .to_string()
     }
 
-    fn parameters_schema(&self) -> Value {
+    fn parameters_schema(&self) -> serde_json::Value {
         clean_schema(serde_json::to_value(schema_for!(PatchFileArgs)).unwrap())
     }
 
     async fn execute(
         &self,
-        args: Value,
-        ctx: &crate::tools::protocol::ToolContext,
-    ) -> Result<String, ToolError> {
-        let start = Instant::now();
-        let parsed: PatchFileArgs =
-            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+        args: serde_json::Value,
+        ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
+        let start = std::time::Instant::now();
+        let parsed: PatchFileArgs = serde_json::from_value(args)
+            .map_err(|e| crate::tools::ToolError::InvalidArguments(e.to_string()))?;
 
         // Sandbox path guard
         if let Some(sandbox) = &ctx.sandbox {
             let policy = sandbox.default_policy();
             sandbox
                 .check_path_access(std::path::Path::new(&parsed.path), true, policy)
-                .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
+                .map_err(|v| crate::tools::ToolError::ExecutionFailed(v.to_string()))?;
         }
 
-        let patch_path = format!("{}.patch", parsed.path);
-        std::fs::write(&patch_path, &parsed.patch).map_err(ToolError::IoError)?;
+        let mut file_content =
+            std::fs::read_to_string(&parsed.path).map_err(crate::tools::ToolError::IoError)?;
 
-        let output = std::process::Command::new("patch")
-            .arg("-u")
-            .arg(&parsed.path)
-            .arg("-i")
-            .arg(&patch_path)
-            .output()
-            .map_err(ToolError::IoError)?;
+        // Validate all edits first (Atomicity)
+        for (i, edit) in parsed.edits.iter().enumerate() {
+            let mut search_str = edit.search.as_str();
+            let mut replace_str = edit.replace.as_str();
+            let mut matches: Vec<_> = file_content.match_indices(search_str).collect();
 
-        let _ = std::fs::remove_file(&patch_path);
+            // Fallback: Fuzzy match (trim leading/trailing whitespace)
+            if matches.is_empty() {
+                let trimmed_search = edit.search.trim();
+                if !trimmed_search.is_empty() {
+                    let fuzzy_matches: Vec<_> =
+                        file_content.match_indices(trimmed_search).collect();
+                    if fuzzy_matches.len() == 1 {
+                        search_str = trimmed_search;
+                        replace_str = edit.replace.trim();
+                        matches = fuzzy_matches;
+                    }
+                }
+            }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let ok = output.status.success();
-
-        if ok {
-            StructuredToolOutput::new(
-                "patch_file",
-                true,
-                stdout,
-                output.status.code(),
-                Some(start.elapsed().as_millis()),
-                false,
-            )
-            .with_file_path(parsed.path)
-            .to_json_string()
-        } else {
-            serialize_tool_envelope(
-                "patch_file",
-                false,
-                format!("STDOUT:\n{}\n\nSTDERR:\n{}", stdout, stderr),
-                output.status.code(),
-                Some(start.elapsed().as_millis()),
-                false,
-            )
+            if matches.is_empty() {
+                return crate::tools::protocol::StructuredToolOutput::new(
+                    "patch_file",
+                    false,
+                    format!("Edit {} failed: Search text not found in file. Exact and fuzzy match failed. Please ensure you provide the exact text.", i + 1),
+                    Some(1),
+                    Some(start.elapsed().as_millis()),
+                    false,
+                ).to_json_string();
+            } else if matches.len() > 1 {
+                return crate::tools::protocol::StructuredToolOutput::new(
+                    "patch_file",
+                    false,
+                    format!("Edit {} failed: Search text found multiple times in file. Please provide more context lines to make it unique.", i + 1),
+                    Some(1),
+                    Some(start.elapsed().as_millis()),
+                    false,
+                ).to_json_string();
+            }
+            // Apply in memory
+            file_content = file_content.replace(search_str, replace_str);
         }
+
+        std::fs::write(&parsed.path, &file_content).map_err(crate::tools::ToolError::IoError)?;
+
+        crate::tools::protocol::StructuredToolOutput::new(
+            "patch_file",
+            true,
+            format!(
+                "Successfully applied {} edits to {}",
+                parsed.edits.len(),
+                parsed.path
+            ),
+            Some(0),
+            Some(start.elapsed().as_millis()),
+            false,
+        )
+        .with_invalidated_diagnostics()
+        .with_file_path(parsed.path)
+        .to_json_string()
     }
 }
 
@@ -565,11 +598,19 @@ mod tests {
         let test_file = "test_patch.txt";
         std::fs::write(test_file, "Line 1\nLine 2\nLine 3\n").unwrap();
 
-        let patch = "--- test_patch.txt\n+++ test_patch.txt\n@@ -1,3 +1,3 @@\n Line 1\n-Line 2\n+Line 2 edited\n Line 3\n";
         let args = serde_json::json!({
-            "thought": "edit line 2",
+            "thought": "edit line 2 and 3",
             "path": test_file,
-            "patch": patch
+            "edits": [
+                {
+                    "search": "Line 2\n",
+                    "replace": "Line 2 edited\n"
+                },
+                {
+                    "search": "Line 3\n",
+                    "replace": "Line 3 edited\n"
+                }
+            ]
         });
 
         let result = tool
@@ -579,7 +620,28 @@ mod tests {
         assert!(result.contains("true"));
 
         let content = std::fs::read_to_string(test_file).unwrap();
-        assert_eq!(content, "Line 1\nLine 2 edited\nLine 3\n");
+        assert_eq!(content, "Line 1\nLine 2 edited\nLine 3 edited\n");
+
+        // Test fuzzy match fallback
+        let fuzzy_args = serde_json::json!({
+            "thought": "fuzzy match test",
+            "path": test_file,
+            "edits": [
+                {
+                    "search": "  Line 2 edited  \n",
+                    "replace": "  Line 2 fuzzy  \n"
+                }
+            ]
+        });
+
+        let fuzzy_result = tool
+            .execute(fuzzy_args, &crate::tools::ToolContext::new("test", "test"))
+            .await
+            .unwrap();
+        assert!(fuzzy_result.contains("true"));
+
+        let fuzzy_content = std::fs::read_to_string(test_file).unwrap();
+        assert_eq!(fuzzy_content, "Line 1\nLine 2 fuzzy\nLine 3 edited\n");
 
         std::fs::remove_file(test_file).unwrap();
     }
