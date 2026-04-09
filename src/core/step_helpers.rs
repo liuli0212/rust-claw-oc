@@ -515,16 +515,16 @@ impl AgentLoop {
             if self.is_autopilot {
                 let current_completed = self.count_completed_todos();
                 if current_completed > self.autopilot_todos_completed_count {
-                    // Physical audit passed — generate rolling summary via LLM
+                    // Physical audit passed — generate status summary for user
                     tracing::info!(
-                        "Autopilot physical audit passed. Resetting energy and generating summary."
+                        "Autopilot physical audit passed. Resetting energy and generating status summary."
                     );
                     self.output
-                        .on_text("[System] 物理审计通过，正在生成滚动摘要并重置上下文...\n")
+                        .on_text("[System] 物理审计通过，正在生成阶段性进展报告...\n")
                         .await;
 
-                    let summary = self.generate_rolling_summary().await;
-                    self.context.rolling_summary = Some(summary);
+                    let summary = self.generate_status_summary().await;
+                    self.output.on_text(&format!("\n{}\n\n", summary)).await;
 
                     // Use rule_based_compact to safely compress history (preserves message pairing)
                     let keep_turns = 3;
@@ -545,9 +545,9 @@ impl AgentLoop {
                 }
             }
 
-            tracing::warn!("Energy points depleted. Generating summary for user handoff.");
+            tracing::warn!("Energy points depleted. Generating status summary for user handoff.");
             self.output
-                .on_text("[System] 能量耗尽，正在生成阶段性总结并暂停任务...\n")
+                .on_text("[System] 能量耗尽，正在生成阶段性进展报告并暂停任务...\n")
                 .await;
             self.record_trace_event(
                 TraceActor::System,
@@ -561,7 +561,7 @@ impl AgentLoop {
                 None,
             );
 
-            let summary = self.generate_rolling_summary().await;
+            let summary = self.generate_status_summary().await;
 
             return Some(
                 self.finalize_exit(RunExit::EnergyDepleted(summary), true)
@@ -1011,9 +1011,9 @@ impl AgentLoop {
         (response_parts, should_yield_to_user)
     }
 
-    /// Generate a rolling summary of recent history via the LLM.
-    /// Falls back to a structural summary if the LLM call fails.
-    pub(super) async fn generate_rolling_summary(&self) -> String {
+    /// Generate a user-facing status summary of current unfinished work via the LLM.
+    /// Falls back to a structural status report if the LLM call fails.
+    pub(super) async fn generate_status_summary(&self) -> String {
         // Build a concise text representation of recent history for summarization
         let mut history_text = String::new();
         let max_history_chars = 8_000;
@@ -1055,11 +1055,32 @@ impl AgentLoop {
             history_text.push('\n');
         }
 
+        // Collect optional supplementary signals
+        let task_hint = self
+            .task_state_store
+            .load()
+            .ok()
+            .and_then(|s| s.goal.as_ref().map(|g| format!("\nOriginal task goal: {}", g)))
+            .unwrap_or_default();
+
+        let (completed, uncompleted) = self.count_todos_status();
+        let todos_hint = if completed + uncompleted > 0 {
+            format!("\nTODOS progress: {} completed, {} remaining", completed, uncompleted)
+        } else {
+            String::new()
+        };
+
         let summary_prompt = format!(
-            "Summarize the following agent execution history into a concise rolling summary. \
-             Focus on: (1) What tasks were attempted (2) What succeeded/failed (3) Current state of TODOS. \
-             Be objective and concise (max 500 words).\n\n---\n{}\n---",
-            history_text
+            "You are an AI agent that has paused mid-task. Based on the execution history below, \
+             generate a concise status report for the user.\n\n\
+             Focus on:\n\
+             1. What is the current task objective\n\
+             2. What has been accomplished so far (briefly)\n\
+             3. What remains unfinished (key focus)\n\
+             4. Any errors or blockers encountered\n\
+             5. Suggested next steps\n\n\
+             Do NOT produce a chronological history recap. Write an actionable status report \
+             (max 300 words).{task_hint}{todos_hint}\n\n---\n{history_text}\n---"
         );
 
         let messages = vec![Message {
@@ -1096,18 +1117,28 @@ impl AgentLoop {
                 }
             }
             Ok(Err(e)) => {
-                tracing::warn!("LLM summary generation failed: {}", e);
+                tracing::warn!("Status summary generation failed: {}", e);
             }
             Err(_) => {
-                tracing::warn!("LLM summary generation timed out");
+                tracing::warn!("Status summary generation timed out");
             }
         }
 
-        // Fallback: structural summary from history
-        let mut fallback = String::from("Structural summary of recent autopilot activity:\n");
-        for turn in self.context.dialogue_history.iter().rev().take(5) {
+        // Fallback: user-facing structural status report
+        let mut fallback = String::new();
+
+        // Task goal (from TaskState if available)
+        if let Ok(state) = self.task_state_store.load() {
+            if let Some(goal) = &state.goal {
+                fallback.push_str(&format!("📋 任务目标: {}\n\n", goal));
+            }
+        }
+
+        // Recent actions summary
+        fallback.push_str("📊 最近执行:\n");
+        for turn in self.context.dialogue_history.iter().rev().take(3) {
             fallback.push_str(&format!(
-                "- User: {}\n",
+                "- {}\n",
                 crate::context::AgentContext::truncate_chars(&turn.user_message, 100)
             ));
             let mut tool_count = 0;
@@ -1124,16 +1155,24 @@ impl AgentLoop {
                     }
                 }
             }
+            if error_count > 0 {
+                fallback.push_str(&format!(
+                    "  ({} 操作, {} 失败)\n",
+                    tool_count, error_count
+                ));
+            } else {
+                fallback.push_str(&format!("  ({} 操作, 均成功)\n", tool_count));
+            }
+        }
+
+        // TODOS progress (if any)
+        if completed + uncompleted > 0 {
             fallback.push_str(&format!(
-                "  ({} tool calls, {} errors)\n",
-                tool_count, error_count
+                "\n📝 TODOS: {} 已完成, {} 待完成\n",
+                completed, uncompleted
             ));
         }
-        let (completed, uncompleted) = self.count_todos_status();
-        fallback.push_str(&format!(
-            "Current TODOS: {} completed, {} remaining\n",
-            completed, uncompleted
-        ));
+
         fallback
     }
 

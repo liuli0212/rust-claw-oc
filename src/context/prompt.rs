@@ -282,19 +282,7 @@ Architecture: {}
         active_evidence,
         Vec::new(),
     );
-    let mut final_system_text = assembled_system_text;
-
-    if let Some(summary) = &ctx.rolling_summary {
-        final_system_text.push_str(&format!(
-            "\n\n--- [COMPRESSED HISTORY SUMMARY] ---\n\
-             The following is an AI-generated summary of the previous conversation turns that have \
-             been compressed to save context space. Treat this as authoritative history — it \
-             reflects what actually happened before the current dialogue window.\n\n\
-             {}\n\
-             ------------------------------------\n",
-            summary
-        ));
-    }
+    let final_system_text = assembled_system_text;
 
     let system_msg = super::model::Message {
         role: "system".to_string(),
