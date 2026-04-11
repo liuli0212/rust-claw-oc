@@ -9,8 +9,10 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone)]
 pub enum ScenarioEvent {
     Text(String),
+    #[allow(dead_code)]
     Thought(String),
     ToolCall(FunctionCall, Option<String>),
+    #[allow(dead_code)]
     Error(String),
 }
 
