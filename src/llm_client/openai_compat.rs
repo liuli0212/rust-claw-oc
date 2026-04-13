@@ -546,7 +546,6 @@ impl OpenAiCompatClient {
         Ok(text)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
