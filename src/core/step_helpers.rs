@@ -1060,12 +1060,19 @@ impl AgentLoop {
             .task_state_store
             .load()
             .ok()
-            .and_then(|s| s.goal.as_ref().map(|g| format!("\nOriginal task goal: {}", g)))
+            .and_then(|s| {
+                s.goal
+                    .as_ref()
+                    .map(|g| format!("\nOriginal task goal: {}", g))
+            })
             .unwrap_or_default();
 
         let (completed, uncompleted) = self.count_todos_status();
         let todos_hint = if completed + uncompleted > 0 {
-            format!("\nTODOS progress: {} completed, {} remaining", completed, uncompleted)
+            format!(
+                "\nTODOS progress: {} completed, {} remaining",
+                completed, uncompleted
+            )
         } else {
             String::new()
         };
@@ -1156,10 +1163,7 @@ impl AgentLoop {
                 }
             }
             if error_count > 0 {
-                fallback.push_str(&format!(
-                    "  ({} 操作, {} 失败)\n",
-                    tool_count, error_count
-                ));
+                fallback.push_str(&format!("  ({} 操作, {} 失败)\n", tool_count, error_count));
             } else {
                 fallback.push_str(&format!("  ({} 操作, 均成功)\n", tool_count));
             }
