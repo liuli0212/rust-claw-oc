@@ -213,7 +213,7 @@ impl LlmClient for OpenAiCompatClient {
             "model": self.model_name,
             "messages": openai_messages,
             "stream": true,
-            "parallel_tool_calls": false,
+            "parallel_tool_calls": true,
         });
 
         if let Some(effort) = &self.reasoning_effort {
