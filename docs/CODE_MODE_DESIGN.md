@@ -5,7 +5,7 @@
 - [x] Phase 1 foundations: `ToolDefinition` / `ToolKind`, provider capability reporting, capability-gated code-mode prompt notices, and `code_mode` module scaffolding are implemented.
 - [x] Phase 2 minimal exec runtime and guarded nested dispatch are implemented.
 - [x] Phase 3 minimal `wait` / yield-resume semantics are implemented.
-- [ ] Phase 4 hardening items such as richer trace coverage and broader tests are not implemented yet.
+- [x] Phase 4 hardening items such as richer trace coverage, history/sanitization updates, and broader tests are implemented.
 
 ## 1. Goal
 
@@ -1067,11 +1067,11 @@ Exit criteria:
 
 ## Phase 4: Hardening
 
-- add timeout helpers
-- add output truncation/token budget controls
-- add trace/event-log visibility
-- add allow-list / policy guards
-- expand tests
+- [x] add timeout helpers
+- [x] add output truncation/token budget controls
+- [x] add trace/event-log visibility
+- [x] add allow-list / policy guards
+- [x] expand tests
 
 ## 17. Testing Strategy
 

@@ -777,6 +777,7 @@ impl AgentLoop {
         remaining_steps: usize,
         iteration_trace_ctx: Option<crate::trace::TraceContext>,
         parent_span_id: Option<String>,
+        outer_tool_call_id: Option<&str>,
     ) -> Result<String, crate::tools::ToolError> {
         if !Self::is_code_mode_nested_tool(tool_name) {
             return Err(crate::tools::ToolError::ExecutionFailed(format!(
@@ -798,6 +799,8 @@ impl AgentLoop {
         let nested_trace_ctx = iteration_trace_ctx
             .as_ref()
             .map(|ctx| ctx.with_parent_span_id(parent_span_id.clone()));
+        let provider = self.llm.provider_name();
+        let model = self.llm.model_name();
         let mut nested_span = nested_trace_ctx.as_ref().map(|ctx| {
             self.trace_bus.start_span(
                 ctx,
@@ -805,6 +808,9 @@ impl AgentLoop {
                 "code_mode_nested_tool_started",
                 serde_json::json!({
                     "tool_name": tool_name,
+                    "outer_tool_call_id": outer_tool_call_id,
+                    "provider": provider,
+                    "model": model,
                     "args_preview": crate::context::AgentContext::truncate_chars(&args.to_string(), 500),
                     "remaining_steps": remaining_steps,
                 }),
@@ -843,7 +849,11 @@ impl AgentLoop {
                 Some(crate::context::AgentContext::truncate_chars(&result, 240)),
                 serde_json::json!({
                     "tool_name": tool_name,
+                    "outer_tool_call_id": outer_tool_call_id,
+                    "provider": provider,
+                    "model": model,
                     "result_preview": crate::context::AgentContext::truncate_chars(&result, 500),
+                    "result_size_chars": result.chars().count(),
                 }),
             );
         }
@@ -871,18 +881,8 @@ impl AgentLoop {
     ) -> ToolDispatchOutcome {
         let start = Instant::now();
         let iteration = iteration_trace_ctx.as_ref().and_then(|ctx| ctx.iteration);
-        self.record_trace_event(
-            TraceActor::Tool,
-            "code_mode_exec_started",
-            TraceStatus::Ok,
-            Some(call.name.clone()),
-            serde_json::json!({
-                "tool_name": call.name,
-                "args_preview": crate::context::AgentContext::truncate_chars(&call.args.to_string(), 500),
-            }),
-            parent_span_id.clone(),
-            iteration,
-        );
+        let provider = self.llm.provider_name().to_string();
+        let model = self.llm.model_name().to_string();
 
         enum CodeModeInvocation {
             Exec(crate::tools::code_mode::ExecArgs),
@@ -951,17 +951,42 @@ impl AgentLoop {
             }
         };
 
+        let (source_length, requested_cell_id) = match &invocation {
+            CodeModeInvocation::Exec(parsed) => (parsed.code.chars().count(), None),
+            CodeModeInvocation::Wait(parsed) => (0usize, parsed.cell_id.clone()),
+        };
+
         let visible_tools: Vec<String> = current_tools
             .iter()
             .map(|tool| tool.name())
             .filter(|name| Self::is_code_mode_nested_tool(name))
             .collect();
 
+        self.record_trace_event(
+            TraceActor::Tool,
+            "code_mode_exec_started",
+            TraceStatus::Ok,
+            Some(call.name.clone()),
+            serde_json::json!({
+                "tool_name": call.name,
+                "outer_tool_call_id": call.id.clone(),
+                "provider": provider,
+                "model": model,
+                "source_length": source_length,
+                "requested_cell_id": requested_cell_id,
+                "visible_nested_tools": visible_tools.len(),
+                "args_preview": crate::context::AgentContext::truncate_chars(&call.args.to_string(), 500),
+            }),
+            parent_span_id.clone(),
+            iteration,
+        );
+
         let service = self.code_mode_service.clone();
         let session_id = self.session_id.clone();
         let nested_tools = current_tools.to_vec();
         let nested_parent_span_id = parent_span_id.clone();
         let iteration_trace_ctx_for_nested = iteration_trace_ctx.clone();
+        let outer_tool_call_id = call.id.clone();
         let cancel_token = self.cancel_token.clone();
         let self_ptr = self as *mut Self as usize;
         let exec_result = tokio::select! {
@@ -972,6 +997,7 @@ impl AgentLoop {
                         let nested_tools = nested_tools.clone();
                         let iteration_trace_ctx_for_nested = iteration_trace_ctx_for_nested.clone();
                         let nested_parent_span_id = nested_parent_span_id.clone();
+                        let outer_tool_call_id = outer_tool_call_id.clone();
                         async move {
                             let args = serde_json::from_str::<serde_json::Value>(&args_json).map_err(|err| {
                                 crate::tools::ToolError::InvalidArguments(format!(
@@ -987,6 +1013,7 @@ impl AgentLoop {
                                         remaining_steps,
                                         iteration_trace_ctx_for_nested,
                                         nested_parent_span_id,
+                                        outer_tool_call_id.as_deref(),
                                     )
                             }
                             .await?;
@@ -1035,6 +1062,16 @@ impl AgentLoop {
                 let yielded = summary.yielded;
                 let nested_tool_calls = summary.nested_tool_calls;
                 let truncated = summary.truncated;
+                let yield_kind = summary.yield_kind.clone();
+                let termination_reason = if summary.yielded {
+                    match yield_kind {
+                        Some(crate::code_mode::response::ExecYieldKind::Timer) => "timer_wait",
+                        Some(crate::code_mode::response::ExecYieldKind::Manual) => "yield",
+                        None => "yield",
+                    }
+                } else {
+                    "completed"
+                };
                 self.record_trace_event(
                     TraceActor::Tool,
                     event_name,
@@ -1042,9 +1079,17 @@ impl AgentLoop {
                     Some(cell_id.clone()),
                     serde_json::json!({
                         "tool_name": call.name.clone(),
+                        "outer_tool_call_id": call.id.clone(),
+                        "provider": provider,
+                        "model": model,
                         "cell_id": cell_id,
+                        "source_length": source_length,
+                        "requested_cell_id": requested_cell_id,
                         "yielded": yielded,
+                        "yield_kind": summary.yield_kind,
                         "nested_tool_calls": nested_tool_calls,
+                        "output_size_chars": summary.output_text.chars().count(),
+                        "termination_reason": termination_reason,
                         "truncated": truncated,
                     }),
                     parent_span_id,
@@ -1087,6 +1132,18 @@ impl AgentLoop {
                     Some(err.to_string()),
                     serde_json::json!({
                         "tool_name": call.name.clone(),
+                        "outer_tool_call_id": call.id.clone(),
+                        "provider": provider,
+                        "model": model,
+                        "source_length": source_length,
+                        "requested_cell_id": requested_cell_id,
+                        "termination_reason": if matches!(err, crate::tools::ToolError::Timeout) {
+                            "timeout"
+                        } else if err.to_string().contains("interrupted by user") {
+                            "cancelled"
+                        } else {
+                            "runtime_error"
+                        },
                         "error": err.to_string(),
                     }),
                     parent_span_id,

@@ -246,13 +246,20 @@ where
                     }
 
                     *call_tool_ref.lock().unwrap() += 1;
-                    let result_json = {
+                    let result_json = match {
                         let mut invoke_tool = invoke_tool_ref.lock().unwrap();
                         (*invoke_tool)(tool_name.clone(), args_json.clone())
-                    }
-                    .map_err(|err| {
-                        Error::new_from_js_message("tool_call", "promise", err.to_string())
-                    })?;
+                    } {
+                        Ok(result_json) => result_json,
+                        Err(err) => {
+                            return Ok(
+                                serde_json::json!({
+                                    "__rustyClawToolError": err.to_string()
+                                })
+                                .to_string(),
+                            )
+                        }
+                    };
                     newly_recorded_tool_calls_ref
                         .lock()
                         .unwrap()
@@ -355,6 +362,12 @@ where
 
         let payload = serde_json::from_str::<serde_json::Value>(&return_payload)
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
+        if let Some(runtime_error) = payload.get("runtimeError").and_then(serde_json::Value::as_str)
+        {
+            return Err(crate::tools::ToolError::ExecutionFailed(
+                runtime_error.to_string(),
+            ));
+        }
         let yielded = payload
             .get("yielded")
             .and_then(serde_json::Value::as_bool)
@@ -410,7 +423,7 @@ fn build_wrapper_script(code: &str) -> String {
     script.push_str("const __allTools = JSON.parse(__allToolsJson);\n");
     script.push_str("globalThis.ALL_TOOLS = Object.freeze(__allTools.slice());\n");
     script.push_str(
-        "globalThis.tools = new Proxy({}, { get(_target, prop) { if (typeof prop !== 'string') { return undefined; } if (!ALL_TOOLS.includes(prop)) { throw new Error(`Tool not available in code mode: ${String(prop)}`); } return async (args = {}) => JSON.parse(await __callTool(prop, JSON.stringify(args ?? {}))); } });\n",
+        "globalThis.tools = new Proxy({}, { get(_target, prop) { if (typeof prop !== 'string') { return undefined; } if (!ALL_TOOLS.includes(prop)) { throw new Error(`Tool not available in code mode: ${String(prop)}`); } return async (args = {}) => { const result = JSON.parse(await __callTool(prop, JSON.stringify(args ?? {}))); if (result && result.__rustyClawToolError) { throw String(result.__rustyClawToolError); } return result; }; } });\n",
     );
     script.push_str("globalThis.text = (value) => __text(String(value));\n");
     script.push_str("globalThis.notify = (value) => __notify(String(value));\n");
@@ -459,7 +472,9 @@ fn build_wrapper_script(code: &str) -> String {
     script.push_str(
         "if (err && err.__rustyClawYield) { return JSON.stringify({ yielded: true, yieldKind: 'manual', returnValue: null, yieldValue: err.value === undefined ? null : err.value }); }\n",
     );
-    script.push_str("throw err;\n");
+    script.push_str(
+        "return JSON.stringify({ yielded: false, yieldKind: null, runtimeError: err && err.stack ? String(err.stack) : (err && err.message ? String(err.message) : String(err)) });\n",
+    );
     script.push_str("}\n");
     script.push_str("})()");
     script
