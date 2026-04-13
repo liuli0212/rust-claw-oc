@@ -244,6 +244,7 @@ pub fn filter_subagent_tools(
     allow_subagent_tool: bool,
 ) -> Vec<Arc<dyn Tool>> {
     let runtime_tools = ["finish_task", "task_plan"];
+    let code_mode_companion_allowed = allowed.iter().any(|tool| tool == "exec");
     let mut accepted = Vec::new();
 
     for tool in base_tools {
@@ -258,6 +259,7 @@ pub fn filter_subagent_tools(
         if !restrict_to_allowed_tools
             || runtime_tools.contains(&name.as_str())
             || allowed.contains(&name)
+            || (name == "wait" && code_mode_companion_allowed)
         {
             accepted.push(tool.clone());
         }
@@ -693,6 +695,21 @@ mod tests {
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"write_file".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"read_file".to_string()));
+    }
+
+    #[test]
+    fn test_filter_subagent_tools_keeps_wait_when_exec_is_whitelisted() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool("exec")),
+            Arc::new(MockTool("wait")),
+            Arc::new(MockTool("read_file")),
+        ];
+
+        let filtered = filter_subagent_tools(&tools, &["exec".to_string()], true, false);
+        let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"exec".to_string()));
+        assert!(names.contains(&"wait".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
     }
 

@@ -202,6 +202,7 @@ pub struct AgentLoop {
     trace_bus: Arc<crate::trace::TraceBus>,
     trace_seed: Option<TraceSeed>,
     active_trace: Option<ActiveTrace>,
+    code_mode_service: crate::code_mode::service::CodeModeService,
 }
 
 impl AgentLoop {
@@ -243,6 +244,7 @@ impl AgentLoop {
             trace_bus: shared_bus(),
             trace_seed: None,
             active_trace: None,
+            code_mode_service: crate::code_mode::service::CodeModeService::default(),
         }
     }
 

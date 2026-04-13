@@ -461,7 +461,10 @@ async fn test_code_mode_notice_is_omitted_when_provider_disables_it() {
         task_state_store,
     );
 
-    let exit = agent.step("Code mode should stay hidden".to_string()).await.unwrap();
+    let exit = agent
+        .step("Code mode should stay hidden".to_string())
+        .await
+        .unwrap();
     assert_eq!(exit, RunExit::YieldedToUser);
 
     let system_text = llm.last_system_text().unwrap_or_default();

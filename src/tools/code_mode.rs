@@ -10,7 +10,14 @@ pub struct ExecArgs {
     pub code: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct WaitArgs {
+    pub cell_id: Option<String>,
+}
+
 pub struct ExecTool;
+
+pub struct WaitTool;
 
 #[async_trait]
 impl Tool for ExecTool {
@@ -27,6 +34,10 @@ impl Tool for ExecTool {
         clean_schema(serde_json::to_value(schema_for!(ExecArgs)).unwrap())
     }
 
+    fn has_side_effects(&self) -> bool {
+        false
+    }
+
     async fn execute(
         &self,
         _args: serde_json::Value,
@@ -36,6 +47,41 @@ impl Tool for ExecTool {
             "exec",
             false,
             "The `exec` tool must be dispatched through the code-mode service.".to_string(),
+            Some(1),
+            None,
+            false,
+        )
+    }
+}
+
+#[async_trait]
+impl Tool for WaitTool {
+    fn name(&self) -> String {
+        "wait".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Resume the currently pending code-mode cell for this session. Optionally provide a `cell_id` to assert which yielded cell should continue."
+            .to_string()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        clean_schema(serde_json::to_value(schema_for!(WaitArgs)).unwrap())
+    }
+
+    fn has_side_effects(&self) -> bool {
+        false
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<String, ToolError> {
+        serialize_tool_envelope(
+            "wait",
+            false,
+            "The `wait` tool must be dispatched through the code-mode service.".to_string(),
             Some(1),
             None,
             false,

@@ -3,8 +3,8 @@
 ## Implementation Status
 
 - [x] Phase 1 foundations: `ToolDefinition` / `ToolKind`, provider capability reporting, capability-gated code-mode prompt notices, and `code_mode` module scaffolding are implemented.
-- [ ] Phase 2 minimal exec runtime and guarded nested dispatch are still in progress.
-- [ ] Phase 3 `wait` / yield-resume semantics are not implemented yet.
+- [x] Phase 2 minimal exec runtime and guarded nested dispatch are implemented.
+- [x] Phase 3 minimal `wait` / yield-resume semantics are implemented.
 - [ ] Phase 4 hardening items such as richer trace coverage and broader tests are not implemented yet.
 
 ## 1. Goal
@@ -1055,14 +1055,15 @@ Exit criteria:
 
 ## Phase 3: Wait / Yield
 
-- Add `WaitTool`
-- add `yield_control()`
-- add timed yielding and resumable cells
-- support session-scoped stored values
+- [x] Add `WaitTool`
+- [x] add `yield_control()`
+- [x] add resumable cells
+- [x] support session-scoped stored values
+- [x] add timed yielding helpers such as `setTimeout()`-driven resume flows
 
 Exit criteria:
 
-- long-running `exec` can yield and resume safely
+- [x] long-running `exec` can yield and resume safely
 
 ## Phase 4: Hardening
 
