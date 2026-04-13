@@ -87,7 +87,7 @@ impl ExecutionExtension for SubagentNotificationExtension {
 mod tests {
     use super::*;
 
-    use crate::llm_client::{LlmClient, LlmError, StreamEvent};
+    use crate::llm_client::{LlmCapabilities, LlmClient, LlmError, StreamEvent};
     use crate::subagent_runtime::SubagentNotification;
     use crate::tools::Tool;
     use std::sync::Arc;
@@ -103,6 +103,15 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "test"
+        }
+
+        fn capabilities(&self) -> LlmCapabilities {
+            LlmCapabilities {
+                function_tools: true,
+                custom_tools: false,
+                parallel_tool_calls: true,
+                supports_code_mode: true,
+            }
         }
 
         async fn stream(

@@ -33,6 +33,27 @@ pub enum ToolError {
     IoError(#[from] std::io::Error),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolKind {
+    Function,
+    Freeform,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeformToolFormat {
+    pub syntax: String,
+    pub definition: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub kind: ToolKind,
+    pub input_schema: Option<serde_json::Value>,
+    pub freeform_format: Option<FreeformToolFormat>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolTraceContext {
     pub trace_id: String,
@@ -79,6 +100,15 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> String;
     fn parameters_schema(&self) -> serde_json::Value;
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError>;
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name(),
+            description: self.description(),
+            kind: ToolKind::Function,
+            input_schema: Some(self.parameters_schema()),
+            freeform_format: None,
+        }
+    }
     /// Whether this tool can modify files, state, or the outside world.
     /// Read-only tools should return false. Default is true (conservative).
     fn has_side_effects(&self) -> bool {

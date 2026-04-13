@@ -404,6 +404,13 @@ impl AgentLoop {
             current_tools = ext.before_tool_resolution(current_tools).await;
         }
 
+        if !self.llm.capabilities().supports_code_mode {
+            current_tools.retain(|tool| {
+                let name = tool.name();
+                name != "exec" && name != "wait"
+            });
+        }
+
         current_tools
     }
 
@@ -592,7 +599,22 @@ impl AgentLoop {
         }
         self.context.skill_instructions = draft.skill_instructions.clone();
         self.context.skill_state_summary = draft.skill_state_summary.clone();
-        self.context.execution_notices = draft.execution_notices.clone();
+
+        let mut execution_notices = draft.execution_notices;
+        let code_mode_visible = self.llm.capabilities().supports_code_mode
+            && current_tools
+                .iter()
+                .any(|tool| matches!(tool.name().as_str(), "exec" | "wait"));
+        if code_mode_visible {
+            let code_mode_notice = crate::code_mode::description::execution_notice();
+            execution_notices = Some(match execution_notices {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{existing}\n\n{code_mode_notice}")
+                }
+                _ => code_mode_notice,
+            });
+        }
+        self.context.execution_notices = execution_notices;
 
         let max_tokens = self.context.max_history_tokens;
         let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
@@ -1060,12 +1082,19 @@ impl AgentLoop {
             .task_state_store
             .load()
             .ok()
-            .and_then(|s| s.goal.as_ref().map(|g| format!("\nOriginal task goal: {}", g)))
+            .and_then(|s| {
+                s.goal
+                    .as_ref()
+                    .map(|g| format!("\nOriginal task goal: {}", g))
+            })
             .unwrap_or_default();
 
         let (completed, uncompleted) = self.count_todos_status();
         let todos_hint = if completed + uncompleted > 0 {
-            format!("\nTODOS progress: {} completed, {} remaining", completed, uncompleted)
+            format!(
+                "\nTODOS progress: {} completed, {} remaining",
+                completed, uncompleted
+            )
         } else {
             String::new()
         };
@@ -1156,10 +1185,7 @@ impl AgentLoop {
                 }
             }
             if error_count > 0 {
-                fallback.push_str(&format!(
-                    "  ({} 操作, {} 失败)\n",
-                    tool_count, error_count
-                ));
+                fallback.push_str(&format!("  ({} 操作, {} 失败)\n", tool_count, error_count));
             } else {
                 fallback.push_str(&format!("  ({} 操作, 均成功)\n", tool_count));
             }

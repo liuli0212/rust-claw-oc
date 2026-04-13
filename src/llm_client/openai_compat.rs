@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::Instrument;
 
-use super::protocol::{create_standard_client, LlmClient, LlmError, StreamEvent};
+use super::protocol::{create_standard_client, LlmCapabilities, LlmClient, LlmError, StreamEvent};
 use crate::utils::{format_full_error, truncate_log, truncate_log_error};
 
 pub struct OpenAiCompatClient {
@@ -139,6 +139,14 @@ impl LlmClient for OpenAiCompatClient {
     fn provider_name(&self) -> &str {
         &self.provider_name
     }
+    fn capabilities(&self) -> LlmCapabilities {
+        LlmCapabilities {
+            function_tools: true,
+            custom_tools: false,
+            parallel_tool_calls: true,
+            supports_code_mode: true,
+        }
+    }
     async fn stream(
         &self,
         messages: Vec<Message>,
@@ -223,24 +231,30 @@ impl LlmClient for OpenAiCompatClient {
         if !tools.is_empty() {
             let mut openai_tools = Vec::new();
             for tool in tools {
+                let definition = tool.definition();
+                if definition.kind != crate::tools::ToolKind::Function {
+                    continue;
+                }
                 openai_tools.push(serde_json::json!({
                     "type": "function",
                     "function": {
-                        "name": tool.name(),
-                        "description": tool.description(),
-                        "parameters": tool.parameters_schema(),
+                        "name": definition.name,
+                        "description": definition.description,
+                        "parameters": definition.input_schema.unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} })),
                     }
                 }));
             }
-            body_map["tools"] = serde_json::json!(openai_tools);
-            body_map["tool_choice"] = serde_json::Value::String("required".to_string());
+            if !openai_tools.is_empty() {
+                body_map["tools"] = serde_json::json!(openai_tools);
+                body_map["tool_choice"] = serde_json::Value::String("required".to_string());
 
-            openai_messages.push(serde_json::json!({
-                "role": "system",
-                "content": "CRITICAL FINAL REMINDER: You MUST output a tool call now unless the task is completely finished. Do NOT output conversational text asking for permission to continue."
-            }));
+                openai_messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": "CRITICAL FINAL REMINDER: You MUST output a tool call now unless the task is completely finished. Do NOT output conversational text asking for permission to continue."
+                }));
 
-            body_map["messages"] = serde_json::json!(openai_messages);
+                body_map["messages"] = serde_json::json!(openai_messages);
+            }
         }
 
         let client = self.client.clone();

@@ -1,5 +1,12 @@
 # Rusty-Claw Code Mode Design
 
+## Implementation Status
+
+- [x] Phase 1 foundations: `ToolDefinition` / `ToolKind`, provider capability reporting, capability-gated code-mode prompt notices, and `code_mode` module scaffolding are implemented.
+- [ ] Phase 2 minimal exec runtime and guarded nested dispatch are still in progress.
+- [ ] Phase 3 `wait` / yield-resume semantics are not implemented yet.
+- [ ] Phase 4 hardening items such as richer trace coverage and broader tests are not implemented yet.
+
 ## 1. Goal
 
 Introduce a Codex-style "Code Mode" into `rust-claw-oc` so the model can orchestrate multiple tool calls inside a single LLM turn by emitting JavaScript source to a dedicated runtime, while still preserving ordinary direct tool calls as a first-class path.

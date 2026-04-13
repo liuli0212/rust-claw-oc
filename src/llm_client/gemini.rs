@@ -11,7 +11,9 @@ use tokio::sync::Mutex;
 use tracing::Instrument;
 
 use super::gemini_context;
-use super::protocol::{create_standard_client, GeminiPlatform, LlmClient, LlmError, StreamEvent};
+use super::protocol::{
+    create_standard_client, GeminiPlatform, LlmCapabilities, LlmClient, LlmError, StreamEvent,
+};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GeminiRequest {
@@ -156,6 +158,16 @@ impl LlmClient for GeminiClient {
     fn provider_name(&self) -> &str {
         &self.provider_name
     }
+
+    fn capabilities(&self) -> LlmCapabilities {
+        LlmCapabilities {
+            function_tools: true,
+            custom_tools: false,
+            parallel_tool_calls: false,
+            supports_code_mode: true,
+        }
+    }
+
     async fn stream(
         &self,
         messages: Vec<Message>,

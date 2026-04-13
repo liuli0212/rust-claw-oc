@@ -26,10 +26,19 @@ pub enum StreamEvent {
     Done,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlmCapabilities {
+    pub function_tools: bool,
+    pub custom_tools: bool,
+    pub parallel_tool_calls: bool,
+    pub supports_code_mode: bool,
+}
+
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
+    fn capabilities(&self) -> LlmCapabilities;
 
     async fn stream(
         &self,

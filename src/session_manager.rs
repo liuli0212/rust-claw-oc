@@ -331,6 +331,15 @@ mod tests {
             "test"
         }
 
+        fn capabilities(&self) -> crate::llm_client::LlmCapabilities {
+            crate::llm_client::LlmCapabilities {
+                function_tools: true,
+                custom_tools: false,
+                parallel_tool_calls: true,
+                supports_code_mode: true,
+            }
+        }
+
         async fn stream(
             &self,
             messages: Vec<Message>,

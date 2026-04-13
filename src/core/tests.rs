@@ -1,6 +1,6 @@
 use super::*;
 use crate::context::Message;
-use crate::llm_client::{LlmClient, LlmError, StreamEvent};
+use crate::llm_client::{LlmCapabilities, LlmClient, LlmError, StreamEvent};
 use crate::tools::Tool;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -36,13 +36,27 @@ impl TestLlmClient {
 struct PromptCapturingLlm {
     last_system: Mutex<Option<String>>,
     events: Mutex<Vec<StreamEvent>>,
+    capabilities: LlmCapabilities,
 }
 
 impl PromptCapturingLlm {
     fn new(events: Vec<StreamEvent>) -> Self {
+        Self::new_with_capabilities(
+            events,
+            LlmCapabilities {
+                function_tools: true,
+                custom_tools: false,
+                parallel_tool_calls: true,
+                supports_code_mode: true,
+            },
+        )
+    }
+
+    fn new_with_capabilities(events: Vec<StreamEvent>, capabilities: LlmCapabilities) -> Self {
         Self {
             last_system: Mutex::new(None),
             events: Mutex::new(events),
+            capabilities,
         }
     }
 
@@ -60,6 +74,15 @@ impl LlmClient for TestLlmClient {
 
     fn provider_name(&self) -> &str {
         "test-provider"
+    }
+
+    fn capabilities(&self) -> LlmCapabilities {
+        LlmCapabilities {
+            function_tools: true,
+            custom_tools: false,
+            parallel_tool_calls: true,
+            supports_code_mode: true,
+        }
     }
 
     async fn stream(
@@ -85,6 +108,10 @@ impl LlmClient for PromptCapturingLlm {
 
     fn provider_name(&self) -> &str {
         "test-provider"
+    }
+
+    fn capabilities(&self) -> LlmCapabilities {
+        self.capabilities
     }
 
     async fn stream(
@@ -371,5 +398,74 @@ async fn test_step_yields_after_ask_user_tool_result() {
 
     assert_eq!(exit, RunExit::YieldedToUser);
     assert!(text.contains("What is your goal?"));
+    cleanup_session(session_id);
+}
+
+#[tokio::test]
+async fn test_code_mode_notice_is_added_when_exec_is_visible() {
+    let llm = Arc::new(PromptCapturingLlm::new(vec![StreamEvent::Text(
+        "Ready".to_string(),
+    )]));
+    let output = Arc::new(TestOutput::new());
+    let session_id = "test-code-mode-notice";
+    cleanup_session(session_id);
+
+    let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+    let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(session_id));
+    let mut agent = AgentLoop::new(
+        session_id.to_string(),
+        llm.clone(),
+        "test_cli".to_string(),
+        vec![Arc::new(crate::tools::ExecTool)],
+        AgentContext::new(),
+        output,
+        Arc::new(telemetry),
+        task_state_store,
+    );
+
+    let exit = agent.step("Use code mode".to_string()).await.unwrap();
+    assert_eq!(exit, RunExit::YieldedToUser);
+
+    let system_text = llm.last_system_text().unwrap_or_default();
+    assert!(system_text.contains("Code Mode is enabled for this provider."));
+    assert!(system_text.contains("prefer the `exec` tool"));
+
+    cleanup_session(session_id);
+}
+
+#[tokio::test]
+async fn test_code_mode_notice_is_omitted_when_provider_disables_it() {
+    let llm = Arc::new(PromptCapturingLlm::new_with_capabilities(
+        vec![StreamEvent::Text("Ready".to_string())],
+        LlmCapabilities {
+            function_tools: true,
+            custom_tools: false,
+            parallel_tool_calls: true,
+            supports_code_mode: false,
+        },
+    ));
+    let output = Arc::new(TestOutput::new());
+    let session_id = "test-code-mode-disabled";
+    cleanup_session(session_id);
+
+    let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+    let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(session_id));
+    let mut agent = AgentLoop::new(
+        session_id.to_string(),
+        llm.clone(),
+        "test_cli".to_string(),
+        vec![Arc::new(crate::tools::ExecTool)],
+        AgentContext::new(),
+        output,
+        Arc::new(telemetry),
+        task_state_store,
+    );
+
+    let exit = agent.step("Code mode should stay hidden".to_string()).await.unwrap();
+    assert_eq!(exit, RunExit::YieldedToUser);
+
+    let system_text = llm.last_system_text().unwrap_or_default();
+    assert!(!system_text.contains("Code Mode is enabled for this provider."));
+
     cleanup_session(session_id);
 }
