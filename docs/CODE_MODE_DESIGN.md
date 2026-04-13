@@ -184,6 +184,17 @@ The new module integrates into:
 - `src/context/*`
   - store `exec` calls and outputs in the same turn model without losing replay fidelity
 
+Additional integration files that must be considered explicitly:
+
+- `src/session/factory.rs`
+  - subagent tool filtering and runtime-tool visibility rules
+- `src/context/sanitize.rs`
+  - history sanitization and envelope-aware response stripping
+- `src/context/history.rs`
+  - current-turn compression, tool-result truncation, and argument summarization in compacted history
+- `src/telegram/output.rs`
+  - user-facing rendering/summarization of tool starts and tool outputs for chat surfaces
+
 ### 5.3 Provider Compatibility Matrix
 
 Before implementation, Rusty-Claw should maintain an explicit compatibility table for target providers/endpoints.
@@ -296,6 +307,13 @@ Examples of AgentLoop-owned state that must not silently fork:
 - `task_state_store`
 - evidence and tool-effect handling
 - output routing and task-finish signaling
+
+Phase 0 must explicitly assess whether this state can be:
+
+- reused through extraction of a shared guarded-dispatch helper
+- or only reused by routing nested calls back through AgentLoop-owned methods
+
+If that refactor is not feasible without large churn, the first implementation scope must be reduced accordingly.
 
 ### 6.4 Exec Input Canonical Form
 
@@ -546,6 +564,18 @@ This bridge must reuse:
 
 In other words, nested code-mode tools are not a new execution system; they are a new orchestration surface over the same execution system.
 
+This is a hard requirement:
+
+- nested `ToolContext` construction must flow through the same extension enrichment path used by top-level tool execution
+- otherwise extensions such as sandbox injection can be bypassed
+
+Concretely, the nested path should preserve the equivalent of:
+
+- visible tool population
+- `skill_budget` propagation
+- trace propagation
+- repeated `ext.enrich_tool_context(ctx).await`
+
 Nested tool failures should propagate like this:
 
 - a nested tool success resolves the JS-side awaitable value
@@ -631,6 +661,7 @@ Recommended ownership split:
   - access to mutable run/autopilot state
   - trace parent propagation
   - top-level output/effect integration policy
+  - extension-based `ToolContext` enrichment
 
 ## 10. Core Loop Integration
 
@@ -723,6 +754,11 @@ Concrete insertion point:
 - this fits the current prompt assembly path without mutating the static `system_prompts` baseline
 - static identity text in `system_prompts` should remain provider-agnostic
 
+Additional context integration requirements:
+
+- `sanitize.rs` must know how to strip/compress persisted `exec` results without destroying their envelope semantics
+- `history.rs` must define how large `exec` args/results are summarized inside compaction and truncation paths
+
 ### 11.1 Context Data Representation
 
 For replay fidelity and compatibility with the existing context model:
@@ -774,6 +810,11 @@ Stage A explicit rule:
 - recommended `payload_kind`: `code_mode_exec`
 
 This avoids creating a second success path outside the current `handle_successful_tool_effects()` / envelope parsing pipeline.
+
+Output-surface implication:
+
+- chat-oriented `AgentOutput` implementations such as Telegram should continue to see standard top-level tool lifecycle events
+- `ExecTool` therefore needs a concise, stable visible summary so chat surfaces do not become unreadable when code mode is used
 
 ## 12. Output Model
 
@@ -842,6 +883,11 @@ Implementation note:
 
 - reuse should happen by extracting or re-invoking shared guardrail logic from AgentLoop paths
 - not by duplicating a second, drifting copy of the same protections inside `code_mode`
+
+Subagent/tool-visibility implication:
+
+- the nested allow-list must also respect the effective visible-tool filtering model already used for subagents and restricted sessions
+- implementation should not assume that every top-level registered tool is always eligible for nested code-mode calls
 
 ## 13.3 Policy Restrictions
 
@@ -942,6 +988,7 @@ Implementation requirement:
 - decide first target path:
   - native freeform `exec`
   - or function-tool fallback `exec({code})`
+- evaluate `execute_tool_round` guardrail reuse/refactor feasibility
 - spike runtime engines for:
   - promise/await
   - callback bridge
@@ -953,6 +1000,7 @@ Exit criteria:
 - provider capability reporting works
 - chosen runtime passes minimal async viability checks
 - canonical `exec` replay format is agreed
+- there is a concrete plan for reusing or extracting guarded dispatch without bypassing AgentLoop state
 
 ## Phase 1: Foundations
 
@@ -961,6 +1009,11 @@ Exit criteria:
 - Add code-mode prompt fragments behind capability checks
 - If native path is selected, add stream protocol support for custom tool calls
 - Add freeform-tool format metadata for native client serialization
+- Decide the concrete integration points in:
+  - `session/factory.rs`
+  - `context/sanitize.rs`
+  - `context/history.rs`
+  - output adapters such as `telegram/output.rs`
 
 Exit criteria:
 
@@ -984,12 +1037,14 @@ Exit criteria:
 - Add guarded nested dispatch so JS-originated tool calls do not bypass existing AgentLoop protections
 - Canonicalize persisted `exec` calls into `{ "code": ... }` replay form
 - Return `ExecTool` results as `ToolExecutionEnvelope`
+- Ensure nested `ToolContext` goes through extension enrichment before tool execution
 
 Exit criteria:
 
 - one `exec` can call nested tools and return aggregated text
 - nested side-effecting tools still respect autopilot / loop-protection rules
 - code-mode outputs successfully flow through the existing envelope/effects parser
+- nested code-mode calls still receive sandbox and other extension-provided context
 
 ## Phase 3: Wait / Yield
 
@@ -1022,6 +1077,8 @@ Add tests at four layers.
 - transcript serialization of custom tool calls
 - native/custom `exec` canonicalizes into `{ "code": ... }`
 - canonical `{ "code": ... }` rehydrates into provider-native custom input when needed
+- `sanitize.rs` preserves `exec` envelope semantics while stripping large responses
+- `history.rs` compaction summarizes large `exec` args/results safely
 
 ### 17.2 Runtime Tests
 
@@ -1040,6 +1097,7 @@ Add tests at four layers.
 - nested guarded dispatch receives and applies parent trace/span linkage
 - nested guarded dispatch does not bypass autopilot denials
 - `ExecTool` emits a valid `ToolExecutionEnvelope`
+- nested `ToolContext` is passed through extension enrichment before execution
 
 ### 17.4 Integration Tests
 
@@ -1090,6 +1148,17 @@ We still need to decide exactly which current AgentLoop protections are:
 - intentionally left top-level only
 
 This is an implementation-shaping decision, because too little reuse creates safety gaps, while too much reuse risks duplicating the whole outer loop inside code mode.
+
+### 18.5 Additional Integration Surface
+
+The design must continue to track how code mode interacts with:
+
+- subagent/restricted-session tool filtering in `session/factory.rs`
+- sanitization and compression in `context/sanitize.rs`
+- history compaction/truncation in `context/history.rs`
+- output adapters such as `telegram/output.rs`
+
+These are not optional polish files; they shape whether code mode behaves coherently across the existing product surfaces.
 
 ## 19. Recommended First Implementation Scope
 
