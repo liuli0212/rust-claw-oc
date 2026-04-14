@@ -6,7 +6,9 @@
 - [x] Phase 2 minimal exec runtime and guarded nested dispatch are implemented.
 - [x] Phase 3 minimal `wait` / yield-resume semantics are implemented.
 - [x] Phase 4 hardening items such as richer trace coverage, history/sanitization updates, and broader tests are implemented.
-- [x] Phase 5 safe non-terminal drain lifecycle is implemented, including replay-safe progress metadata, service-owned live workers, and non-blocking `wait` polling via `wait_timeout_ms`.
+- [x] Phase 5 safe non-terminal drain lifecycle is implemented, including service-owned live workers and non-blocking `wait` polling via `wait_timeout_ms`.
+- [x] Phase 6 replay removal and event-driven architecture: all replay state (`ResumeState`, `OutputBuffer`, `NotificationBuffer`, `CellResumeState`, `CellResumeProgressDelta`) is deleted. Runtime now emits structured `RuntimeEvent` via `event_tx` channel. `yield_control` is a non-blocking event emission that does not terminate JS execution.
+- [x] Phase 7 channel-based tool bridge: nested tool calls now use a synchronous-to-async channel bridge. The worker thread in `spawn_blocking` blocks on a tool result channel while the drain loop fulfills requests. This removes the need for `'static` closures and simplifies orchestration.
 
 ## 1. Goal
 
@@ -1728,3 +1730,286 @@ The migration is complete when all of the following are true:
 - the background driver can continue servicing nested tools and timers between `wait` calls
 
 At that point, the live-cell model becomes the sole supported implementation for code-mode `wait` / yield behavior.
+
+## 22. Post-Replay Event-Driven Architecture (Phase 6)
+
+This section documents the current architecture after the replay-removal refactor. It supersedes the transitional replay-based implementation described in Phase 5 and replaces the migration plan in Section 21 with the delivered result.
+
+### 22.1 Design Summary
+
+The code-mode runtime is now fully event-driven. Each `exec` call spawns a single live JS runtime worker that runs to completion (or yield) without ever being re-executed. All output, notifications, yields, tool requests, and terminal events flow through a typed `RuntimeEvent` channel (`tokio::sync::mpsc::unbounded_channel`). There is no replay fallback.
+
+Key properties:
+
+- **One live worker per cell.** The JS runtime runs once. Local variables, closures, and pending promises remain valid for the lifetime of the worker.
+- **`yield_control()` is non-blocking.** It emits a `RuntimeEvent::Yield` event but does not throw, pause, or terminate JS execution. The script continues running after `yield_control()` returns.
+- **`text()` output is streamed as events.** Each `text(value)` call emits a `RuntimeEvent::Text` event. Output accumulates in the event log, not in an in-runtime buffer.
+- **No replay counters.** `ResumeState`, `OutputBuffer`, `NotificationBuffer`, `CellResumeState`, `CellResumeProgressDelta`, and all suppressed-call counters have been deleted.
+- **Drain semantics are pure event consumption.** `exec` spawns + does an initial drain. `wait` drains the same live cell's event buffer. Neither re-runs JS.
+
+### 22.2 Module Responsibilities
+
+#### `src/code_mode/runtime/mod.rs` — JS Runtime
+
+Owns the `rquickjs` execution. Provides `run_cell()` which:
+
+1. Creates an `AsyncRuntime` + `AsyncContext`.
+2. Registers global functions (`__text`, `__notify`, `__yield_control`, `__store`, `__load`, `__callTool`, `__setTimeout`, `__clearTimeout`, `__markTimeoutComplete`, `__timerStateJson`).
+3. Wraps user code in an async IIFE via `build_wrapper_script()`.
+4. Executes the wrapped script to completion (including timer callback draining).
+5. Returns `(ExecRunResult, HashMap<String, StoredValue>)`.
+
+All side-effect globals communicate through:
+
+- `event_tx: UnboundedSender<RuntimeEvent>` — for streaming `Text`, `Notification`, `Yield`, and `ToolCallRequested` events to the driver/service layer.
+- `next_seq: Arc<AtomicUsize>` — monotonic sequence counter shared across all event-emitting globals within one cell.
+- `invoke_tool: Arc<Mutex<F>>` — synchronous nested tool invocation closure (called within the blocking `rquickjs` context).
+
+##### Deleted from this module:
+
+- `OutputBuffer` / `NotificationBuffer` — output is no longer buffered in-runtime; each `text()` call sends an event immediately.
+- `ResumeState` fields (`replayed_tool_calls`, `recorded_timer_calls`, `skipped_yields`, `suppressed_text_calls`, `suppressed_notification_calls`) — no replay means no suppression counters.
+- `RunCellMetadata` fields (`total_text_calls`, `total_notification_calls`, `newly_recorded_tool_calls`) — metadata tracking for replay advancement is gone.
+
+##### `ResumeState` and `RunCellMetadata`
+
+Both structs still exist but are empty (`#[derive(Default)]`). They are retained as zero-cost placeholders to avoid churn in function signatures during the transition. They may be fully removed in a future cleanup pass.
+
+#### `src/code_mode/protocol.rs` — Event and Command Types
+
+Defines the typed channel protocol:
+
+```rust
+enum RuntimeEvent {
+    Text { seq, text },
+    Notification { seq, message },
+    Yield { seq, kind, value, resume_after_ms },
+    ToolCallRequested(ToolCallRequestEvent),
+    ToolCallResolved { seq, request_id, ok },
+    Completed { seq, return_value },
+    Failed { seq, error },
+    Cancelled { seq, reason },
+    WorkerCompleted(Result<RuntimeCellResult, String>),
+    TimerRegistrationChanged { seq, timer_calls },
+}
+
+enum CellCommand {
+    ToolResult { request_id: String, outcome },
+    Drain(DrainRequest),
+    Cancel { reason },
+}
+```
+
+Key changes from the replay era:
+
+- `RuntimeEvent` now derives `Clone` directly (no manual impl).
+- `Text` field is named `text` (was `chunk`).
+- `request_id` is `String` (was `u64`), formatted as `"{tool_name}-{seq}"`.
+- `RuntimeCellResult` is a 2-tuple `(ExecRunResult, HashMap<String, StoredValue>)` — the third `RunCellMetadata` element is removed.
+- `ToolCallRequestEvent` (renamed from `ToolCallRequest`) carries `request_id: String`.
+
+#### `src/code_mode/driver.rs` — CellDriver (Background Broker)
+
+Manages the background worker task and provides drain semantics.
+
+```
+CellDriver::spawn() / spawn_live()
+  → tokio::spawn worker thread
+    → runtime::run_cell(code, invoke_tool, event_tx)
+      → JS runs: text(), yield_control(), tools.X(), etc.
+      → each JS global → event_tx.send(RuntimeEvent::*)
+      → invoke_tool() for nested tools (synchronous within rquickjs)
+      → script completes → WorkerCompleted event
+  → driver.drain_event_batch_with_request()
+    → consumes events from event_rx
+    → fulfills nested tool calls via invoke_tool callback
+    → returns DriverDrainBatch { events, terminal_result }
+```
+
+Deleted from this module:
+
+- `WorkerRuntimeState` — the worker no longer needs a shared state struct; it uses captured locals.
+- `SharedCommandReceiver` / `std::sync::mpsc` — replaced with `tokio::sync::mpsc::unbounded_channel`.
+- `resume_progress: Arc<Mutex<CellResumeProgressDelta>>` — no replay progress tracking.
+- `DriverDrainBatch.resume_progress` field — removed.
+
+#### `src/code_mode/cell.rs` — ActiveCellHandle and Snapshots
+
+Tracks the per-session active cell state:
+
+```rust
+struct ActiveCellHandle {
+    cell_id: String,
+    status: CellStatus,
+    events: Vec<RuntimeEvent>,       // full event log
+    last_summary: Option<ExecRunResult>,
+}
+```
+
+Deleted from this module:
+
+- `CellResumeState` — replay-oriented state (replayed tool calls, suppressed counters, skipped yields).
+- `CellResumeProgressDelta` — incremental replay progress for advancing resume state between drains.
+- All `advance_with_yield`, `advance_with_progress`, `runtime_resume_state` methods.
+- `code`, `visible_tools` fields from `ActiveCellHandle` — no longer needed since the worker is never re-spawned.
+
+Retained:
+
+- `CellStatus` enum (now uses `request_id: String` instead of `u64` for `WaitingOnTool`).
+- `CellDrainSnapshot` for rendering output to the LLM.
+- `recent_visible_events()` for bounded event window rendering.
+
+#### `src/code_mode/service.rs` — CodeModeService
+
+Session-scoped service that owns cell lifecycle.
+
+```rust
+struct SessionState {
+    next_cell_seq: u64,
+    stored_values: HashMap<String, StoredValue>,
+    active_cell: Option<ActiveCellHandle>,
+    live_driver: Option<SharedCellDriver>,
+}
+```
+
+Provides `execute_live()` which:
+
+1. Allocates a `cell_id`.
+2. Spawns a `CellDriver::spawn_live()`.
+3. Performs an initial drain via `driver.drain_event_batch_with_request()`.
+4. Registers `ActiveCellHandle` and `live_driver` in `SessionState`.
+5. Returns a `CellDrainSnapshot`.
+
+Deleted from this module:
+
+- `PendingDrainBatch`, `PendingDrainResolution` — intermediate drain resolution helpers for replay-based progress tracking.
+- `RuntimeBatchInvocation::for_pending_cell()` — replay-oriented cell re-spawn helper.
+- `resume_state` field from `RuntimeBatchInvocation`.
+- The original `execute()` method — replaced by `execute_live()`.
+- All replay-specific `wait` / `wait_with_request` method bodies — replaced by live drain.
+
+#### `src/code_mode/executor.rs` — Guarded Nested Tool Executor
+
+Standalone executor for nested tool calls from JS. Preserves all AgentLoop guardrails:
+
+- Autopilot / TODOS gating
+- Repeated-action / reflection-strike loop protection
+- Trace span parentage propagation
+- Extension-based `ToolContext` enrichment
+- Timeout and cancellation handling
+
+This module is unchanged by the replay removal. It was already extracted as a clean boundary during Phase B of the live-cell migration.
+
+#### `src/code_mode/response.rs` — Output Rendering
+
+`DrainRenderState::from_events()` builds a render state from the event stream:
+
+- Accumulates `Text` events into `output_text`.
+- Collects `Notification` events.
+- Captures terminal state from `Yield`, `Completed`, `Failed`, `Cancelled` events.
+
+The `render_output()` / `render_output_with_status()` methods produce the final LLM-visible string.
+
+Key change: `Text` field matching now uses `text` instead of `chunk`.
+
+### 22.3 `yield_control()` Semantics
+
+The `yield_control(value?)` JS global works as follows:
+
+1. JS calls `yield_control(value)` (or `yield_control()`).
+2. The wrapper script calls `__yield_control(JSON.stringify(value))`.
+3. `__yield_control` sends a `RuntimeEvent::Yield { kind: Manual, value, ... }` via `event_tx`.
+4. **The function returns immediately.** JS execution continues.
+5. The driver's drain loop sees the `Yield` event and marks `saw_visible_event = true`.
+6. On the next drain boundary (timeout or refresh slice), accumulated events (including any `Text` events emitted before and after the yield) are returned to the caller.
+
+This means:
+
+- `yield_control()` does **not** block JS execution.
+- Any `text()` calls made after `yield_control()` are still captured as events.
+- The LLM receives all accumulated output (text + notifications + yield value) in the drain batch.
+- Multiple `yield_control()` calls within one script execution are valid — each emits a separate `Yield` event.
+
+### 22.4 Data Flow: `exec` Call
+
+```
+LLM emits exec({code})
+  → AgentLoop.dispatch_exec_tool_call()
+    → CodeModeService.execute_live()
+      → CellDriver::spawn_live()
+        → tokio::spawn worker thread
+          → runtime::run_cell(code, invoke_tool, event_tx)
+            → JS runs: text(), yield_control(), tools.X(), etc.
+            → each JS global → event_tx.send(RuntimeEvent::*)
+            → invoke_tool() for nested tools (synchronous within rquickjs)
+            → script completes → WorkerCompleted event
+      → driver.drain_event_batch_with_request(initial_drain)
+        → consumes events from event_rx
+        → returns DriverDrainBatch
+    → ActiveCellHandle.apply_drain_batch()
+    → snapshot.render_state().render_output()
+  → StructuredToolOutput envelope → LLM context
+```
+
+### 22.5 Data Flow: `wait` Call
+
+```
+LLM emits wait({cell_id?, wait_timeout_ms?, refresh_slice_ms?})
+  → AgentLoop.dispatch_exec_tool_call()
+    → CodeModeService.wait_with_request()
+      → validates cell_id against active_cell
+      → acquires live_driver lock
+      → driver.drain_event_batch_with_request(drain_request)
+        → if wait_for_event: blocks up to wait_timeout_ms
+        → if refresh_slice_ms: returns progress after slice
+        → on terminal: returns DriverDrainBatch with terminal_result
+      → ActiveCellHandle.apply_drain_batch()
+      → snapshot.render_state().render_output()
+    → cleared active_cell if terminal
+  → StructuredToolOutput envelope → LLM context
+```
+
+### 22.6 Timer Semantics (Unchanged)
+
+JS timers (`setTimeout` / `clearTimeout`) remain runtime-internal:
+
+- `setTimeout(callback, delayMs)` registers a timer via `register_timeout()`.
+- If `delayMs == 0` or the timer is already due, the callback is pushed to `__dueTimeoutCallbacks` and executed inline after the main script body.
+- If the timer is pending (future), it is not executed. The wrapper script detects pending timers and returns a `yielded: true, yieldKind: 'timer'` result.
+- Timer state is communicated to the service via `RuntimeEvent::TimerRegistrationChanged`.
+- Host slice timing (`refresh_slice_ms` in `DrainRequest`) is independent of JS timer deadlines.
+
+- [x] `wait_with_request()` implementation wired to driver drain loop.
+- [x] `step_helpers.rs` integration for `execute` and `wait`.
+- [x] Cleanup of stale `ResumeState`, `RunCellMetadata`, and `ReplayState` structs.
+- [x] Channel-based tool bridge to avoid `'static` lifetime requirements.
+- [x] Updated test suite (17/17 passing) and clean clippy status.
+
+## 23. Channel-Based Tool Bridge Implementation
+
+To bridge between the synchronous `rquickjs` execution context (running in `tokio::task::spawn_blocking`) and the asynchronous `AgentLoop` (which handles nested tool dispatch), we implemented a message-passing bridge:
+
+1.  **Request Flow**: When JS calls `tools.read_file()`, the runtime's native `__callTool` writes a `RuntimeEvent::ToolCallRequested` to the `event_tx` channel.
+2.  **Worker Suspension**: The worker thread then calls `tool_result_rx.recv()`, which is a blocking call on a `std::sync::mpsc` channel, effectively suspending the JS execution.
+3.  **Host Dispatch**: The `CellDriver::drain_event_batch_with_request` loop sees the `ToolCallRequested` event, uses the provided `invoke_tool` async closure to execute the tool in the host's async context.
+4.  **Resumption**: Once the host has the result, it sends it back to the worker via `tool_result_tx.send()`. The worker thread wakes up and resumes JS execution with the result.
+
+This pattern allows `AgentLoop` to use its own stateful, async closures (capturing `&mut self` for autopilot and hit-counting) without needing to satisfy the `'static` bound.
+
+## 24. Next Steps
+
+Focused work for the next phase:
+
+- [ ] **Production Hardening**:
+    - [ ] Add explicit timeout monitoring at the `CodeModeService` level for long-running workers.
+    - [ ] Implement graceful termination for orphaned workers.
+    - [ ] Improve JS stack trace capture and formatting in `ExecRunResult`.
+- [ ] **Performance Optimization**:
+    - [ ] Profile `rquickjs` context initialization overhead.
+    - [ ] Optimize large output buffering to avoid excessive string copying.
+- [ ] **UI & Observability**:
+    - [ ] Ensure the browser/adapter layer can consume the `RuntimeEvent` stream for live "thinking" indicators or nested tool logs.
+    - [ ] Richer rendering of `StoredValue` state in debugging overlays.
+- [ ] **Expanded Capabilities**:
+    - [ ] Multi-cell session testing (complex state persistence across turns).
+    - [ ] Parallel tool call support inside `exec` (concurrent nested dispatch).

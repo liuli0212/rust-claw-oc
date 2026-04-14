@@ -93,11 +93,11 @@ impl DrainRenderState {
 
         for event in events {
             match event {
-                RuntimeEvent::Text { chunk, .. } => {
-                    if !state.output_text.is_empty() && !chunk.is_empty() {
+                RuntimeEvent::Text { text, .. } => {
+                    if !state.output_text.is_empty() && !text.is_empty() {
                         state.output_text.push('\n');
                     }
-                    state.output_text.push_str(chunk);
+                    state.output_text.push_str(text);
                 }
                 RuntimeEvent::Notification { message, .. } => {
                     state.notifications.push(message.clone());
@@ -126,7 +126,8 @@ impl DrainRenderState {
                 }
                 RuntimeEvent::ToolCallRequested(_)
                 | RuntimeEvent::ToolCallResolved { .. }
-                | RuntimeEvent::WorkerCompleted(_) => {}
+                | RuntimeEvent::WorkerCompleted(_)
+                | RuntimeEvent::TimerRegistrationChanged { .. } => {}
             }
         }
 
@@ -337,7 +338,7 @@ mod tests {
         let events = vec![
             RuntimeEvent::Text {
                 seq: 1,
-                chunk: "hello".to_string(),
+                text: "hello".to_string(),
             },
             RuntimeEvent::Notification {
                 seq: 2,
@@ -366,7 +367,7 @@ mod tests {
         let events = vec![
             RuntimeEvent::Text {
                 seq: 1,
-                chunk: "before\nafter".to_string(),
+                text: "before\nafter".to_string(),
             },
             RuntimeEvent::Yield {
                 seq: 2,
@@ -406,7 +407,7 @@ mod tests {
         let events = vec![
             RuntimeEvent::Text {
                 seq: 1,
-                chunk: "hello".to_string(),
+                text: "hello".to_string(),
             },
             RuntimeEvent::Notification {
                 seq: 2,
@@ -444,7 +445,7 @@ mod tests {
         let events = vec![
             RuntimeEvent::Text {
                 seq: 1,
-                chunk: "before\nafter".to_string(),
+                text: "before\nafter".to_string(),
             },
             RuntimeEvent::Yield {
                 seq: 2,
@@ -466,7 +467,7 @@ mod tests {
             "cell_5",
             3,
             false,
-            Some(&CellStatus::WaitingOnTool { request_id: 7 }),
+            Some(&CellStatus::WaitingOnTool { request_id: "7".to_string() }),
         );
 
         assert!(rendered.contains("waiting on nested tool request 7"));
