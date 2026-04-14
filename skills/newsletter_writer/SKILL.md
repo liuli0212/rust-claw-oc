@@ -60,6 +60,7 @@ If successful, consume the result and parse the URLs from that JSON array.
 
 ## Content Extraction & Condensation Phase
 
+**RUN IN PARELLEL:**
 For each of the URLs the subagent returned:
 1. Extract and save the raw readable content using `web_fetch`:
    - `url`: `https://r.jina.ai/<URL>`
