@@ -35,6 +35,14 @@ pub struct RunCellMetadata {
     pub timer_calls: Vec<RecordedTimerCall>,
 }
 
+pub struct RunCellRequest {
+    pub cell_id: String,
+    pub code: String,
+    pub visible_tools: Vec<String>,
+    pub stored_values: HashMap<String, StoredValue>,
+    pub resume_state: ResumeState,
+}
+
 #[derive(Debug, Default)]
 struct OutputBuffer {
     text: String,
@@ -102,12 +110,9 @@ impl NotificationBuffer {
 
 pub fn run_cell<F>(
     handle: tokio::runtime::Handle,
-    cell_id: String,
-    code: String,
-    visible_tools: Vec<String>,
-    stored_values: HashMap<String, StoredValue>,
-    resume_state: ResumeState,
+    request: RunCellRequest,
     invoke_tool: F,
+    on_timer_calls_updated: impl Fn(Vec<RecordedTimerCall>) + Send + Sync + 'static,
 ) -> Result<(ExecRunResult, HashMap<String, StoredValue>, RunCellMetadata), crate::tools::ToolError>
 where
     F: FnMut(String, String) -> Result<String, crate::tools::ToolError> + Send + 'static,
@@ -118,6 +123,14 @@ where
         let context = AsyncContext::full(&runtime)
             .await
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
+
+        let RunCellRequest {
+            cell_id,
+            code,
+            visible_tools,
+            stored_values,
+            resume_state,
+        } = request;
 
         let ResumeState {
             replayed_tool_calls,
@@ -141,6 +154,7 @@ where
         let timer_calls = Arc::new(Mutex::new(recorded_timer_calls));
         let observed_timer_calls = Arc::new(Mutex::new(0usize));
         let invoke_tool = Arc::new(Mutex::new(invoke_tool));
+        let on_timer_calls_updated = Arc::new(on_timer_calls_updated);
         let visible_tools_json = serde_json::to_string(&visible_tools)
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
         let skipped_yields = i32::try_from(skipped_yields).unwrap_or(i32::MAX);
@@ -154,6 +168,7 @@ where
         let timer_calls_for_script = timer_calls.clone();
         let observed_timer_calls_for_script = observed_timer_calls.clone();
         let invoke_tool_for_script = invoke_tool.clone();
+        let on_timer_calls_updated_for_script = on_timer_calls_updated.clone();
 
         let return_payload = async_with!(context => |ctx| {
             let globals = ctx.globals();
@@ -246,19 +261,16 @@ where
                     }
 
                     *call_tool_ref.lock().unwrap() += 1;
-                    let result_json = match {
+                    let tool_result = {
                         let mut invoke_tool = invoke_tool_ref.lock().unwrap();
                         (*invoke_tool)(tool_name.clone(), args_json.clone())
-                    } {
+                    };
+                    let result_json = match tool_result {
                         Ok(result_json) => result_json,
-                        Err(err) => {
-                            return Ok(
-                                serde_json::json!({
-                                    "__rustyClawToolError": err.to_string()
-                                })
-                                .to_string(),
-                            )
-                        }
+                        Err(err) => serde_json::json!({
+                            "__rustyClawToolError": err.to_string()
+                        })
+                        .to_string(),
                     };
                     newly_recorded_tool_calls_ref
                         .lock()
@@ -282,6 +294,7 @@ where
                 .map_err(js_error_to_tool_error)?;
             let timer_calls_ref = timer_calls_for_script.clone();
             let observed_timer_calls_ref = observed_timer_calls_for_script.clone();
+            let on_timer_calls_updated_ref = on_timer_calls_updated_for_script.clone();
             globals
                 .set(
                     "__setTimeout",
@@ -293,15 +306,20 @@ where
                             *observed += 1;
                             current
                         };
-                        let registration = self::timers::register_timeout(
-                            &mut timer_calls_ref.lock().unwrap(),
-                            call_index,
-                            delay_ms,
-                            crate::trace::unix_ms_now(),
-                        )
-                        .map_err(|err| {
-                            Error::new_from_js_message("timer", "resume", err.to_string())
-                        })?;
+                        let registration = {
+                            let mut timer_calls = timer_calls_ref.lock().unwrap();
+                            let registration = self::timers::register_timeout(
+                                &mut timer_calls,
+                                call_index,
+                                delay_ms,
+                                crate::trace::unix_ms_now(),
+                            )
+                            .map_err(|err| {
+                                Error::new_from_js_message("timer", "resume", err.to_string())
+                            })?;
+                            on_timer_calls_updated_ref(timer_calls.clone());
+                            registration
+                        };
                         serde_json::to_string(&registration).map_err(|err| {
                             Error::new_from_js_message("timer", "json", err.to_string())
                         })
@@ -310,25 +328,28 @@ where
                 .map_err(js_error_to_tool_error)?;
 
             let timer_calls_ref = timer_calls_for_script.clone();
+            let on_timer_calls_updated_ref = on_timer_calls_updated_for_script.clone();
             globals
                 .set(
                     "__clearTimeout",
                     Func::from(move |timer_id: String| -> rquickjs::Result<()> {
-                        self::timers::clear_timeout(&mut timer_calls_ref.lock().unwrap(), &timer_id);
+                        let mut timer_calls = timer_calls_ref.lock().unwrap();
+                        self::timers::clear_timeout(&mut timer_calls, &timer_id);
+                        on_timer_calls_updated_ref(timer_calls.clone());
                         Ok(())
                     }),
                 )
                 .map_err(js_error_to_tool_error)?;
 
             let timer_calls_ref = timer_calls_for_script.clone();
+            let on_timer_calls_updated_ref = on_timer_calls_updated_for_script.clone();
             globals
                 .set(
                     "__markTimeoutComplete",
                     Func::from(move |timer_id: String| -> rquickjs::Result<()> {
-                        self::timers::mark_timeout_completed(
-                            &mut timer_calls_ref.lock().unwrap(),
-                            &timer_id,
-                        );
+                        let mut timer_calls = timer_calls_ref.lock().unwrap();
+                        self::timers::mark_timeout_completed(&mut timer_calls, &timer_id);
+                        on_timer_calls_updated_ref(timer_calls.clone());
                         Ok(())
                     }),
                 )
@@ -494,16 +515,19 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let (result, stored_values, metadata) = run_cell(
             runtime.handle().clone(),
-            "cell_runtime_1".to_string(),
-            r#"
+            RunCellRequest {
+                cell_id: "cell_runtime_1".to_string(),
+                code: r#"
 text("hello");
 exit({ done: true });
 "#
-            .to_string(),
-            Vec::new(),
-            HashMap::new(),
-            ResumeState::default(),
+                .to_string(),
+                visible_tools: Vec::new(),
+                stored_values: HashMap::new(),
+                resume_state: ResumeState::default(),
+            },
             |_tool, _args| Ok("\"unused\"".to_string()),
+            |_| {},
         )
         .expect("runtime cell executes");
 
@@ -530,12 +554,15 @@ text("after");
 
         let (first, stored_values, metadata) = run_cell(
             runtime.handle().clone(),
-            "cell_runtime_2".to_string(),
-            code.to_string(),
-            Vec::new(),
-            HashMap::new(),
-            ResumeState::default(),
+            RunCellRequest {
+                cell_id: "cell_runtime_2".to_string(),
+                code: code.to_string(),
+                visible_tools: Vec::new(),
+                stored_values: HashMap::new(),
+                resume_state: ResumeState::default(),
+            },
             |_tool, _args| Ok("\"unused\"".to_string()),
+            |_| {},
         )
         .expect("runtime cell yields on timer");
 
@@ -548,16 +575,19 @@ text("after");
 
         let (resumed, _, resumed_metadata) = run_cell(
             runtime.handle().clone(),
-            "cell_runtime_2".to_string(),
-            code.to_string(),
-            Vec::new(),
-            stored_values,
-            ResumeState {
-                recorded_timer_calls: metadata.timer_calls,
-                suppressed_text_calls: metadata.total_text_calls,
-                ..ResumeState::default()
+            RunCellRequest {
+                cell_id: "cell_runtime_2".to_string(),
+                code: code.to_string(),
+                visible_tools: Vec::new(),
+                stored_values,
+                resume_state: ResumeState {
+                    recorded_timer_calls: metadata.timer_calls,
+                    suppressed_text_calls: metadata.total_text_calls,
+                    ..ResumeState::default()
+                },
             },
             |_tool, _args| Ok("\"unused\"".to_string()),
+            |_| {},
         )
         .expect("runtime cell resumes after timer fires");
 

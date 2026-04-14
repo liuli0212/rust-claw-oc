@@ -656,17 +656,7 @@ impl AgentLoop {
     }
 
     fn is_code_mode_nested_tool(tool_name: &str) -> bool {
-        !matches!(
-            tool_name,
-            "exec"
-                | "wait"
-                | "finish_task"
-                | "ask_user_question"
-                | "subagent"
-                | "task_plan"
-                | "manage_schedule"
-                | "send_telegram_message"
-        )
+        crate::code_mode::executor::is_code_mode_nested_tool(tool_name)
     }
 
     fn autopilot_denial_for_call(
@@ -769,108 +759,6 @@ impl AgentLoop {
         ctx
     }
 
-    async fn dispatch_nested_code_mode_tool_call(
-        &mut self,
-        tool_name: &str,
-        args: serde_json::Value,
-        current_tools: &[Arc<dyn Tool>],
-        remaining_steps: usize,
-        iteration_trace_ctx: Option<crate::trace::TraceContext>,
-        parent_span_id: Option<String>,
-        outer_tool_call_id: Option<&str>,
-    ) -> Result<String, crate::tools::ToolError> {
-        if !Self::is_code_mode_nested_tool(tool_name) {
-            return Err(crate::tools::ToolError::ExecutionFailed(format!(
-                "Tool `{tool_name}` is not available inside code mode."
-            )));
-        }
-
-        let tool = current_tools
-            .iter()
-            .find(|tool| tool.name() == tool_name)
-            .ok_or_else(|| {
-                crate::tools::ToolError::ExecutionFailed(format!("Tool not found: {tool_name}"))
-            })?;
-
-        if let Some(reason) = self.autopilot_denial_for_call(tool_name, &args, current_tools) {
-            return Err(crate::tools::ToolError::ExecutionFailed(reason));
-        }
-
-        let nested_trace_ctx = iteration_trace_ctx
-            .as_ref()
-            .map(|ctx| ctx.with_parent_span_id(parent_span_id.clone()));
-        let provider = self.llm.provider_name();
-        let model = self.llm.model_name();
-        let mut nested_span = nested_trace_ctx.as_ref().map(|ctx| {
-            self.trace_bus.start_span(
-                ctx,
-                TraceActor::Tool,
-                "code_mode_nested_tool_started",
-                serde_json::json!({
-                    "tool_name": tool_name,
-                    "outer_tool_call_id": outer_tool_call_id,
-                    "provider": provider,
-                    "model": model,
-                    "args_preview": crate::context::AgentContext::truncate_chars(&args.to_string(), 500),
-                    "remaining_steps": remaining_steps,
-                }),
-            )
-        });
-
-        let nested_ctx = self
-            .prepare_tool_context(
-                current_tools,
-                remaining_steps,
-                nested_trace_ctx.as_ref(),
-                nested_span.as_ref().map(|span| span.span_id().to_string()),
-            )
-            .await;
-
-        let (result, is_error, stopped, trace_status, end_name) = tokio::select! {
-            exec_res = tokio::time::timeout(
-                Duration::from_secs(120),
-                tool.execute(args.clone(), &nested_ctx)
-            ) => {
-                match exec_res {
-                    Ok(Ok(res)) => (res, false, false, TraceStatus::Ok, "code_mode_nested_tool_finished"),
-                    Ok(Err(e)) => (format!("Tool error: {}", e), true, false, TraceStatus::Error, "code_mode_nested_tool_failed"),
-                    Err(e) => (format!("Timeout executing {}: {}", tool_name, e), true, false, TraceStatus::TimedOut, "code_mode_nested_tool_timed_out"),
-                }
-            }
-            _ = self.cancel_token.notified() => {
-                ("Tool execution interrupted by user.".to_string(), true, true, TraceStatus::Cancelled, "code_mode_nested_tool_cancelled")
-            }
-        };
-
-        if let Some(span) = nested_span.take() {
-            span.finish(
-                end_name,
-                trace_status,
-                Some(crate::context::AgentContext::truncate_chars(&result, 240)),
-                serde_json::json!({
-                    "tool_name": tool_name,
-                    "outer_tool_call_id": outer_tool_call_id,
-                    "provider": provider,
-                    "model": model,
-                    "result_preview": crate::context::AgentContext::truncate_chars(&result, 500),
-                    "result_size_chars": result.chars().count(),
-                }),
-            );
-        }
-
-        if let Some((message, _signal)) =
-            self.record_autopilot_action_outcome(tool_name, &args, is_error)
-        {
-            return Err(crate::tools::ToolError::ExecutionFailed(message));
-        }
-
-        if stopped || is_error {
-            return Err(crate::tools::ToolError::ExecutionFailed(result));
-        }
-
-        Ok(result)
-    }
-
     async fn dispatch_exec_tool_call(
         &mut self,
         call: &crate::context::FunctionCall,
@@ -951,10 +839,16 @@ impl AgentLoop {
             }
         };
 
-        let (source_length, requested_cell_id) = match &invocation {
-            CodeModeInvocation::Exec(parsed) => (parsed.code.chars().count(), None),
-            CodeModeInvocation::Wait(parsed) => (0usize, parsed.cell_id.clone()),
-        };
+        let (source_length, requested_cell_id, wait_timeout_ms, refresh_slice_ms) =
+            match &invocation {
+                CodeModeInvocation::Exec(parsed) => (parsed.code.chars().count(), None, None, None),
+                CodeModeInvocation::Wait(parsed) => (
+                    0usize,
+                    parsed.cell_id.clone(),
+                    parsed.wait_timeout_ms,
+                    parsed.refresh_slice_ms,
+                ),
+            };
 
         let visible_tools: Vec<String> = current_tools
             .iter()
@@ -974,6 +868,8 @@ impl AgentLoop {
                 "model": model,
                 "source_length": source_length,
                 "requested_cell_id": requested_cell_id,
+                "wait_timeout_ms": wait_timeout_ms,
+                "refresh_slice_ms": refresh_slice_ms,
                 "visible_nested_tools": visible_tools.len(),
                 "args_preview": crate::context::AgentContext::truncate_chars(&call.args.to_string(), 500),
             }),
@@ -983,40 +879,48 @@ impl AgentLoop {
 
         let service = self.code_mode_service.clone();
         let session_id = self.session_id.clone();
-        let nested_tools = current_tools.to_vec();
-        let nested_parent_span_id = parent_span_id.clone();
-        let iteration_trace_ctx_for_nested = iteration_trace_ctx.clone();
-        let outer_tool_call_id = call.id.clone();
         let cancel_token = self.cancel_token.clone();
-        let self_ptr = self as *mut Self as usize;
+        let reply_to = self.reply_to.clone();
+        let session_deadline = self.session_deadline;
+        let trace_bus = self.trace_bus.clone();
+        let nested_cancel_token = self.cancel_token.clone();
+        let todos_path = self.todos_path();
+        let is_autopilot = self.is_autopilot;
+        let extensions = &self.extensions;
+        let action_history = &mut self.action_history;
+        let reflection_strike = &mut self.reflection_strike;
         let exec_result = tokio::select! {
             result = tokio::time::timeout(
                 Duration::from_secs(90),
                 async {
-                    let mut invoke_tool = move |tool_name: String, args_json: String| {
-                        let nested_tools = nested_tools.clone();
-                        let iteration_trace_ctx_for_nested = iteration_trace_ctx_for_nested.clone();
-                        let nested_parent_span_id = nested_parent_span_id.clone();
-                        let outer_tool_call_id = outer_tool_call_id.clone();
+                    let nested_executor = Arc::new(tokio::sync::Mutex::new(
+                        crate::code_mode::executor::CodeModeNestedToolExecutor::new(
+                            crate::code_mode::executor::CodeModeNestedToolExecutorConfig {
+                                current_tools: current_tools.to_vec(),
+                                extensions,
+                                session_id: session_id.clone(),
+                                reply_to,
+                                remaining_steps,
+                                session_deadline,
+                                iteration_trace_ctx: iteration_trace_ctx.clone(),
+                                parent_span_id: parent_span_id.clone(),
+                                outer_tool_call_id: call.id.clone(),
+                                trace_bus,
+                                provider: provider.clone(),
+                                model: model.clone(),
+                                cancel_token: nested_cancel_token,
+                                is_autopilot,
+                                todos_path,
+                                action_history,
+                                reflection_strike,
+                            },
+                        ),
+                    ));
+                    let mut invoke_tool = |tool_name: String, args_json: String| {
+                        let nested_executor = nested_executor.clone();
                         async move {
-                            let args = serde_json::from_str::<serde_json::Value>(&args_json).map_err(|err| {
-                                crate::tools::ToolError::InvalidArguments(format!(
-                                    "Invalid JSON arguments for nested tool `{tool_name}`: {err}"
-                                ))
-                            })?;
-                            let raw = unsafe {
-                                (&mut *(self_ptr as *mut Self))
-                                    .dispatch_nested_code_mode_tool_call(
-                                        &tool_name,
-                                        args,
-                                        &nested_tools,
-                                        remaining_steps,
-                                        iteration_trace_ctx_for_nested,
-                                        nested_parent_span_id,
-                                        outer_tool_call_id.as_deref(),
-                                    )
-                            }
-                            .await?;
+                            let mut executor = nested_executor.lock().await;
+                            let raw = executor.execute_json(tool_name, args_json).await?;
                             Ok(crate::code_mode::runtime::value::normalize_tool_result_for_js(&raw))
                         }
                     };
@@ -1031,9 +935,13 @@ impl AgentLoop {
                             ).await
                         }
                         CodeModeInvocation::Wait(parsed) => {
-                            service.wait(
+                            service.wait_with_request(
                                 &session_id,
                                 parsed.cell_id.as_deref(),
+                                crate::code_mode::protocol::DrainRequest::for_wait(
+                                    parsed.wait_timeout_ms,
+                                    parsed.refresh_slice_ms,
+                                ),
                                 &mut invoke_tool,
                             ).await
                         }
