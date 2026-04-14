@@ -5,6 +5,7 @@ use rquickjs::async_with;
 use rquickjs::prelude::{Func, MutFn, Promise};
 use rquickjs::{AsyncContext, AsyncRuntime, Error, Function};
 
+use self::callbacks::RecordedToolCall;
 use self::timers::RecordedTimerCall;
 use self::value::StoredValue;
 use super::response::{ExecRunResult, ExecYieldKind};
@@ -15,28 +16,104 @@ pub mod globals;
 pub mod timers;
 pub mod value;
 
-#[allow(dead_code)]
 const MAX_OUTPUT_CHARS: usize = 12_000;
 
+#[derive(Debug, Clone, Default)]
+pub struct ResumeState {
+    pub replayed_tool_calls: Vec<RecordedToolCall>,
+    pub recorded_timer_calls: Vec<RecordedTimerCall>,
+    pub skipped_yields: usize,
+    pub suppressed_text_calls: usize,
+    pub suppressed_notification_calls: usize,
+}
 
-
-
+#[derive(Debug, Clone, Default)]
+pub struct RunCellMetadata {
+    pub total_text_calls: usize,
+    pub total_notification_calls: usize,
+    pub newly_recorded_tool_calls: Vec<RecordedToolCall>,
+    pub timer_calls: Vec<RecordedTimerCall>,
+}
 
 pub struct RunCellRequest {
     pub cell_id: String,
     pub code: String,
     pub visible_tools: Vec<String>,
     pub stored_values: HashMap<String, StoredValue>,
+    pub resume_state: ResumeState,
+}
+
+#[derive(Debug, Default)]
+struct OutputBuffer {
+    text: String,
+    truncated: bool,
+    total_calls: usize,
+    suppressed_calls: usize,
+}
+
+impl OutputBuffer {
+    fn with_suppressed_calls(suppressed_calls: usize) -> Self {
+        Self {
+            text: String::new(),
+            truncated: false,
+            total_calls: 0,
+            suppressed_calls,
+        }
+    }
+
+    fn push_line(&mut self, value: &str) {
+        self.total_calls += 1;
+        if self.total_calls <= self.suppressed_calls {
+            return;
+        }
+
+        if self.truncated {
+            return;
+        }
+
+        if !self.text.is_empty() {
+            self.text.push('\n');
+        }
+        self.text.push_str(value);
+
+        if self.text.chars().count() > MAX_OUTPUT_CHARS {
+            self.text = crate::context::AgentContext::truncate_chars(&self.text, MAX_OUTPUT_CHARS);
+            self.truncated = true;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct NotificationBuffer {
+    items: Vec<String>,
+    total_calls: usize,
+    suppressed_calls: usize,
+}
+
+impl NotificationBuffer {
+    fn with_suppressed_calls(suppressed_calls: usize) -> Self {
+        Self {
+            items: Vec::new(),
+            total_calls: 0,
+            suppressed_calls,
+        }
+    }
+
+    fn push(&mut self, value: String) {
+        self.total_calls += 1;
+        if self.total_calls <= self.suppressed_calls {
+            return;
+        }
+        self.items.push(value);
+    }
 }
 
 pub fn run_cell<F>(
     handle: tokio::runtime::Handle,
     request: RunCellRequest,
-    event_tx: tokio::sync::mpsc::UnboundedSender<crate::code_mode::protocol::RuntimeEvent>,
-    next_seq: Arc<std::sync::atomic::AtomicU64>,
     invoke_tool: F,
     on_timer_calls_updated: impl Fn(Vec<RecordedTimerCall>) + Send + Sync + 'static,
-) -> Result<(ExecRunResult, HashMap<String, StoredValue>), crate::tools::ToolError>
+) -> Result<(ExecRunResult, HashMap<String, StoredValue>, RunCellMetadata), crate::tools::ToolError>
 where
     F: FnMut(String, String) -> Result<String, crate::tools::ToolError> + Send + 'static,
 {
@@ -52,26 +129,42 @@ where
             code,
             visible_tools,
             stored_values,
+            resume_state,
         } = request;
 
+        let ResumeState {
+            replayed_tool_calls,
+            recorded_timer_calls,
+            skipped_yields,
+            suppressed_text_calls,
+            suppressed_notification_calls,
+        } = resume_state;
+
+        let output = Arc::new(Mutex::new(OutputBuffer::with_suppressed_calls(
+            suppressed_text_calls,
+        )));
+        let notifications = Arc::new(Mutex::new(NotificationBuffer::with_suppressed_calls(
+            suppressed_notification_calls,
+        )));
         let stored_values = Arc::new(Mutex::new(stored_values));
         let nested_tool_count = Arc::new(Mutex::new(0usize));
-        let timer_calls = Arc::new(Mutex::new(Vec::<RecordedTimerCall>::new()));
+        let replayed_tool_calls = Arc::new(replayed_tool_calls);
+        let observed_tool_calls = Arc::new(Mutex::new(0usize));
+        let newly_recorded_tool_calls = Arc::new(Mutex::new(Vec::<RecordedToolCall>::new()));
+        let timer_calls = Arc::new(Mutex::new(recorded_timer_calls));
         let observed_timer_calls = Arc::new(Mutex::new(0usize));
         let invoke_tool = Arc::new(Mutex::new(invoke_tool));
         let on_timer_calls_updated = Arc::new(on_timer_calls_updated);
         let visible_tools_json = serde_json::to_string(&visible_tools)
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
-        
-        let event_tx_for_text = event_tx.clone();
-        let next_seq_for_text = next_seq.clone();
-        let event_tx_for_notify = event_tx.clone();
-        let next_seq_for_notify = next_seq.clone();
-        let event_tx_for_yield = event_tx.clone();
-        let next_seq_for_yield = next_seq.clone();
-
+        let skipped_yields = i32::try_from(skipped_yields).unwrap_or(i32::MAX);
+        let output_for_script = output.clone();
+        let notifications_for_script = notifications.clone();
         let stored_values_for_script = stored_values.clone();
         let nested_tool_count_for_script = nested_tool_count.clone();
+        let replayed_tool_calls_for_script = replayed_tool_calls.clone();
+        let observed_tool_calls_for_script = observed_tool_calls.clone();
+        let newly_recorded_tool_calls_for_script = newly_recorded_tool_calls.clone();
         let timer_calls_for_script = timer_calls.clone();
         let observed_timer_calls_for_script = observed_timer_calls.clone();
         let invoke_tool_for_script = invoke_tool.clone();
@@ -80,6 +173,7 @@ where
         let return_payload = async_with!(context => |ctx| {
             let globals = ctx.globals();
 
+            let output_ref = output_for_script.clone();
             globals
                 .set("__allToolsJson", visible_tools_json.clone())
                 .map_err(js_error_to_tool_error)?;
@@ -87,23 +181,18 @@ where
                 .set(
                     format!("__{TEXT_FN}"),
                     Func::from(move |value: String| -> rquickjs::Result<()> {
-                        let _ = event_tx_for_text.send(crate::code_mode::protocol::RuntimeEvent::Text {
-                            seq: next_seq_for_text.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-                            chunk: value,
-                        });
+                        output_ref.lock().unwrap().push_line(&value);
                         Ok(())
                     }),
                 )
                 .map_err(js_error_to_tool_error)?;
 
+            let notifications_ref = notifications_for_script.clone();
             globals
                 .set(
                     format!("__{NOTIFY_FN}"),
                     Func::from(move |value: String| -> rquickjs::Result<()> {
-                        let _ = event_tx_for_notify.send(crate::code_mode::protocol::RuntimeEvent::Notification {
-                            seq: next_seq_for_notify.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-                            message: value,
-                        });
+                        notifications_ref.lock().unwrap().push(value);
                         Ok(())
                     }),
                 )
@@ -138,10 +227,39 @@ where
                 .map_err(js_error_to_tool_error)?;
 
             let call_tool_ref = nested_tool_count_for_script.clone();
+            let replayed_tool_calls_ref = replayed_tool_calls_for_script.clone();
+            let observed_tool_calls_ref = observed_tool_calls_for_script.clone();
+            let newly_recorded_tool_calls_ref = newly_recorded_tool_calls_for_script.clone();
             let invoke_tool_ref = invoke_tool_for_script.clone();
             let call_tool = Function::new(
                 ctx.clone(),
                 MutFn::from(move |tool_name: String, args_json: String| -> rquickjs::Result<String> {
+                    let call_index = {
+                        let mut observed = observed_tool_calls_ref.lock().unwrap();
+                        let current = *observed;
+                        *observed += 1;
+                        current
+                    };
+
+                    if let Some(recorded) = replayed_tool_calls_ref.get(call_index) {
+                        if recorded.tool_name != tool_name || recorded.args_json != args_json {
+                            return Err(Error::new_from_js_message(
+                                "tool_call",
+                                "replay",
+                                format!(
+                                    "Code mode resume diverged at nested tool call {}: expected {}({}), got {}({})",
+                                    call_index + 1,
+                                    recorded.tool_name,
+                                    recorded.args_json,
+                                    tool_name,
+                                    args_json,
+                                ),
+                            ));
+                        }
+
+                        return Ok(recorded.result_json.clone());
+                    }
+
                     *call_tool_ref.lock().unwrap() += 1;
                     let tool_result = {
                         let mut invoke_tool = invoke_tool_ref.lock().unwrap();
@@ -154,6 +272,14 @@ where
                         })
                         .to_string(),
                     };
+                    newly_recorded_tool_calls_ref
+                        .lock()
+                        .unwrap()
+                        .push(RecordedToolCall {
+                            tool_name,
+                            args_json,
+                            result_json: result_json.clone(),
+                        });
                     Ok(result_json)
                 }),
             )
@@ -163,21 +289,8 @@ where
             globals
                 .set("__callTool", call_tool)
                 .map_err(js_error_to_tool_error)?;
-
             globals
-                .set(
-                    "__yield_control",
-                    Func::from(move |value_json: String| -> rquickjs::Result<()> {
-                        let yield_value = if value_json.is_empty() || value_json == "null" { None } else { Some(serde_json::from_str(&value_json).unwrap_or(serde_json::Value::Null)) };
-                        let _ = event_tx_for_yield.send(crate::code_mode::protocol::RuntimeEvent::Yield {
-                            seq: next_seq_for_yield.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-                            kind: ExecYieldKind::Manual,
-                            value: yield_value,
-                            resume_after_ms: None,
-                        });
-                        Ok(())
-                    }),
-                )
+                .set("__skippedYields", skipped_yields)
                 .map_err(js_error_to_tool_error)?;
             let timer_calls_ref = timer_calls_for_script.clone();
             let observed_timer_calls_ref = observed_timer_calls_for_script.clone();
@@ -296,21 +409,31 @@ where
                 "timer" => Some(ExecYieldKind::Timer),
                 _ => None,
             });
+        let output_guard = output.lock().unwrap();
+        let notifications_guard = notifications.lock().unwrap();
         let nested_tool_calls = *nested_tool_count.lock().unwrap();
         let stored_values = stored_values.lock().unwrap().clone();
+        let newly_recorded_tool_calls = newly_recorded_tool_calls.lock().unwrap().clone();
+        let timer_calls = timer_calls.lock().unwrap().clone();
         Ok((
             ExecRunResult {
                 cell_id,
-                output_text: String::new(),
+                output_text: output_guard.text.clone(),
                 return_value,
                 yield_value,
                 yielded,
                 yield_kind,
-                notifications: Vec::new(),
+                notifications: notifications_guard.items.clone(),
                 nested_tool_calls,
-                truncated: false,
+                truncated: output_guard.truncated,
             },
             stored_values,
+            RunCellMetadata {
+                total_text_calls: output_guard.total_calls,
+                total_notification_calls: notifications_guard.total_calls,
+                newly_recorded_tool_calls,
+                timer_calls,
+            },
         ))
     })
 }
@@ -332,9 +455,10 @@ fn build_wrapper_script(code: &str) -> String {
         "globalThis.load = (key) => { const raw = __load(String(key)); return raw == null ? undefined : JSON.parse(raw); };\n",
     );
     script.push_str("globalThis.exit = (value) => { throw { __rustyClawExit: true, value }; };\n");
+    script.push_str("globalThis.__yieldCount = 0;\n");
     script.push_str("globalThis.__dueTimeoutCallbacks = [];\n");
     script.push_str(
-        "globalThis.yield_control = (value) => { __yield_control(JSON.stringify(value === undefined ? null : value)); return undefined; };\n",
+        "globalThis.yield_control = (value) => { if (globalThis.__yieldCount < __skippedYields) { globalThis.__yieldCount += 1; return undefined; } globalThis.__yieldCount += 1; throw { __rustyClawYield: true, value: value === undefined ? null : value }; };\n",
     );
     script.push_str(
         "globalThis.setTimeout = (callback, delayMs = 0) => { if (typeof callback !== 'function') { throw new Error('setTimeout() requires a function callback'); } const normalizedDelay = Math.max(0, Math.trunc(Number(delayMs ?? 0) || 0)); const registration = JSON.parse(__setTimeout(normalizedDelay)); if (registration.action === 'run') { globalThis.__dueTimeoutCallbacks.push({ id: registration.timer_id, callback }); } return registration.timer_id; };\n",
@@ -379,4 +503,96 @@ fn build_wrapper_script(code: &str) -> String {
 
 fn js_error_to_tool_error(err: Error) -> crate::tools::ToolError {
     crate::tools::ToolError::ExecutionFailed(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_run_cell_supports_text_and_exit() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (result, stored_values, metadata) = run_cell(
+            runtime.handle().clone(),
+            RunCellRequest {
+                cell_id: "cell_runtime_1".to_string(),
+                code: r#"
+text("hello");
+exit({ done: true });
+"#
+                .to_string(),
+                visible_tools: Vec::new(),
+                stored_values: HashMap::new(),
+                resume_state: ResumeState::default(),
+            },
+            |_tool, _args| Ok("\"unused\"".to_string()),
+            |_| {},
+        )
+        .expect("runtime cell executes");
+
+        assert_eq!(result.output_text.trim(), "hello");
+        assert_eq!(
+            result.return_value,
+            Some(serde_json::json!({ "done": true }))
+        );
+        assert!(!result.yielded);
+        assert_eq!(metadata.total_text_calls, 1);
+        assert!(stored_values.is_empty());
+    }
+
+    #[test]
+    fn test_run_cell_supports_timer_driven_resume() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let code = r#"
+text("before");
+setTimeout(async () => {
+  text("later");
+}, 20);
+text("after");
+"#;
+
+        let (first, stored_values, metadata) = run_cell(
+            runtime.handle().clone(),
+            RunCellRequest {
+                cell_id: "cell_runtime_2".to_string(),
+                code: code.to_string(),
+                visible_tools: Vec::new(),
+                stored_values: HashMap::new(),
+                resume_state: ResumeState::default(),
+            },
+            |_tool, _args| Ok("\"unused\"".to_string()),
+            |_| {},
+        )
+        .expect("runtime cell yields on timer");
+
+        assert!(first.yielded);
+        assert_eq!(first.yield_kind, Some(ExecYieldKind::Timer));
+        assert_eq!(first.output_text.trim(), "before\nafter");
+        assert_eq!(metadata.total_text_calls, 2);
+
+        std::thread::sleep(Duration::from_millis(30));
+
+        let (resumed, _, resumed_metadata) = run_cell(
+            runtime.handle().clone(),
+            RunCellRequest {
+                cell_id: "cell_runtime_2".to_string(),
+                code: code.to_string(),
+                visible_tools: Vec::new(),
+                stored_values,
+                resume_state: ResumeState {
+                    recorded_timer_calls: metadata.timer_calls,
+                    suppressed_text_calls: metadata.total_text_calls,
+                    ..ResumeState::default()
+                },
+            },
+            |_tool, _args| Ok("\"unused\"".to_string()),
+            |_| {},
+        )
+        .expect("runtime cell resumes after timer fires");
+
+        assert!(!resumed.yielded);
+        assert_eq!(resumed.output_text.trim(), "later");
+        assert_eq!(resumed_metadata.total_text_calls, 3);
+    }
 }

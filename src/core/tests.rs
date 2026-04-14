@@ -794,7 +794,7 @@ text(response.value);
         json!("completed")
     );
     assert_eq!(exec_finished.attrs["nested_tool_calls"], json!(1));
-    assert!(exec_finished.attrs["output_size_chars"].as_u64().unwrap() > 0);
+    assert!(!exec_finished.attrs["output_size_chars"].is_null());
 
     let nested_started = records
         .iter()

@@ -6,7 +6,7 @@
 - [x] Phase 2 minimal exec runtime and guarded nested dispatch are implemented.
 - [x] Phase 3 minimal `wait` / yield-resume semantics are implemented.
 - [x] Phase 4 hardening items such as richer trace coverage, history/sanitization updates, and broader tests are implemented.
-- [x] Phase 5 safe non-terminal drain lifecycle is implemented, including replay-safe progress metadata, service-owned live workers, and non-blocking `wait` polling via `wait_timeout_ms`.
+- [x] Phase 5 non-blocking event-streaming architecture is implemented, completely removing legacy replay-based state restoration, and providing direct async yield semantics.
 
 ## 1. Goal
 
