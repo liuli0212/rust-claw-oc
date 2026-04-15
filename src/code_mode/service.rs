@@ -325,4 +325,28 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    #[tokio::test]
+    async fn execute_cancels_infinite_loop() {
+        let service = CodeModeService::default();
+        let svc_clone = service.clone();
+        
+        let mut invoke_tool =
+            |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) };
+
+        let exec_result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            svc_clone.execute(
+                "session-loop",
+                "while (true) {}",
+                Vec::new(),
+                &mut invoke_tool,
+            )
+        ).await;
+
+        assert!(exec_result.is_err(), "execute should time out");
+
+        let cancelled = service.abort_active_cell("session-loop", "Timeout").await;
+        assert!(cancelled, "should successfully abort active cell");
+    }
 }

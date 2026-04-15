@@ -22,6 +22,7 @@ pub struct RunCellRequest {
     pub visible_tools: Vec<String>,
     pub stored_values: HashMap<String, StoredValue>,
     pub command_rx: std::sync::mpsc::Receiver<crate::code_mode::protocol::CellCommand>,
+    pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub fn run_cell<F>(
@@ -37,6 +38,11 @@ where
     handle.block_on(async move {
         let runtime = AsyncRuntime::new()
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
+        
+        let cancel_flag_clone = request.cancel_flag.clone();
+        runtime.set_interrupt_handler(Some(Box::new(move || {
+            cancel_flag_clone.load(std::sync::atomic::Ordering::Relaxed)
+        }))).await;
         let context = AsyncContext::full(&runtime)
             .await
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
@@ -47,6 +53,7 @@ where
             visible_tools,
             stored_values,
             command_rx,
+            cancel_flag: _,
         } = request;
 
         let event_tx_for_script = event_tx.clone();

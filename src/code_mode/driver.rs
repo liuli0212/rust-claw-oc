@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ pub struct CellDriver {
     /// Channel for sending commands (like resume) to the worker thread.
     command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
     worker: Option<tokio::task::JoinHandle<()>>,
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for CellDriver {
@@ -71,6 +72,9 @@ impl CellDriver {
         let (command_tx, command_rx) =
             std::sync::mpsc::channel::<crate::code_mode::protocol::CellCommand>();
 
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_flag_for_worker = cancel_flag.clone();
+
         let event_tx_captured = event_tx.clone();
         let next_seq = Arc::new(AtomicU64::new(0));
 
@@ -84,6 +88,7 @@ impl CellDriver {
                 visible_tools,
                 stored_values,
                 command_rx,
+                cancel_flag: cancel_flag_for_worker,
             };
 
             // Build a synchronous invoke_tool that simply blocks waiting for
@@ -128,10 +133,12 @@ impl CellDriver {
             tool_result_tx,
             command_tx,
             worker: Some(worker),
+            cancel_flag,
         }
     }
 
     pub fn request_cancel(&mut self, reason: &str) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
         let _ = self
             .tool_result_tx
             .send(Err(crate::tools::ToolError::ExecutionFailed(
@@ -216,7 +223,14 @@ impl CellDriver {
             };
 
             let Some(event) = next_event else {
-                return Ok(DriverDrainBatch::progress(events));
+                if self.cancel_flag.load(Ordering::Relaxed) {
+                    return Err(crate::tools::ToolError::ExecutionFailed(
+                        "Code mode cell execution was cancelled.".to_string(),
+                    ));
+                }
+                return Err(crate::tools::ToolError::ExecutionFailed(
+                    "Worker thread unexpectedly terminated.".to_string(),
+                ));
             };
 
             if let Some(batch) = self
@@ -292,5 +306,43 @@ impl CellDriver {
                 Ok(None)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn test_driver_cancels_infinite_loop_and_thread_exits() {
+        let mut driver = CellDriver::spawn_live(
+            "test-cell".to_string(),
+            "while(true) {}".to_string(),
+            vec![],
+            HashMap::new(),
+        );
+
+        // Allow it to start and enter the loop
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Set the cancel flag without aborting the join handle yet
+        driver.cancel_flag.store(true, Ordering::Relaxed);
+
+        // Take the worker handle and await it
+        let worker_handle = driver.worker.take().expect("Should have worker handle");
+        
+        // Wait for the thread to exit. We wrap this in a timeout just in case it doesn't,
+        // so the test doesn't hang forever.
+        let join_result = tokio::time::timeout(Duration::from_secs(2), worker_handle).await;
+        
+        assert!(
+            join_result.is_ok(),
+            "The worker thread did not exit within the timeout after cancellation flag was set!"
+        );
+        
+        // It joined successfully
+        let result = join_result.unwrap();
+        assert!(result.is_ok(), "The worker thread should finish gracefully (or with a JS exception that is caught and converted to an Error event)");
     }
 }
