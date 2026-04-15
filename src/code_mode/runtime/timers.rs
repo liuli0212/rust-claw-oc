@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct RecordedTimerCall {
     pub timer_id: String,
     pub delay_ms: u64,
-    pub due_at_unix_ms: u64,
+    pub due_at_ms: u64,
     #[serde(default)]
     pub completed: bool,
     #[serde(default)]
@@ -58,13 +58,13 @@ pub fn register_timeout(
 
         let action = if recorded.cleared || recorded.completed {
             TimerAction::Done
-        } else if now_ms >= recorded.due_at_unix_ms {
+        } else if now_ms >= recorded.due_at_ms {
             TimerAction::Run
         } else {
             TimerAction::Pending
         };
         let remaining_ms = matches!(action, TimerAction::Pending)
-            .then_some(recorded.due_at_unix_ms.saturating_sub(now_ms));
+            .then_some(recorded.due_at_ms.saturating_sub(now_ms));
 
         return Ok(TimerRegistration {
             timer_id: recorded.timer_id.clone(),
@@ -74,7 +74,7 @@ pub fn register_timeout(
     }
 
     let timer_id = format!("timer_{}", timer_calls.len() + 1);
-    let due_at_unix_ms = now_ms.saturating_add(delay_ms);
+    let due_at_ms = now_ms.saturating_add(delay_ms);
     // Only zero-delay timers run immediately; others remain pending.
     let action = if delay_ms == 0 {
         TimerAction::Run
@@ -82,12 +82,12 @@ pub fn register_timeout(
         TimerAction::Pending
     };
     let remaining_ms =
-        matches!(action, TimerAction::Pending).then_some(due_at_unix_ms.saturating_sub(now_ms));
+        matches!(action, TimerAction::Pending).then_some(due_at_ms.saturating_sub(now_ms));
 
     timer_calls.push(RecordedTimerCall {
         timer_id: timer_id.clone(),
         delay_ms,
-        due_at_unix_ms,
+        due_at_ms,
         completed: false,
         cleared: false,
     });
@@ -130,7 +130,7 @@ pub fn pending_timer_state(timer_calls: &[RecordedTimerCall], now_ms: u64) -> Pe
         }
 
         pending_timers += 1;
-        let remaining_ms = timer.due_at_unix_ms.saturating_sub(now_ms);
+        let remaining_ms = timer.due_at_ms.saturating_sub(now_ms);
         let should_replace = resume_after_ms
             .map(|current| remaining_ms < current)
             .unwrap_or(true);
@@ -151,7 +151,7 @@ pub fn pending_timer_state(timer_calls: &[RecordedTimerCall], now_ms: u64) -> Pe
 pub fn due_timers(timer_calls: &[RecordedTimerCall], now_ms: u64) -> Vec<String> {
     timer_calls
         .iter()
-        .filter(|timer| !timer.cleared && !timer.completed && now_ms >= timer.due_at_unix_ms)
+        .filter(|timer| !timer.cleared && !timer.completed && now_ms >= timer.due_at_ms)
         .map(|timer| timer.timer_id.clone())
         .collect()
 }

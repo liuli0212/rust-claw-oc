@@ -10,7 +10,6 @@ pub type RuntimeCellResult = (ExecRunResult, HashMap<String, StoredValue>);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DrainRequest {
-    pub wait_for_event: bool,
     pub wait_timeout_ms: Option<u64>,
     pub refresh_slice_ms: Option<u64>,
 }
@@ -18,7 +17,6 @@ pub struct DrainRequest {
 impl DrainRequest {
     pub fn to_completion() -> Self {
         Self {
-            wait_for_event: true,
             wait_timeout_ms: None,
             refresh_slice_ms: None,
         }
@@ -30,7 +28,6 @@ impl DrainRequest {
 
     pub fn for_wait(wait_timeout_ms: Option<u64>, refresh_slice_ms: Option<u64>) -> Self {
         Self {
-            wait_for_event: true,
             wait_timeout_ms,
             refresh_slice_ms,
         }
@@ -43,14 +40,8 @@ impl DrainRequest {
 
 #[derive(Debug)]
 pub enum CellCommand {
-    ToolResult {
-        request_id: String,
-        outcome: Result<String, crate::tools::ToolError>,
-    },
-    Drain(DrainRequest),
-    Cancel {
-        reason: String,
-    },
+    Drain,
+    Cancel { reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -59,13 +50,6 @@ pub struct ToolCallRequestEvent {
     pub request_id: String,
     pub tool_name: String,
     pub args_json: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeTerminalKind {
-    Completed,
-    Failed,
-    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -127,19 +111,6 @@ impl RuntimeEvent {
             Self::ToolCallRequested(request) => Some(request.seq),
             Self::WorkerCompleted(_) => None,
         }
-    }
-
-    pub fn terminal_kind(&self) -> Option<RuntimeTerminalKind> {
-        match self {
-            Self::Completed { .. } => Some(RuntimeTerminalKind::Completed),
-            Self::Failed { .. } => Some(RuntimeTerminalKind::Failed),
-            Self::Cancelled { .. } => Some(RuntimeTerminalKind::Cancelled),
-            _ => None,
-        }
-    }
-
-    pub fn is_terminal_summary_event(&self) -> bool {
-        self.terminal_kind().is_some()
     }
 
     pub fn is_visible_to_drain(&self) -> bool {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use support::capture_output::CaptureOutput;
 use support::scenario_llm::{ScenarioEvent, ScenarioLlm, ScenarioTurn};
 use support::temp_workspace::TempWorkspace;
-use support::test_tools::MockTool;
+use support::test_tools::{BlockingTool, MockTool};
 
 fn scripted_wait_turn(call_id: &str, cell_id: &str, wait_timeout_ms: u64) -> ScenarioTurn {
     ScenarioTurn {
@@ -485,6 +485,106 @@ async fn test_code_mode_timer_completion() {
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+
+    support::temp_workspace::cleanup_session(&session_id);
+}
+
+#[tokio::test]
+async fn test_code_mode_cancel_clears_active_cell_for_next_exec() {
+    let _workspace = TempWorkspace::new();
+    let session_id = format!(
+        "test_code_mode_cancel_cleanup_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+
+    let exec_tool = Arc::new(rusty_claw::tools::ExecTool);
+    let blocking_tool = Arc::new(BlockingTool::new("blocker"));
+    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("done".to_string())));
+    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, blocking_tool, finish_tool];
+
+    let llm = Arc::new(ScenarioLlm::new(vec![
+        ScenarioTurn {
+            events: vec![ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "exec".to_string(),
+                    args: serde_json::json!({
+                        "code": "await tools.blocker({}); text('unreachable');"
+                    }),
+                    id: Some("cancel_exec".to_string()),
+                },
+                Some("cancel_exec".to_string()),
+            )],
+        },
+        ScenarioTurn {
+            events: vec![ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "exec".to_string(),
+                    args: serde_json::json!({ "code": "text('Recovered');" }),
+                    id: Some("recovery_exec".to_string()),
+                },
+                Some("recovery_exec".to_string()),
+            )],
+        },
+        ScenarioTurn {
+            events: vec![ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: serde_json::json!({ "summary": "Recovered after cancel" }),
+                    id: Some("finish_recovery".to_string()),
+                },
+                Some("finish_recovery".to_string()),
+            )],
+        },
+    ]));
+
+    let output = Arc::new(CaptureOutput::new());
+    let (telemetry, _handle) = TelemetryExporter::new();
+    let mut agent = AgentLoop::new(
+        session_id.clone(),
+        llm,
+        "cli".to_string(),
+        tools,
+        AgentContext::new(),
+        output.clone(),
+        Arc::new(telemetry),
+        Arc::new(TaskStateStore::new(&session_id)),
+    );
+
+    let cancel_token = agent.cancel_token.clone();
+    let cancelled = agent.cancelled.clone();
+    let first_step = tokio::spawn(async move {
+        let result = agent.step("Run blocking code mode".to_string()).await;
+        (agent, result)
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    cancel_token.notify_waiters();
+
+    let (mut agent, first_result) = first_step.await.unwrap();
+    assert!(matches!(first_result.unwrap(), RunExit::StoppedByUser));
+
+    let second_result = agent
+        .step("Run recovery code mode".to_string())
+        .await
+        .unwrap();
+    assert!(
+        matches!(second_result, RunExit::Finished(_)),
+        "Expected recovery step to finish, got: {:?}",
+        second_result
+    );
+
+    let tool_ends = output.tool_ends.lock().await;
+    assert!(
+        tool_ends.iter().any(|item| item.contains("Recovered")),
+        "Expected recovery exec output, got: {:?}",
+        *tool_ends
+    );
+    assert!(
+        !tool_ends.iter().any(|item| item.contains("still active")),
+        "Active cell should have been cleared after cancel, got: {:?}",
+        *tool_ends
+    );
 
     support::temp_workspace::cleanup_session(&session_id);
 }

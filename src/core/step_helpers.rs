@@ -878,7 +878,11 @@ impl AgentLoop {
         );
 
         let service = self.code_mode_service.clone();
+        let service_for_exec = service.clone();
+        let service_for_abort = service.clone();
         let session_id = self.session_id.clone();
+        let session_id_for_exec = session_id.clone();
+        let session_id_for_abort = session_id.clone();
         let cancel_token = self.cancel_token.clone();
         let reply_to = self.reply_to.clone();
         let session_deadline = self.session_deadline;
@@ -927,16 +931,16 @@ impl AgentLoop {
 
                     match invocation {
                         CodeModeInvocation::Exec(parsed) => {
-                            service.execute(
-                                &session_id,
+                            service_for_exec.execute(
+                                &session_id_for_exec,
                                 &parsed.code,
                                 visible_tools,
                                 &mut invoke_tool,
                             ).await
                         }
                         CodeModeInvocation::Wait(parsed) => {
-                            service.wait_with_request(
-                                &session_id,
+                            service_for_exec.wait_with_request(
+                                &session_id_for_exec,
                                 parsed.cell_id.as_deref(),
                                 crate::code_mode::protocol::DrainRequest::for_wait(
                                     parsed.wait_timeout_ms,
@@ -951,12 +955,22 @@ impl AgentLoop {
                 match result {
                     Ok(Ok(value)) => Ok(value),
                     Ok(Err(err)) => Err(err),
-                    Err(_) => Err(crate::tools::ToolError::Timeout),
+                    Err(_) => {
+                        service_for_abort
+                            .abort_active_cell(&session_id_for_abort, "Code mode execution timed out.")
+                            .await;
+                        Err(crate::tools::ToolError::Timeout)
+                    }
                 }
             }
-            _ = cancel_token.notified() => Err(crate::tools::ToolError::ExecutionFailed(
-                "Code mode execution interrupted by user.".to_string(),
-            )),
+            _ = cancel_token.notified() => {
+                service
+                    .abort_active_cell(&session_id, "Code mode execution interrupted by user.")
+                    .await;
+                Err(crate::tools::ToolError::ExecutionFailed(
+                    "Code mode execution interrupted by user.".to_string(),
+                ))
+            }
         };
 
         match exec_result {
@@ -973,7 +987,11 @@ impl AgentLoop {
                 let nested_tool_calls = summary.nested_tool_calls;
                 let truncated = summary.truncated;
                 let termination_reason = if summary.flushed {
-                    "flush"
+                    if summary.waiting_on_timer_ms.is_some() {
+                        "waiting_on_timer"
+                    } else {
+                        "flush"
+                    }
                 } else if summary.failure.is_some() {
                     "failed"
                 } else {
@@ -1014,17 +1032,25 @@ impl AgentLoop {
                 .with_payload_kind("code_mode_exec");
 
                 if summary.flushed {
-                    let flush_value_str = summary
-                        .flush_value
-                        .as_ref()
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "none".to_string());
+                    let question = if let Some(delay_ms) = summary.waiting_on_timer_ms {
+                        format!(
+                            "Code mode is waiting on a timer. Call `wait` again in about {} ms.",
+                            delay_ms
+                        )
+                    } else {
+                        let flush_value_str = summary
+                            .flush_value
+                            .as_ref()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        format!(
+                            "Code mode flushed. Value: {}. Call `wait` to continue.",
+                            flush_value_str
+                        )
+                    };
                     tool_output =
                         tool_output.with_await_user(crate::tools::protocol::UserPromptRequest {
-                            question: format!(
-                                "Code mode flushed. Value: {}. Call `wait` to continue.",
-                                flush_value_str
-                            ),
+                            question,
                             context_key: format!("code_mode_flush_{}", summary.cell_id),
                             options: vec!["continue".to_string(), "cancel".to_string()],
                             recommendation: Some("continue".to_string()),

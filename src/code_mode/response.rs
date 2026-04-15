@@ -15,6 +15,7 @@ pub struct ExecRunResult {
     pub return_value: Option<Value>,
     pub flush_value: Option<Value>,
     pub flushed: bool,
+    pub waiting_on_timer_ms: Option<u64>,
     pub notifications: Vec<String>,
     pub failure: Option<String>,
     pub cancellation: Option<String>,
@@ -51,9 +52,9 @@ impl DrainRenderState {
             notifications: result.notifications.clone(),
             return_value: result.return_value.clone(),
             flush_value: result.flush_value.clone(),
+            waiting_on_timer_ms: result.waiting_on_timer_ms,
             failure: result.failure.clone(),
             cancellation: result.cancellation.clone(),
-            waiting_on_timer_ms: None,
             is_flushed: result.flushed,
         }
     }
@@ -64,16 +65,19 @@ impl DrainRenderState {
         for event in events {
             match event {
                 RuntimeEvent::Text { text, .. } => {
+                    state.waiting_on_timer_ms = None;
                     if !state.output_text.is_empty() && !text.is_empty() {
                         state.output_text.push('\n');
                     }
                     state.output_text.push_str(text);
                 }
                 RuntimeEvent::Notification { message, .. } => {
+                    state.waiting_on_timer_ms = None;
                     state.notifications.push(message.clone());
                 }
                 RuntimeEvent::Flush { value, .. } => {
                     state.flush_value = value.clone();
+                    state.waiting_on_timer_ms = None;
                     state.is_flushed = true;
                 }
                 RuntimeEvent::WaitingForTimer {
@@ -91,14 +95,17 @@ impl DrainRenderState {
                 RuntimeEvent::Failed { error, .. } => {
                     state.failure = Some(error.clone());
                     state.cancellation = None;
+                    state.waiting_on_timer_ms = None;
                 }
                 RuntimeEvent::Cancelled { reason, .. } => {
                     state.cancellation = Some(reason.clone());
                     state.failure = None;
+                    state.waiting_on_timer_ms = None;
                 }
-                RuntimeEvent::ToolCallRequested(_)
-                | RuntimeEvent::ToolCallResolved { .. }
-                | RuntimeEvent::WorkerCompleted(_)
+                RuntimeEvent::ToolCallRequested(_) | RuntimeEvent::ToolCallResolved { .. } => {
+                    state.waiting_on_timer_ms = None;
+                }
+                RuntimeEvent::WorkerCompleted(_)
                 | RuntimeEvent::TimerRegistrationChanged { .. } => {}
             }
         }
@@ -276,5 +283,75 @@ impl DrainRenderState {
                 cell_id, nested_tool_calls
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_output_preserves_failure_details() {
+        let summary = ExecRunResult {
+            cell_id: "cell-7".to_string(),
+            output_text: "partial output".to_string(),
+            return_value: None,
+            flush_value: None,
+            flushed: false,
+            waiting_on_timer_ms: None,
+            notifications: Vec::new(),
+            failure: Some("ReferenceError: boom".to_string()),
+            cancellation: None,
+            nested_tool_calls: 2,
+            truncated: false,
+        };
+
+        let rendered = summary.render_output();
+        assert!(rendered.contains("failed after 2 nested tool call(s)"));
+        assert!(rendered.contains("Failure:\nReferenceError: boom"));
+        assert!(rendered.contains("Text output:\npartial output"));
+    }
+
+    #[test]
+    fn render_output_preserves_cancellation_details() {
+        let summary = ExecRunResult {
+            cell_id: "cell-8".to_string(),
+            output_text: String::new(),
+            return_value: None,
+            flush_value: None,
+            flushed: false,
+            waiting_on_timer_ms: None,
+            notifications: Vec::new(),
+            failure: None,
+            cancellation: Some("interrupted by user".to_string()),
+            nested_tool_calls: 0,
+            truncated: false,
+        };
+
+        let rendered = summary.render_output();
+        assert!(rendered.contains("was cancelled"));
+        assert!(rendered.contains("Cancellation reason:\ninterrupted by user"));
+    }
+
+    #[test]
+    fn render_output_uses_timer_wait_status_for_flushed_cells() {
+        let summary = ExecRunResult {
+            cell_id: "cell-9".to_string(),
+            output_text: String::new(),
+            return_value: None,
+            flush_value: None,
+            flushed: true,
+            waiting_on_timer_ms: Some(125),
+            notifications: Vec::new(),
+            failure: None,
+            cancellation: None,
+            nested_tool_calls: 1,
+            truncated: false,
+        };
+
+        let rendered = summary.render_output();
+        assert!(rendered.contains("waiting on timer(s)"));
+        assert!(rendered.contains("about 125 ms"));
+        assert!(!rendered.contains("flushed after 1 nested tool call(s)"));
     }
 }

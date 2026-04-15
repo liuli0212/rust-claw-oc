@@ -10,13 +10,11 @@ use super::protocol::{DrainRequest, RuntimeCellResult, RuntimeEvent};
 use super::runtime;
 
 pub struct CellDriver {
-    pub cell_id: String,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
     /// Channel for sending tool results back to the worker thread.
     tool_result_tx: std::sync::mpsc::Sender<Result<String, crate::tools::ToolError>>,
     /// Channel for sending commands (like resume) to the worker thread.
     command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
-    #[allow(dead_code)] // Kept to hold the JoinHandle alive
     worker: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -28,60 +26,25 @@ impl std::fmt::Debug for CellDriver {
     }
 }
 
-pub struct DriverCompletion {
-    pub runtime_result: RuntimeCellResult,
-    pub events: Vec<RuntimeEvent>,
-}
-
 #[derive(Debug)]
 pub struct DriverDrainBatch {
-    pub request: DrainRequest,
     pub terminal_result: Option<RuntimeCellResult>,
     pub events: Vec<RuntimeEvent>,
 }
 
 impl DriverDrainBatch {
-    pub fn empty(request: DrainRequest) -> Self {
-        Self::progress(request, Vec::new())
-    }
-
-    pub fn progress(request: DrainRequest, events: Vec<RuntimeEvent>) -> Self {
+    pub fn progress(events: Vec<RuntimeEvent>) -> Self {
         Self {
-            request,
             terminal_result: None,
             events,
         }
     }
 
-    pub fn terminal(
-        request: DrainRequest,
-        runtime_result: RuntimeCellResult,
-        events: Vec<RuntimeEvent>,
-    ) -> Self {
+    pub fn terminal(runtime_result: RuntimeCellResult, events: Vec<RuntimeEvent>) -> Self {
         Self {
-            request,
             terminal_result: Some(runtime_result),
             events,
         }
-    }
-
-    pub fn into_completion(self) -> Result<DriverCompletion, crate::tools::ToolError> {
-        Ok(DriverCompletion {
-            runtime_result: self.terminal_result.ok_or_else(|| {
-                crate::tools::ToolError::ExecutionFailed(
-                    "Code mode drain batch did not include a terminal completion.".to_string(),
-                )
-            })?,
-            events: self.events,
-        })
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
-    }
-
-    pub fn requested_wait_for_event(&self) -> bool {
-        self.request.wait_for_event
     }
 }
 
@@ -98,7 +61,6 @@ impl CellDriver {
         code: String,
         visible_tools: Vec<String>,
         stored_values: HashMap<String, runtime::value::StoredValue>,
-        _suppress_initial_timer_flush: bool,
     ) -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         // Use a std::sync channel for tool results so the blocking worker can
@@ -162,11 +124,26 @@ impl CellDriver {
         });
 
         Self {
-            cell_id,
             event_rx,
             tool_result_tx,
             command_tx,
             worker: Some(worker),
+        }
+    }
+
+    pub fn request_cancel(&mut self, reason: &str) {
+        let _ = self
+            .tool_result_tx
+            .send(Err(crate::tools::ToolError::ExecutionFailed(
+                reason.to_string(),
+            )));
+        let _ = self
+            .command_tx
+            .send(crate::code_mode::protocol::CellCommand::Cancel {
+                reason: reason.to_string(),
+            });
+        if let Some(worker) = self.worker.take() {
+            worker.abort();
         }
     }
 
@@ -183,12 +160,10 @@ impl CellDriver {
         Fut: Future<Output = Result<String, crate::tools::ToolError>>,
     {
         if send_resume {
-            // Signal the worker to resume if it's waiting, passing the current request
+            // Signal the worker to resume if it's waiting.
             let _ = self
                 .command_tx
-                .send(crate::code_mode::protocol::CellCommand::Drain(
-                    request.clone(),
-                ));
+                .send(crate::code_mode::protocol::CellCommand::Drain);
         }
 
         let mut events = Vec::new();
@@ -201,13 +176,7 @@ impl CellDriver {
             // Drain any buffered events first
             while let Ok(event) = self.event_rx.try_recv() {
                 if let Some(batch) = self
-                    .classify_event(
-                        request,
-                        &mut events,
-                        event,
-                        invoke_tool,
-                        &mut saw_visible_event,
-                    )
+                    .classify_event(&mut events, event, invoke_tool, &mut saw_visible_event)
                     .await?
                 {
                     return Ok(batch);
@@ -223,11 +192,11 @@ impl CellDriver {
             // returns Some(batch)).
             let next_event = if let Some(deadline) = refresh_deadline {
                 if saw_visible_event && TokioInstant::now() >= deadline {
-                    return Ok(DriverDrainBatch::progress(request, events));
+                    return Ok(DriverDrainBatch::progress(events));
                 }
                 match tokio::time::timeout_at(deadline, self.event_rx.recv()).await {
                     Ok(event) => event,
-                    Err(_) => return Ok(DriverDrainBatch::progress(request, events)),
+                    Err(_) => return Ok(DriverDrainBatch::progress(events)),
                 }
             } else if let Some(wait_timeout_ms) = request.wait_timeout_ms {
                 match tokio::time::timeout(
@@ -237,7 +206,7 @@ impl CellDriver {
                 .await
                 {
                     Ok(event) => event,
-                    Err(_) => return Ok(DriverDrainBatch::progress(request, events)),
+                    Err(_) => return Ok(DriverDrainBatch::progress(events)),
                 }
             } else {
                 // to_completion mode: block indefinitely for the next event.
@@ -247,17 +216,11 @@ impl CellDriver {
             };
 
             let Some(event) = next_event else {
-                return Ok(DriverDrainBatch::progress(request, events));
+                return Ok(DriverDrainBatch::progress(events));
             };
 
             if let Some(batch) = self
-                .classify_event(
-                    request,
-                    &mut events,
-                    event,
-                    invoke_tool,
-                    &mut saw_visible_event,
-                )
+                .classify_event(&mut events, event, invoke_tool, &mut saw_visible_event)
                 .await?
             {
                 return Ok(batch);
@@ -269,7 +232,6 @@ impl CellDriver {
     /// invoke_tool and send the result back to the worker.
     async fn classify_event<F, Fut>(
         &self,
-        request: DrainRequest,
         events: &mut Vec<RuntimeEvent>,
         event: RuntimeEvent,
         invoke_tool: &mut F,
@@ -313,7 +275,6 @@ impl CellDriver {
             }
             RuntimeEvent::WorkerCompleted(result) => match result {
                 Ok(cell_result) => Ok(Some(DriverDrainBatch::terminal(
-                    request,
                     cell_result,
                     std::mem::take(events),
                 ))),
@@ -321,10 +282,7 @@ impl CellDriver {
             },
             RuntimeEvent::Flush { .. } | RuntimeEvent::WaitingForTimer { .. } => {
                 events.push(event);
-                Ok(Some(DriverDrainBatch::progress(
-                    request,
-                    std::mem::take(events),
-                )))
+                Ok(Some(DriverDrainBatch::progress(std::mem::take(events))))
             }
             event => {
                 if event.is_visible_to_drain() {

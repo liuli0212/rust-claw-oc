@@ -33,10 +33,6 @@ impl ActiveCellHandle {
         }
     }
 
-    pub fn finish_turn_with_yield(&mut self, summary: ExecRunResult) {
-        self.last_summary = Some(summary);
-    }
-
     pub fn drain_snapshot(&self) -> CellDrainSnapshot {
         let max_seq = max_event_seq(&self.events);
         let recent_events = self.recent_visible_events();
@@ -87,11 +83,16 @@ impl ActiveCellHandle {
         }
         if let Some(terminal) = &batch.terminal_result {
             self.last_summary = Some(terminal.0.clone());
-            // Infer terminal status from the ExecRunResult if not already set
-            if self.last_summary.as_ref().is_some_and(|s| s.flushed) {
-                // flushed — keep running status
-            } else {
-                self.status = CellStatus::Completed;
+            if let Some(summary) = self.last_summary.as_ref() {
+                self.status = if summary.flushed {
+                    self.status.clone()
+                } else if summary.cancellation.is_some() {
+                    CellStatus::Cancelled
+                } else if summary.failure.is_some() {
+                    CellStatus::Failed
+                } else {
+                    CellStatus::Completed
+                };
             }
         }
     }
@@ -200,6 +201,7 @@ mod tests {
             return_value: None,
             flush_value: Some(json!({"foo": "bar"})),
             flushed: true,
+            waiting_on_timer_ms: None,
             notifications: Vec::new(),
             failure: None,
             cancellation: None,

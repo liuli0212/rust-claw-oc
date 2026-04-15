@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rquickjs::async_with;
 use rquickjs::prelude::{Func, MutFn, Promise};
@@ -61,6 +62,7 @@ where
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
 
         let command_rx = Arc::new(Mutex::new(command_rx));
+        let timer_clock_start = Arc::new(Instant::now());
 
         let event_tx_for_script_captured = event_tx_for_script.clone();
         let next_seq_for_script_captured = next_seq_for_script.clone();
@@ -215,6 +217,7 @@ where
             let timer_calls_ref = timer_calls_for_script.clone();
             let observed_timer_calls_ref = observed_timer_calls_for_script.clone();
             let on_timer_calls_updated_ref = on_timer_calls_updated_for_script.clone();
+            let timer_clock_for_register = timer_clock_start.clone();
             globals
                 .set(
                     "__setTimeout",
@@ -226,16 +229,16 @@ where
                             *observed += 1;
                             current
                         };
-                        let registration = {
-                            let mut timer_calls = timer_calls_ref.lock().unwrap();
-                            let registration = self::timers::register_timeout(
-                                &mut timer_calls,
-                                call_index,
-                                delay_ms,
-                                crate::trace::unix_ms_now(),
-                            )
-                            .map_err(|err| {
-                                Error::new_from_js_message("timer", "resume", err.to_string())
+                            let registration = {
+                                let mut timer_calls = timer_calls_ref.lock().unwrap();
+                                let registration = self::timers::register_timeout(
+                                    &mut timer_calls,
+                                    call_index,
+                                    delay_ms,
+                                    monotonic_elapsed_ms(timer_clock_for_register.as_ref()),
+                                )
+                                .map_err(|err| {
+                                    Error::new_from_js_message("timer", "resume", err.to_string())
                             })?;
                             on_timer_calls_updated_ref(timer_calls.clone());
                             registration
@@ -276,13 +279,14 @@ where
                 .map_err(js_error_to_tool_error)?;
 
             let timer_calls_ref = timer_calls_for_script.clone();
+            let timer_clock_for_pending = timer_clock_start.clone();
             globals
                 .set(
                     "__timerStateJson",
                     Func::from(move || -> rquickjs::Result<String> {
                         let pending = self::timers::pending_timer_state(
                             &timer_calls_ref.lock().unwrap(),
-                            crate::trace::unix_ms_now(),
+                            monotonic_elapsed_ms(timer_clock_for_pending.as_ref()),
                         );
                         serde_json::to_string(&pending).map_err(|err| {
                             Error::new_from_js_message("timer", "json", err.to_string())
@@ -292,13 +296,14 @@ where
                 .map_err(js_error_to_tool_error)?;
 
             let timer_calls_ref = timer_calls_for_script.clone();
+            let timer_clock_for_due = timer_clock_start.clone();
             globals
                 .set(
                     "__dueTimersJson",
                     Func::from(move || -> rquickjs::Result<String> {
                         let due_timers = self::timers::due_timers(
                             &timer_calls_ref.lock().unwrap(),
-                            crate::trace::unix_ms_now(),
+                            monotonic_elapsed_ms(timer_clock_for_due.as_ref()),
                         );
                         serde_json::to_string(&due_timers).map_err(|err| {
                             Error::new_from_js_message("timer", "json", err.to_string())
@@ -317,7 +322,7 @@ where
                     Func::from(move || -> rquickjs::Result<String> {
                         let rx = command_rx_for_resume.lock().unwrap();
                         match rx.recv() {
-                            Ok(crate::code_mode::protocol::CellCommand::Drain(_)) => {
+                            Ok(crate::code_mode::protocol::CellCommand::Drain) => {
                                 Ok(r#"{"continue":true}"#.to_string())
                             }
                             Ok(crate::code_mode::protocol::CellCommand::Cancel { reason }) => {
@@ -375,6 +380,7 @@ where
                 return_value,
                 flush_value,
                 flushed,
+                waiting_on_timer_ms: None,
                 notifications: Vec::new(),
                 failure: runtime_error,
                 cancellation: None,
@@ -384,6 +390,10 @@ where
             stored_values,
         ))
     })
+}
+
+fn monotonic_elapsed_ms(start: &Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn build_wrapper_script(code: &str) -> String {
