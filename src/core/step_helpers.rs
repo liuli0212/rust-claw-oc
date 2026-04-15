@@ -961,22 +961,21 @@ impl AgentLoop {
 
         match exec_result {
             Ok(summary) => {
-                let (event_name, event_status) = if summary.yielded {
-                    ("code_mode_exec_yielded", TraceStatus::Yielded)
+                let (event_name, event_status) = if summary.flushed {
+                    ("code_mode_exec_flushed", TraceStatus::Ok)
+                } else if summary.failure.is_some() {
+                    ("code_mode_exec_failed", TraceStatus::Error)
                 } else {
                     ("code_mode_exec_finished", TraceStatus::Ok)
                 };
                 let cell_id = summary.cell_id.clone();
-                let yielded = summary.yielded;
+                let flushed = summary.flushed;
                 let nested_tool_calls = summary.nested_tool_calls;
                 let truncated = summary.truncated;
-                let yield_kind = summary.yield_kind.clone();
-                let termination_reason = if summary.yielded {
-                    match yield_kind {
-                        Some(crate::code_mode::response::ExecYieldKind::Timer) => "timer_wait",
-                        Some(crate::code_mode::response::ExecYieldKind::Manual) => "yield",
-                        None => "yield",
-                    }
+                let termination_reason = if summary.flushed {
+                    "flush"
+                } else if summary.failure.is_some() {
+                    "failed"
                 } else {
                     "completed"
                 };
@@ -993,8 +992,8 @@ impl AgentLoop {
                         "cell_id": cell_id,
                         "source_length": source_length,
                         "requested_cell_id": requested_cell_id,
-                        "yielded": yielded,
-                        "yield_kind": summary.yield_kind,
+                        "flushed": flushed,
+                        "flush_value": summary.flush_value,
                         "nested_tool_calls": nested_tool_calls,
                         "output_size_chars": summary.output_text.chars().count(),
                         "termination_reason": termination_reason,
@@ -1004,7 +1003,7 @@ impl AgentLoop {
                     iteration,
                 );
 
-                let result = crate::tools::protocol::StructuredToolOutput::new(
+                let mut tool_output = crate::tools::protocol::StructuredToolOutput::new(
                     call.name.clone(),
                     true,
                     summary.render_output(),
@@ -1012,9 +1011,35 @@ impl AgentLoop {
                     Some(start.elapsed().as_millis()),
                     summary.truncated,
                 )
-                .with_payload_kind("code_mode_exec")
-                .to_json_string()
-                .unwrap_or_else(|err| format!("Tool error: {}", err));
+                .with_payload_kind("code_mode_exec");
+
+                if summary.flushed {
+                    let flush_value_str = summary
+                        .flush_value
+                        .as_ref()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    tool_output =
+                        tool_output.with_await_user(crate::tools::protocol::UserPromptRequest {
+                            question: format!(
+                                "Code mode flushed. Value: {}. Call `wait` to continue.",
+                                flush_value_str
+                            ),
+                            context_key: format!("code_mode_flush_{}", summary.cell_id),
+                            options: vec!["continue".to_string(), "cancel".to_string()],
+                            recommendation: Some("continue".to_string()),
+                        });
+                }
+
+                let output_text = summary.render_output();
+                if !output_text.is_empty() {
+                    self.output.on_text(&output_text).await;
+                    self.output.on_text("\n").await;
+                }
+
+                let result = tool_output
+                    .to_json_string()
+                    .unwrap_or_else(|err| format!("Tool error: {}", err));
 
                 ToolDispatchOutcome {
                     result,
@@ -1393,6 +1418,7 @@ impl AgentLoop {
                             .await;
                     }
                 }
+
                 if let Some(summary) = Self::extract_finish_task_summary_from_result(&result) {
                     if self.is_autopilot && self.has_uncompleted_todos() {
                         response_parts.push(Self::build_function_response_part(

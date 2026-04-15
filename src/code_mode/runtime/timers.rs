@@ -31,6 +31,7 @@ pub struct PendingTimerState {
     pub pending_timers: usize,
     pub next_timer_id: Option<String>,
     pub resume_after_ms: Option<u64>,
+    pub completed_ids: Vec<String>,
 }
 
 impl PendingTimerState {
@@ -74,7 +75,8 @@ pub fn register_timeout(
 
     let timer_id = format!("timer_{}", timer_calls.len() + 1);
     let due_at_unix_ms = now_ms.saturating_add(delay_ms);
-    let action = if now_ms >= due_at_unix_ms {
+    // Only zero-delay timers run immediately; others remain pending.
+    let action = if delay_ms == 0 {
         TimerAction::Run
     } else {
         TimerAction::Pending
@@ -119,11 +121,14 @@ pub fn pending_timer_state(timer_calls: &[RecordedTimerCall], now_ms: u64) -> Pe
     let mut pending_timers = 0usize;
     let mut next_timer_id = None;
     let mut resume_after_ms = None;
+    let mut completed_ids = Vec::new();
 
-    for timer in timer_calls
-        .iter()
-        .filter(|timer| !timer.cleared && !timer.completed)
-    {
+    for timer in timer_calls.iter() {
+        if timer.cleared || timer.completed {
+            completed_ids.push(timer.timer_id.clone());
+            continue;
+        }
+
         pending_timers += 1;
         let remaining_ms = timer.due_at_unix_ms.saturating_sub(now_ms);
         let should_replace = resume_after_ms
@@ -139,7 +144,16 @@ pub fn pending_timer_state(timer_calls: &[RecordedTimerCall], now_ms: u64) -> Pe
         pending_timers,
         next_timer_id,
         resume_after_ms,
+        completed_ids,
     }
+}
+
+pub fn due_timers(timer_calls: &[RecordedTimerCall], now_ms: u64) -> Vec<String> {
+    timer_calls
+        .iter()
+        .filter(|timer| !timer.cleared && !timer.completed && now_ms >= timer.due_at_unix_ms)
+        .map(|timer| timer.timer_id.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -175,6 +189,7 @@ mod tests {
         assert!(!pending_timer_state(&calls, 1_000).has_pending_timers());
 
         let second = register_timeout(&mut calls, 1, 50, 1_000).expect("delayed timeout");
+        assert_eq!(second.action, TimerAction::Pending);
         clear_timeout(&mut calls, &second.timer_id);
         assert!(!pending_timer_state(&calls, 1_010).has_pending_timers());
     }

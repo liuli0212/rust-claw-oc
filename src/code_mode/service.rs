@@ -68,7 +68,7 @@ impl CodeModeService {
 
         // Drain to completion — this also fulfills nested tool calls via invoke_tool
         let batch = driver
-            .drain_event_batch_with_request(DrainRequest::to_completion(), invoke_tool)
+            .drain_event_batch_with_request(DrainRequest::to_completion(), invoke_tool, false)
             .await?;
 
         // Update session state
@@ -153,16 +153,14 @@ impl CodeModeService {
         let batch = {
             let mut driver = driver_handle.lock().await;
             driver
-                .drain_event_batch_with_request(request, invoke_tool)
+                .drain_event_batch_with_request(request, invoke_tool, true)
                 .await?
         };
 
         // Re-acquire the lock to update session state
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(session_id).ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(
-                "Session disappeared during wait.".to_string(),
-            )
+            crate::tools::ToolError::ExecutionFailed("Session disappeared during wait.".to_string())
         })?;
 
         if let Some(ref mut active_cell) = session.active_cell {
@@ -192,15 +190,17 @@ impl CodeModeService {
         let snapshot = cell.drain_snapshot();
         let render = snapshot.render_state();
         let nested_tool_calls = cell.nested_tool_call_count();
+        let flushed = cell.is_yielding();
 
         ExecRunResult {
             cell_id: cell.cell_id.clone(),
             output_text: render.output_text,
             return_value: render.return_value,
-            yield_value: render.yield_value,
-            yielded: render.yield_kind.is_some(),
-            yield_kind: render.yield_kind,
+            flush_value: render.flush_value,
+            flushed,
             notifications: render.notifications,
+            failure: render.failure,
+            cancellation: render.cancellation,
             nested_tool_calls,
             truncated: false,
         }

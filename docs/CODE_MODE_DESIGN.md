@@ -1737,12 +1737,12 @@ This section documents the current architecture after the replay-removal refacto
 
 ### 22.1 Design Summary
 
-The code-mode runtime is now fully event-driven. Each `exec` call spawns a single live JS runtime worker that runs to completion (or yield) without ever being re-executed. All output, notifications, yields, tool requests, and terminal events flow through a typed `RuntimeEvent` channel (`tokio::sync::mpsc::unbounded_channel`). There is no replay fallback.
+The code-mode runtime is now fully event-driven. Each `exec` call spawns a single live JS runtime worker that runs to completion (or flush) without ever being re-executed. All output, notifications, flush/timer-wait signals, tool requests, and terminal events flow through a typed `RuntimeEvent` channel (`tokio::sync::mpsc::unbounded_channel`). There is no replay fallback.
 
 Key properties:
 
 - **One live worker per cell.** The JS runtime runs once. Local variables, closures, and pending promises remain valid for the lifetime of the worker.
-- **`yield_control()` is non-blocking.** It emits a `RuntimeEvent::Yield` event but does not throw, pause, or terminate JS execution. The script continues running after `yield_control()` returns.
+- **`flush()` is non-throwing.** It emits a `RuntimeEvent::Flush` event and allows the host drain loop to surface `await_user`; execution can later be resumed with `wait`.
 - **`text()` output is streamed as events.** Each `text(value)` call emits a `RuntimeEvent::Text` event. Output accumulates in the event log, not in an in-runtime buffer.
 - **No replay counters.** `ResumeState`, `OutputBuffer`, `NotificationBuffer`, `CellResumeState`, `CellResumeProgressDelta`, and all suppressed-call counters have been deleted.
 - **Drain semantics are pure event consumption.** `exec` spawns + does an initial drain. `wait` drains the same live cell's event buffer. Neither re-runs JS.
@@ -1754,7 +1754,7 @@ Key properties:
 Owns the `rquickjs` execution. Provides `run_cell()` which:
 
 1. Creates an `AsyncRuntime` + `AsyncContext`.
-2. Registers global functions (`__text`, `__notify`, `__yield_control`, `__store`, `__load`, `__callTool`, `__setTimeout`, `__clearTimeout`, `__markTimeoutComplete`, `__timerStateJson`).
+2. Registers global functions (`__text`, `__notify`, `__flush`, `__waiting_for_timer`, `__store`, `__load`, `__callTool`, `__setTimeout`, `__clearTimeout`, `__markTimeoutComplete`, `__timerStateJson`, `__dueTimersJson`, `__wait_for_resume`).
 3. Wraps user code in an async IIFE via `build_wrapper_script()`.
 4. Executes the wrapped script to completion (including timer callback draining).
 5. Returns `(ExecRunResult, HashMap<String, StoredValue>)`.
@@ -1912,23 +1912,21 @@ The `render_output()` / `render_output_with_status()` methods produce the final 
 
 Key change: `Text` field matching now uses `text` instead of `chunk`.
 
-### 22.3 `yield_control()` Semantics
+### 22.3 `flush()` / Timer Wait Semantics
 
-The `yield_control(value?)` JS global works as follows:
+The `flush(value?)` and timer wait bridge work as follows:
 
-1. JS calls `yield_control(value)` (or `yield_control()`).
-2. The wrapper script calls `__yield_control(JSON.stringify(value))`.
-3. `__yield_control` sends a `RuntimeEvent::Yield { kind: Manual, value, ... }` via `event_tx`.
-4. **The function returns immediately.** JS execution continues.
-5. The driver's drain loop sees the `Yield` event and marks `saw_visible_event = true`.
-6. On the next drain boundary (timeout or refresh slice), accumulated events (including any `Text` events emitted before and after the yield) are returned to the caller.
+1. JS calls `flush(value)` to publish a host-visible checkpoint.
+2. The wrapper script calls `__flush(JSON.stringify(value))`.
+3. `__flush` sends `RuntimeEvent::Flush { value, ... }` via `event_tx`.
+4. For pending timers, the wrapper script emits `RuntimeEvent::WaitingForTimer { resume_after_ms, ... }` via `__waiting_for_timer(...)` and blocks on `__wait_for_resume()`.
+5. `wait` sends `CellCommand::Drain(...)`, unblocking the worker and letting it continue from the same runtime state.
 
 This means:
 
-- `yield_control()` does **not** block JS execution.
-- Any `text()` calls made after `yield_control()` are still captured as events.
-- The LLM receives all accumulated output (text + notifications + yield value) in the drain batch.
-- Multiple `yield_control()` calls within one script execution are valid — each emits a separate `Yield` event.
+- `flush()` emits a host-visible drain event without throwing a JS exception.
+- Timer waits preserve runtime-local state and resume only through `wait`.
+- The LLM receives accumulated text/notifications plus flush status in each drain batch.
 
 ### 22.4 Data Flow: `exec` Call
 
@@ -1974,7 +1972,7 @@ LLM emits wait({cell_id?, wait_timeout_ms?, refresh_slice_ms?})
 JS timers (`setTimeout` / `clearTimeout`) remain runtime-internal:
 
 - `setTimeout(callback, delayMs)` registers a timer via `register_timeout()`.
-- If `delayMs == 0` or the timer is already due, the callback is pushed to `__dueTimeoutCallbacks` and executed inline after the main script body.
+- If `delayMs == 0`, the callback is pushed to `__dueTimeoutCallbacks` and executed inline after the main script body.
 - If the timer is pending (future), it is not executed. The wrapper script detects pending timers and returns a `yielded: true, yieldKind: 'timer'` result.
 - Timer state is communicated to the service via `RuntimeEvent::TimerRegistrationChanged`.
 - Host slice timing (`refresh_slice_ms` in `DrainRequest`) is independent of JS timer deadlines.
@@ -1998,18 +1996,22 @@ This pattern allows `AgentLoop` to use its own stateful, async closures (capturi
 
 ## 24. Next Steps
 
+**Phase 3 (Integration & Event-Driven Migration) Completed**:
+- [x] Map Code Mode flush/timer-wait events to tool output `await_user` effect.
+- [x] Fix event propagation in `ActiveCellHandle::apply_drain_batch` for flush/timer states.
+- [x] Fix `to_completion()` drain requests and blocking logic.
+- [x] Implement rendered text output emission to `AgentOutput`.
+- [x] Verify full lifecycle with integration tests.
+
 Focused work for the next phase:
 
 - [ ] **Production Hardening**:
     - [ ] Add explicit timeout monitoring at the `CodeModeService` level for long-running workers.
     - [ ] Implement graceful termination for orphaned workers.
-    - [ ] Improve JS stack trace capture and formatting in `ExecRunResult`.
+    - [ ] Refine error reporting for nested tool failures.
 - [ ] **Performance Optimization**:
     - [ ] Profile `rquickjs` context initialization overhead.
     - [ ] Optimize large output buffering to avoid excessive string copying.
-- [ ] **UI & Observability**:
-    - [ ] Ensure the browser/adapter layer can consume the `RuntimeEvent` stream for live "thinking" indicators or nested tool logs.
-    - [ ] Richer rendering of `StoredValue` state in debugging overlays.
 - [ ] **Expanded Capabilities**:
-    - [ ] Multi-cell session testing (complex state persistence across turns).
+    - [x] Multi-cell session testing (Verified state persistence across turns).
     - [ ] Parallel tool call support inside `exec` (concurrent nested dispatch).

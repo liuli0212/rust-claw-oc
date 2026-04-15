@@ -1,5 +1,5 @@
 use super::protocol::{max_event_seq, RuntimeEvent};
-use super::response::{DrainRenderState, ExecRunResult, ExecYieldKind};
+use super::response::{DrainRenderState, ExecRunResult};
 
 const RECENT_EVENT_BUDGET_CHARS: usize = 8_000;
 
@@ -9,6 +9,7 @@ pub enum CellStatus {
     Running,
     WaitingOnTool { request_id: String },
     WaitingOnJsTimer { next_due_in_ms: Option<u64> },
+    Flushed,
     Completed,
     Failed,
     Cancelled,
@@ -61,13 +62,15 @@ impl ActiveCellHandle {
                 RuntimeEvent::ToolCallResolved { .. } => {
                     self.status = CellStatus::Running;
                 }
-                RuntimeEvent::Yield { kind: ExecYieldKind::Timer, resume_after_ms, .. } => {
+                RuntimeEvent::WaitingForTimer {
+                    resume_after_ms, ..
+                } => {
                     self.status = CellStatus::WaitingOnJsTimer {
                         next_due_in_ms: *resume_after_ms,
                     };
                 }
-                RuntimeEvent::Yield { .. } => {
-                    self.status = CellStatus::Running;
+                RuntimeEvent::Flush { .. } => {
+                    self.status = CellStatus::Flushed;
                 }
                 RuntimeEvent::Completed { .. } => {
                     self.status = CellStatus::Completed;
@@ -85,8 +88,8 @@ impl ActiveCellHandle {
         if let Some(terminal) = &batch.terminal_result {
             self.last_summary = Some(terminal.0.clone());
             // Infer terminal status from the ExecRunResult if not already set
-            if self.last_summary.as_ref().is_some_and(|s| s.yielded) {
-                // yielded — keep running status
+            if self.last_summary.as_ref().is_some_and(|s| s.flushed) {
+                // flushed — keep running status
             } else {
                 self.status = CellStatus::Completed;
             }
@@ -94,6 +97,15 @@ impl ActiveCellHandle {
     }
 
     /// Whether the cell is in a terminal state (completed, failed, or cancelled).
+    pub fn is_yielding(&self) -> bool {
+        matches!(
+            self.status,
+            CellStatus::WaitingOnTool { .. }
+                | CellStatus::WaitingOnJsTimer { .. }
+                | CellStatus::Flushed
+        )
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.status,
@@ -144,33 +156,17 @@ pub struct CellDrainSnapshot {
 
 impl CellDrainSnapshot {
     pub fn render_state(&self) -> DrainRenderState {
-        let mut text_buf = String::new();
-        let mut notifications = Vec::new();
+        let mut state = DrainRenderState::from_events(&self.recent_events);
 
-        for event in &self.recent_events {
-            match event {
-                RuntimeEvent::Text { text, .. } => {
-                    if !text_buf.is_empty() && !text.is_empty() {
-                        text_buf.push('\n');
-                    }
-                    text_buf.push_str(text);
-                }
-                RuntimeEvent::Notification { message, .. } => {
-                    notifications.push(message.clone());
-                }
-                _ => {}
-            }
+        // If we have a terminal last_summary, it is the final authority on the execution state.
+        if let Some(summary) = &self.last_summary {
+            state.return_value = summary.return_value.clone();
+            state.flush_value = summary.flush_value.clone();
+            state.failure = summary.failure.clone();
+            state.cancellation = summary.cancellation.clone();
         }
 
-        DrainRenderState {
-            output_text: text_buf,
-            notifications,
-            return_value: self.last_summary.as_ref().and_then(|s| s.return_value.clone()),
-            yield_value: self.last_summary.as_ref().and_then(|s| s.yield_value.clone()),
-            yield_kind: self.last_summary.as_ref().and_then(|s| s.yield_kind.clone()),
-            failure: None,
-            cancellation: None,
-        }
+        state
     }
 }
 
@@ -182,23 +178,31 @@ mod tests {
     #[test]
     fn test_active_cell_handle_collects_events_and_renders_snapshot() {
         let mut cell = ActiveCellHandle::new("test-cell".to_string());
-        cell.events.push(RuntimeEvent::Text { seq: 1, text: "hello ".to_string() });
-        cell.events.push(RuntimeEvent::Text { seq: 2, text: "world".to_string() });
-        cell.events.push(RuntimeEvent::Notification { seq: 3, message: "notif".to_string() });
-        cell.events.push(RuntimeEvent::Yield {
+        cell.events.push(RuntimeEvent::Text {
+            seq: 1,
+            text: "hello ".to_string(),
+        });
+        cell.events.push(RuntimeEvent::Text {
+            seq: 2,
+            text: "world".to_string(),
+        });
+        cell.events.push(RuntimeEvent::Notification {
+            seq: 3,
+            message: "notif".to_string(),
+        });
+        cell.events.push(RuntimeEvent::Flush {
             seq: 4,
-            kind: ExecYieldKind::Manual,
             value: Some(json!({"foo": "bar"})),
-            resume_after_ms: None,
         });
         cell.last_summary = Some(ExecRunResult {
             cell_id: "test-cell".to_string(),
             output_text: String::new(),
             return_value: None,
-            yield_value: Some(json!({"foo": "bar"})),
-            yielded: true,
-            yield_kind: Some(ExecYieldKind::Manual),
+            flush_value: Some(json!({"foo": "bar"})),
+            flushed: true,
             notifications: Vec::new(),
+            failure: None,
+            cancellation: None,
             nested_tool_calls: 0,
             truncated: false,
         });
@@ -206,10 +210,10 @@ mod tests {
         let snapshot = cell.drain_snapshot();
         assert_eq!(snapshot.cell_id, "test-cell");
         assert_eq!(snapshot.max_seq, 4);
-        
+
         let render = snapshot.render_state();
         assert_eq!(render.output_text, "hello \nworld");
         assert_eq!(render.notifications, vec!["notif"]);
-        assert_eq!(render.yield_value, Some(json!({"foo": "bar"})));
+        assert_eq!(render.flush_value, Some(json!({"foo": "bar"})));
     }
 }

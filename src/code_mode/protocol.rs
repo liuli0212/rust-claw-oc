@@ -3,14 +3,10 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use super::response::ExecRunResult;
-use super::response::ExecYieldKind;
 use super::runtime;
 use super::runtime::value::StoredValue;
 
-pub type RuntimeCellResult = (
-    ExecRunResult,
-    HashMap<String, StoredValue>,
-);
+pub type RuntimeCellResult = (ExecRunResult, HashMap<String, StoredValue>);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DrainRequest {
@@ -21,7 +17,11 @@ pub struct DrainRequest {
 
 impl DrainRequest {
     pub fn to_completion() -> Self {
-        Self::default()
+        Self {
+            wait_for_event: true,
+            wait_timeout_ms: None,
+            refresh_slice_ms: None,
+        }
     }
 
     pub fn wait_for_next_event() -> Self {
@@ -78,13 +78,16 @@ pub enum RuntimeEvent {
         seq: u64,
         message: String,
     },
-    Yield {
+    Flush {
         seq: u64,
-        kind: ExecYieldKind,
         value: Option<Value>,
+    },
+    WaitingForTimer {
+        seq: u64,
         resume_after_ms: Option<u64>,
     },
     ToolCallRequested(ToolCallRequestEvent),
+
     ToolCallResolved {
         seq: u64,
         request_id: String,
@@ -114,7 +117,8 @@ impl RuntimeEvent {
         match self {
             Self::Text { seq, .. }
             | Self::Notification { seq, .. }
-            | Self::Yield { seq, .. }
+            | Self::Flush { seq, .. }
+            | Self::WaitingForTimer { seq, .. }
             | Self::ToolCallResolved { seq, .. }
             | Self::Completed { seq, .. }
             | Self::Failed { seq, .. }
