@@ -880,6 +880,19 @@ impl AgentLoop {
                 async {
                     match invocation {
                         CodeModeInvocation::Exec(parsed) => {
+                            let cell_span = iteration_trace_ctx.as_ref().map(|ctx| {
+                                trace_bus.start_span(
+                                    ctx,
+                                    crate::trace::TraceActor::Tool,
+                                    "code_mode_cell_background",
+                                    serde_json::json!({
+                                        "session_id": session_id,
+                                        "outer_tool_call_id": call.id.clone(),
+                                    }),
+                                )
+                            });
+                            let cell_span_id = cell_span.as_ref().map(|s| s.span_id().to_string());
+
                             let nested_executor = Arc::new(tokio::sync::Mutex::new(
                                 crate::code_mode::executor::CodeModeNestedToolExecutor::new(
                                     crate::code_mode::executor::CodeModeNestedToolExecutorConfig {
@@ -890,7 +903,7 @@ impl AgentLoop {
                                         remaining_steps,
                                         session_deadline,
                                         iteration_trace_ctx: iteration_trace_ctx.clone(),
-                                        parent_span_id: parent_span_id.clone(),
+                                        parent_span_id: cell_span_id,
                                         outer_tool_call_id: call.id.clone(),
                                         trace_bus,
                                         provider: provider.clone(),
@@ -916,6 +929,7 @@ impl AgentLoop {
                                 &parsed.code,
                                 visible_tools,
                                 invoke_tool,
+                                cell_span,
                             ).await
                         }
                         CodeModeInvocation::Wait(parsed) => {

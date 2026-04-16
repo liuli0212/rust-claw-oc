@@ -192,8 +192,6 @@ impl ContextAssembler {
             }
         }
 
-
-
         // Layer 3: Task State
         let state_summary = task_state.summary();
 

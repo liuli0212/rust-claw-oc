@@ -93,6 +93,7 @@ impl CodeModeService {
         code: &str,
         visible_tools: Vec<String>,
         invoke_tool: F,
+        cell_span: Option<crate::trace::TraceSpanHandle>,
     ) -> Result<ExecRunResult, crate::tools::ToolError>
     where
         F: FnMut(String, String) -> Fut + Send + 'static,
@@ -151,6 +152,7 @@ impl CodeModeService {
                     host_handle_for_task,
                     invoke_tool,
                     initial_summary_tx,
+                    cell_span,
                 )
                 .await;
         });
@@ -258,6 +260,7 @@ impl CodeModeService {
         host_handle: SharedCellHost,
         mut invoke_tool: F,
         initial_summary_tx: oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>,
+        mut cell_span: Option<crate::trace::TraceSpanHandle>,
     ) where
         F: FnMut(String, String) -> Fut + Send + 'static,
         Fut: Future<Output = Result<String, crate::tools::ToolError>> + Send + 'static,
@@ -287,14 +290,14 @@ impl CodeModeService {
                         match disposition {
                             CellDisposition::Continue => {}
                             CellDisposition::WaitingOnTimer => {}
-                            CellDisposition::Terminal => return,
+                            CellDisposition::Terminal => break,
                         }
                     }
                     Err(err) => {
                         if let Some(tx) = initial_summary_tx.take() {
                             let _ = tx.send(Err(err));
                         }
-                        return;
+                        break;
                     }
                 },
                 Err(err) => {
@@ -314,9 +317,20 @@ impl CodeModeService {
                             }
                         }
                     }
-                    return;
+                    break;
                 }
             }
+        }
+
+        if let Some(span) = cell_span.take() {
+            span.finish(
+                "code_mode_cell_finished",
+                crate::trace::TraceStatus::Ok,
+                None,
+                serde_json::json!({
+                    "cell_id": cell_id,
+                }),
+            );
         }
     }
 
@@ -487,7 +501,8 @@ mod tests {
                 "flush({ ok: true });",
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
-            )
+                None,
+)
             .await
             .expect("exec should yield");
         assert!(summary.flushed);
@@ -517,7 +532,8 @@ mod tests {
                 "#,
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
-            )
+                None,
+)
             .await
             .expect("initial exec should yield on timer");
         assert!(summary.flushed);
@@ -529,7 +545,8 @@ mod tests {
                 "text('next');",
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
-            )
+                None,
+)
             .await
             .unwrap_err();
 
@@ -551,7 +568,8 @@ mod tests {
                 "while (true) {}",
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
-            ),
+                None,
+),
         )
         .await;
 
@@ -578,7 +596,8 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     Ok(r#"{"value":"done"}"#.to_string())
                 },
-            )
+                None,
+)
             .await
             .expect("exec should publish initial flush state");
 
@@ -613,7 +632,8 @@ mod tests {
                 "#,
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
-            )
+                None,
+)
             .await
             .expect("exec should yield on timer");
 
