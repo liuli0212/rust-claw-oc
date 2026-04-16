@@ -32,11 +32,16 @@ This document is an incremental redesign for the current implementation in:
   - `CodeModeService` now spawns a background `CellHostTask` for each `exec`.
   - nested tool requests are fulfilled by the background host task instead of the foreground `wait` call path.
   - `wait` now observes background progress and only nudges execution when the cell is paused on a JS timer boundary.
+- [x] Phase 3 started and completed:
+  - Timers no longer require external host resumes; the loop is closed inside the cell worker.
+  - `CellCommand::Drain` and `__wait_for_resume()` are removed.
+- [x] Phase 4 started and completed:
+  - `wait` is now observation-only (snapshot/read semantics).
+  - nested tool fulfillment and timer progress are decoupled from foreground `wait`.
 - [x] Phase 5 started and completed:
   - Added a dedicated cell background span.
   - Ensured nested tool spans hang under the cell span.
   - Updated docs.
-- [ ] Phase 3 not started: timers still require the current resume-based runtime contract.
 
 Phase 1 implementation finding:
 
