@@ -14,7 +14,6 @@ pub struct ExecArgs {
 pub struct WaitArgs {
     pub cell_id: Option<String>,
     pub wait_timeout_ms: Option<u64>,
-    pub refresh_slice_ms: Option<u64>,
 }
 
 pub struct ExecTool;
@@ -63,7 +62,7 @@ impl Tool for WaitTool {
     }
 
     fn description(&self) -> String {
-        "Resume the currently pending code-mode cell for this session. Optionally provide a `cell_id` to assert which flushed cell should continue. Set `wait_timeout_ms` to `0` for a non-blocking poll, and use `refresh_slice_ms` to pass host-side slice hints."
+        "Resume the currently pending code-mode cell for this session. Optionally provide a `cell_id` to assert which flushed cell should continue. Set `wait_timeout_ms` to `0` for a non-blocking poll, "
             .to_string()
     }
 

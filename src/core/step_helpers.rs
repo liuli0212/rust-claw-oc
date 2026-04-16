@@ -828,16 +828,12 @@ impl AgentLoop {
             }
         };
 
-        let (source_length, requested_cell_id, wait_timeout_ms, refresh_slice_ms) =
-            match &invocation {
-                CodeModeInvocation::Exec(parsed) => (parsed.code.chars().count(), None, None, None),
-                CodeModeInvocation::Wait(parsed) => (
-                    0usize,
-                    parsed.cell_id.clone(),
-                    parsed.wait_timeout_ms,
-                    parsed.refresh_slice_ms,
-                ),
-            };
+        let (source_length, requested_cell_id, wait_timeout_ms) = match &invocation {
+            CodeModeInvocation::Exec(parsed) => (parsed.code.chars().count(), None, None),
+            CodeModeInvocation::Wait(parsed) => {
+                (0usize, parsed.cell_id.clone(), parsed.wait_timeout_ms)
+            }
+        };
 
         let visible_tools: Vec<String> = current_tools
             .iter()
@@ -858,8 +854,7 @@ impl AgentLoop {
                 "source_length": source_length,
                 "requested_cell_id": requested_cell_id,
                 "wait_timeout_ms": wait_timeout_ms,
-                "refresh_slice_ms": refresh_slice_ms,
-                "visible_nested_tools": visible_tools.len(),
+                                "visible_nested_tools": visible_tools.len(),
                 "args_preview": crate::context::AgentContext::truncate_chars(&call.args.to_string(), 500),
             }),
             parent_span_id.clone(),
@@ -927,10 +922,7 @@ impl AgentLoop {
                             service_for_exec.wait_with_request(
                                 &session_id_for_exec,
                                 parsed.cell_id.as_deref(),
-                                crate::code_mode::protocol::DrainRequest::for_wait(
-                                    parsed.wait_timeout_ms,
-                                    parsed.refresh_slice_ms,
-                                ),
+                                parsed.wait_timeout_ms,
                             ).await
                         }
                     }

@@ -2,11 +2,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
-use tokio::time::Instant as TokioInstant;
-
-use super::protocol::{DrainRequest, RuntimeCellResult, RuntimeEvent};
+use super::protocol::{RuntimeCellResult, RuntimeEvent};
 use super::runtime;
 
 pub struct CellDriver {
@@ -179,7 +176,6 @@ impl CellDriver {
     /// `invoke_tool` when `ToolCallRequested` events are seen.
     pub async fn drain_event_batch_with_request<F, Fut>(
         &mut self,
-        request: DrainRequest,
         invoke_tool: &mut F,
     ) -> Result<DriverDrainBatch, crate::tools::ToolError>
     where
@@ -187,9 +183,6 @@ impl CellDriver {
         Fut: Future<Output = Result<String, crate::tools::ToolError>>,
     {
         let mut events = Vec::new();
-        let refresh_deadline = request
-            .refresh_slice_ms
-            .map(|refresh_ms| TokioInstant::now() + Duration::from_millis(refresh_ms));
         let mut saw_visible_event = false;
 
         loop {
@@ -203,37 +196,10 @@ impl CellDriver {
                 }
             }
 
-            // Determine how to wait for the next event.
-            // If we have a refresh_deadline (from refresh_slice_ms), we wait
-            // for more events until the deadline, then return whatever we have.
-            // If no refresh_deadline and no wait_timeout: we are in
-            // "to_completion" mode — keep blocking until a terminal/flush
-            // event arrives (those are handled in classify_event which
-            // returns Some(batch)).
-            let next_event = if let Some(deadline) = refresh_deadline {
-                if saw_visible_event && TokioInstant::now() >= deadline {
-                    return Ok(DriverDrainBatch::progress(events));
-                }
-                match tokio::time::timeout_at(deadline, self.event_rx.recv()).await {
-                    Ok(event) => event,
-                    Err(_) => return Ok(DriverDrainBatch::progress(events)),
-                }
-            } else if let Some(wait_timeout_ms) = request.wait_timeout_ms {
-                match tokio::time::timeout(
-                    Duration::from_millis(wait_timeout_ms),
-                    self.event_rx.recv(),
-                )
-                .await
-                {
-                    Ok(event) => event,
-                    Err(_) => return Ok(DriverDrainBatch::progress(events)),
-                }
-            } else {
-                // to_completion mode: block indefinitely for the next event.
-                // classify_event will return the batch when a terminal or
-                // flush event arrives.
-                self.event_rx.recv().await
-            };
+            // Block indefinitely for the next event.
+            // classify_event will return the batch when a terminal or
+            // flush event arrives.
+            let next_event = self.event_rx.recv().await;
 
             let Some(event) = next_event else {
                 if self.cancel_flag.load(Ordering::Relaxed) {
@@ -325,7 +291,6 @@ impl CellDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn test_driver_cancels_infinite_loop_and_thread_exits() {
@@ -337,7 +302,7 @@ mod tests {
         );
 
         // Allow it to start and enter the loop
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Set the cancel flag without aborting the join handle yet
         driver.cancel_flag.store(true, Ordering::Relaxed);
@@ -347,7 +312,8 @@ mod tests {
 
         // Wait for the thread to exit. We wrap this in a timeout just in case it doesn't,
         // so the test doesn't hang forever.
-        let join_result = tokio::time::timeout(Duration::from_secs(2), worker_handle).await;
+        let join_result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), worker_handle).await;
 
         assert!(
             join_result.is_ok(),

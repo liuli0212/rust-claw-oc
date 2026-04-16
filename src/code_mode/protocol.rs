@@ -8,36 +8,6 @@ use super::runtime::value::StoredValue;
 
 pub type RuntimeCellResult = (ExecRunResult, HashMap<String, StoredValue>);
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DrainRequest {
-    pub wait_timeout_ms: Option<u64>,
-    pub refresh_slice_ms: Option<u64>,
-}
-
-impl DrainRequest {
-    pub fn to_completion() -> Self {
-        Self {
-            wait_timeout_ms: None,
-            refresh_slice_ms: None,
-        }
-    }
-
-    pub fn wait_for_next_event() -> Self {
-        Self::for_wait(None, None)
-    }
-
-    pub fn for_wait(wait_timeout_ms: Option<u64>, refresh_slice_ms: Option<u64>) -> Self {
-        Self {
-            wait_timeout_ms,
-            refresh_slice_ms,
-        }
-    }
-
-    pub fn poll_now() -> Self {
-        Self::for_wait(Some(0), None)
-    }
-}
-
 #[derive(Debug)]
 pub enum CellCommand {
     Cancel { reason: String },

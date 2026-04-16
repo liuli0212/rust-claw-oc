@@ -10,7 +10,6 @@ use tokio::sync::Notify;
 
 use super::cell::{ActiveCellHandle, CellStatus};
 use super::driver::{CellDriver, CellDriverControl};
-use super::protocol::DrainRequest;
 use super::response::ExecRunResult;
 use super::runtime;
 
@@ -178,7 +177,7 @@ impl CodeModeService {
         &self,
         session_id: &str,
         requested_cell_id: Option<&str>,
-        request: DrainRequest,
+        wait_timeout_ms: Option<u64>,
     ) -> Result<ExecRunResult, crate::tools::ToolError> {
         let (cell_id, host_handle, revision) = {
             let mut sessions = self.sessions.lock().await;
@@ -223,7 +222,7 @@ impl CodeModeService {
             )
         };
 
-        let wait_timeout = request.wait_timeout_ms.map(Duration::from_millis);
+        let wait_timeout = wait_timeout_ms.map(Duration::from_millis);
         let updated = host_handle
             .wait_for_update_after(revision, wait_timeout)
             .await;
@@ -269,7 +268,7 @@ impl CodeModeService {
             let batch = {
                 let mut driver = host_handle.driver_handle.lock().await;
                 driver
-                    .drain_event_batch_with_request(DrainRequest::to_completion(), &mut invoke_tool)
+                    .drain_event_batch_with_request(&mut invoke_tool)
                     .await
             };
 
@@ -468,11 +467,7 @@ mod tests {
         let service = CodeModeService::default();
 
         let err = service
-            .wait_with_request(
-                "missing-session",
-                None,
-                DrainRequest::for_wait(Some(5), None),
-            )
+            .wait_with_request("missing-session", None, Some(5))
             .await
             .unwrap_err();
 
@@ -498,11 +493,7 @@ mod tests {
         assert!(summary.flushed);
 
         let err = service
-            .wait_with_request(
-                "session-a",
-                Some("cell-99"),
-                DrainRequest::for_wait(Some(5), None),
-            )
+            .wait_with_request("session-a", Some("cell-99"), Some(5))
             .await
             .unwrap_err();
 
@@ -599,11 +590,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
 
         let final_summary = service
-            .wait_with_request(
-                "session-c",
-                Some(&summary.cell_id),
-                DrainRequest::poll_now(),
-            )
+            .wait_with_request("session-c", Some(&summary.cell_id), Some(0))
             .await
             .expect("wait should observe the terminal summary");
 
@@ -636,11 +623,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
         let final_summary = service
-            .wait_with_request(
-                "session-d",
-                Some(&summary.cell_id),
-                DrainRequest::for_wait(Some(50), None),
-            )
+            .wait_with_request("session-d", Some(&summary.cell_id), Some(50))
             .await
             .expect("wait should resume the timer boundary");
 
