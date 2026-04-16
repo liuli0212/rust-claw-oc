@@ -203,12 +203,12 @@ impl DrainRenderState {
         match status {
             CellStatus::Starting | CellStatus::Running | CellStatus::Flushed => {
                 Some(format!(
-                    "Code mode cell `{}` is running after {} nested tool call(s). Call `wait` to resume it.",
+                    "Code mode cell `{}` is still running after {} nested tool call(s). Call `wait` to check for more output.",
                     cell_id, nested_tool_calls
                 ))
             }
             CellStatus::WaitingOnTool { request_id } => Some(format!(
-                "Code mode cell `{}` is waiting on nested tool request {} after {} nested tool call(s). Call `wait` to resume it.",
+                "Code mode cell `{}` is processing nested tool request {} after {} nested tool call(s). Call `wait` to observe more progress.",
                 cell_id, request_id, nested_tool_calls
             )),
             CellStatus::WaitingOnJsTimer { next_due_in_ms } => {

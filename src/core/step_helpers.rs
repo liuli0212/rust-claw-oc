@@ -879,50 +879,48 @@ impl AgentLoop {
         let nested_cancel_token = self.cancel_token.clone();
         let todos_path = self.todos_path();
         let is_autopilot = self.is_autopilot;
-        let extensions = self.extensions.clone();
-        let execution_guard_state = self.execution_guard_state.clone();
         let exec_result = tokio::select! {
             result = tokio::time::timeout(
                 Duration::from_secs(90),
                 async {
-                    let nested_executor = Arc::new(tokio::sync::Mutex::new(
-                        crate::code_mode::executor::CodeModeNestedToolExecutor::new(
-                            crate::code_mode::executor::CodeModeNestedToolExecutorConfig {
-                                current_tools: current_tools.to_vec(),
-                                extensions,
-                                session_id: session_id.clone(),
-                                reply_to,
-                                remaining_steps,
-                                session_deadline,
-                                iteration_trace_ctx: iteration_trace_ctx.clone(),
-                                parent_span_id: parent_span_id.clone(),
-                                outer_tool_call_id: call.id.clone(),
-                                trace_bus,
-                                provider: provider.clone(),
-                                model: model.clone(),
-                                cancel_token: nested_cancel_token,
-                                is_autopilot,
-                                todos_path,
-                                execution_guard_state,
-                            },
-                        ),
-                    ));
-                    let mut invoke_tool = |tool_name: String, args_json: String| {
-                        let nested_executor = nested_executor.clone();
-                        async move {
-                            let mut executor = nested_executor.lock().await;
-                            let raw = executor.execute_json(tool_name, args_json).await?;
-                            Ok(crate::code_mode::runtime::value::normalize_tool_result_for_js(&raw))
-                        }
-                    };
-
                     match invocation {
                         CodeModeInvocation::Exec(parsed) => {
+                            let nested_executor = Arc::new(tokio::sync::Mutex::new(
+                                crate::code_mode::executor::CodeModeNestedToolExecutor::new(
+                                    crate::code_mode::executor::CodeModeNestedToolExecutorConfig {
+                                        current_tools: current_tools.to_vec(),
+                                        extensions: self.extensions.clone(),
+                                        session_id: session_id.clone(),
+                                        reply_to,
+                                        remaining_steps,
+                                        session_deadline,
+                                        iteration_trace_ctx: iteration_trace_ctx.clone(),
+                                        parent_span_id: parent_span_id.clone(),
+                                        outer_tool_call_id: call.id.clone(),
+                                        trace_bus,
+                                        provider: provider.clone(),
+                                        model: model.clone(),
+                                        cancel_token: nested_cancel_token,
+                                        is_autopilot,
+                                        todos_path,
+                                        execution_guard_state: self.execution_guard_state.clone(),
+                                    },
+                                ),
+                            ));
+                            let invoke_tool = move |tool_name: String, args_json: String| {
+                                let nested_executor = nested_executor.clone();
+                                async move {
+                                    let mut executor = nested_executor.lock().await;
+                                    let raw = executor.execute_json(tool_name, args_json).await?;
+                                    Ok(crate::code_mode::runtime::value::normalize_tool_result_for_js(&raw))
+                                }
+                            };
+
                             service_for_exec.execute(
                                 &session_id_for_exec,
                                 &parsed.code,
                                 visible_tools,
-                                &mut invoke_tool,
+                                invoke_tool,
                             ).await
                         }
                         CodeModeInvocation::Wait(parsed) => {
@@ -933,7 +931,6 @@ impl AgentLoop {
                                     parsed.wait_timeout_ms,
                                     parsed.refresh_slice_ms,
                                 ),
-                                &mut invoke_tool,
                             ).await
                         }
                     }

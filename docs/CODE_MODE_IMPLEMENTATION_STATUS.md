@@ -13,6 +13,10 @@ Delivered pieces:
   - `AgentLoop` extensions now use `Vec<Arc<dyn ExecutionExtension>>`.
   - loop-protection state now lives in a shared `ExecutionGuardState`.
   - `CodeModeNestedToolExecutor` no longer borrows mutable guard state or extension slices from the foreground `exec` / `wait` stack frame.
+- Phase 2 of the background-execution refactor is complete:
+  - `CodeModeService` now spawns a background cell host task per `exec`.
+  - nested tool calls continue in the background after the initial `exec` summary is returned.
+  - `wait` no longer fulfills nested tool requests and now acts as an observer, except for the current timer-resume path.
 - Runtime output is tracked as ordered `RuntimeEvent` values (`Text`, `Notification`, `Yield`, `ToolCallRequested`, `ToolCallResolved`, `Completed`, `Failed`, `Cancelled`, `WorkerCompleted`).
 - Session state is centered on `ActiveCellHandle`, including status, recent event slices, committed resume state, and pending non-terminal progress.
 - `CodeModeService` owns one active code-mode cell per session and now also owns the corresponding live worker handle.
@@ -51,6 +55,9 @@ This is the accepted implementation model in the current tree and is fully cover
 
 - Background execution Phase 1 intentionally uses `Arc<std::sync::Mutex<ExecutionGuardState>>` rather than `tokio::sync::Mutex`.
   The guarded updates are synchronous and await-free, so a standard mutex keeps the first refactor smaller and avoids introducing async locking into the foreground tool path.
-- The runtime behavior is unchanged in this phase:
-  - nested tool fulfillment still happens through the current drain loop
+- Background execution Phase 2 keeps the timer model unchanged on purpose:
+  - nested tool fulfillment is now handled by the background host task
   - timers still depend on the current resume protocol
+  - `wait` only resumes cells that are blocked on that timer boundary
+- `exec` now receives its initial summary through a one-shot publication from the background host task.
+  This preserves the first visible flush snapshot instead of racing against later background progress.

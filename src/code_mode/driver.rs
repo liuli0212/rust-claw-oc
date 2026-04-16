@@ -19,6 +19,29 @@ pub struct CellDriver {
     cancel_flag: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+pub struct CellDriverControl {
+    tool_result_tx: std::sync::mpsc::Sender<Result<String, crate::tools::ToolError>>,
+    command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+impl CellDriverControl {
+    pub fn request_cancel(&self, reason: &str) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+        let _ = self
+            .tool_result_tx
+            .send(Err(crate::tools::ToolError::ExecutionFailed(
+                reason.to_string(),
+            )));
+        let _ = self
+            .command_tx
+            .send(crate::code_mode::protocol::CellCommand::Cancel {
+                reason: reason.to_string(),
+            });
+    }
+}
+
 impl std::fmt::Debug for CellDriver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CellDriver")
@@ -138,19 +161,17 @@ impl CellDriver {
     }
 
     pub fn request_cancel(&mut self, reason: &str) {
-        self.cancel_flag.store(true, Ordering::Relaxed);
-        let _ = self
-            .tool_result_tx
-            .send(Err(crate::tools::ToolError::ExecutionFailed(
-                reason.to_string(),
-            )));
-        let _ = self
-            .command_tx
-            .send(crate::code_mode::protocol::CellCommand::Cancel {
-                reason: reason.to_string(),
-            });
+        self.control_handle().request_cancel(reason);
         if let Some(worker) = self.worker.take() {
             worker.abort();
+        }
+    }
+
+    pub fn control_handle(&self) -> CellDriverControl {
+        CellDriverControl {
+            tool_result_tx: self.tool_result_tx.clone(),
+            command_tx: self.command_tx.clone(),
+            cancel_flag: self.cancel_flag.clone(),
         }
     }
 
@@ -331,16 +352,16 @@ mod tests {
 
         // Take the worker handle and await it
         let worker_handle = driver.worker.take().expect("Should have worker handle");
-        
+
         // Wait for the thread to exit. We wrap this in a timeout just in case it doesn't,
         // so the test doesn't hang forever.
         let join_result = tokio::time::timeout(Duration::from_secs(2), worker_handle).await;
-        
+
         assert!(
             join_result.is_ok(),
             "The worker thread did not exit within the timeout after cancellation flag was set!"
         );
-        
+
         // It joined successfully
         let result = join_result.unwrap();
         assert!(result.is_ok(), "The worker thread should finish gracefully (or with a JS exception that is caught and converted to an Error event)");

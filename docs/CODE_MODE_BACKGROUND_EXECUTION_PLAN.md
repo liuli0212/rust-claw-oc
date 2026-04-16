@@ -28,13 +28,23 @@ This document is an incremental redesign for the current implementation in:
   - `AgentLoop` extensions now use shared ownership via `Vec<Arc<dyn ExecutionExtension>>`.
   - direct tool execution and code-mode nested tool execution now share a single `ExecutionGuardState`.
   - `CodeModeNestedToolExecutor` no longer borrows extension slices or mutable guard references from the foreground `exec` / `wait` frame.
-- [ ] Phase 2 not started: background nested tool fulfillment is still driven through the existing drain path.
+- [x] Phase 2 started and completed:
+  - `CodeModeService` now spawns a background `CellHostTask` for each `exec`.
+  - nested tool requests are fulfilled by the background host task instead of the foreground `wait` call path.
+  - `wait` now observes background progress and only nudges execution when the cell is paused on a JS timer boundary.
 - [ ] Phase 3 not started: timers still require the current resume-based runtime contract.
 
 Phase 1 implementation finding:
 
 - The shared guard state is implemented with `Arc<std::sync::Mutex<ExecutionGuardState>>`, not `tokio::sync::Mutex`.
   This is intentional because the guard updates are short, synchronous, and do not cross `await` points in either the foreground or nested-tool paths.
+
+Phase 2 implementation findings:
+
+- To preserve deterministic `exec` behavior, the background host task publishes its first summary through a one-shot channel before `execute(...)` returns.
+  This avoids a race where a fast background continuation could otherwise overwrite the initial flush snapshot with a later terminal snapshot.
+- Phase 2 intentionally keeps timer resume semantics unchanged.
+  `wait` no longer fulfills nested tools, but it still resumes cells that are blocked at the current timer boundary.
 
 ## 2. Why The Current Model Is Still Coupled To `wait`
 
