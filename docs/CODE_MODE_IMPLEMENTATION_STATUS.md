@@ -9,6 +9,10 @@ Delivered pieces:
 - Provider-aware code-mode scaffolding and prompt notices are in place.
 - `exec` / `wait` are registered as top-level tools and still coexist with normal direct function tools.
 - Nested code-mode tool calls go through `CodeModeNestedToolExecutor`, so autopilot/TODOS gating, loop protection, trace linkage, timeouts, and cancellation still apply.
+- Phase 1 of the background-execution refactor is complete:
+  - `AgentLoop` extensions now use `Vec<Arc<dyn ExecutionExtension>>`.
+  - loop-protection state now lives in a shared `ExecutionGuardState`.
+  - `CodeModeNestedToolExecutor` no longer borrows mutable guard state or extension slices from the foreground `exec` / `wait` stack frame.
 - Runtime output is tracked as ordered `RuntimeEvent` values (`Text`, `Notification`, `Yield`, `ToolCallRequested`, `ToolCallResolved`, `Completed`, `Failed`, `Cancelled`, `WorkerCompleted`).
 - Session state is centered on `ActiveCellHandle`, including status, recent event slices, committed resume state, and pending non-terminal progress.
 - `CodeModeService` owns one active code-mode cell per session and now also owns the corresponding live worker handle.
@@ -42,3 +46,11 @@ The non-terminal drain lifecycle is now safe and service-owned, but the runtime 
 - JS local state is still reconstructed from the persisted resume boundary rather than from a serialized VM snapshot
 
 This is the accepted implementation model in the current tree and is fully covered by tests.
+
+## Latest Phase Notes
+
+- Background execution Phase 1 intentionally uses `Arc<std::sync::Mutex<ExecutionGuardState>>` rather than `tokio::sync::Mutex`.
+  The guarded updates are synchronous and await-free, so a standard mutex keeps the first refactor smaller and avoids introducing async locking into the foreground tool path.
+- The runtime behavior is unchanged in this phase:
+  - nested tool fulfillment still happens through the current drain loop
+  - timers still depend on the current resume protocol

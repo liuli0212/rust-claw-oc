@@ -374,7 +374,7 @@ pub fn build_subagent_session(
             parent_span_id: trace.parent_span_id.clone(),
         });
     }
-    agent_loop.add_extension(Box::new(
+    agent_loop.add_extension(Arc::new(
         crate::skills::runtime::SkillRuntime::with_session_seed(
             sub_session_id.clone(),
             skill_session_seed,
@@ -438,10 +438,10 @@ pub fn build_agent_session(
         telemetry,
         task_state_store,
     );
-    agent_loop.add_extension(Box::new(
+    agent_loop.add_extension(Arc::new(
         crate::skills::runtime::SkillRuntime::new_for_session(session_id.to_string()),
     ));
-    agent_loop.add_extension(Box::new(
+    agent_loop.add_extension(Arc::new(
         crate::subagent_notification::SubagentNotificationExtension::new(
             session_id,
             subagent_runtime.clone(),
@@ -464,7 +464,7 @@ pub fn build_agent_session(
                     .to_string());
             }
 
-            agent_loop.add_extension(Box::new(crate::sandbox_extension::SandboxExtension::new(
+            agent_loop.add_extension(Arc::new(crate::sandbox_extension::SandboxExtension::new(
                 std::sync::Arc::new(enforcer),
             )));
             tracing::info!("Sandbox extension registered (level={:?})", level);

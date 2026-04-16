@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,6 +7,7 @@ use tokio::sync::Notify;
 
 use crate::context::AgentContext;
 use crate::core::extensions::ExecutionExtension;
+use crate::core::ExecutionGuardState;
 use crate::tools::protocol::ToolTraceContext;
 use crate::tools::{Tool, ToolContext, ToolError};
 use crate::trace::{TraceActor, TraceBus, TraceContext, TraceStatus};
@@ -26,29 +26,28 @@ pub fn is_code_mode_nested_tool(tool_name: &str) -> bool {
     )
 }
 
-pub struct CodeModeNestedToolExecutorConfig<'a> {
-    pub current_tools: Vec<Arc<dyn Tool>>,
-    pub extensions: &'a [Box<dyn ExecutionExtension>],
-    pub session_id: String,
-    pub reply_to: String,
-    pub remaining_steps: usize,
-    pub session_deadline: Option<Instant>,
-    pub iteration_trace_ctx: Option<TraceContext>,
-    pub parent_span_id: Option<String>,
-    pub outer_tool_call_id: Option<String>,
-    pub trace_bus: Arc<TraceBus>,
-    pub provider: String,
-    pub model: String,
-    pub cancel_token: Arc<Notify>,
-    pub is_autopilot: bool,
-    pub todos_path: PathBuf,
-    pub action_history: &'a mut VecDeque<String>,
-    pub reflection_strike: &'a mut u8,
+pub(crate) struct CodeModeNestedToolExecutorConfig {
+    pub(crate) current_tools: Vec<Arc<dyn Tool>>,
+    pub(crate) extensions: Vec<Arc<dyn ExecutionExtension>>,
+    pub(crate) session_id: String,
+    pub(crate) reply_to: String,
+    pub(crate) remaining_steps: usize,
+    pub(crate) session_deadline: Option<Instant>,
+    pub(crate) iteration_trace_ctx: Option<TraceContext>,
+    pub(crate) parent_span_id: Option<String>,
+    pub(crate) outer_tool_call_id: Option<String>,
+    pub(crate) trace_bus: Arc<TraceBus>,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) cancel_token: Arc<Notify>,
+    pub(crate) is_autopilot: bool,
+    pub(crate) todos_path: PathBuf,
+    pub(crate) execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
 }
 
-pub struct CodeModeNestedToolExecutor<'a> {
+pub(crate) struct CodeModeNestedToolExecutor {
     current_tools: Vec<Arc<dyn Tool>>,
-    extensions: &'a [Box<dyn ExecutionExtension>],
+    extensions: Vec<Arc<dyn ExecutionExtension>>,
     session_id: String,
     reply_to: String,
     visible_tools: Vec<String>,
@@ -63,12 +62,11 @@ pub struct CodeModeNestedToolExecutor<'a> {
     cancel_token: Arc<Notify>,
     is_autopilot: bool,
     todos_path: PathBuf,
-    action_history: &'a mut VecDeque<String>,
-    reflection_strike: &'a mut u8,
+    execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
 }
 
-impl<'a> CodeModeNestedToolExecutor<'a> {
-    pub fn new(config: CodeModeNestedToolExecutorConfig<'a>) -> Self {
+impl CodeModeNestedToolExecutor {
+    pub(crate) fn new(config: CodeModeNestedToolExecutorConfig) -> Self {
         let visible_tools = config
             .current_tools
             .iter()
@@ -91,12 +89,11 @@ impl<'a> CodeModeNestedToolExecutor<'a> {
             cancel_token: config.cancel_token,
             is_autopilot: config.is_autopilot,
             todos_path: config.todos_path,
-            action_history: config.action_history,
-            reflection_strike: config.reflection_strike,
+            execution_guard_state: config.execution_guard_state,
         }
     }
 
-    pub async fn execute_json(
+    pub(crate) async fn execute_json(
         &mut self,
         tool_name: String,
         args_json: String,
@@ -220,7 +217,7 @@ impl<'a> CodeModeNestedToolExecutor<'a> {
                 parent_span_id,
             });
         }
-        for ext in self.extensions {
+        for ext in &self.extensions {
             ctx = ext.enrich_tool_context(ctx).await;
         }
         ctx
@@ -264,7 +261,7 @@ impl<'a> CodeModeNestedToolExecutor<'a> {
     }
 
     fn record_autopilot_action_outcome(
-        &mut self,
+        &self,
         call_name: &str,
         call_args: &Value,
         is_error: bool,
@@ -273,27 +270,12 @@ impl<'a> CodeModeNestedToolExecutor<'a> {
             return None;
         }
 
-        let action_key = format!("{}:{}:{}", call_name, call_args, is_error);
-        self.action_history.push_back(action_key.clone());
-        if self.action_history.len() > 3 {
-            self.action_history.pop_front();
-        }
-
-        if self.action_history.len() == 3
-            && self.action_history.iter().all(|key| key == &action_key)
-        {
-            *self.reflection_strike += 1;
-            self.action_history.clear();
-
-            if *self.reflection_strike >= 2 {
-                return Some("[System Error] 检测到深度死循环，反思无效。".to_string());
-            }
-
-            return Some(
-                "[System Warning] 检测到你正在重复执行相同的错误动作。请立即停止当前尝试，反思失败原因，并提出全新的解决路径。".to_string(),
-            );
-        }
-
-        None
+        let mut guard_state = self
+            .execution_guard_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard_state
+            .record_action_outcome(call_name, call_args, is_error)
+            .map(|signal| signal.message().to_string())
     }
 }

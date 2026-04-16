@@ -710,30 +710,13 @@ impl AgentLoop {
             return None;
         }
 
-        let action_key = format!("{}:{}:{}", call_name, call_args, is_error);
-        self.action_history.push_back(action_key.clone());
-        if self.action_history.len() > 3 {
-            self.action_history.pop_front();
-        }
-
-        if self.action_history.len() == 3 && self.action_history.iter().all(|k| k == &action_key) {
-            self.reflection_strike += 1;
-            self.action_history.clear();
-
-            if self.reflection_strike >= 2 {
-                return Some((
-                    "[System Error] 检测到深度死循环，反思无效。".to_string(),
-                    "autopilot_meltdown",
-                ));
-            }
-
-            return Some((
-                "[System Warning] 检测到你正在重复执行相同的错误动作。请立即停止当前尝试，反思失败原因，并提出全新的解决路径。".to_string(),
-                "reflection_warning",
-            ));
-        }
-
-        None
+        let mut guard_state = self
+            .execution_guard_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard_state
+            .record_action_outcome(call_name, call_args, is_error)
+            .map(|signal| (signal.message().to_string(), signal.signal()))
     }
 
     async fn prepare_tool_context(
@@ -896,9 +879,8 @@ impl AgentLoop {
         let nested_cancel_token = self.cancel_token.clone();
         let todos_path = self.todos_path();
         let is_autopilot = self.is_autopilot;
-        let extensions = &self.extensions;
-        let action_history = &mut self.action_history;
-        let reflection_strike = &mut self.reflection_strike;
+        let extensions = self.extensions.clone();
+        let execution_guard_state = self.execution_guard_state.clone();
         let exec_result = tokio::select! {
             result = tokio::time::timeout(
                 Duration::from_secs(90),
@@ -921,8 +903,7 @@ impl AgentLoop {
                                 cancel_token: nested_cancel_token,
                                 is_autopilot,
                                 todos_path,
-                                action_history,
-                                reflection_strike,
+                                execution_guard_state,
                             },
                         ),
                     ));

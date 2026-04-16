@@ -621,7 +621,7 @@ async fn test_code_mode_nested_tool_context_is_enriched_by_extensions() {
         Arc::new(telemetry),
         Arc::new(crate::task_state::TaskStateStore::new(session_id)),
     );
-    agent.add_extension(Box::new(ContextTaggingExtension));
+    agent.add_extension(Arc::new(ContextTaggingExtension));
     agent.begin_trace_run("exercise code mode", None);
 
     let outcome = agent
@@ -662,6 +662,38 @@ text(response.value);
         .any(|tool_name| tool_name == "echo_tool"));
 
     cleanup_session(session_id);
+}
+
+#[test]
+fn execution_guard_state_escalates_after_repeated_failures() {
+    let mut guard_state = ExecutionGuardState::default();
+    let args = json!({ "path": "foo.rs" });
+
+    assert_eq!(
+        guard_state.record_action_outcome("write_file", &args, true),
+        None
+    );
+    assert_eq!(
+        guard_state.record_action_outcome("write_file", &args, true),
+        None
+    );
+    assert_eq!(
+        guard_state.record_action_outcome("write_file", &args, true),
+        Some(ExecutionGuardSignal::ReflectionWarning)
+    );
+
+    assert_eq!(
+        guard_state.record_action_outcome("write_file", &args, true),
+        None
+    );
+    assert_eq!(
+        guard_state.record_action_outcome("write_file", &args, true),
+        None
+    );
+    assert_eq!(
+        guard_state.record_action_outcome("write_file", &args, true),
+        Some(ExecutionGuardSignal::AutopilotMeltdown)
+    );
 }
 
 #[tokio::test]
