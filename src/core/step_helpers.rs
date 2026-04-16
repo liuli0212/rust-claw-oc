@@ -606,7 +606,13 @@ impl AgentLoop {
                 .iter()
                 .any(|tool| matches!(tool.name().as_str(), "exec" | "wait"));
         if code_mode_visible {
-            let code_mode_notice = crate::code_mode::description::execution_notice();
+            let available_nested_tools: Vec<String> = current_tools
+                .iter()
+                .map(|tool| tool.name())
+                .filter(|name| Self::is_code_mode_nested_tool(name))
+                .collect();
+            let code_mode_notice =
+                crate::code_mode::description::execution_notice(&available_nested_tools);
             execution_notices = Some(match execution_notices {
                 Some(existing) if !existing.trim().is_empty() => {
                     format!("{existing}\n\n{code_mode_notice}")

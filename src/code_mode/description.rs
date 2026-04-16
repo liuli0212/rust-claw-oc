@@ -1,4 +1,7 @@
-pub fn execution_notice() -> String {
+pub fn execution_notice(available_tools: &[String]) -> String {
+    let tools_list = available_tools.join(", ");
+    let tools_notice = format!("- `tools`: An object to call any available host tool asynchronously (e.g., `let res = await tools.read_file({{ path: '...' }});`). Let the host handle filesystem, shell, and network access through these tools. Available tools: [{}]", tools_list);
+
     [
         "Code Mode is enabled for this provider.",
         "For multi-step work, prefer the `exec` tool so you can orchestrate several nested tool calls inside one JavaScript cell.",
@@ -7,7 +10,7 @@ pub fn execution_notice() -> String {
         "Use direct tools for trivial one-shot actions.",
         "",
         "Inside the `exec` JavaScript environment, you have access to the following globals:",
-        "- `tools`: An object to call any available host tool asynchronously (e.g., `let res = await tools.read_file({ path: '...' });`). Let the host handle filesystem, shell, and network access through these tools.",
+        &tools_notice,
         "- `text(value)`: Append a string to the execution output buffer. This buffer is sent to the LLM only when `flush`, `wait`, or cell completion occurs.",
         "- `flush(value)`: Immediately send the accumulated output buffer back to the LLM along with an optional state value. The JavaScript code will smoothly continue running in the background. You must use the `wait` tool to sync up and receive its subsequent outputs.",
         "- `store(key, value)`: Save a JSON-serializable value in the session state to persist data across multiple separate `exec` tool calls (regular JS variables are destroyed when a cell finishes).",
