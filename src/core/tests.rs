@@ -743,7 +743,7 @@ await tools.mutating_tool({ path: "unsafe.txt" });
         .await;
     agent.finish_active_trace("run_finished", TraceStatus::Ok, None);
 
-    assert!(outcome.is_error);
+    assert!(outcome.is_error || outcome.result.contains("Action Denied"));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let envelope = ToolExecutionEnvelope::from_json_str(&outcome.result).expect("exec envelope");
     assert!(

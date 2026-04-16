@@ -38,7 +38,7 @@ where
     handle.block_on(async move {
         let runtime = AsyncRuntime::new()
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
-        
+
         let cancel_flag_clone = request.cancel_flag.clone();
         runtime.set_interrupt_handler(Some(Box::new(move || {
             cancel_flag_clone.load(std::sync::atomic::Ordering::Relaxed)
@@ -319,23 +319,24 @@ where
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            // Register __wait_for_resume: blocks the worker thread waiting for a
-            // CellCommand::Drain from the driver. Used by the timer yield loop
-            // to pause JS execution until the host signals that time has passed.
+            // Register __wait_for_timer: blocks the worker thread for the specified duration
+            // while checking for CellCommand::Cancel from the driver. Used by the timer
+            // yield loop to pause JS execution autonomously.
             let command_rx_for_resume = command_rx.clone();
             globals
                 .set(
-                    "__wait_for_resume",
-                    Func::from(move || -> rquickjs::Result<String> {
+                    "__wait_for_timer",
+                    Func::from(move |ms: f64| -> rquickjs::Result<String> {
                         let rx = command_rx_for_resume.lock().unwrap();
-                        match rx.recv() {
-                            Ok(crate::code_mode::protocol::CellCommand::Drain) => {
-                                Ok(r#"{"continue":true}"#.to_string())
-                            }
+                        let wait_dur = std::time::Duration::from_millis(ms as u64);
+                        match rx.recv_timeout(wait_dur) {
                             Ok(crate::code_mode::protocol::CellCommand::Cancel { reason }) => {
                                 Ok(format!(r#"{{"yield":true,"cancel":true,"reason":"{}"}}"#, reason))
                             }
-                            _ => {
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                Ok(r#"{"continue":true}"#.to_string())
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                                 Ok(r#"{"yield":true}"#.to_string())
                             }
                         }
@@ -474,7 +475,9 @@ fn build_wrapper_script(code: &str) -> String {
     script.push_str("  if (__timerState.pending_timers > 0 || (__unfinishedTimerIds.length > 0 && globalThis.__totalTimersRegistered > 0)) {\n");
     script.push_str("    const __yieldObj = { reason: 'timer_pending', pending_timers: __timerState.pending_timers || 1, next_timer_id: __timerState.next_timer_id, resume_after_ms: __timerState.resume_after_ms || 100 };\n");
     script.push_str("__waiting_for_timer(__timerState.resume_after_ms || 100);\n");
-    script.push_str("    const resume = JSON.parse(__wait_for_resume());\n");
+    script.push_str(
+        "    const resume = JSON.parse(__wait_for_timer(__timerState.resume_after_ms || 100));\n",
+    );
     script.push_str("    if (resume && (resume.yield || resume.cancel)) {\n");
     script.push_str(
         "      return JSON.stringify({ yielded: true, yieldKind: 'timer', returnValue: null, yieldValue: __yieldObj });\n",

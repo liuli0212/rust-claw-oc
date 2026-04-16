@@ -35,7 +35,6 @@ struct CellHostHandle {
     driver_control: CellDriverControl,
     revision: AtomicU64,
     update_notify: Notify,
-    resume_notify: Notify,
 }
 
 impl std::fmt::Debug for CellHostHandle {
@@ -53,7 +52,6 @@ impl CellHostHandle {
             driver_control,
             revision: AtomicU64::new(0),
             update_notify: Notify::new(),
-            resume_notify: Notify::new(),
         }
     }
 
@@ -64,10 +62,6 @@ impl CellHostHandle {
     fn publish_update(&self) {
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.update_notify.notify_waiters();
-    }
-
-    fn request_resume(&self) {
-        self.resume_notify.notify_one();
     }
 
     async fn wait_for_update_after(&self, revision: u64, timeout: Option<Duration>) -> bool {
@@ -186,7 +180,7 @@ impl CodeModeService {
         requested_cell_id: Option<&str>,
         request: DrainRequest,
     ) -> Result<ExecRunResult, crate::tools::ToolError> {
-        let (cell_id, host_handle, revision, should_resume_timer) = {
+        let (cell_id, host_handle, revision) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions.get_mut(session_id).ok_or_else(|| {
                 crate::tools::ToolError::ExecutionFailed(
@@ -226,13 +220,8 @@ impl CodeModeService {
                 active_cell.cell_id.clone(),
                 host_handle.clone(),
                 host_handle.current_revision(),
-                matches!(active_cell.status, CellStatus::WaitingOnJsTimer { .. }),
             )
         };
-
-        if should_resume_timer {
-            host_handle.request_resume();
-        }
 
         let wait_timeout = request.wait_timeout_ms.map(Duration::from_millis);
         let updated = host_handle
@@ -257,7 +246,6 @@ impl CodeModeService {
 
         if let Some(host_handle) = host_handle {
             host_handle.driver_control.request_cancel(reason);
-            host_handle.request_resume();
             true
         } else {
             false
@@ -276,20 +264,14 @@ impl CodeModeService {
         Fut: Future<Output = Result<String, crate::tools::ToolError>> + Send + 'static,
     {
         let mut initial_summary_tx = Some(initial_summary_tx);
-        let mut send_resume = false;
 
         loop {
             let batch = {
                 let mut driver = host_handle.driver_handle.lock().await;
                 driver
-                    .drain_event_batch_with_request(
-                        DrainRequest::to_completion(),
-                        &mut invoke_tool,
-                        send_resume,
-                    )
+                    .drain_event_batch_with_request(DrainRequest::to_completion(), &mut invoke_tool)
                     .await
             };
-            send_resume = false;
 
             match batch {
                 Ok(batch) => match self
@@ -305,10 +287,7 @@ impl CodeModeService {
 
                         match disposition {
                             CellDisposition::Continue => {}
-                            CellDisposition::WaitingOnTimer => {
-                                host_handle.resume_notify.notified().await;
-                                send_resume = true;
-                            }
+                            CellDisposition::WaitingOnTimer => {}
                             CellDisposition::Terminal => return,
                         }
                     }

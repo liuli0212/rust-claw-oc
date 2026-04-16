@@ -181,19 +181,11 @@ impl CellDriver {
         &mut self,
         request: DrainRequest,
         invoke_tool: &mut F,
-        send_resume: bool,
     ) -> Result<DriverDrainBatch, crate::tools::ToolError>
     where
         F: FnMut(String, String) -> Fut,
         Fut: Future<Output = Result<String, crate::tools::ToolError>>,
     {
-        if send_resume {
-            // Signal the worker to resume if it's waiting.
-            let _ = self
-                .command_tx
-                .send(crate::code_mode::protocol::CellCommand::Drain);
-        }
-
         let mut events = Vec::new();
         let refresh_deadline = request
             .refresh_slice_ms

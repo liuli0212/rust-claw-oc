@@ -40,7 +40,6 @@ impl DrainRequest {
 
 #[derive(Debug)]
 pub enum CellCommand {
-    Drain,
     Cancel { reason: String },
 }
 
