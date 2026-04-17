@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ScenarioEvent {
     Text(String),
     Thought(String),
