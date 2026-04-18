@@ -2,15 +2,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 use super::cell::{ActiveCellHandle, CellStatus};
-use super::driver::{CellDriver, CellDriverControl};
-use super::response::ExecRunResult;
+use super::driver::{CellDriver, CellDriverControl, DriverDrainBatch, DriverDrainOutcome};
+use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 use super::runtime;
 
 #[derive(Debug, Default, Clone)]
@@ -83,6 +84,87 @@ impl CellHostHandle {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PublicationTracker {
+    auto_flush_interval: Option<Duration>,
+    last_published_at: Instant,
+    last_published_progress_seq: u64,
+    latest_progress_seq: u64,
+}
+
+impl PublicationTracker {
+    fn new(auto_flush_ms: Option<u64>) -> Self {
+        Self {
+            auto_flush_interval: auto_flush_ms.map(Duration::from_millis),
+            last_published_at: Instant::now(),
+            last_published_progress_seq: 0,
+            latest_progress_seq: 0,
+        }
+    }
+
+    fn observe_batch(&mut self, metadata: &BatchPublicationMetadata) {
+        if let Some(seq) = metadata.latest_progress_seq {
+            self.latest_progress_seq = self.latest_progress_seq.max(seq);
+        }
+    }
+
+    fn has_unpublished_progress(&self) -> bool {
+        self.latest_progress_seq > self.last_published_progress_seq
+    }
+
+    fn should_auto_flush_now(&self) -> bool {
+        let Some(interval) = self.auto_flush_interval else {
+            return false;
+        };
+
+        self.has_unpublished_progress() && self.last_published_at.elapsed() >= interval
+    }
+
+    fn next_idle_timeout(&self) -> Option<Duration> {
+        let interval = self.auto_flush_interval?;
+        if !self.has_unpublished_progress() {
+            return None;
+        }
+
+        Some(interval.saturating_sub(self.last_published_at.elapsed()))
+    }
+
+    fn mark_published(&mut self) {
+        self.last_published_progress_seq = self.latest_progress_seq;
+        self.last_published_at = Instant::now();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct BatchPublicationMetadata {
+    explicit_flush_value: Option<Option<Value>>,
+    latest_progress_seq: Option<u64>,
+}
+
+impl BatchPublicationMetadata {
+    fn from_batch(batch: &DriverDrainBatch) -> Self {
+        let mut metadata = Self::default();
+
+        for event in &batch.events {
+            match event {
+                crate::code_mode::protocol::RuntimeEvent::Text { seq, .. }
+                | crate::code_mode::protocol::RuntimeEvent::Notification { seq, .. } => {
+                    metadata.latest_progress_seq =
+                        Some(metadata.latest_progress_seq.unwrap_or_default().max(*seq));
+                }
+                crate::code_mode::protocol::RuntimeEvent::Flush { seq, value } => {
+                    metadata.explicit_flush_value = Some(value.clone());
+                    metadata.latest_progress_seq =
+                        Some(metadata.latest_progress_seq.unwrap_or_default().max(*seq));
+                }
+                _ => {}
+            }
+        }
+
+        metadata
+    }
+}
+
 impl CodeModeService {
     /// Execute a new code-mode cell. Spawns a live JS runtime worker, performs
     /// an initial background drain, and returns the first published
@@ -91,6 +173,7 @@ impl CodeModeService {
         &self,
         session_id: &str,
         code: &str,
+        auto_flush_ms: Option<u64>,
         visible_tools: Vec<String>,
         invoke_tool: F,
         cell_span: Option<crate::trace::TraceSpanHandle>,
@@ -150,6 +233,7 @@ impl CodeModeService {
                     session_id_owned,
                     cell_id_owned,
                     host_handle_for_task,
+                    auto_flush_ms,
                     invoke_tool,
                     initial_summary_tx,
                     cell_span,
@@ -172,9 +256,9 @@ impl CodeModeService {
         }
     }
 
-    /// Wait on an existing live code-mode cell. This observes the latest state
-    /// published by the background host task and only resumes runtime execution
-    /// when the cell is explicitly waiting on a JS timer.
+    /// Wait on an existing live code-mode cell. This observes the latest
+    /// progress publication from the background host task and falls back to the
+    /// current snapshot when the optional timeout elapses.
     pub async fn wait_with_request(
         &self,
         session_id: &str,
@@ -205,7 +289,7 @@ impl CodeModeService {
             }
 
             if active_cell.is_terminal() {
-                let summary = Self::build_exec_result_from_cell(active_cell);
+                let summary = Self::build_exec_result_from_cell(active_cell, None, None);
                 session.active_cell = None;
                 session.host_handle = None;
                 return Ok(summary);
@@ -229,10 +313,10 @@ impl CodeModeService {
             .wait_for_update_after(revision, wait_timeout)
             .await;
         if !updated {
-            return self.read_cell_summary(session_id, &cell_id).await;
+            return self.read_cell_summary(session_id, &cell_id, false).await;
         }
 
-        self.read_cell_summary(session_id, &cell_id).await
+        self.read_cell_summary(session_id, &cell_id, true).await
     }
 
     pub async fn abort_active_cell(&self, session_id: &str, reason: &str) -> bool {
@@ -258,6 +342,7 @@ impl CodeModeService {
         session_id: String,
         cell_id: String,
         host_handle: SharedCellHost,
+        auto_flush_ms: Option<u64>,
         mut invoke_tool: F,
         initial_summary_tx: oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>,
         mut cell_span: Option<crate::trace::TraceSpanHandle>,
@@ -266,46 +351,165 @@ impl CodeModeService {
         Fut: Future<Output = Result<String, crate::tools::ToolError>> + Send + 'static,
     {
         let mut initial_summary_tx = Some(initial_summary_tx);
+        let mut publication_tracker = PublicationTracker::new(auto_flush_ms);
 
         loop {
-            let batch = {
+            let drain_outcome = {
                 let mut driver = host_handle.driver_handle.lock().await;
                 driver
-                    .drain_event_batch_with_request(&mut invoke_tool)
+                    .drain_event_batch_with_request(
+                        &mut invoke_tool,
+                        publication_tracker.next_idle_timeout(),
+                    )
                     .await
             };
 
-            match batch {
-                Ok(batch) => match self
-                    .publish_batch_to_session(&session_id, &cell_id, batch)
-                    .await
-                {
-                    Ok((summary, disposition)) => {
-                        host_handle.publish_update();
+            match drain_outcome {
+                Ok(DriverDrainOutcome::Batch(batch)) => {
+                    let batch_metadata = BatchPublicationMetadata::from_batch(&batch);
+                    publication_tracker.observe_batch(&batch_metadata);
 
-                        if let Some(tx) = initial_summary_tx.take() {
-                            let _ = tx.send(Ok(summary.clone()));
+                    match self
+                        .apply_batch_to_session(&session_id, &cell_id, batch)
+                        .await
+                    {
+                        Ok(disposition) => {
+                            let publication = if disposition == CellDisposition::Terminal {
+                                match self
+                                    .peek_cell_summary(&session_id, &cell_id, None, None)
+                                    .await
+                                {
+                                    Ok(summary) => Some(summary),
+                                    Err(err) => {
+                                        if let Some(tx) = initial_summary_tx.take() {
+                                            let _ = tx.send(Err(err));
+                                        }
+                                        break;
+                                    }
+                                }
+                            } else if let Some(flush_value) =
+                                batch_metadata.explicit_flush_value.clone()
+                            {
+                                match self
+                                    .peek_cell_summary(
+                                        &session_id,
+                                        &cell_id,
+                                        Some(ExecProgressKind::ExplicitFlush),
+                                        flush_value,
+                                    )
+                                    .await
+                                {
+                                    Ok(summary) => {
+                                        publication_tracker.mark_published();
+                                        Some(summary)
+                                    }
+                                    Err(err) => {
+                                        if let Some(tx) = initial_summary_tx.take() {
+                                            let _ = tx.send(Err(err));
+                                        }
+                                        break;
+                                    }
+                                }
+                            } else if publication_tracker.should_auto_flush_now() {
+                                match self
+                                    .peek_cell_summary(
+                                        &session_id,
+                                        &cell_id,
+                                        Some(ExecProgressKind::AutoFlush),
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    Ok(summary) => {
+                                        publication_tracker.mark_published();
+                                        Some(summary)
+                                    }
+                                    Err(err) => {
+                                        if let Some(tx) = initial_summary_tx.take() {
+                                            let _ = tx.send(Err(err));
+                                        }
+                                        break;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some(summary) = publication {
+                                if let Err(err) = self
+                                    .store_publication_summary(&session_id, &cell_id, &summary)
+                                    .await
+                                {
+                                    if let Some(tx) = initial_summary_tx.take() {
+                                        let _ = tx.send(Err(err));
+                                    }
+                                    break;
+                                }
+                                host_handle.publish_update();
+                                if let Some(tx) = initial_summary_tx.take() {
+                                    let _ = tx.send(Ok(summary.clone()));
+                                }
+                            }
+
+                            if disposition == CellDisposition::Terminal {
+                                break;
+                            }
                         }
-
-                        match disposition {
-                            CellDisposition::Continue => {}
-                            CellDisposition::WaitingOnTimer => {}
-                            CellDisposition::Terminal => break,
+                        Err(err) => {
+                            if let Some(tx) = initial_summary_tx.take() {
+                                let _ = tx.send(Err(err));
+                            }
+                            break;
                         }
                     }
-                    Err(err) => {
-                        if let Some(tx) = initial_summary_tx.take() {
-                            let _ = tx.send(Err(err));
-                        }
-                        break;
+                }
+                Ok(DriverDrainOutcome::Idle) => {
+                    if !publication_tracker.should_auto_flush_now() {
+                        continue;
                     }
-                },
+
+                    match self
+                        .peek_cell_summary(
+                            &session_id,
+                            &cell_id,
+                            Some(ExecProgressKind::AutoFlush),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(summary) => {
+                            publication_tracker.mark_published();
+                            if let Err(err) = self
+                                .store_publication_summary(&session_id, &cell_id, &summary)
+                                .await
+                            {
+                                if let Some(tx) = initial_summary_tx.take() {
+                                    let _ = tx.send(Err(err));
+                                }
+                                break;
+                            }
+                            host_handle.publish_update();
+                            if let Some(tx) = initial_summary_tx.take() {
+                                let _ = tx.send(Ok(summary));
+                            }
+                        }
+                        Err(err) => {
+                            if let Some(tx) = initial_summary_tx.take() {
+                                let _ = tx.send(Err(err));
+                            }
+                            break;
+                        }
+                    }
+                }
                 Err(err) => {
                     match self
                         .record_host_error_in_session(&session_id, &cell_id, &err)
                         .await
                     {
                         Some(summary) => {
+                            let _ = self
+                                .store_publication_summary(&session_id, &cell_id, &summary)
+                                .await;
                             host_handle.publish_update();
                             if let Some(tx) = initial_summary_tx.take() {
                                 let _ = tx.send(Ok(summary));
@@ -334,12 +538,12 @@ impl CodeModeService {
         }
     }
 
-    async fn publish_batch_to_session(
+    async fn apply_batch_to_session(
         &self,
         session_id: &str,
         cell_id: &str,
-        batch: crate::code_mode::driver::DriverDrainBatch,
-    ) -> Result<(ExecRunResult, CellDisposition), crate::tools::ToolError> {
+        batch: DriverDrainBatch,
+    ) -> Result<CellDisposition, crate::tools::ToolError> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(session_id).ok_or_else(|| {
             crate::tools::ToolError::ExecutionFailed("Session disappeared during wait.".to_string())
@@ -363,32 +567,45 @@ impl CodeModeService {
             session.stored_values = terminal.1.clone();
         }
 
-        let summary = Self::build_exec_result_from_cell(active_cell);
-        let disposition = if active_cell.is_terminal() {
-            CellDisposition::Terminal
-        } else if matches!(active_cell.status, CellStatus::WaitingOnJsTimer { .. }) {
-            CellDisposition::WaitingOnTimer
+        if active_cell.is_terminal() {
+            Ok(CellDisposition::Terminal)
         } else {
-            CellDisposition::Continue
-        };
-
-        Ok((summary, disposition))
+            Ok(CellDisposition::Continue)
+        }
     }
 
-    /// Build an `ExecRunResult` from the current active cell state.
-    fn build_exec_result_from_cell(cell: &ActiveCellHandle) -> ExecRunResult {
+    fn build_exec_result_from_cell(
+        cell: &ActiveCellHandle,
+        progress_kind: Option<ExecProgressKind>,
+        flush_value: Option<Value>,
+    ) -> ExecRunResult {
         let snapshot = cell.drain_snapshot();
         let render = snapshot.render_state();
         let nested_tool_calls = cell.nested_tool_call_count();
-        let flushed = cell.is_yielding();
+        let lifecycle = match cell.status {
+            CellStatus::Completed => ExecLifecycle::Completed,
+            CellStatus::Failed => ExecLifecycle::Failed,
+            CellStatus::Cancelled => ExecLifecycle::Cancelled,
+            _ => ExecLifecycle::Running,
+        };
+        let waiting_on_timer_ms = match cell.status {
+            CellStatus::WaitingOnJsTimer { next_due_in_ms } => next_due_in_ms,
+            _ => None,
+        };
 
         ExecRunResult {
             cell_id: cell.cell_id.clone(),
             output_text: render.output_text,
             return_value: render.return_value,
-            flush_value: render.flush_value,
-            flushed,
-            waiting_on_timer_ms: render.waiting_on_timer_ms,
+            flush_value: if progress_kind == Some(ExecProgressKind::ExplicitFlush) {
+                flush_value
+            } else {
+                None
+            },
+            lifecycle,
+            progress_kind: progress_kind.clone(),
+            flushed: progress_kind.is_some(),
+            waiting_on_timer_ms,
             notifications: render.notifications,
             failure: render.failure,
             cancellation: render.cancellation,
@@ -397,10 +614,43 @@ impl CodeModeService {
         }
     }
 
+    async fn peek_cell_summary(
+        &self,
+        session_id: &str,
+        cell_id: &str,
+        progress_kind: Option<ExecProgressKind>,
+        flush_value: Option<Value>,
+    ) -> Result<ExecRunResult, crate::tools::ToolError> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(session_id).ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed(
+                "No code-mode session found for this session.".to_string(),
+            )
+        })?;
+        let active_cell = session.active_cell.as_ref().ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed(
+                "No active code-mode cell to inspect. Call `exec` first.".to_string(),
+            )
+        })?;
+        if active_cell.cell_id != cell_id {
+            return Err(crate::tools::ToolError::ExecutionFailed(format!(
+                "Code mode cell `{}` was superseded before the summary was published.",
+                cell_id
+            )));
+        }
+
+        Ok(Self::build_exec_result_from_cell(
+            active_cell,
+            progress_kind,
+            flush_value,
+        ))
+    }
+
     async fn read_cell_summary(
         &self,
         session_id: &str,
         cell_id: &str,
+        prefer_publication: bool,
     ) -> Result<ExecRunResult, crate::tools::ToolError> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(session_id).ok_or_else(|| {
@@ -420,13 +670,48 @@ impl CodeModeService {
             )));
         }
 
-        let summary = Self::build_exec_result_from_cell(active_cell);
+        let summary = if prefer_publication {
+            active_cell
+                .last_publication
+                .clone()
+                .unwrap_or_else(|| Self::build_exec_result_from_cell(active_cell, None, None))
+        } else {
+            Self::build_exec_result_from_cell(active_cell, None, None)
+        };
         if active_cell.is_terminal() {
             session.active_cell = None;
             session.host_handle = None;
         }
 
         Ok(summary)
+    }
+
+    async fn store_publication_summary(
+        &self,
+        session_id: &str,
+        cell_id: &str,
+        summary: &ExecRunResult,
+    ) -> Result<(), crate::tools::ToolError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed(
+                "No code-mode session found for this session.".to_string(),
+            )
+        })?;
+        let active_cell = session.active_cell.as_mut().ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed(
+                "No active code-mode cell to store progress for.".to_string(),
+            )
+        })?;
+        if active_cell.cell_id != cell_id {
+            return Err(crate::tools::ToolError::ExecutionFailed(format!(
+                "Code mode cell `{}` was superseded before the publication summary was stored.",
+                cell_id
+            )));
+        }
+
+        active_cell.last_publication = Some(summary.clone());
+        Ok(())
     }
 
     async fn record_host_error_in_session(
@@ -451,7 +736,9 @@ impl CodeModeService {
             cell_id: active_cell.cell_id.clone(),
             output_text: render.output_text,
             return_value: render.return_value,
-            flush_value: render.flush_value,
+            flush_value: None,
+            lifecycle: ExecLifecycle::Failed,
+            progress_kind: None,
             flushed: false,
             waiting_on_timer_ms: None,
             notifications: render.notifications,
@@ -461,20 +748,20 @@ impl CodeModeService {
             truncated: false,
         });
 
-        Some(Self::build_exec_result_from_cell(active_cell))
+        Some(Self::build_exec_result_from_cell(active_cell, None, None))
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CellDisposition {
     Continue,
-    WaitingOnTimer,
     Terminal,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_mode::response::{ExecLifecycle, ExecProgressKind};
 
     #[tokio::test]
     async fn wait_rejects_when_no_active_cell_exists() {
@@ -499,10 +786,11 @@ mod tests {
             .execute(
                 "session-a",
                 "flush({ ok: true });",
+                None,
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
                 None,
-)
+            )
             .await
             .expect("exec should yield");
         assert!(summary.flushed);
@@ -526,16 +814,18 @@ mod tests {
             .execute(
                 "session-b",
                 r#"
+                    flush({ stage: "waiting" });
                     setTimeout(() => {
                         text("done");
                     }, 1_000);
                 "#,
+                None,
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
                 None,
-)
+            )
             .await
-            .expect("initial exec should yield on timer");
+            .expect("initial exec should publish the explicit flush");
         assert!(summary.flushed);
         assert_eq!(summary.cell_id, "cell-0");
 
@@ -543,10 +833,11 @@ mod tests {
             .execute(
                 "session-b",
                 "text('next');",
+                None,
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
                 None,
-)
+            )
             .await
             .unwrap_err();
 
@@ -566,10 +857,11 @@ mod tests {
             svc_clone.execute(
                 "session-loop",
                 "while (true) {}",
+                None,
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
                 None,
-),
+            ),
         )
         .await;
 
@@ -591,13 +883,14 @@ mod tests {
                     const response = await tools.echo_tool({ value: "done" });
                     text(response.value);
                 "#,
+                None,
                 vec!["echo_tool".to_string()],
                 |_tool_name: String, _args_json: String| async move {
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                     Ok(r#"{"value":"done"}"#.to_string())
                 },
                 None,
-)
+            )
             .await
             .expect("exec should publish initial flush state");
 
@@ -619,7 +912,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_still_resumes_timer_boundaries() {
+    async fn timer_boundaries_stay_internal_until_completion() {
         let service = CodeModeService::default();
 
         let summary = service
@@ -630,24 +923,57 @@ mod tests {
                         text("timer done");
                     }, 20);
                 "#,
+                None,
                 Vec::new(),
                 |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
                 None,
-)
+            )
             .await
-            .expect("exec should yield on timer");
+            .expect("exec should wait for completion when there is no progress publication");
+
+        assert!(!summary.flushed);
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Completed);
+        assert_eq!(summary.output_text, "timer done");
+    }
+
+    #[tokio::test]
+    async fn auto_flush_publishes_progress_while_timer_runs() {
+        let service = CodeModeService::default();
+
+        let summary = service
+            .execute(
+                "session-e",
+                r#"
+                    text("starting");
+                    setTimeout(() => {
+                        text("timer done");
+                    }, 40);
+                "#,
+                Some(10),
+                Vec::new(),
+                |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
+                None,
+            )
+            .await
+            .expect("exec should auto-publish progress while the timer is pending");
 
         assert!(summary.flushed);
-        assert!(summary.waiting_on_timer_ms.is_some());
+        assert_eq!(
+            summary.progress_kind.as_ref(),
+            Some(&ExecProgressKind::AutoFlush)
+        );
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Running);
+        assert_eq!(summary.output_text, "starting");
 
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
 
         let final_summary = service
-            .wait_with_request("session-d", Some(&summary.cell_id), Some(50))
+            .wait_with_request("session-e", Some(&summary.cell_id), Some(50))
             .await
-            .expect("wait should resume the timer boundary");
+            .expect("wait should observe completion after the timer fires");
 
         assert!(!final_summary.flushed);
-        assert_eq!(final_summary.output_text, "timer done");
+        assert_eq!(&final_summary.lifecycle, &ExecLifecycle::Completed);
+        assert!(final_summary.output_text.contains("timer done"));
     }
 }

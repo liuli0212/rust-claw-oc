@@ -381,12 +381,21 @@ where
 
         let nested_tool_calls = *nested_tool_count.lock().unwrap();
         let stored_values = stored_values.lock().unwrap().clone();
+        let lifecycle = if runtime_error.is_some() {
+            super::response::ExecLifecycle::Failed
+        } else if flushed {
+            super::response::ExecLifecycle::Running
+        } else {
+            super::response::ExecLifecycle::Completed
+        };
         Ok((
             ExecRunResult {
                 cell_id,
                 output_text: String::new(),
                 return_value,
                 flush_value,
+                lifecycle,
+                progress_kind: None,
                 flushed,
                 waiting_on_timer_ms: None,
                 notifications: Vec::new(),

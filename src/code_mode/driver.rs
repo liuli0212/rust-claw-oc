@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::protocol::{RuntimeCellResult, RuntimeEvent};
 use super::runtime;
@@ -67,6 +68,12 @@ impl DriverDrainBatch {
             events,
         }
     }
+}
+
+#[derive(Debug)]
+pub enum DriverDrainOutcome {
+    Batch(DriverDrainBatch),
+    Idle,
 }
 
 impl CellDriver {
@@ -177,29 +184,33 @@ impl CellDriver {
     pub async fn drain_event_batch_with_request<F, Fut>(
         &mut self,
         invoke_tool: &mut F,
-    ) -> Result<DriverDrainBatch, crate::tools::ToolError>
+        idle_timeout: Option<Duration>,
+    ) -> Result<DriverDrainOutcome, crate::tools::ToolError>
     where
         F: FnMut(String, String) -> Fut,
         Fut: Future<Output = Result<String, crate::tools::ToolError>>,
     {
         let mut events = Vec::new();
-        let mut saw_visible_event = false;
 
         loop {
             // Drain any buffered events first
             while let Ok(event) = self.event_rx.try_recv() {
-                if let Some(batch) = self
-                    .classify_event(&mut events, event, invoke_tool, &mut saw_visible_event)
-                    .await?
-                {
-                    return Ok(batch);
+                if let Some(batch) = self.classify_event(&mut events, event, invoke_tool).await? {
+                    return Ok(DriverDrainOutcome::Batch(batch));
                 }
             }
 
-            // Block indefinitely for the next event.
-            // classify_event will return the batch when a terminal or
-            // flush event arrives.
-            let next_event = self.event_rx.recv().await;
+            // Block for the next event, or return control to the host if we
+            // hit the optional idle timeout while waiting for an auto-flush
+            // deadline.
+            let next_event = if let Some(timeout) = idle_timeout {
+                tokio::select! {
+                    event = self.event_rx.recv() => event,
+                    _ = tokio::time::sleep(timeout) => return Ok(DriverDrainOutcome::Idle),
+                }
+            } else {
+                self.event_rx.recv().await
+            };
 
             let Some(event) = next_event else {
                 if self.cancel_flag.load(Ordering::Relaxed) {
@@ -212,11 +223,8 @@ impl CellDriver {
                 ));
             };
 
-            if let Some(batch) = self
-                .classify_event(&mut events, event, invoke_tool, &mut saw_visible_event)
-                .await?
-            {
-                return Ok(batch);
+            if let Some(batch) = self.classify_event(&mut events, event, invoke_tool).await? {
+                return Ok(DriverDrainOutcome::Batch(batch));
             }
         }
     }
@@ -228,7 +236,6 @@ impl CellDriver {
         events: &mut Vec<RuntimeEvent>,
         event: RuntimeEvent,
         invoke_tool: &mut F,
-        saw_visible_event: &mut bool,
     ) -> Result<Option<DriverDrainBatch>, crate::tools::ToolError>
     where
         F: FnMut(String, String) -> Fut,
@@ -278,9 +285,6 @@ impl CellDriver {
                 Ok(Some(DriverDrainBatch::progress(std::mem::take(events))))
             }
             event => {
-                if event.is_visible_to_drain() {
-                    *saw_visible_event = true;
-                }
                 events.push(event);
                 Ok(None)
             }

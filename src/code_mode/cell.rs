@@ -1,5 +1,5 @@
 use super::protocol::{max_event_seq, RuntimeEvent};
-use super::response::{DrainRenderState, ExecRunResult};
+use super::response::{DrainRenderState, ExecLifecycle, ExecRunResult};
 
 const RECENT_EVENT_BUDGET_CHARS: usize = 8_000;
 
@@ -20,6 +20,7 @@ pub struct ActiveCellHandle {
     pub cell_id: String,
     pub status: CellStatus,
     pub events: Vec<RuntimeEvent>,
+    pub last_publication: Option<ExecRunResult>,
     pub last_summary: Option<ExecRunResult>,
 }
 
@@ -29,6 +30,7 @@ impl ActiveCellHandle {
             cell_id,
             status: CellStatus::Starting,
             events: Vec::new(),
+            last_publication: None,
             last_summary: None,
         }
     }
@@ -84,27 +86,14 @@ impl ActiveCellHandle {
         if let Some(terminal) = &batch.terminal_result {
             self.last_summary = Some(terminal.0.clone());
             if let Some(summary) = self.last_summary.as_ref() {
-                self.status = if summary.flushed {
-                    self.status.clone()
-                } else if summary.cancellation.is_some() {
-                    CellStatus::Cancelled
-                } else if summary.failure.is_some() {
-                    CellStatus::Failed
-                } else {
-                    CellStatus::Completed
+                self.status = match &summary.lifecycle {
+                    ExecLifecycle::Running => self.status.clone(),
+                    ExecLifecycle::Completed => CellStatus::Completed,
+                    ExecLifecycle::Failed => CellStatus::Failed,
+                    ExecLifecycle::Cancelled => CellStatus::Cancelled,
                 };
             }
         }
-    }
-
-    /// Whether the cell is in a terminal state (completed, failed, or cancelled).
-    pub fn is_yielding(&self) -> bool {
-        matches!(
-            self.status,
-            CellStatus::WaitingOnTool { .. }
-                | CellStatus::WaitingOnJsTimer { .. }
-                | CellStatus::Flushed
-        )
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -163,6 +152,8 @@ impl CellDrainSnapshot {
         if let Some(summary) = &self.last_summary {
             state.return_value = summary.return_value.clone();
             state.flush_value = summary.flush_value.clone();
+            state.lifecycle = summary.lifecycle.clone();
+            state.progress_kind = summary.progress_kind.clone();
             state.failure = summary.failure.clone();
             state.cancellation = summary.cancellation.clone();
         }
@@ -174,6 +165,7 @@ impl CellDrainSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_mode::response::ExecProgressKind;
     use serde_json::json;
 
     #[test]
@@ -200,6 +192,8 @@ mod tests {
             output_text: String::new(),
             return_value: None,
             flush_value: Some(json!({"foo": "bar"})),
+            lifecycle: ExecLifecycle::Running,
+            progress_kind: Some(ExecProgressKind::ExplicitFlush),
             flushed: true,
             waiting_on_timer_ms: None,
             notifications: Vec::new(),

@@ -83,7 +83,14 @@ impl RuntimeEvent {
     }
 
     pub fn is_visible_to_drain(&self) -> bool {
-        !matches!(self, Self::WorkerCompleted(_))
+        !matches!(
+            self,
+            Self::WorkerCompleted(_)
+                | Self::WaitingForTimer { .. }
+                | Self::ToolCallRequested(_)
+                | Self::ToolCallResolved { .. }
+                | Self::TimerRegistrationChanged { .. }
+        )
     }
 }
 

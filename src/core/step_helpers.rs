@@ -828,10 +828,15 @@ impl AgentLoop {
             }
         };
 
-        let (source_length, requested_cell_id, wait_timeout_ms) = match &invocation {
-            CodeModeInvocation::Exec(parsed) => (parsed.code.chars().count(), None, None),
+        let (source_length, requested_cell_id, wait_timeout_ms, auto_flush_ms) = match &invocation {
+            CodeModeInvocation::Exec(parsed) => (
+                parsed.code.chars().count(),
+                None,
+                None,
+                parsed.auto_flush_ms,
+            ),
             CodeModeInvocation::Wait(parsed) => {
-                (0usize, parsed.cell_id.clone(), parsed.wait_timeout_ms)
+                (0usize, parsed.cell_id.clone(), parsed.wait_timeout_ms, None)
             }
         };
 
@@ -854,7 +859,8 @@ impl AgentLoop {
                 "source_length": source_length,
                 "requested_cell_id": requested_cell_id,
                 "wait_timeout_ms": wait_timeout_ms,
-                                "visible_nested_tools": visible_tools.len(),
+                "auto_flush_ms": auto_flush_ms,
+                "visible_nested_tools": visible_tools.len(),
                 "args_preview": crate::context::AgentContext::truncate_chars(&call.args.to_string(), 500),
             }),
             parent_span_id.clone(),
@@ -927,6 +933,7 @@ impl AgentLoop {
                             service_for_exec.execute(
                                 &session_id_for_exec,
                                 &parsed.code,
+                                parsed.auto_flush_ms,
                                 visible_tools,
                                 invoke_tool,
                                 cell_span,
@@ -967,25 +974,43 @@ impl AgentLoop {
             Ok(summary) => {
                 let (event_name, event_status) = if summary.flushed {
                     ("code_mode_exec_flushed", TraceStatus::Ok)
-                } else if summary.failure.is_some() {
-                    ("code_mode_exec_failed", TraceStatus::Error)
                 } else {
-                    ("code_mode_exec_finished", TraceStatus::Ok)
+                    match &summary.lifecycle {
+                        crate::code_mode::response::ExecLifecycle::Running => {
+                            ("code_mode_exec_running", TraceStatus::Ok)
+                        }
+                        crate::code_mode::response::ExecLifecycle::Completed => {
+                            ("code_mode_exec_finished", TraceStatus::Ok)
+                        }
+                        crate::code_mode::response::ExecLifecycle::Failed => {
+                            ("code_mode_exec_failed", TraceStatus::Error)
+                        }
+                        crate::code_mode::response::ExecLifecycle::Cancelled => {
+                            ("code_mode_exec_terminated", TraceStatus::Cancelled)
+                        }
+                    }
                 };
                 let cell_id = summary.cell_id.clone();
                 let flushed = summary.flushed;
                 let nested_tool_calls = summary.nested_tool_calls;
                 let truncated = summary.truncated;
                 let termination_reason = if summary.flushed {
-                    if summary.waiting_on_timer_ms.is_some() {
-                        "waiting_on_timer"
-                    } else {
-                        "flush"
+                    match summary.progress_kind.as_ref() {
+                        Some(&crate::code_mode::response::ExecProgressKind::ExplicitFlush) => {
+                            "flush"
+                        }
+                        Some(&crate::code_mode::response::ExecProgressKind::AutoFlush) => {
+                            "auto_flush"
+                        }
+                        None => "progress",
                     }
-                } else if summary.failure.is_some() {
-                    "failed"
                 } else {
-                    "completed"
+                    match &summary.lifecycle {
+                        crate::code_mode::response::ExecLifecycle::Running => "running",
+                        crate::code_mode::response::ExecLifecycle::Completed => "completed",
+                        crate::code_mode::response::ExecLifecycle::Failed => "failed",
+                        crate::code_mode::response::ExecLifecycle::Cancelled => "cancelled",
+                    }
                 };
                 self.record_trace_event(
                     TraceActor::Tool,
@@ -1001,7 +1026,9 @@ impl AgentLoop {
                         "source_length": source_length,
                         "requested_cell_id": requested_cell_id,
                         "flushed": flushed,
-                        "flush_value": summary.flush_value,
+                        "progress_kind": summary.progress_kind.clone(),
+                        "flush_value": summary.flush_value.clone(),
+                        "lifecycle": summary.lifecycle.clone(),
                         "nested_tool_calls": nested_tool_calls,
                         "output_size_chars": summary.output_text.chars().count(),
                         "termination_reason": termination_reason,
@@ -1022,11 +1049,11 @@ impl AgentLoop {
                 .with_payload_kind("code_mode_exec");
 
                 if summary.flushed {
-                    let question = if let Some(delay_ms) = summary.waiting_on_timer_ms {
-                        format!(
-                            "Code mode is waiting on a timer. Call `wait` again in about {} ms.",
-                            delay_ms
-                        )
+                    let question = if summary.progress_kind.as_ref()
+                        == Some(&crate::code_mode::response::ExecProgressKind::AutoFlush)
+                    {
+                        "Code mode published an automatic progress update. Call `wait` to sync more output."
+                            .to_string()
                     } else {
                         let flush_value_str = summary
                             .flush_value
@@ -1034,7 +1061,7 @@ impl AgentLoop {
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "none".to_string());
                         format!(
-                            "Code mode flushed. Value: {}. Call `wait` to continue.",
+                            "Code mode flushed. Value: {}. Call `wait` to sync more output.",
                             flush_value_str
                         )
                     };

@@ -151,12 +151,14 @@ async fn test_code_mode_wait_timeout() {
 
     let exec_tool = Arc::new(rusty_claw::tools::ExecTool);
     let wait_tool = Arc::new(rusty_claw::tools::WaitTool);
+    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
 
-    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool];
+    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool, finish_tool];
 
     // Code that uses a timer. The environment will flush at the end of execution
     // because it sees a pending timer.
     let code = r#"
+        text("Started");
         setTimeout(() => {
             text("Done");
         }, 30000);
@@ -167,7 +169,10 @@ async fn test_code_mode_wait_timeout() {
             events: vec![ScenarioEvent::ToolCall(
                 FunctionCall {
                     name: "exec".to_string(),
-                    args: serde_json::json!({ "code": code }),
+                    args: serde_json::json!({
+                        "code": code,
+                        "auto_flush_ms": 50,
+                    }),
                     id: Some("c1".to_string()),
                 },
                 Some("c1".to_string()),
@@ -175,6 +180,16 @@ async fn test_code_mode_wait_timeout() {
         },
         ScenarioTurn {
             events: scripted_wait_turn("c2", "cell-0", 100).events,
+        },
+        ScenarioTurn {
+            events: vec![ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: serde_json::json!({ "summary": "Observed wait timeout snapshot" }),
+                    id: Some("c3".to_string()),
+                },
+                Some("c3".to_string()),
+            )],
         },
     ]));
 
@@ -190,19 +205,32 @@ async fn test_code_mode_wait_timeout() {
         Arc::new(TaskStateStore::new(&session_id)),
     );
 
-    // Turn 1: exec. It will start the timer and flush (timer wait).
+    // Turn 1: exec. It will start the timer and auto-publish progress while
+    // the timer stays pending.
     let result1 = agent.step("Start".to_string()).await.unwrap();
     assert!(matches!(result1, RunExit::YieldedToUser));
 
     // Turn 2: wait with 100ms timeout. The timer is far in the future, so this
-    // should keep the cell yielded instead of completing.
+    // should return a running snapshot instead of completing the cell. The
+    // scripted LLM then closes the turn with finish_task.
     let result2 = agent.step("Wait".to_string()).await.unwrap();
 
-    // It should still be YieldedToUser because it hasn't finished.
     assert!(
-        matches!(result2, RunExit::YieldedToUser),
-        "Expected YieldedToUser, got: {:?}",
+        matches!(result2, RunExit::Finished(_)),
+        "Expected the scripted finish_task turn to complete, got: {:?}",
         result2
+    );
+
+    let tool_ends = output.tool_ends.lock().await;
+    assert!(
+        tool_ends.iter().any(|item| item.contains("still running")),
+        "Expected wait timeout to report a running snapshot, got: {:?}",
+        *tool_ends
+    );
+    assert!(
+        !tool_ends.iter().any(|item| item.contains("Done")),
+        "Wait timeout should not report timer completion, got: {:?}",
+        *tool_ends
     );
 
     support::temp_workspace::cleanup_session(&session_id);
@@ -407,7 +435,8 @@ async fn test_code_mode_timer_completion() {
     let wait_tool = Arc::new(rusty_claw::tools::WaitTool);
     let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool];
 
-    // Register a 500ms timer.
+    // Register a 500ms timer and let the host auto-publish progress while it
+    // is pending.
     let code = r#"
         setTimeout(() => {
             text("Timer Fired");
@@ -420,7 +449,10 @@ async fn test_code_mode_timer_completion() {
             events: vec![ScenarioEvent::ToolCall(
                 FunctionCall {
                     name: "exec".to_string(),
-                    args: serde_json::json!({ "code": code }),
+                    args: serde_json::json!({
+                        "code": code,
+                        "auto_flush_ms": 100,
+                    }),
                     id: Some("c1".to_string()),
                 },
                 Some("c1".to_string()),
@@ -449,7 +481,8 @@ async fn test_code_mode_timer_completion() {
         Arc::new(TaskStateStore::new(&session_id)),
     );
 
-    // Turn 1: exec. It should yield because the timer is still pending.
+    // Turn 1: exec. It should yield because auto-flush publishes progress
+    // while the timer is still pending.
     let result1 = agent.step("Start".to_string()).await.unwrap();
     assert!(matches!(result1, RunExit::YieldedToUser));
     {

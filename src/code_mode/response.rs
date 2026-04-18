@@ -8,12 +8,36 @@ pub enum ExecOutputItem {
     Text(String),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecLifecycle {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecProgressKind {
+    ExplicitFlush,
+    AutoFlush,
+}
+
+impl Default for ExecLifecycle {
+    fn default() -> Self {
+        Self::Running
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecRunResult {
     pub cell_id: String,
     pub output_text: String,
     pub return_value: Option<Value>,
     pub flush_value: Option<Value>,
+    pub lifecycle: ExecLifecycle,
+    pub progress_kind: Option<ExecProgressKind>,
     pub flushed: bool,
     pub waiting_on_timer_ms: Option<u64>,
     pub notifications: Vec<String>,
@@ -39,10 +63,10 @@ pub struct DrainRenderState {
     pub notifications: Vec<String>,
     pub return_value: Option<Value>,
     pub flush_value: Option<Value>,
+    pub lifecycle: ExecLifecycle,
+    pub progress_kind: Option<ExecProgressKind>,
     pub failure: Option<String>,
     pub cancellation: Option<String>,
-    pub waiting_on_timer_ms: Option<u64>,
-    pub is_flushed: bool,
 }
 
 impl DrainRenderState {
@@ -52,10 +76,10 @@ impl DrainRenderState {
             notifications: result.notifications.clone(),
             return_value: result.return_value.clone(),
             flush_value: result.flush_value.clone(),
-            waiting_on_timer_ms: result.waiting_on_timer_ms,
+            lifecycle: result.lifecycle.clone(),
+            progress_kind: result.progress_kind.clone(),
             failure: result.failure.clone(),
             cancellation: result.cancellation.clone(),
-            is_flushed: result.flushed,
         }
     }
 
@@ -65,46 +89,37 @@ impl DrainRenderState {
         for event in events {
             match event {
                 RuntimeEvent::Text { text, .. } => {
-                    state.waiting_on_timer_ms = None;
+                    state.flush_value = None;
                     if !state.output_text.is_empty() && !text.is_empty() {
                         state.output_text.push('\n');
                     }
                     state.output_text.push_str(text);
                 }
                 RuntimeEvent::Notification { message, .. } => {
-                    state.waiting_on_timer_ms = None;
+                    state.flush_value = None;
                     state.notifications.push(message.clone());
                 }
                 RuntimeEvent::Flush { value, .. } => {
                     state.flush_value = value.clone();
-                    state.waiting_on_timer_ms = None;
-                    state.is_flushed = true;
-                }
-                RuntimeEvent::WaitingForTimer {
-                    resume_after_ms, ..
-                } => {
-                    state.waiting_on_timer_ms = *resume_after_ms;
-                    state.is_flushed = true;
                 }
                 RuntimeEvent::Completed { return_value, .. } => {
                     state.return_value = return_value.clone();
                     state.flush_value = None;
-                    state.waiting_on_timer_ms = None;
-                    state.is_flushed = false;
+                    state.lifecycle = ExecLifecycle::Completed;
                 }
                 RuntimeEvent::Failed { error, .. } => {
+                    state.lifecycle = ExecLifecycle::Failed;
                     state.failure = Some(error.clone());
                     state.cancellation = None;
-                    state.waiting_on_timer_ms = None;
                 }
                 RuntimeEvent::Cancelled { reason, .. } => {
+                    state.lifecycle = ExecLifecycle::Cancelled;
                     state.cancellation = Some(reason.clone());
                     state.failure = None;
-                    state.waiting_on_timer_ms = None;
                 }
-                RuntimeEvent::ToolCallRequested(_) | RuntimeEvent::ToolCallResolved { .. } => {
-                    state.waiting_on_timer_ms = None;
-                }
+                RuntimeEvent::ToolCallRequested(_)
+                | RuntimeEvent::ToolCallResolved { .. }
+                | RuntimeEvent::WaitingForTimer { .. } => {}
                 RuntimeEvent::WorkerCompleted(_)
                 | RuntimeEvent::TimerRegistrationChanged { .. } => {}
             }
@@ -203,26 +218,18 @@ impl DrainRenderState {
         match status {
             CellStatus::Starting | CellStatus::Running | CellStatus::Flushed => {
                 Some(format!(
-                    "Code mode cell `{}` is still running after {} nested tool call(s). Call `wait` to check for more output.",
+                    "Code mode cell `{}` is still running after {} nested tool call(s). Call `wait` to poll for more output.",
                     cell_id, nested_tool_calls
                 ))
             }
             CellStatus::WaitingOnTool { request_id } => Some(format!(
-                "Code mode cell `{}` is processing nested tool request {} after {} nested tool call(s). Call `wait` to observe more progress.",
+                "Code mode cell `{}` is processing nested tool request {} after {} nested tool call(s). Call `wait` to poll for more output.",
                 cell_id, request_id, nested_tool_calls
             )),
-            CellStatus::WaitingOnJsTimer { next_due_in_ms } => {
-                Some(match next_due_in_ms {
-                    Some(delay) => format!(
-                        "Code mode cell `{}` is waiting on a timer after {} nested tool call(s). Call `wait` again in about {} ms.",
-                        cell_id, nested_tool_calls, delay
-                    ),
-                    None => format!(
-                        "Code mode cell `{}` is waiting on a timer after {} nested tool call(s). Call `wait` to resume it.",
-                        cell_id, nested_tool_calls
-                    ),
-                })
-            }
+            CellStatus::WaitingOnJsTimer { .. } => Some(format!(
+                "Code mode cell `{}` is still running in the background after {} nested tool call(s). Call `wait` to poll for more output.",
+                cell_id, nested_tool_calls
+            )),
             CellStatus::Completed => {
                 if self.cancellation.is_some() || self.failure.is_some() {
                     None
@@ -257,31 +264,39 @@ impl DrainRenderState {
     }
 
     fn default_status_line(&self, cell_id: &str, nested_tool_calls: usize) -> String {
-        if self.cancellation.is_some() {
-            format!(
+        match &self.lifecycle {
+            ExecLifecycle::Cancelled => format!(
                 "Code mode cell `{}` was cancelled after {} nested tool call(s).",
                 cell_id, nested_tool_calls
-            )
-        } else if self.failure.is_some() {
-            format!(
+            ),
+            ExecLifecycle::Failed => format!(
                 "Code mode cell `{}` failed after {} nested tool call(s).",
                 cell_id, nested_tool_calls
-            )
-        } else if let Some(resume_after_ms) = self.waiting_on_timer_ms {
-            format!(
-                "Code mode cell `{}` is waiting on timer(s) after {} nested tool call(s). Call `wait` again in about {} ms.",
-                cell_id, nested_tool_calls, resume_after_ms
-            )
-        } else if self.is_flushed {
-            format!(
-                "Code mode cell `{}` flushed after {} nested tool call(s). Call `wait` to resume it.",
-                cell_id, nested_tool_calls
-            )
-        } else {
-            format!(
+            ),
+            ExecLifecycle::Completed => format!(
                 "Code mode cell `{}` completed after {} nested tool call(s).",
                 cell_id, nested_tool_calls
-            )
+            ),
+            ExecLifecycle::Running
+                if self.progress_kind.as_ref() == Some(&ExecProgressKind::ExplicitFlush) =>
+            {
+                format!(
+                    "Code mode cell `{}` flushed after {} nested tool call(s). Call `wait` to sync more output.",
+                    cell_id, nested_tool_calls
+                )
+            }
+            ExecLifecycle::Running
+                if self.progress_kind.as_ref() == Some(&ExecProgressKind::AutoFlush) =>
+            {
+                format!(
+                    "Code mode cell `{}` published an automatic progress update after {} nested tool call(s). Call `wait` to sync more output.",
+                    cell_id, nested_tool_calls
+                )
+            }
+            ExecLifecycle::Running => format!(
+                "Code mode cell `{}` is still running after {} nested tool call(s). Call `wait` to poll for more output.",
+                cell_id, nested_tool_calls
+            ),
         }
     }
 }
@@ -297,6 +312,8 @@ mod tests {
             output_text: "partial output".to_string(),
             return_value: None,
             flush_value: None,
+            lifecycle: ExecLifecycle::Failed,
+            progress_kind: None,
             flushed: false,
             waiting_on_timer_ms: None,
             notifications: Vec::new(),
@@ -319,6 +336,8 @@ mod tests {
             output_text: String::new(),
             return_value: None,
             flush_value: None,
+            lifecycle: ExecLifecycle::Cancelled,
+            progress_kind: None,
             flushed: false,
             waiting_on_timer_ms: None,
             notifications: Vec::new(),
@@ -334,12 +353,14 @@ mod tests {
     }
 
     #[test]
-    fn render_output_uses_timer_wait_status_for_flushed_cells() {
+    fn render_output_uses_progress_status_for_auto_flush_cells() {
         let summary = ExecRunResult {
             cell_id: "cell-9".to_string(),
             output_text: String::new(),
             return_value: None,
             flush_value: None,
+            lifecycle: ExecLifecycle::Running,
+            progress_kind: Some(ExecProgressKind::AutoFlush),
             flushed: true,
             waiting_on_timer_ms: Some(125),
             notifications: Vec::new(),
@@ -350,8 +371,7 @@ mod tests {
         };
 
         let rendered = summary.render_output();
-        assert!(rendered.contains("waiting on timer(s)"));
-        assert!(rendered.contains("about 125 ms"));
-        assert!(!rendered.contains("flushed after 1 nested tool call(s)"));
+        assert!(rendered.contains("automatic progress update"));
+        assert!(!rendered.contains("waiting on timer"));
     }
 }

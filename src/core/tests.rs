@@ -553,6 +553,9 @@ async fn test_code_mode_notice_is_added_when_exec_is_visible() {
     let system_text = llm.last_system_text().unwrap_or_default();
     assert!(system_text.contains("Code Mode is enabled for this provider."));
     assert!(system_text.contains("prefer the `exec` tool"));
+    assert!(system_text.contains("usually set `auto_flush_ms`"));
+    assert!(system_text.contains("Timer boundaries are internal runtime details"));
+    assert!(system_text.contains("`wait` does not resume timers"));
 
     cleanup_session(session_id);
 }
