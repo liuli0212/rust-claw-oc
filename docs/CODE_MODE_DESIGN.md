@@ -1944,7 +1944,7 @@ LLM emits exec({code})
       → driver.drain_event_batch_with_request(initial_drain)
         → consumes events from event_rx
         → returns DriverDrainBatch
-    → ActiveCellHandle.apply_drain_batch()
+    → ActiveCellHandle.record_driver_update()
     → snapshot.render_state().render_output()
   → StructuredToolOutput envelope → LLM context
 ```
@@ -1961,7 +1961,7 @@ LLM emits wait({cell_id?, wait_timeout_ms?, refresh_slice_ms?})
         → if wait_for_event: blocks up to wait_timeout_ms
         → if refresh_slice_ms: returns progress after slice
         → on terminal: returns DriverDrainBatch with terminal_result
-      → ActiveCellHandle.apply_drain_batch()
+      → ActiveCellHandle.record_driver_update()
       → snapshot.render_state().render_output()
     → cleared active_cell if terminal
   → StructuredToolOutput envelope → LLM context
@@ -1998,7 +1998,7 @@ This pattern allows `AgentLoop` to use its own stateful, async closures (capturi
 
 **Phase 3 (Integration & Event-Driven Migration) Completed**:
 - [x] Map Code Mode flush/timer-wait events to tool output `await_user` effect.
-- [x] Fix event propagation in `ActiveCellHandle::apply_drain_batch` for flush/timer states.
+- [x] Fix event propagation in `ActiveCellHandle::record_driver_update` for flush/timer states.
 - [x] Fix `to_completion()` drain requests and blocking logic.
 - [x] Implement rendered text output emission to `AgentOutput`.
 - [x] Verify full lifecycle with integration tests.
