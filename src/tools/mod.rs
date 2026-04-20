@@ -3,6 +3,7 @@ pub mod bash;
 pub mod code_mode;
 pub mod files;
 pub mod integrations;
+pub(crate) mod invocation;
 pub mod lsp;
 pub mod memory;
 pub mod protocol;

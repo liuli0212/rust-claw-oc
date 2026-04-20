@@ -665,472 +665,25 @@ impl AgentLoop {
         crate::code_mode::executor::is_code_mode_nested_tool(tool_name)
     }
 
-    fn code_mode_tool_result_status(
-        summary: &crate::code_mode::response::ExecRunResult,
-    ) -> (bool, Option<i32>, bool) {
-        match summary.lifecycle {
-            crate::code_mode::response::ExecLifecycle::Running
-            | crate::code_mode::response::ExecLifecycle::Completed => (true, Some(0), false),
-            crate::code_mode::response::ExecLifecycle::Failed => (false, Some(1), true),
-            crate::code_mode::response::ExecLifecycle::Cancelled => (false, Some(130), true),
-        }
-    }
-
-    fn autopilot_denial_for_call(
-        &self,
-        call_name: &str,
-        call_args: &serde_json::Value,
-        current_tools: &[Arc<dyn Tool>],
-    ) -> Option<String> {
-        if !self.is_autopilot {
-            return None;
-        }
-
-        let tool_has_effects = current_tools
-            .iter()
-            .find(|t| t.name() == call_name)
-            .map(|t| t.has_side_effects())
-            .unwrap_or(true);
-        if !tool_has_effects {
-            return None;
-        }
-
-        let todos_path = self.todos_path();
-        if todos_path.exists() {
-            return None;
-        }
-
-        let is_creating_todos = (call_name == "write_file" || call_name == "execute_bash")
-            && call_args.to_string().contains("TODOS.md");
-        if is_creating_todos {
-            return None;
-        }
-
-        Some(
-            "[System Error] Action Denied. Autopilot 模式下必须先创建并规划 TODOS.md。".to_string(),
-        )
-    }
-
-    fn record_autopilot_action_outcome(
-        &mut self,
-        call_name: &str,
-        call_args: &serde_json::Value,
-        is_error: bool,
-    ) -> Option<(String, &'static str)> {
-        if !self.is_autopilot {
-            return None;
-        }
-
-        let mut guard_state = self
-            .execution_guard_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard_state
-            .record_action_outcome(call_name, call_args, is_error)
-            .map(|signal| (signal.message().to_string(), signal.signal()))
-    }
-
-    async fn prepare_tool_context(
+    fn build_tool_invoker(
         &self,
         current_tools: &[Arc<dyn Tool>],
         remaining_steps: usize,
-        trace_ctx: Option<&crate::trace::TraceContext>,
-        parent_span_id: Option<String>,
-    ) -> crate::tools::ToolContext {
-        let mut ctx =
-            crate::tools::ToolContext::new(self.session_id.clone(), self.reply_to.clone());
-        ctx.visible_tools = current_tools.iter().map(|tool| tool.name()).collect();
-        ctx.skill_budget.remaining_steps = Some(remaining_steps);
-        ctx.skill_budget.remaining_timeout_sec = self.remaining_session_timeout_sec();
-        if let Some(trace_ctx) = trace_ctx {
-            ctx.trace = Some(crate::tools::protocol::ToolTraceContext {
-                trace_id: trace_ctx.trace_id.clone(),
-                run_id: trace_ctx.run_id.clone(),
-                root_session_id: trace_ctx.root_session_id.clone(),
-                task_id: trace_ctx.task_id.clone(),
-                turn_id: trace_ctx.turn_id.clone(),
-                iteration: trace_ctx.iteration,
-                parent_span_id,
-            });
-        }
-        for ext in &self.extensions {
-            ctx = ext.enrich_tool_context(ctx).await;
-        }
-        ctx
-    }
-
-    async fn dispatch_exec_tool_call(
-        &mut self,
-        call: &crate::context::FunctionCall,
-        current_tools: &[Arc<dyn Tool>],
-        remaining_steps: usize,
-        iteration_trace_ctx: Option<crate::trace::TraceContext>,
-        parent_span_id: Option<String>,
-    ) -> ToolDispatchOutcome {
-        let start = Instant::now();
-        let iteration = iteration_trace_ctx.as_ref().and_then(|ctx| ctx.iteration);
-        let provider = self.llm.provider_name().to_string();
-        let model = self.llm.model_name().to_string();
-
-        enum CodeModeInvocation {
-            Exec(crate::tools::code_mode::ExecArgs),
-            Wait(crate::tools::code_mode::WaitArgs),
-        }
-
-        let invocation = match call.name.as_str() {
-            "exec" => {
-                match serde_json::from_value::<crate::tools::code_mode::ExecArgs>(call.args.clone())
-                {
-                    Ok(parsed) => CodeModeInvocation::Exec(parsed),
-                    Err(err) => {
-                        let result = crate::tools::protocol::StructuredToolOutput::new(
-                        "exec",
-                        false,
-                        format!("Invalid exec arguments: {}", err),
-                        Some(1),
-                        Some(start.elapsed().as_millis()),
-                        false,
-                    )
-                    .with_payload_kind("code_mode_exec")
-                    .to_json_string()
-                    .unwrap_or_else(|serialize_err| {
-                        format!("Tool error: failed to serialize exec error envelope: {serialize_err}")
-                    });
-                        return ToolDispatchOutcome {
-                            result,
-                            is_error: true,
-                            stopped: false,
-                        };
-                    }
-                }
-            }
-            "wait" => {
-                match serde_json::from_value::<crate::tools::code_mode::WaitArgs>(call.args.clone())
-                {
-                    Ok(parsed) => CodeModeInvocation::Wait(parsed),
-                    Err(err) => {
-                        let result = crate::tools::protocol::StructuredToolOutput::new(
-                        "wait",
-                        false,
-                        format!("Invalid wait arguments: {}", err),
-                        Some(1),
-                        Some(start.elapsed().as_millis()),
-                        false,
-                    )
-                    .with_payload_kind("code_mode_exec")
-                    .to_json_string()
-                    .unwrap_or_else(|serialize_err| {
-                        format!("Tool error: failed to serialize wait error envelope: {serialize_err}")
-                    });
-                        return ToolDispatchOutcome {
-                            result,
-                            is_error: true,
-                            stopped: false,
-                        };
-                    }
-                }
-            }
-            _ => {
-                return ToolDispatchOutcome {
-                    result: format!("Tool `{}` is not a code-mode entry tool.", call.name),
-                    is_error: true,
-                    stopped: false,
-                };
-            }
-        };
-
-        let (source_length, requested_cell_id, wait_timeout_ms, auto_flush_ms) = match &invocation {
-            CodeModeInvocation::Exec(parsed) => (
-                parsed.code.chars().count(),
-                None,
-                None,
-                parsed.auto_flush_ms,
-            ),
-            CodeModeInvocation::Wait(parsed) => {
-                (0usize, parsed.cell_id.clone(), parsed.wait_timeout_ms, None)
-            }
-        };
-
-        let visible_tools: Vec<String> = current_tools
-            .iter()
-            .map(|tool| tool.name())
-            .filter(|name| Self::is_code_mode_nested_tool(name))
-            .collect();
-
-        self.record_trace_event(
-            TraceActor::Tool,
-            "code_mode_exec_started",
-            TraceStatus::Ok,
-            Some(call.name.clone()),
-            serde_json::json!({
-                "tool_name": call.name,
-                "outer_tool_call_id": call.id.clone(),
-                "provider": provider,
-                "model": model,
-                "source_length": source_length,
-                "requested_cell_id": requested_cell_id,
-                "wait_timeout_ms": wait_timeout_ms,
-                "auto_flush_ms": auto_flush_ms,
-                "visible_nested_tools": visible_tools.len(),
-                "args_preview": crate::context::AgentContext::truncate_chars(&call.args.to_string(), 500),
-            }),
-            parent_span_id.clone(),
-            iteration,
-        );
-
-        let service = self.code_mode_service.clone();
-        let service_for_exec = service.clone();
-        let service_for_abort = service.clone();
-        let session_id = self.session_id.clone();
-        let session_id_for_exec = session_id.clone();
-        let session_id_for_abort = session_id.clone();
-        let cancel_token = self.cancel_token.clone();
-        let reply_to = self.reply_to.clone();
-        let session_deadline = self.session_deadline;
-        let trace_bus = self.trace_bus.clone();
-        let nested_cancel_token = self.cancel_token.clone();
-        let todos_path = self.todos_path();
-        let is_autopilot = self.is_autopilot;
-        let exec_result = tokio::select! {
-            result = tokio::time::timeout(
-                Duration::from_secs(90),
-                async {
-                    match invocation {
-                        CodeModeInvocation::Exec(parsed) => {
-                            let cell_span = iteration_trace_ctx.as_ref().map(|ctx| {
-                                trace_bus.start_span(
-                                    ctx,
-                                    crate::trace::TraceActor::Tool,
-                                    "code_mode_cell_background",
-                                    serde_json::json!({
-                                        "session_id": session_id,
-                                        "outer_tool_call_id": call.id.clone(),
-                                    }),
-                                )
-                            });
-                            let cell_span_id = cell_span.as_ref().map(|s| s.span_id().to_string());
-
-                            let nested_executor = Arc::new(tokio::sync::Mutex::new(
-                                crate::code_mode::executor::CodeModeNestedToolExecutor::new(
-                                    crate::code_mode::executor::CodeModeNestedToolExecutorConfig {
-                                        current_tools: current_tools.to_vec(),
-                                        extensions: self.extensions.clone(),
-                                        session_id: session_id.clone(),
-                                        reply_to,
-                                        remaining_steps,
-                                        session_deadline,
-                                        iteration_trace_ctx: iteration_trace_ctx.clone(),
-                                        parent_span_id: cell_span_id,
-                                        outer_tool_call_id: call.id.clone(),
-                                        trace_bus,
-                                        provider: provider.clone(),
-                                        model: model.clone(),
-                                        cancel_token: nested_cancel_token,
-                                        is_autopilot,
-                                        todos_path,
-                                        execution_guard_state: self.execution_guard_state.clone(),
-                                    },
-                                ),
-                            ));
-                            let invoke_tool = move |tool_name: String, args_json: String| {
-                                let nested_executor = nested_executor.clone();
-                                async move {
-                                    let mut executor = nested_executor.lock().await;
-                                    let raw = executor.execute_json(tool_name, args_json).await?;
-                                    Ok(crate::code_mode::runtime::value::normalize_tool_result_for_js(&raw))
-                                }
-                            };
-
-                            service_for_exec.execute(
-                                &session_id_for_exec,
-                                &parsed.code,
-                                parsed.auto_flush_ms,
-                                visible_tools,
-                                invoke_tool,
-                                cell_span,
-                            ).await
-                        }
-                        CodeModeInvocation::Wait(parsed) => {
-                            service_for_exec.wait_with_request(
-                                &session_id_for_exec,
-                                parsed.cell_id.as_deref(),
-                                parsed.wait_timeout_ms,
-                            ).await
-                        }
-                    }
-                }
-            ) => {
-                match result {
-                    Ok(Ok(value)) => Ok(value),
-                    Ok(Err(err)) => Err(err),
-                    Err(_) => {
-                        service_for_abort
-                            .abort_active_cell(&session_id_for_abort, "Code mode execution timed out.")
-                            .await;
-                        Err(crate::tools::ToolError::Timeout)
-                    }
-                }
-            }
-            _ = cancel_token.notified() => {
-                service
-                    .abort_active_cell(&session_id, "Code mode execution interrupted by user.")
-                    .await;
-                Err(crate::tools::ToolError::ExecutionFailed(
-                    "Code mode execution interrupted by user.".to_string(),
-                ))
-            }
-        };
-
-        match exec_result {
-            Ok(summary) => {
-                let (event_name, event_status) = if summary.flushed {
-                    ("code_mode_exec_flushed", TraceStatus::Ok)
-                } else {
-                    match &summary.lifecycle {
-                        crate::code_mode::response::ExecLifecycle::Running => {
-                            ("code_mode_exec_running", TraceStatus::Ok)
-                        }
-                        crate::code_mode::response::ExecLifecycle::Completed => {
-                            ("code_mode_exec_finished", TraceStatus::Ok)
-                        }
-                        crate::code_mode::response::ExecLifecycle::Failed => {
-                            ("code_mode_exec_failed", TraceStatus::Error)
-                        }
-                        crate::code_mode::response::ExecLifecycle::Cancelled => {
-                            ("code_mode_exec_terminated", TraceStatus::Cancelled)
-                        }
-                    }
-                };
-                let cell_id = summary.cell_id.clone();
-                let flushed = summary.flushed;
-                let nested_tool_calls = summary.nested_tool_calls;
-                let truncated = summary.truncated;
-                let termination_reason = if summary.flushed {
-                    match summary.progress_kind.as_ref() {
-                        Some(&crate::code_mode::response::ExecProgressKind::ExplicitFlush) => {
-                            "flush"
-                        }
-                        Some(&crate::code_mode::response::ExecProgressKind::AutoFlush) => {
-                            "auto_flush"
-                        }
-                        None => "progress",
-                    }
-                } else {
-                    match &summary.lifecycle {
-                        crate::code_mode::response::ExecLifecycle::Running => "running",
-                        crate::code_mode::response::ExecLifecycle::Completed => "completed",
-                        crate::code_mode::response::ExecLifecycle::Failed => "failed",
-                        crate::code_mode::response::ExecLifecycle::Cancelled => "cancelled",
-                    }
-                };
-                self.record_trace_event(
-                    TraceActor::Tool,
-                    event_name,
-                    event_status,
-                    Some(cell_id.clone()),
-                    serde_json::json!({
-                        "tool_name": call.name.clone(),
-                        "outer_tool_call_id": call.id.clone(),
-                        "provider": provider,
-                        "model": model,
-                        "cell_id": cell_id,
-                        "source_length": source_length,
-                        "requested_cell_id": requested_cell_id,
-                        "flushed": flushed,
-                        "progress_kind": summary.progress_kind.clone(),
-                        "flush_value": summary.flush_value.clone(),
-                        "lifecycle": summary.lifecycle.clone(),
-                        "nested_tool_calls": nested_tool_calls,
-                        "output_size_chars": summary.output_text.chars().count(),
-                        "termination_reason": termination_reason,
-                        "truncated": truncated,
-                    }),
-                    parent_span_id,
-                    iteration,
-                );
-
-                let (ok, exit_code, is_error) = Self::code_mode_tool_result_status(&summary);
-                let tool_output = crate::tools::protocol::StructuredToolOutput::new(
-                    call.name.clone(),
-                    ok,
-                    summary.render_output(),
-                    exit_code,
-                    Some(start.elapsed().as_millis()),
-                    summary.truncated,
-                )
-                .with_payload_kind("code_mode_exec");
-
-                let output_text = summary.render_output();
-                if !output_text.is_empty() {
-                    self.output.on_text(&output_text).await;
-                    self.output.on_text("\n").await;
-                }
-
-                let result = tool_output
-                    .to_json_string()
-                    .unwrap_or_else(|err| format!("Tool error: {}", err));
-
-                ToolDispatchOutcome {
-                    result,
-                    is_error,
-                    stopped: false,
-                }
-            }
-            Err(err) => {
-                let is_stopped = matches!(err, crate::tools::ToolError::Timeout)
-                    || err.to_string().contains("interrupted by user");
-                let (event_name, event_status) = if matches!(err, crate::tools::ToolError::Timeout)
-                {
-                    ("code_mode_exec_terminated", TraceStatus::TimedOut)
-                } else if err.to_string().contains("interrupted by user") {
-                    ("code_mode_exec_terminated", TraceStatus::Cancelled)
-                } else {
-                    ("code_mode_exec_finished", TraceStatus::Error)
-                };
-                self.record_trace_event(
-                    TraceActor::Tool,
-                    event_name,
-                    event_status,
-                    Some(err.to_string()),
-                    serde_json::json!({
-                        "tool_name": call.name.clone(),
-                        "outer_tool_call_id": call.id.clone(),
-                        "provider": provider,
-                        "model": model,
-                        "source_length": source_length,
-                        "requested_cell_id": requested_cell_id,
-                        "termination_reason": if matches!(err, crate::tools::ToolError::Timeout) {
-                            "timeout"
-                        } else if err.to_string().contains("interrupted by user") {
-                            "cancelled"
-                        } else {
-                            "runtime_error"
-                        },
-                        "error": err.to_string(),
-                    }),
-                    parent_span_id,
-                    iteration,
-                );
-
-                let result = crate::tools::protocol::StructuredToolOutput::new(
-                    call.name.clone(),
-                    false,
-                    format!("{} runtime failed: {}", call.name, err),
-                    Some(1),
-                    Some(start.elapsed().as_millis()),
-                    false,
-                )
-                .with_payload_kind("code_mode_exec")
-                .to_json_string()
-                .unwrap_or_else(|serialize_err| format!("Tool error: {}", serialize_err));
-
-                ToolDispatchOutcome {
-                    result,
-                    is_error: true,
-                    stopped: is_stopped,
-                }
-            }
-        }
+    ) -> crate::tools::invocation::ToolInvoker {
+        crate::tools::invocation::ToolInvoker::new(crate::tools::invocation::ToolInvokerConfig {
+            current_tools: current_tools.to_vec(),
+            visible_tools: current_tools.iter().map(|tool| tool.name()).collect(),
+            extensions: self.extensions.clone(),
+            session_id: self.session_id.clone(),
+            reply_to: self.reply_to.clone(),
+            remaining_steps,
+            session_deadline: self.session_deadline,
+            trace_bus: self.trace_bus.clone(),
+            cancel_token: self.cancel_token.clone(),
+            is_autopilot: self.is_autopilot,
+            todos_path: self.todos_path(),
+            execution_guard_state: self.execution_guard_state.clone(),
+        })
     }
 
     pub(super) async fn dispatch_tool_call(
@@ -1142,7 +695,7 @@ impl AgentLoop {
     ) -> ToolDispatchOutcome {
         let tool_opt = current_tools.iter().find(|tool| tool.name() == call.name);
 
-        if let Some(tool) = tool_opt {
+        if tool_opt.is_some() {
             tracing::info!("Executing tool '{}' with args: {}", call.name, call.args);
             self.output
                 .on_tool_start(&call.name, &call.args.to_string())
@@ -1183,16 +736,32 @@ impl AgentLoop {
                 };
             }
 
+            let tool_invoker = self.build_tool_invoker(current_tools, remaining_steps);
+
             if matches!(call.name.as_str(), "exec" | "wait") {
-                let exec_outcome = self
-                    .dispatch_exec_tool_call(
-                        call,
-                        current_tools,
+                let exec_outcome = crate::code_mode::entry::dispatch_tool_call(
+                    call,
+                    crate::code_mode::entry::CodeModeDispatchConfig {
+                        current_tools: current_tools.to_vec(),
+                        extensions: self.extensions.clone(),
+                        service: self.code_mode_service.clone(),
+                        session_id: self.session_id.clone(),
+                        reply_to: self.reply_to.clone(),
                         remaining_steps,
-                        iteration_trace_ctx.clone(),
-                        tool_span.as_ref().map(|span| span.span_id().to_string()),
-                    )
-                    .await;
+                        session_deadline: self.session_deadline,
+                        iteration_trace_ctx: iteration_trace_ctx.clone(),
+                        parent_span_id: tool_span.as_ref().map(|span| span.span_id().to_string()),
+                        trace_bus: self.trace_bus.clone(),
+                        provider: self.llm.provider_name().to_string(),
+                        model: self.llm.model_name().to_string(),
+                        cancel_token: self.cancel_token.clone(),
+                        output: self.output.clone(),
+                        is_autopilot: self.is_autopilot,
+                        todos_path: self.todos_path(),
+                        execution_guard_state: self.execution_guard_state.clone(),
+                    },
+                )
+                .await;
                 if let Some(span) = tool_span.take() {
                     span.finish(
                         if exec_outcome.is_error {
@@ -1218,57 +787,50 @@ impl AgentLoop {
                 return exec_outcome;
             }
 
-            let ctx = self
-                .prepare_tool_context(
-                    current_tools,
-                    remaining_steps,
-                    iteration_trace_ctx.as_ref(),
-                    tool_span.as_ref().map(|span| span.span_id().to_string()),
-                )
+            let outcome = tool_invoker
+                .invoke(crate::tools::invocation::ToolInvocationRequest {
+                    tool_name: &call.name,
+                    args: call.args.clone(),
+                    timeout: Duration::from_secs(120),
+                    trace_ctx: iteration_trace_ctx.clone(),
+                    context_parent_span_id: tool_span
+                        .as_ref()
+                        .map(|span| span.span_id().to_string()),
+                    span: None,
+                })
                 .await;
-
-            let (result, is_error, stopped, trace_status, end_name) = tokio::select! {
-                exec_res = tokio::time::timeout(
-                    Duration::from_secs(120),
-                    tool.execute(call.args.clone(), &ctx)
-                ) => {
-                    match exec_res {
-                        Ok(Ok(res)) => {
-                            tracing::info!("Tool '{}' executed successfully", call.name);
-                            (res, false, false, TraceStatus::Ok, "tool_finished")
-                        },
-                        Ok(Err(e)) => {
-                            tracing::warn!("Tool '{}' returned an error: {}", call.name, e);
-                            (format!("Tool error: {}", e), true, false, TraceStatus::Error, "tool_failed")
-                        },
-                        Err(e) => {
-                            tracing::error!("Tool '{}' timed out: {}", call.name, e);
-                            (format!("Timeout executing {}: {}", call.name, e), true, false, TraceStatus::TimedOut, "tool_timed_out")
-                        },
-                    }
-                }
-                _ = self.cancel_token.notified() => {
-                    tracing::warn!("Tool execution '{}' interrupted by user", call.name);
-                    ("Tool execution interrupted by user.".to_string(), true, true, TraceStatus::Cancelled, "tool_cancelled")
-                }
-            };
             if let Some(span) = tool_span.take() {
                 span.finish(
-                    end_name,
-                    trace_status,
-                    Some(crate::context::AgentContext::truncate_chars(&result, 240)),
+                    if outcome.stopped {
+                        "tool_cancelled"
+                    } else if outcome.is_error {
+                        "tool_failed"
+                    } else {
+                        "tool_finished"
+                    },
+                    if outcome.stopped {
+                        TraceStatus::Cancelled
+                    } else if outcome.is_error {
+                        TraceStatus::Error
+                    } else {
+                        TraceStatus::Ok
+                    },
+                    Some(crate::context::AgentContext::truncate_chars(
+                        &outcome.result,
+                        240,
+                    )),
                     serde_json::json!({
                         "tool_name": call.name,
-                        "result_preview": crate::context::AgentContext::truncate_chars(&result, 500),
-                        "result_size_chars": result.len(),
+                        "result_preview": crate::context::AgentContext::truncate_chars(&outcome.result, 500),
+                        "result_size_chars": outcome.result.len(),
                     }),
                 );
             }
 
             return ToolDispatchOutcome {
-                result,
-                is_error,
-                stopped,
+                result: outcome.result,
+                is_error: outcome.is_error,
+                stopped: outcome.stopped,
             };
         }
 
@@ -1357,6 +919,7 @@ impl AgentLoop {
         } else {
             (0, 0)
         };
+        let tool_invoker = self.build_tool_invoker(current_tools, remaining_steps);
 
         for (mut call, thought_sig) in tool_calls_accumulated {
             if skip_remaining {
@@ -1383,9 +946,7 @@ impl AgentLoop {
                 continue;
             }
 
-            if let Some(reason) =
-                self.autopilot_denial_for_call(&call.name, &call.args, current_tools)
-            {
+            if let Some(reason) = tool_invoker.autopilot_denial_for_call(&call.name, &call.args) {
                 response_parts.push(Self::build_function_response_part(
                     call.name.clone(),
                     call.id.clone(),
@@ -1406,15 +967,15 @@ impl AgentLoop {
                     iteration_trace_ctx.clone(),
                 )
                 .await;
-            if let Some((message, signal)) =
-                self.record_autopilot_action_outcome(&call.name, &call.args, is_error)
+            if let Some(signal) =
+                tool_invoker.record_action_outcome(&call.name, &call.args, is_error)
             {
                 response_parts.push(Self::build_function_response_part(
                     call.name.clone(),
                     call.id.clone(),
                     serde_json::json!({
-                        "result": message,
-                        "signal": signal
+                        "result": signal.message(),
+                        "signal": signal.signal()
                     }),
                     thought_sig.clone(),
                 ));

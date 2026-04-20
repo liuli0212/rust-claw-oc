@@ -168,10 +168,10 @@ enum StreamCollectionOutcome {
     Exit(RunExit),
 }
 
-struct ToolDispatchOutcome {
-    result: String,
-    is_error: bool,
-    stopped: bool,
+pub(crate) struct ToolDispatchOutcome {
+    pub(crate) result: String,
+    pub(crate) is_error: bool,
+    pub(crate) stopped: bool,
 }
 
 struct ActiveTrace {

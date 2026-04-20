@@ -8,9 +8,12 @@ use tokio::sync::Notify;
 use crate::context::AgentContext;
 use crate::core::extensions::ExecutionExtension;
 use crate::core::ExecutionGuardState;
-use crate::tools::protocol::ToolTraceContext;
-use crate::tools::{Tool, ToolContext, ToolError};
-use crate::trace::{TraceActor, TraceBus, TraceContext, TraceStatus};
+use crate::tools::invocation::{
+    ToolInvocationEndNames, ToolInvocationRequest, ToolInvocationSpanConfig, ToolInvoker,
+    ToolInvokerConfig,
+};
+use crate::tools::{Tool, ToolError};
+use crate::trace::{TraceActor, TraceBus, TraceContext};
 
 pub fn is_code_mode_nested_tool(tool_name: &str) -> bool {
     !matches!(
@@ -46,50 +49,65 @@ pub(crate) struct CodeModeNestedToolExecutorConfig {
 }
 
 pub(crate) struct CodeModeNestedToolExecutor {
-    current_tools: Vec<Arc<dyn Tool>>,
-    extensions: Vec<Arc<dyn ExecutionExtension>>,
-    session_id: String,
-    reply_to: String,
-    visible_tools: Vec<String>,
+    tool_invoker: ToolInvoker,
     remaining_steps: usize,
-    session_deadline: Option<Instant>,
     iteration_trace_ctx: Option<TraceContext>,
     parent_span_id: Option<String>,
     outer_tool_call_id: Option<String>,
-    trace_bus: Arc<TraceBus>,
     provider: String,
     model: String,
-    cancel_token: Arc<Notify>,
-    is_autopilot: bool,
-    todos_path: PathBuf,
-    execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
 }
 
 impl CodeModeNestedToolExecutor {
     pub(crate) fn new(config: CodeModeNestedToolExecutorConfig) -> Self {
-        let visible_tools = config
-            .current_tools
+        let CodeModeNestedToolExecutorConfig {
+            current_tools,
+            extensions,
+            session_id,
+            reply_to,
+            remaining_steps,
+            session_deadline,
+            iteration_trace_ctx,
+            parent_span_id,
+            outer_tool_call_id,
+            trace_bus,
+            provider,
+            model,
+            cancel_token,
+            is_autopilot,
+            todos_path,
+            execution_guard_state,
+        } = config;
+
+        let visible_tools = current_tools
             .iter()
             .map(|tool| tool.name())
+            .filter(|name| is_code_mode_nested_tool(name))
             .collect();
-        Self {
-            current_tools: config.current_tools,
-            extensions: config.extensions,
-            session_id: config.session_id,
-            reply_to: config.reply_to,
+
+        let tool_invoker = ToolInvoker::new(ToolInvokerConfig {
+            current_tools,
             visible_tools,
-            remaining_steps: config.remaining_steps,
-            session_deadline: config.session_deadline,
-            iteration_trace_ctx: config.iteration_trace_ctx,
-            parent_span_id: config.parent_span_id,
-            outer_tool_call_id: config.outer_tool_call_id,
-            trace_bus: config.trace_bus,
-            provider: config.provider,
-            model: config.model,
-            cancel_token: config.cancel_token,
-            is_autopilot: config.is_autopilot,
-            todos_path: config.todos_path,
-            execution_guard_state: config.execution_guard_state,
+            extensions,
+            session_id,
+            reply_to,
+            remaining_steps,
+            session_deadline,
+            trace_bus,
+            cancel_token,
+            is_autopilot,
+            todos_path,
+            execution_guard_state,
+        });
+
+        Self {
+            tool_invoker,
+            remaining_steps,
+            iteration_trace_ctx,
+            parent_span_id,
+            outer_tool_call_id,
+            provider,
+            model,
         }
     }
 
@@ -113,169 +131,59 @@ impl CodeModeNestedToolExecutor {
             )));
         }
 
-        if let Some(reason) = self.autopilot_denial_for_call(&tool_name, &args) {
+        if let Some(reason) = self
+            .tool_invoker
+            .autopilot_denial_for_call(&tool_name, &args)
+        {
             return Err(ToolError::ExecutionFailed(reason));
         }
 
-        let nested_trace_ctx = self
-            .iteration_trace_ctx
-            .as_ref()
-            .map(|ctx| ctx.with_parent_span_id(self.parent_span_id.clone()));
-        let mut nested_span = nested_trace_ctx.as_ref().map(|ctx| {
-            self.trace_bus.start_span(
-                ctx,
-                TraceActor::Tool,
-                "code_mode_nested_tool_started",
-                serde_json::json!({
-                    "tool_name": tool_name.clone(),
-                    "outer_tool_call_id": self.outer_tool_call_id.clone(),
-                    "provider": self.provider.clone(),
-                    "model": self.model.clone(),
-                    "args_preview": AgentContext::truncate_chars(&args.to_string(), 500),
-                    "remaining_steps": self.remaining_steps,
+        let outcome = self
+            .tool_invoker
+            .invoke(ToolInvocationRequest {
+                tool_name: &tool_name,
+                args: args.clone(),
+                timeout: Duration::from_secs(120),
+                trace_ctx: self.iteration_trace_ctx.clone(),
+                context_parent_span_id: self.parent_span_id.clone(),
+                span: Some(ToolInvocationSpanConfig {
+                    actor: TraceActor::Tool,
+                    start_name: "code_mode_nested_tool_started",
+                    start_attrs: serde_json::json!({
+                        "tool_name": tool_name.clone(),
+                        "outer_tool_call_id": self.outer_tool_call_id.clone(),
+                        "provider": self.provider.clone(),
+                        "model": self.model.clone(),
+                        "args_preview": AgentContext::truncate_chars(&args.to_string(), 500),
+                        "remaining_steps": self.remaining_steps,
+                    }),
+                    end_names: ToolInvocationEndNames {
+                        success: "code_mode_nested_tool_finished",
+                        error: "code_mode_nested_tool_failed",
+                        timeout: "code_mode_nested_tool_timed_out",
+                        cancelled: "code_mode_nested_tool_cancelled",
+                    },
+                    end_attrs: serde_json::json!({
+                        "tool_name": tool_name.clone(),
+                        "outer_tool_call_id": self.outer_tool_call_id.clone(),
+                        "provider": self.provider.clone(),
+                        "model": self.model.clone(),
+                    }),
                 }),
-            )
-        });
-
-        let nested_ctx = self
-            .prepare_tool_context(
-                nested_trace_ctx.as_ref(),
-                nested_span.as_ref().map(|span| span.span_id().to_string()),
-            )
+            })
             .await;
 
-        let (result, is_error, stopped, trace_status, end_name) = {
-            let tool = self
-                .current_tools
-                .iter()
-                .find(|tool| tool.name() == tool_name)
-                .ok_or_else(|| {
-                    ToolError::ExecutionFailed(format!("Tool not found: {tool_name}"))
-                })?;
-
-            tokio::select! {
-                exec_res = tokio::time::timeout(
-                    Duration::from_secs(120),
-                    tool.execute(args.clone(), &nested_ctx)
-                ) => {
-                    match exec_res {
-                        Ok(Ok(res)) => (res, false, false, TraceStatus::Ok, "code_mode_nested_tool_finished"),
-                        Ok(Err(err)) => (format!("Tool error: {}", err), true, false, TraceStatus::Error, "code_mode_nested_tool_failed"),
-                        Err(err) => (format!("Timeout executing {}: {}", tool_name, err), true, false, TraceStatus::TimedOut, "code_mode_nested_tool_timed_out"),
-                    }
-                }
-                _ = self.cancel_token.notified() => {
-                    ("Tool execution interrupted by user.".to_string(), true, true, TraceStatus::Cancelled, "code_mode_nested_tool_cancelled")
-                }
-            }
-        };
-
-        if let Some(span) = nested_span.take() {
-            span.finish(
-                end_name,
-                trace_status,
-                Some(AgentContext::truncate_chars(&result, 240)),
-                serde_json::json!({
-                    "tool_name": tool_name.clone(),
-                    "outer_tool_call_id": self.outer_tool_call_id.clone(),
-                    "provider": self.provider.clone(),
-                    "model": self.model.clone(),
-                    "result_preview": AgentContext::truncate_chars(&result, 500),
-                    "result_size_chars": result.chars().count(),
-                }),
-            );
+        if let Some(signal) =
+            self.tool_invoker
+                .record_action_outcome(&tool_name, &args, outcome.is_error)
+        {
+            return Err(ToolError::ExecutionFailed(signal.message().to_string()));
         }
 
-        if let Some(message) = self.record_autopilot_action_outcome(&tool_name, &args, is_error) {
-            return Err(ToolError::ExecutionFailed(message));
+        if outcome.stopped || outcome.is_error {
+            return Err(ToolError::ExecutionFailed(outcome.result));
         }
 
-        if stopped || is_error {
-            return Err(ToolError::ExecutionFailed(result));
-        }
-
-        Ok(result)
-    }
-
-    async fn prepare_tool_context(
-        &self,
-        trace_ctx: Option<&TraceContext>,
-        parent_span_id: Option<String>,
-    ) -> ToolContext {
-        let mut ctx = ToolContext::new(self.session_id.clone(), self.reply_to.clone());
-        ctx.visible_tools = self.visible_tools.clone();
-        ctx.skill_budget.remaining_steps = Some(self.remaining_steps);
-        ctx.skill_budget.remaining_timeout_sec = self.remaining_session_timeout_sec();
-        if let Some(trace_ctx) = trace_ctx {
-            ctx.trace = Some(ToolTraceContext {
-                trace_id: trace_ctx.trace_id.clone(),
-                run_id: trace_ctx.run_id.clone(),
-                root_session_id: trace_ctx.root_session_id.clone(),
-                task_id: trace_ctx.task_id.clone(),
-                turn_id: trace_ctx.turn_id.clone(),
-                iteration: trace_ctx.iteration,
-                parent_span_id,
-            });
-        }
-        for ext in &self.extensions {
-            ctx = ext.enrich_tool_context(ctx).await;
-        }
-        ctx
-    }
-
-    fn remaining_session_timeout_sec(&self) -> Option<u64> {
-        self.session_deadline.map(|deadline| {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            remaining.as_secs().max(1)
-        })
-    }
-
-    fn autopilot_denial_for_call(&self, call_name: &str, call_args: &Value) -> Option<String> {
-        if !self.is_autopilot {
-            return None;
-        }
-
-        let tool_has_effects = self
-            .current_tools
-            .iter()
-            .find(|tool| tool.name() == call_name)
-            .map(|tool| tool.has_side_effects())
-            .unwrap_or(true);
-        if !tool_has_effects {
-            return None;
-        }
-
-        if self.todos_path.exists() {
-            return None;
-        }
-
-        let is_creating_todos = (call_name == "write_file" || call_name == "execute_bash")
-            && call_args.to_string().contains("TODOS.md");
-        if is_creating_todos {
-            return None;
-        }
-
-        Some(
-            "[System Error] Action Denied. Autopilot 模式下必须先创建并规划 TODOS.md。".to_string(),
-        )
-    }
-
-    fn record_autopilot_action_outcome(
-        &self,
-        call_name: &str,
-        call_args: &Value,
-        is_error: bool,
-    ) -> Option<String> {
-        if !self.is_autopilot {
-            return None;
-        }
-
-        let mut guard_state = self
-            .execution_guard_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard_state
-            .record_action_outcome(call_name, call_args, is_error)
-            .map(|signal| signal.message().to_string())
+        Ok(outcome.result)
     }
 }
