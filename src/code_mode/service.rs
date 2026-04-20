@@ -9,8 +9,10 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
-use super::cell::{ActiveCellHandle, CellStatus};
-use super::driver::{CellDriver, CellDriverControl, DriverUpdate, DriverUpdateBatch};
+use super::cell::{ActiveCellHandle, CellSnapshot};
+use super::driver::{
+    CellDriver, CellDriverControl, DriverBoundary, DriverEventBatch, DriverUpdate,
+};
 use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 use super::runtime;
 use crate::trace::TraceStatus;
@@ -143,7 +145,7 @@ struct BatchPublicationMetadata {
 }
 
 impl BatchPublicationMetadata {
-    fn from_batch(batch: &DriverUpdateBatch) -> Self {
+    fn from_batch(batch: &DriverEventBatch) -> Self {
         let mut metadata = Self::default();
 
         for event in &batch.events {
@@ -290,7 +292,7 @@ impl CodeModeService {
             }
 
             if active_cell.is_terminal() {
-                let summary = Self::build_exec_result_from_cell(active_cell, None, None);
+                let summary = active_cell.snapshot().to_exec_result(None, None);
                 session.active_cell = None;
                 session.host_handle = None;
                 return Ok(summary);
@@ -353,11 +355,13 @@ impl CodeModeService {
     {
         let mut initial_summary_tx = Some(initial_summary_tx);
         let mut publication_tracker = PublicationTracker::new(auto_flush_ms);
-        let mut final_trace_status = TraceStatus::Ok;
+        let mut final_trace_status: Option<TraceStatus> = None;
         let mut final_trace_summary: Option<String> = None;
         let mut final_trace_attrs = serde_json::json!({
             "cell_id": cell_id.clone(),
         });
+        let _ = final_trace_status.is_none();
+        let _ = final_trace_summary.is_none();
 
         loop {
             let driver_update = {
@@ -368,93 +372,102 @@ impl CodeModeService {
             };
 
             match driver_update {
-                Ok(DriverUpdate::Batch(batch)) => {
-                    let batch_metadata = BatchPublicationMetadata::from_batch(&batch);
+                Ok(update) => {
+                    if matches!(update.boundary, DriverBoundary::Idle) {
+                        if !publication_tracker.should_auto_flush_now() {
+                            continue;
+                        }
+
+                        match self
+                            .peek_cell_summary(
+                                &session_id,
+                                &cell_id,
+                                Some(ExecProgressKind::AutoFlush),
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(summary) => {
+                                publication_tracker.mark_published();
+                                if let Err(err) = self
+                                    .publish_summary_update(
+                                        &session_id,
+                                        &cell_id,
+                                        &host_handle,
+                                        &summary,
+                                    )
+                                    .await
+                                {
+                                    final_trace_status =
+                                        Some(Self::trace_status_from_host_error(&err));
+                                    final_trace_summary = Some(err.to_string());
+                                    final_trace_attrs = serde_json::json!({
+                                        "cell_id": cell_id.clone(),
+                                        "error": err.to_string(),
+                                    });
+                                    if let Some(tx) = initial_summary_tx.take() {
+                                        let _ = tx.send(Err(err));
+                                    }
+                                    break;
+                                }
+                                if let Some(tx) = initial_summary_tx.take() {
+                                    let _ = tx.send(Ok(summary));
+                                }
+                            }
+                            Err(err) => {
+                                final_trace_status = Some(Self::trace_status_from_host_error(&err));
+                                final_trace_summary = Some(err.to_string());
+                                final_trace_attrs = serde_json::json!({
+                                    "cell_id": cell_id.clone(),
+                                    "error": err.to_string(),
+                                });
+                                if let Some(tx) = initial_summary_tx.take() {
+                                    let _ = tx.send(Err(err));
+                                }
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+
+                    let batch_metadata = BatchPublicationMetadata::from_batch(&update.batch);
                     publication_tracker.observe_batch(&batch_metadata);
 
-                    match self
-                        .update_session_from_batch(&session_id, &cell_id, batch)
+                    let snapshot = match self
+                        .record_driver_update_in_session(&session_id, &cell_id, &update)
                         .await
                     {
-                        Ok(disposition) => {
-                            let publication = if disposition == CellDisposition::Terminal {
-                                match self
-                                    .peek_cell_summary(&session_id, &cell_id, None, None)
-                                    .await
-                                {
-                                    Ok(summary) => Some(summary),
-                                    Err(err) => {
-                                        final_trace_status =
-                                            Self::trace_status_from_host_error(&err);
-                                        final_trace_summary = Some(err.to_string());
-                                        final_trace_attrs = serde_json::json!({
-                                            "cell_id": cell_id.clone(),
-                                            "error": err.to_string(),
-                                        });
-                                        if let Some(tx) = initial_summary_tx.take() {
-                                            let _ = tx.send(Err(err));
-                                        }
-                                        break;
-                                    }
-                                }
-                            } else if let Some(flush_value) =
+                        Ok(snapshot) => snapshot,
+                        Err(err) => {
+                            final_trace_status = Some(Self::trace_status_from_host_error(&err));
+                            final_trace_summary = Some(err.to_string());
+                            final_trace_attrs = serde_json::json!({
+                                "cell_id": cell_id.clone(),
+                                "error": err.to_string(),
+                            });
+                            if let Some(tx) = initial_summary_tx.take() {
+                                let _ = tx.send(Err(err));
+                            }
+                            break;
+                        }
+                    };
+
+                    match update.boundary {
+                        DriverBoundary::Progress => {
+                            let publication = if let Some(flush_value) =
                                 batch_metadata.explicit_flush_value.clone()
                             {
-                                match self
-                                    .peek_cell_summary(
-                                        &session_id,
-                                        &cell_id,
-                                        Some(ExecProgressKind::ExplicitFlush),
-                                        flush_value,
-                                    )
-                                    .await
-                                {
-                                    Ok(summary) => {
-                                        publication_tracker.mark_published();
-                                        Some(summary)
-                                    }
-                                    Err(err) => {
-                                        final_trace_status =
-                                            Self::trace_status_from_host_error(&err);
-                                        final_trace_summary = Some(err.to_string());
-                                        final_trace_attrs = serde_json::json!({
-                                            "cell_id": cell_id.clone(),
-                                            "error": err.to_string(),
-                                        });
-                                        if let Some(tx) = initial_summary_tx.take() {
-                                            let _ = tx.send(Err(err));
-                                        }
-                                        break;
-                                    }
-                                }
+                                publication_tracker.mark_published();
+                                Some(snapshot.to_exec_result(
+                                    Some(ExecProgressKind::ExplicitFlush),
+                                    flush_value,
+                                ))
                             } else if publication_tracker.should_auto_flush_now() {
-                                match self
-                                    .peek_cell_summary(
-                                        &session_id,
-                                        &cell_id,
-                                        Some(ExecProgressKind::AutoFlush),
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    Ok(summary) => {
-                                        publication_tracker.mark_published();
-                                        Some(summary)
-                                    }
-                                    Err(err) => {
-                                        final_trace_status =
-                                            Self::trace_status_from_host_error(&err);
-                                        final_trace_summary = Some(err.to_string());
-                                        final_trace_attrs = serde_json::json!({
-                                            "cell_id": cell_id.clone(),
-                                            "error": err.to_string(),
-                                        });
-                                        if let Some(tx) = initial_summary_tx.take() {
-                                            let _ = tx.send(Err(err));
-                                        }
-                                        break;
-                                    }
-                                }
+                                publication_tracker.mark_published();
+                                Some(
+                                    snapshot
+                                        .to_exec_result(Some(ExecProgressKind::AutoFlush), None),
+                                )
                             } else {
                                 None
                             };
@@ -469,7 +482,8 @@ impl CodeModeService {
                                     )
                                     .await
                                 {
-                                    final_trace_status = Self::trace_status_from_host_error(&err);
+                                    final_trace_status =
+                                        Some(Self::trace_status_from_host_error(&err));
                                     final_trace_summary = Some(err.to_string());
                                     final_trace_attrs = serde_json::json!({
                                         "cell_id": cell_id.clone(),
@@ -481,78 +495,29 @@ impl CodeModeService {
                                     break;
                                 }
                                 if let Some(tx) = initial_summary_tx.take() {
-                                    let _ = tx.send(Ok(summary.clone()));
-                                }
-                                if disposition == CellDisposition::Terminal {
-                                    final_trace_status = Self::trace_status_from_summary(&summary);
-                                    final_trace_summary = Self::trace_summary_from_result(&summary);
-                                    final_trace_attrs = serde_json::json!({
-                                        "cell_id": cell_id.clone(),
-                                        "lifecycle": summary.lifecycle.clone(),
-                                        "nested_tool_calls": summary.nested_tool_calls,
-                                    });
+                                    let _ = tx.send(Ok(summary));
                                 }
                             }
-
-                            if disposition == CellDisposition::Terminal {
+                        }
+                        DriverBoundary::PendingTool(request) => {
+                            if snapshot.is_terminal() {
+                                let err = crate::tools::ToolError::ExecutionFailed(
+                                    "Code mode entered a terminal state while dispatching a nested tool."
+                                        .to_string(),
+                                );
+                                final_trace_status = Some(TraceStatus::Error);
+                                final_trace_summary = Some(err.to_string());
+                                final_trace_attrs = serde_json::json!({
+                                    "cell_id": cell_id.clone(),
+                                    "error": err.to_string(),
+                                });
+                                if let Some(tx) = initial_summary_tx.take() {
+                                    let _ = tx.send(Err(err));
+                                }
                                 break;
                             }
-                        }
-                        Err(err) => {
-                            final_trace_status = Self::trace_status_from_host_error(&err);
-                            final_trace_summary = Some(err.to_string());
-                            final_trace_attrs = serde_json::json!({
-                                "cell_id": cell_id.clone(),
-                                "error": err.to_string(),
-                            });
-                            if let Some(tx) = initial_summary_tx.take() {
-                                let _ = tx.send(Err(err));
-                            }
-                            break;
-                        }
-                    }
-                }
-                Ok(DriverUpdate::PendingTool { batch, request }) => {
-                    match self
-                        .update_session_from_batch(&session_id, &cell_id, batch)
-                        .await
-                    {
-                        Ok(CellDisposition::Terminal) => {
-                            let err = crate::tools::ToolError::ExecutionFailed(
-                                "Code mode entered a terminal state while dispatching a nested tool."
-                                    .to_string(),
-                            );
-                            final_trace_status = TraceStatus::Error;
-                            final_trace_summary = Some(err.to_string());
-                            final_trace_attrs = serde_json::json!({
-                                "cell_id": cell_id.clone(),
-                                "error": err.to_string(),
-                            });
-                            if let Some(tx) = initial_summary_tx.take() {
-                                let _ = tx.send(Err(err));
-                            }
-                            break;
-                        }
-                        Ok(CellDisposition::Continue) => {
-                            let current_summary = match self
-                                .peek_cell_summary(&session_id, &cell_id, None, None)
-                                .await
-                            {
-                                Ok(summary) => summary,
-                                Err(err) => {
-                                    final_trace_status = Self::trace_status_from_host_error(&err);
-                                    final_trace_summary = Some(err.to_string());
-                                    final_trace_attrs = serde_json::json!({
-                                        "cell_id": cell_id.clone(),
-                                        "error": err.to_string(),
-                                    });
-                                    if let Some(tx) = initial_summary_tx.take() {
-                                        let _ = tx.send(Err(err));
-                                    }
-                                    break;
-                                }
-                            };
 
+                            let current_summary = snapshot.to_exec_result(None, None);
                             if let Err(err) = self
                                 .publish_summary_update(
                                     &session_id,
@@ -562,7 +527,7 @@ impl CodeModeService {
                                 )
                                 .await
                             {
-                                final_trace_status = Self::trace_status_from_host_error(&err);
+                                final_trace_status = Some(Self::trace_status_from_host_error(&err));
                                 final_trace_summary = Some(err.to_string());
                                 final_trace_attrs = serde_json::json!({
                                     "cell_id": cell_id.clone(),
@@ -599,7 +564,7 @@ impl CodeModeService {
                                 driver.complete_pending_tool_call(&request, tool_result)
                             };
                             if let Err(err) = completion_result {
-                                final_trace_status = Self::trace_status_from_host_error(&err);
+                                final_trace_status = Some(Self::trace_status_from_host_error(&err));
                                 final_trace_summary = Some(err.to_string());
                                 final_trace_attrs = serde_json::json!({
                                     "cell_id": cell_id.clone(),
@@ -632,37 +597,8 @@ impl CodeModeService {
                                 break;
                             }
                         }
-                        Err(err) => {
-                            final_trace_status = Self::trace_status_from_host_error(&err);
-                            final_trace_summary = Some(err.to_string());
-                            final_trace_attrs = serde_json::json!({
-                                "cell_id": cell_id.clone(),
-                                "request_id": request.request_id.clone(),
-                                "error": err.to_string(),
-                            });
-                            if let Some(tx) = initial_summary_tx.take() {
-                                let _ = tx.send(Err(err));
-                            }
-                            break;
-                        }
-                    }
-                }
-                Ok(DriverUpdate::Idle) => {
-                    if !publication_tracker.should_auto_flush_now() {
-                        continue;
-                    }
-
-                    match self
-                        .peek_cell_summary(
-                            &session_id,
-                            &cell_id,
-                            Some(ExecProgressKind::AutoFlush),
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(summary) => {
-                            publication_tracker.mark_published();
+                        DriverBoundary::Terminal(_) => {
+                            let summary = snapshot.to_exec_result(None, None);
                             if let Err(err) = self
                                 .publish_summary_update(
                                     &session_id,
@@ -672,7 +608,7 @@ impl CodeModeService {
                                 )
                                 .await
                             {
-                                final_trace_status = Self::trace_status_from_host_error(&err);
+                                final_trace_status = Some(Self::trace_status_from_host_error(&err));
                                 final_trace_summary = Some(err.to_string());
                                 final_trace_attrs = serde_json::json!({
                                     "cell_id": cell_id.clone(),
@@ -684,25 +620,23 @@ impl CodeModeService {
                                 break;
                             }
                             if let Some(tx) = initial_summary_tx.take() {
-                                let _ = tx.send(Ok(summary));
+                                let _ = tx.send(Ok(summary.clone()));
                             }
-                        }
-                        Err(err) => {
-                            final_trace_status = Self::trace_status_from_host_error(&err);
-                            final_trace_summary = Some(err.to_string());
+
+                            final_trace_status = Some(Self::trace_status_from_summary(&summary));
+                            final_trace_summary = Self::trace_summary_from_result(&summary);
                             final_trace_attrs = serde_json::json!({
                                 "cell_id": cell_id.clone(),
-                                "error": err.to_string(),
+                                "lifecycle": summary.lifecycle.clone(),
+                                "nested_tool_calls": summary.nested_tool_calls,
                             });
-                            if let Some(tx) = initial_summary_tx.take() {
-                                let _ = tx.send(Err(err));
-                            }
                             break;
                         }
+                        DriverBoundary::Idle => {}
                     }
                 }
                 Err(err) => {
-                    final_trace_status = Self::trace_status_from_host_error(&err);
+                    final_trace_status = Some(Self::trace_status_from_host_error(&err));
                     final_trace_summary = Some(err.to_string());
                     final_trace_attrs = serde_json::json!({
                         "cell_id": cell_id.clone(),
@@ -721,7 +655,7 @@ impl CodeModeService {
                                     &summary,
                                 )
                                 .await;
-                            final_trace_status = Self::trace_status_from_summary(&summary);
+                            final_trace_status = Some(Self::trace_status_from_summary(&summary));
                             final_trace_summary = Self::trace_summary_from_result(&summary);
                             final_trace_attrs = serde_json::json!({
                                 "cell_id": cell_id.clone(),
@@ -748,19 +682,19 @@ impl CodeModeService {
         if let Some(span) = cell_span.take() {
             span.finish(
                 "code_mode_cell_finished",
-                final_trace_status,
+                final_trace_status.unwrap_or(TraceStatus::Ok),
                 final_trace_summary,
                 final_trace_attrs,
             );
         }
     }
 
-    async fn update_session_from_batch(
+    async fn record_driver_update_in_session(
         &self,
         session_id: &str,
         cell_id: &str,
-        batch: DriverUpdateBatch,
-    ) -> Result<CellDisposition, crate::tools::ToolError> {
+        update: &DriverUpdate,
+    ) -> Result<CellSnapshot, crate::tools::ToolError> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(session_id).ok_or_else(|| {
             crate::tools::ToolError::ExecutionFailed("Session disappeared during wait.".to_string())
@@ -778,62 +712,13 @@ impl CodeModeService {
                 cell_id
             )));
         }
-        active_cell.update_from_batch(&batch);
+        active_cell.record_driver_update(update);
 
-        if let Some(ref terminal) = batch.terminal_result {
-            session.stored_values = terminal.1.clone();
+        if let DriverBoundary::Terminal(terminal_result) = &update.boundary {
+            session.stored_values = terminal_result.stored_values.clone();
         }
 
-        if active_cell.is_terminal() {
-            Ok(CellDisposition::Terminal)
-        } else {
-            Ok(CellDisposition::Continue)
-        }
-    }
-
-    fn build_exec_result_from_cell(
-        cell: &ActiveCellHandle,
-        progress_kind: Option<ExecProgressKind>,
-        flush_value: Option<Value>,
-    ) -> ExecRunResult {
-        let snapshot = cell.state_snapshot();
-        let render = snapshot.build_render_state();
-        let nested_tool_calls = cell.nested_tool_call_count();
-        let lifecycle = match cell.status {
-            CellStatus::Completed => ExecLifecycle::Completed,
-            CellStatus::Failed => ExecLifecycle::Failed,
-            CellStatus::Cancelled => ExecLifecycle::Cancelled,
-            _ => ExecLifecycle::Running,
-        };
-        let waiting_on_timer_ms = match cell.status {
-            CellStatus::WaitingOnJsTimer { next_due_in_ms } => next_due_in_ms,
-            _ => None,
-        };
-        let waiting_on_tool_request_id = match &cell.status {
-            CellStatus::WaitingOnTool { request_id } => Some(request_id.clone()),
-            _ => None,
-        };
-
-        ExecRunResult {
-            cell_id: cell.cell_id.clone(),
-            output_text: render.output_text,
-            return_value: render.return_value,
-            flush_value: if progress_kind == Some(ExecProgressKind::ExplicitFlush) {
-                flush_value
-            } else {
-                None
-            },
-            lifecycle,
-            progress_kind: progress_kind.clone(),
-            flushed: progress_kind.is_some(),
-            waiting_on_tool_request_id,
-            waiting_on_timer_ms,
-            notifications: render.notifications,
-            failure: render.failure,
-            cancellation: render.cancellation,
-            nested_tool_calls,
-            truncated: false,
-        }
+        Ok(active_cell.snapshot())
     }
 
     async fn peek_cell_summary(
@@ -861,11 +746,9 @@ impl CodeModeService {
             )));
         }
 
-        Ok(Self::build_exec_result_from_cell(
-            active_cell,
-            progress_kind,
-            flush_value,
-        ))
+        Ok(active_cell
+            .snapshot()
+            .to_exec_result(progress_kind, flush_value))
     }
 
     async fn read_cell_summary(
@@ -896,9 +779,9 @@ impl CodeModeService {
             active_cell
                 .last_publication
                 .clone()
-                .unwrap_or_else(|| Self::build_exec_result_from_cell(active_cell, None, None))
+                .unwrap_or_else(|| active_cell.snapshot().to_exec_result(None, None))
         } else {
-            Self::build_exec_result_from_cell(active_cell, None, None)
+            active_cell.snapshot().to_exec_result(None, None)
         };
         if active_cell.is_terminal() {
             session.active_cell = None;
@@ -999,36 +882,9 @@ impl CodeModeService {
             return None;
         }
 
-        let snapshot = active_cell.state_snapshot();
-        let render = snapshot.build_render_state();
-        let nested_tool_calls = active_cell.nested_tool_call_count();
-
-        active_cell.status = CellStatus::Failed;
-        active_cell.last_summary = Some(ExecRunResult {
-            cell_id: active_cell.cell_id.clone(),
-            output_text: render.output_text,
-            return_value: render.return_value,
-            flush_value: None,
-            lifecycle: ExecLifecycle::Failed,
-            progress_kind: None,
-            flushed: false,
-            waiting_on_tool_request_id: None,
-            waiting_on_timer_ms: None,
-            notifications: render.notifications,
-            failure: Some(err.to_string()),
-            cancellation: None,
-            nested_tool_calls,
-            truncated: false,
-        });
-
-        Some(Self::build_exec_result_from_cell(active_cell, None, None))
+        active_cell.transition_to_failure(err.to_string());
+        Some(active_cell.snapshot().to_exec_result(None, None))
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CellDisposition {
-    Continue,
-    Terminal,
 }
 
 #[cfg(test)]

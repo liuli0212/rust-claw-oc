@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use self::timers::RecordedTimerCall;
 use self::value::StoredValue;
-use super::response::ExecRunResult;
+use super::protocol::RuntimeTerminalResult;
 use super::runtime::globals::{LOAD_FN, NOTIFY_FN, STORE_FN, TEXT_FN};
 
 pub mod callbacks;
@@ -45,7 +45,7 @@ pub fn run_cell<F>(
     invoke_tool: F,
     on_timer_calls_updated: impl Fn(Vec<RecordedTimerCall>) + Send + Sync + 'static,
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::code_mode::protocol::RuntimeEvent>,
-) -> Result<(ExecRunResult, HashMap<String, StoredValue>), crate::tools::ToolError>
+) -> Result<RuntimeTerminalResult, crate::tools::ToolError>
 where
     F: FnMut(String, String) -> Result<String, crate::tools::ToolError> + Send + 'static,
 {
@@ -62,7 +62,7 @@ where
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
 
         let RunCellRequest {
-            cell_id,
+            cell_id: _cell_id,
             code,
             visible_tools,
             stored_values,
@@ -347,34 +347,13 @@ where
         let runtime_error = payload.runtime_error;
         let cancellation_reason = payload.cancellation_reason;
 
-        let nested_tool_calls = *nested_tool_count.lock().unwrap();
         let stored_values = stored_values.lock().unwrap().clone();
-        let lifecycle = if runtime_error.is_some() {
-            super::response::ExecLifecycle::Failed
-        } else if cancellation_reason.is_some() {
-            super::response::ExecLifecycle::Cancelled
-        } else {
-            super::response::ExecLifecycle::Completed
-        };
-        Ok((
-            ExecRunResult {
-                cell_id,
-                output_text: String::new(),
-                return_value,
-                flush_value: None,
-                lifecycle,
-                progress_kind: None,
-                flushed: false,
-                waiting_on_tool_request_id: None,
-                waiting_on_timer_ms: None,
-                notifications: Vec::new(),
-                failure: runtime_error,
-                cancellation: cancellation_reason,
-                nested_tool_calls,
-                truncated: false,
-            },
+        Ok(RuntimeTerminalResult {
+            return_value,
+            runtime_error,
+            cancellation_reason,
             stored_values,
-        ))
+        })
     })
 }
 

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::protocol::{RuntimeCellResult, RuntimeEvent, ToolCallRequestEvent};
+use super::protocol::{RuntimeEvent, RuntimeTerminalResult, ToolCallRequestEvent};
 use super::runtime;
 
 pub struct CellDriver {
@@ -50,35 +50,58 @@ impl std::fmt::Debug for CellDriver {
 }
 
 #[derive(Debug)]
-pub struct DriverUpdateBatch {
-    pub terminal_result: Option<RuntimeCellResult>,
+pub struct DriverEventBatch {
     pub events: Vec<RuntimeEvent>,
 }
 
-impl DriverUpdateBatch {
-    pub fn progress(events: Vec<RuntimeEvent>) -> Self {
-        Self {
-            terminal_result: None,
-            events,
-        }
-    }
-
-    pub fn terminal(runtime_result: RuntimeCellResult, events: Vec<RuntimeEvent>) -> Self {
-        Self {
-            terminal_result: Some(runtime_result),
-            events,
-        }
+impl DriverEventBatch {
+    pub fn new(events: Vec<RuntimeEvent>) -> Self {
+        Self { events }
     }
 }
 
 #[derive(Debug)]
-pub enum DriverUpdate {
-    Batch(DriverUpdateBatch),
-    PendingTool {
-        batch: DriverUpdateBatch,
-        request: ToolCallRequestEvent,
-    },
+pub enum DriverBoundary {
+    Progress,
+    PendingTool(ToolCallRequestEvent),
+    Terminal(RuntimeTerminalResult),
     Idle,
+}
+
+#[derive(Debug)]
+pub struct DriverUpdate {
+    pub batch: DriverEventBatch,
+    pub boundary: DriverBoundary,
+}
+
+impl DriverUpdate {
+    fn progress(events: Vec<RuntimeEvent>) -> Self {
+        Self {
+            batch: DriverEventBatch::new(events),
+            boundary: DriverBoundary::Progress,
+        }
+    }
+
+    fn pending_tool(events: Vec<RuntimeEvent>, request: ToolCallRequestEvent) -> Self {
+        Self {
+            batch: DriverEventBatch::new(events),
+            boundary: DriverBoundary::PendingTool(request),
+        }
+    }
+
+    fn terminal(events: Vec<RuntimeEvent>, terminal_result: RuntimeTerminalResult) -> Self {
+        Self {
+            batch: DriverEventBatch::new(events),
+            boundary: DriverBoundary::Terminal(terminal_result),
+        }
+    }
+
+    fn idle() -> Self {
+        Self {
+            batch: DriverEventBatch::new(Vec::new()),
+            boundary: DriverBoundary::Idle,
+        }
+    }
 }
 
 impl CellDriver {
@@ -213,7 +236,7 @@ impl CellDriver {
             let next_event = if let Some(timeout) = idle_timeout {
                 tokio::select! {
                     event = self.event_rx.recv() => event,
-                    _ = tokio::time::sleep(timeout) => return Ok(DriverUpdate::Idle),
+                    _ = tokio::time::sleep(timeout) => return Ok(DriverUpdate::idle()),
                 }
             } else {
                 self.event_rx.recv().await
@@ -267,23 +290,21 @@ impl CellDriver {
         match event {
             RuntimeEvent::ToolCallRequested(req) => {
                 events.push(RuntimeEvent::ToolCallRequested(req.clone()));
-                Ok(Some(DriverUpdate::PendingTool {
-                    batch: DriverUpdateBatch::progress(std::mem::take(events)),
-                    request: req,
-                }))
+                Ok(Some(DriverUpdate::pending_tool(
+                    std::mem::take(events),
+                    req,
+                )))
             }
             RuntimeEvent::WorkerCompleted(result) => match result {
-                Ok(cell_result) => Ok(Some(DriverUpdate::Batch(DriverUpdateBatch::terminal(
-                    cell_result,
+                Ok(terminal_result) => Ok(Some(DriverUpdate::terminal(
                     std::mem::take(events),
-                )))),
+                    terminal_result,
+                ))),
                 Err(err_msg) => Err(crate::tools::ToolError::ExecutionFailed(err_msg)),
             },
             RuntimeEvent::Flush { .. } | RuntimeEvent::WaitingForTimer { .. } => {
                 events.push(event);
-                Ok(Some(DriverUpdate::Batch(DriverUpdateBatch::progress(
-                    std::mem::take(events),
-                ))))
+                Ok(Some(DriverUpdate::progress(std::mem::take(events))))
             }
             event => {
                 events.push(event);

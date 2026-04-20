@@ -2,11 +2,16 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::response::ExecRunResult;
 use super::runtime;
 use super::runtime::value::StoredValue;
 
-pub type RuntimeCellResult = (ExecRunResult, HashMap<String, StoredValue>);
+#[derive(Debug, Clone)]
+pub struct RuntimeTerminalResult {
+    pub return_value: Option<Value>,
+    pub runtime_error: Option<String>,
+    pub cancellation_reason: Option<String>,
+    pub stored_values: HashMap<String, StoredValue>,
+}
 
 #[derive(Debug)]
 pub enum CellCommand {
@@ -46,19 +51,7 @@ pub enum RuntimeEvent {
         request_id: String,
         ok: bool,
     },
-    Completed {
-        seq: u64,
-        return_value: Option<Value>,
-    },
-    Failed {
-        seq: u64,
-        error: String,
-    },
-    Cancelled {
-        seq: u64,
-        reason: String,
-    },
-    WorkerCompleted(Result<RuntimeCellResult, String>),
+    WorkerCompleted(Result<RuntimeTerminalResult, String>),
     TimerRegistrationChanged {
         seq: u64,
         timer_calls: Vec<runtime::timers::RecordedTimerCall>,
@@ -73,9 +66,6 @@ impl RuntimeEvent {
             | Self::Flush { seq, .. }
             | Self::WaitingForTimer { seq, .. }
             | Self::ToolCallResolved { seq, .. }
-            | Self::Completed { seq, .. }
-            | Self::Failed { seq, .. }
-            | Self::Cancelled { seq, .. }
             | Self::TimerRegistrationChanged { seq, .. } => Some(*seq),
             Self::ToolCallRequested(request) => Some(request.seq),
             Self::WorkerCompleted(_) => None,

@@ -1,105 +1,87 @@
-use super::protocol::{max_event_seq, RuntimeEvent};
-use super::response::{CellRenderState, ExecLifecycle, ExecRunResult};
+use serde_json::Value;
+
+use super::driver::{DriverBoundary, DriverUpdate};
+use super::protocol::{max_event_seq, RuntimeEvent, RuntimeTerminalResult};
+use super::response::{CellRenderState, ExecLifecycle, ExecProgressKind, ExecRunResult};
 
 const RECENT_EVENT_BUDGET_CHARS: usize = 8_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CellStatus {
-    Starting,
+pub enum CellWaitState {
+    NestedTool { request_id: String },
+    Timer { next_due_in_ms: Option<u64> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellPhase {
     Running,
-    WaitingOnTool { request_id: String },
-    WaitingOnJsTimer { next_due_in_ms: Option<u64> },
-    Flushed,
+    Waiting(CellWaitState),
     Completed,
     Failed,
     Cancelled,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CellTerminalState {
+    pub return_value: Option<Value>,
+    pub failure: Option<String>,
+    pub cancellation: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActiveCellHandle {
     pub cell_id: String,
-    pub status: CellStatus,
+    pub phase: CellPhase,
     pub events: Vec<RuntimeEvent>,
+    pub terminal_state: Option<CellTerminalState>,
     pub last_publication: Option<ExecRunResult>,
-    pub last_summary: Option<ExecRunResult>,
 }
 
 impl ActiveCellHandle {
     pub fn new(cell_id: String) -> Self {
         Self {
             cell_id,
-            status: CellStatus::Starting,
+            phase: CellPhase::Running,
             events: Vec::new(),
+            terminal_state: None,
             last_publication: None,
-            last_summary: None,
         }
     }
 
-    pub fn state_snapshot(&self) -> CellStateSnapshot {
+    pub fn snapshot(&self) -> CellSnapshot {
         let max_seq = max_event_seq(&self.events);
         let recent_events = self.recent_visible_events();
 
-        CellStateSnapshot {
+        CellSnapshot {
             cell_id: self.cell_id.clone(),
-            status: self.status.clone(),
-            last_summary: self.last_summary.clone(),
+            phase: self.phase.clone(),
+            terminal_state: self.terminal_state.clone(),
             max_seq,
             recent_events,
+            nested_tool_calls: self.nested_tool_call_count(),
         }
     }
 
-    pub fn update_from_batch(&mut self, batch: &crate::code_mode::driver::DriverUpdateBatch) {
-        for event in &batch.events {
-            // Update status from events
-            match event {
-                RuntimeEvent::ToolCallRequested(req) => {
-                    self.status = CellStatus::WaitingOnTool {
-                        request_id: req.request_id.clone(),
-                    };
-                }
-                RuntimeEvent::ToolCallResolved { .. } => {
-                    self.status = CellStatus::Running;
-                }
-                RuntimeEvent::WaitingForTimer {
-                    resume_after_ms, ..
-                } => {
-                    self.status = CellStatus::WaitingOnJsTimer {
-                        next_due_in_ms: *resume_after_ms,
-                    };
-                }
-                RuntimeEvent::Flush { .. } => {
-                    self.status = CellStatus::Flushed;
-                }
-                RuntimeEvent::Completed { .. } => {
-                    self.status = CellStatus::Completed;
-                }
-                RuntimeEvent::Failed { .. } => {
-                    self.status = CellStatus::Failed;
-                }
-                RuntimeEvent::Cancelled { .. } => {
-                    self.status = CellStatus::Cancelled;
-                }
-                _ => {}
-            }
-            self.events.push(event.clone());
+    pub fn record_driver_update(&mut self, update: &DriverUpdate) {
+        self.record_event_batch(&update.batch.events);
+        if let DriverBoundary::Terminal(result) = &update.boundary {
+            self.record_terminal_result(result);
         }
-        if let Some(terminal) = &batch.terminal_result {
-            self.last_summary = Some(terminal.0.clone());
-            if let Some(summary) = self.last_summary.as_ref() {
-                self.status = match &summary.lifecycle {
-                    ExecLifecycle::Running => self.status.clone(),
-                    ExecLifecycle::Completed => CellStatus::Completed,
-                    ExecLifecycle::Failed => CellStatus::Failed,
-                    ExecLifecycle::Cancelled => CellStatus::Cancelled,
-                };
-            }
-        }
+    }
+
+    pub fn transition_to_failure(&mut self, error: String) {
+        self.phase = CellPhase::Failed;
+        self.terminal_state = Some(CellTerminalState {
+            return_value: None,
+            failure: Some(error),
+            cancellation: None,
+        });
     }
 
     pub fn is_terminal(&self) -> bool {
         matches!(
-            self.status,
-            CellStatus::Completed | CellStatus::Failed | CellStatus::Cancelled
+            self.phase,
+            CellPhase::Completed | CellPhase::Failed | CellPhase::Cancelled
         )
     }
 
@@ -107,7 +89,7 @@ impl ActiveCellHandle {
     pub fn nested_tool_call_count(&self) -> usize {
         self.events
             .iter()
-            .filter(|e| matches!(e, RuntimeEvent::ToolCallRequested(_)))
+            .filter(|event| matches!(event, RuntimeEvent::ToolCallRequested(_)))
             .count()
     }
 
@@ -133,39 +115,149 @@ impl ActiveCellHandle {
         result.reverse();
         result
     }
+
+    fn record_event_batch(&mut self, events: &[RuntimeEvent]) {
+        for event in events {
+            self.update_phase_from_event(event);
+            self.events.push(event.clone());
+        }
+    }
+
+    fn update_phase_from_event(&mut self, event: &RuntimeEvent) {
+        match event {
+            RuntimeEvent::Text { .. }
+            | RuntimeEvent::Notification { .. }
+            | RuntimeEvent::Flush { .. } => {
+                if matches!(self.phase, CellPhase::Waiting(_)) {
+                    self.phase = CellPhase::Running;
+                }
+            }
+            RuntimeEvent::ToolCallRequested(request) => {
+                self.phase = CellPhase::Waiting(CellWaitState::NestedTool {
+                    request_id: request.request_id.clone(),
+                });
+            }
+            RuntimeEvent::ToolCallResolved { .. } => {
+                self.phase = CellPhase::Running;
+            }
+            RuntimeEvent::WaitingForTimer {
+                resume_after_ms, ..
+            } => {
+                self.phase = CellPhase::Waiting(CellWaitState::Timer {
+                    next_due_in_ms: *resume_after_ms,
+                });
+            }
+            RuntimeEvent::TimerRegistrationChanged { .. } | RuntimeEvent::WorkerCompleted(_) => {}
+        }
+    }
+
+    fn record_terminal_result(&mut self, result: &RuntimeTerminalResult) {
+        self.phase = if result.runtime_error.is_some() {
+            CellPhase::Failed
+        } else if result.cancellation_reason.is_some() {
+            CellPhase::Cancelled
+        } else {
+            CellPhase::Completed
+        };
+        self.terminal_state = Some(CellTerminalState {
+            return_value: result.return_value.clone(),
+            failure: result.runtime_error.clone(),
+            cancellation: result.cancellation_reason.clone(),
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct CellStateSnapshot {
+pub struct CellSnapshot {
     pub cell_id: String,
-    pub status: CellStatus,
-    pub last_summary: Option<ExecRunResult>,
+    pub phase: CellPhase,
+    pub terminal_state: Option<CellTerminalState>,
     pub max_seq: u64,
     pub recent_events: Vec<RuntimeEvent>,
+    pub nested_tool_calls: usize,
 }
 
-impl CellStateSnapshot {
+impl CellSnapshot {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.phase,
+            CellPhase::Completed | CellPhase::Failed | CellPhase::Cancelled
+        )
+    }
+
+    pub fn lifecycle(&self) -> ExecLifecycle {
+        match self.phase {
+            CellPhase::Completed => ExecLifecycle::Completed,
+            CellPhase::Failed => ExecLifecycle::Failed,
+            CellPhase::Cancelled => ExecLifecycle::Cancelled,
+            CellPhase::Running | CellPhase::Waiting(_) => ExecLifecycle::Running,
+        }
+    }
+
+    pub fn waiting_on_tool_request_id(&self) -> Option<&str> {
+        match &self.phase {
+            CellPhase::Waiting(CellWaitState::NestedTool { request_id }) => Some(request_id),
+            _ => None,
+        }
+        .map(String::as_str)
+    }
+
+    pub fn waiting_on_timer_ms(&self) -> Option<u64> {
+        match &self.phase {
+            CellPhase::Waiting(CellWaitState::Timer { next_due_in_ms }) => *next_due_in_ms,
+            _ => None,
+        }
+    }
+
     pub fn build_render_state(&self) -> CellRenderState {
         let mut state = CellRenderState::from_events(&self.recent_events);
+        state.lifecycle = self.lifecycle();
+        state.waiting_on_tool_request_id = self.waiting_on_tool_request_id().map(ToOwned::to_owned);
+        state.waiting_on_timer_ms = self.waiting_on_timer_ms();
 
-        // If we have a terminal last_summary, it is the final authority on the execution state.
-        if let Some(summary) = &self.last_summary {
-            state.return_value = summary.return_value.clone();
-            state.flush_value = summary.flush_value.clone();
-            state.lifecycle = summary.lifecycle.clone();
-            state.progress_kind = summary.progress_kind.clone();
-            state.failure = summary.failure.clone();
-            state.cancellation = summary.cancellation.clone();
+        if let Some(terminal) = &self.terminal_state {
+            state.return_value = terminal.return_value.clone();
+            state.flush_value = None;
+            state.failure = terminal.failure.clone();
+            state.cancellation = terminal.cancellation.clone();
         }
 
         state
+    }
+
+    pub fn to_exec_result(
+        &self,
+        progress_kind: Option<ExecProgressKind>,
+        flush_value: Option<Value>,
+    ) -> ExecRunResult {
+        let render = self.build_render_state();
+
+        ExecRunResult {
+            cell_id: self.cell_id.clone(),
+            output_text: render.output_text,
+            return_value: render.return_value,
+            flush_value: if progress_kind == Some(ExecProgressKind::ExplicitFlush) {
+                flush_value
+            } else {
+                None
+            },
+            lifecycle: self.lifecycle(),
+            progress_kind: progress_kind.clone(),
+            flushed: progress_kind.is_some(),
+            waiting_on_tool_request_id: self.waiting_on_tool_request_id().map(str::to_owned),
+            waiting_on_timer_ms: self.waiting_on_timer_ms(),
+            notifications: render.notifications,
+            failure: render.failure,
+            cancellation: render.cancellation,
+            nested_tool_calls: self.nested_tool_calls,
+            truncated: false,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::code_mode::response::ExecProgressKind;
     use serde_json::json;
 
     #[test]
@@ -187,24 +279,8 @@ mod tests {
             seq: 4,
             value: Some(json!({"foo": "bar"})),
         });
-        cell.last_summary = Some(ExecRunResult {
-            cell_id: "test-cell".to_string(),
-            output_text: String::new(),
-            return_value: None,
-            flush_value: Some(json!({"foo": "bar"})),
-            lifecycle: ExecLifecycle::Running,
-            progress_kind: Some(ExecProgressKind::ExplicitFlush),
-            flushed: true,
-            waiting_on_tool_request_id: None,
-            waiting_on_timer_ms: None,
-            notifications: Vec::new(),
-            failure: None,
-            cancellation: None,
-            nested_tool_calls: 0,
-            truncated: false,
-        });
 
-        let snapshot = cell.state_snapshot();
+        let snapshot = cell.snapshot();
         assert_eq!(snapshot.cell_id, "test-cell");
         assert_eq!(snapshot.max_seq, 4);
 

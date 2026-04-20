@@ -1,4 +1,3 @@
-use super::cell::CellStatus;
 use super::protocol::RuntimeEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -107,25 +106,10 @@ impl CellRenderState {
                 RuntimeEvent::Flush { value, .. } => {
                     state.flush_value = value.clone();
                 }
-                RuntimeEvent::Completed { return_value, .. } => {
-                    state.return_value = return_value.clone();
-                    state.flush_value = None;
-                    state.lifecycle = ExecLifecycle::Completed;
-                }
-                RuntimeEvent::Failed { error, .. } => {
-                    state.lifecycle = ExecLifecycle::Failed;
-                    state.failure = Some(error.clone());
-                    state.cancellation = None;
-                }
-                RuntimeEvent::Cancelled { reason, .. } => {
-                    state.lifecycle = ExecLifecycle::Cancelled;
-                    state.cancellation = Some(reason.clone());
-                    state.failure = None;
-                }
                 RuntimeEvent::ToolCallRequested(_)
                 | RuntimeEvent::ToolCallResolved { .. }
-                | RuntimeEvent::WaitingForTimer { .. } => {}
-                RuntimeEvent::WorkerCompleted(_)
+                | RuntimeEvent::WaitingForTimer { .. }
+                | RuntimeEvent::WorkerCompleted(_)
                 | RuntimeEvent::TimerRegistrationChanged { .. } => {}
             }
         }
@@ -139,21 +123,7 @@ impl CellRenderState {
         nested_tool_calls: usize,
         truncated: bool,
     ) -> String {
-        self.render_output_with_status(cell_id, nested_tool_calls, truncated, None)
-    }
-
-    pub fn render_output_with_status(
-        &self,
-        cell_id: &str,
-        nested_tool_calls: usize,
-        truncated: bool,
-        status: Option<&CellStatus>,
-    ) -> String {
-        let status_line = status
-            .and_then(|status| self.status_line_from_status(cell_id, nested_tool_calls, status))
-            .unwrap_or_else(|| self.default_status_line(cell_id, nested_tool_calls));
-
-        let mut lines = vec![status_line];
+        let mut lines = vec![self.default_status_line(cell_id, nested_tool_calls)];
 
         if !self.output_text.trim().is_empty() {
             lines.push("Text output:".to_string());
@@ -212,60 +182,6 @@ impl CellRenderState {
         }
 
         lines.join("\n")
-    }
-
-    fn status_line_from_status(
-        &self,
-        cell_id: &str,
-        nested_tool_calls: usize,
-        status: &CellStatus,
-    ) -> Option<String> {
-        match status {
-            CellStatus::Starting | CellStatus::Running | CellStatus::Flushed => {
-                Some(format!(
-                    "Code mode cell `{}` is still running after {} nested tool call(s). Call `wait` to poll for more output.",
-                    cell_id, nested_tool_calls
-                ))
-            }
-            CellStatus::WaitingOnTool { request_id } => Some(format!(
-                "Code mode cell `{}` is processing nested tool request {} after {} nested tool call(s). Call `wait` to poll for more output.",
-                cell_id, request_id, nested_tool_calls
-            )),
-            CellStatus::WaitingOnJsTimer { .. } => Some(format!(
-                "Code mode cell `{}` is still running in the background after {} nested tool call(s). Call `wait` to poll for more output.",
-                cell_id, nested_tool_calls
-            )),
-            CellStatus::Completed => {
-                if self.cancellation.is_some() || self.failure.is_some() {
-                    None
-                } else {
-                    Some(format!(
-                        "Code mode cell `{}` completed after {} nested tool call(s).",
-                        cell_id, nested_tool_calls
-                    ))
-                }
-            }
-            CellStatus::Failed => {
-                if self.failure.is_some() {
-                    None
-                } else {
-                    Some(format!(
-                        "Code mode cell `{}` failed after {} nested tool call(s).",
-                        cell_id, nested_tool_calls
-                    ))
-                }
-            }
-            CellStatus::Cancelled => {
-                if self.cancellation.is_some() {
-                    None
-                } else {
-                    Some(format!(
-                        "Code mode cell `{}` was cancelled after {} nested tool call(s).",
-                        cell_id, nested_tool_calls
-                    ))
-                }
-            }
-        }
     }
 
     fn default_status_line(&self, cell_id: &str, nested_tool_calls: usize) -> String {
