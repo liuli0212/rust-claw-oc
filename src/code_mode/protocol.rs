@@ -82,7 +82,7 @@ impl RuntimeEvent {
         }
     }
 
-    pub fn is_visible_to_drain(&self) -> bool {
+    pub fn is_visible_in_snapshot(&self) -> bool {
         !matches!(
             self,
             Self::WorkerCompleted(_)

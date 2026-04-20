@@ -50,12 +50,12 @@ impl std::fmt::Debug for CellDriver {
 }
 
 #[derive(Debug)]
-pub struct DriverDrainBatch {
+pub struct DriverUpdateBatch {
     pub terminal_result: Option<RuntimeCellResult>,
     pub events: Vec<RuntimeEvent>,
 }
 
-impl DriverDrainBatch {
+impl DriverUpdateBatch {
     pub fn progress(events: Vec<RuntimeEvent>) -> Self {
         Self {
             terminal_result: None,
@@ -72,10 +72,10 @@ impl DriverDrainBatch {
 }
 
 #[derive(Debug)]
-pub enum DriverDrainOutcome {
-    Batch(DriverDrainBatch),
+pub enum DriverUpdate {
+    Batch(DriverUpdateBatch),
     PendingTool {
-        batch: DriverDrainBatch,
+        batch: DriverUpdateBatch,
         request: ToolCallRequestEvent,
     },
     Idle,
@@ -86,8 +86,8 @@ impl CellDriver {
     ///
     /// The worker thread uses a channel-based `invoke_tool` bridge: when JS
     /// calls `tools.X()`, the worker emits a `ToolCallRequested` event and
-    /// blocks waiting for a result on `tool_result_rx`. The drain loop in
-    /// `drain_event_batch_with_request` sees the `ToolCallRequested`, calls
+    /// blocks waiting for a result on `tool_result_rx`. The host update loop
+    /// sees the `ToolCallRequested`, calls
     /// the caller's async `invoke_tool`, and sends the result back.
     pub fn spawn_live(
         cell_id: String,
@@ -124,14 +124,14 @@ impl CellDriver {
             };
 
             // Build a synchronous invoke_tool that simply blocks waiting for
-            // the drain loop to fulfill the tool call. The runtime's __callTool
+            // the host update loop to fulfill the tool call. The runtime's __callTool
             // already emits the ToolCallRequested event via event_tx, so the
-            // drain loop will see it, call the real invoke_tool, and send the
+            // host update loop will see it, call the real invoke_tool, and send the
             // result back here.
             let invoke_tool = move |_tool_name: String,
                                     _args_json: String|
                   -> Result<String, crate::tools::ToolError> {
-                // Block until the drain loop sends us the result via std channel
+                // Block until the host update loop sends us the result via std channel
                 tool_result_rx.recv().unwrap_or_else(|_| {
                     Err(crate::tools::ToolError::ExecutionFailed(
                         "Tool result channel closed".to_string(),
@@ -185,12 +185,12 @@ impl CellDriver {
         }
     }
 
-    /// Drain events from the live worker until a visible batch, terminal
-    /// result, pending nested tool request, or idle timeout is reached.
-    pub async fn drain_event_batch(
+    /// Collect the next driver update from the live worker until a visible
+    /// batch, terminal result, pending nested tool request, or idle timeout is reached.
+    pub async fn next_update(
         &mut self,
         idle_timeout: Option<Duration>,
-    ) -> Result<DriverDrainOutcome, crate::tools::ToolError> {
+    ) -> Result<DriverUpdate, crate::tools::ToolError> {
         let mut events = Vec::new();
 
         loop {
@@ -213,7 +213,7 @@ impl CellDriver {
             let next_event = if let Some(timeout) = idle_timeout {
                 tokio::select! {
                     event = self.event_rx.recv() => event,
-                    _ = tokio::time::sleep(timeout) => return Ok(DriverDrainOutcome::Idle),
+                    _ = tokio::time::sleep(timeout) => return Ok(DriverUpdate::Idle),
                 }
             } else {
                 self.event_rx.recv().await
@@ -263,17 +263,17 @@ impl CellDriver {
         &self,
         events: &mut Vec<RuntimeEvent>,
         event: RuntimeEvent,
-    ) -> Result<Option<DriverDrainOutcome>, crate::tools::ToolError> {
+    ) -> Result<Option<DriverUpdate>, crate::tools::ToolError> {
         match event {
             RuntimeEvent::ToolCallRequested(req) => {
                 events.push(RuntimeEvent::ToolCallRequested(req.clone()));
-                Ok(Some(DriverDrainOutcome::PendingTool {
-                    batch: DriverDrainBatch::progress(std::mem::take(events)),
+                Ok(Some(DriverUpdate::PendingTool {
+                    batch: DriverUpdateBatch::progress(std::mem::take(events)),
                     request: req,
                 }))
             }
             RuntimeEvent::WorkerCompleted(result) => match result {
-                Ok(cell_result) => Ok(Some(DriverDrainOutcome::Batch(DriverDrainBatch::terminal(
+                Ok(cell_result) => Ok(Some(DriverUpdate::Batch(DriverUpdateBatch::terminal(
                     cell_result,
                     std::mem::take(events),
                 )))),
@@ -281,7 +281,7 @@ impl CellDriver {
             },
             RuntimeEvent::Flush { .. } | RuntimeEvent::WaitingForTimer { .. } => {
                 events.push(event);
-                Ok(Some(DriverDrainOutcome::Batch(DriverDrainBatch::progress(
+                Ok(Some(DriverUpdate::Batch(DriverUpdateBatch::progress(
                     std::mem::take(events),
                 ))))
             }

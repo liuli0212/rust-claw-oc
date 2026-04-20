@@ -50,7 +50,7 @@ pub struct ExecRunResult {
 
 impl ExecRunResult {
     pub fn render_output(&self) -> String {
-        DrainRenderState::from_exec_result(self).render_output(
+        CellRenderState::from_exec_result(self).render_output(
             &self.cell_id,
             self.nested_tool_calls,
             self.truncated,
@@ -59,7 +59,7 @@ impl ExecRunResult {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct DrainRenderState {
+pub struct CellRenderState {
     pub output_text: String,
     pub notifications: Vec<String>,
     pub return_value: Option<Value>,
@@ -72,7 +72,7 @@ pub struct DrainRenderState {
     pub cancellation: Option<String>,
 }
 
-impl DrainRenderState {
+impl CellRenderState {
     pub fn from_exec_result(result: &ExecRunResult) -> Self {
         Self {
             output_text: result.output_text.clone(),

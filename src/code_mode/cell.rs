@@ -1,5 +1,5 @@
 use super::protocol::{max_event_seq, RuntimeEvent};
-use super::response::{DrainRenderState, ExecLifecycle, ExecRunResult};
+use super::response::{CellRenderState, ExecLifecycle, ExecRunResult};
 
 const RECENT_EVENT_BUDGET_CHARS: usize = 8_000;
 
@@ -35,11 +35,11 @@ impl ActiveCellHandle {
         }
     }
 
-    pub fn drain_snapshot(&self) -> CellDrainSnapshot {
+    pub fn state_snapshot(&self) -> CellStateSnapshot {
         let max_seq = max_event_seq(&self.events);
         let recent_events = self.recent_visible_events();
 
-        CellDrainSnapshot {
+        CellStateSnapshot {
             cell_id: self.cell_id.clone(),
             status: self.status.clone(),
             last_summary: self.last_summary.clone(),
@@ -48,7 +48,7 @@ impl ActiveCellHandle {
         }
     }
 
-    pub fn apply_drain_batch(&mut self, batch: &crate::code_mode::driver::DriverDrainBatch) {
+    pub fn update_from_batch(&mut self, batch: &crate::code_mode::driver::DriverUpdateBatch) {
         for event in &batch.events {
             // Update status from events
             match event {
@@ -115,7 +115,7 @@ impl ActiveCellHandle {
         let mut budget = RECENT_EVENT_BUDGET_CHARS;
         let mut result = Vec::new();
         for event in self.events.iter().rev() {
-            if !event.is_visible_to_drain() {
+            if !event.is_visible_in_snapshot() {
                 continue;
             }
             let text = match event {
@@ -136,7 +136,7 @@ impl ActiveCellHandle {
 }
 
 #[derive(Debug, Clone)]
-pub struct CellDrainSnapshot {
+pub struct CellStateSnapshot {
     pub cell_id: String,
     pub status: CellStatus,
     pub last_summary: Option<ExecRunResult>,
@@ -144,9 +144,9 @@ pub struct CellDrainSnapshot {
     pub recent_events: Vec<RuntimeEvent>,
 }
 
-impl CellDrainSnapshot {
-    pub fn render_state(&self) -> DrainRenderState {
-        let mut state = DrainRenderState::from_events(&self.recent_events);
+impl CellStateSnapshot {
+    pub fn build_render_state(&self) -> CellRenderState {
+        let mut state = CellRenderState::from_events(&self.recent_events);
 
         // If we have a terminal last_summary, it is the final authority on the execution state.
         if let Some(summary) = &self.last_summary {
@@ -204,11 +204,11 @@ mod tests {
             truncated: false,
         });
 
-        let snapshot = cell.drain_snapshot();
+        let snapshot = cell.state_snapshot();
         assert_eq!(snapshot.cell_id, "test-cell");
         assert_eq!(snapshot.max_seq, 4);
 
-        let render = snapshot.render_state();
+        let render = snapshot.build_render_state();
         assert_eq!(render.output_text, "hello \nworld");
         assert_eq!(render.notifications, vec!["notif"]);
         assert_eq!(render.flush_value, Some(json!({"foo": "bar"})));

@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 use super::cell::{ActiveCellHandle, CellStatus};
-use super::driver::{CellDriver, CellDriverControl, DriverDrainBatch, DriverDrainOutcome};
+use super::driver::{CellDriver, CellDriverControl, DriverUpdate, DriverUpdateBatch};
 use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 use super::runtime;
 use crate::trace::TraceStatus;
@@ -143,7 +143,7 @@ struct BatchPublicationMetadata {
 }
 
 impl BatchPublicationMetadata {
-    fn from_batch(batch: &DriverDrainBatch) -> Self {
+    fn from_batch(batch: &DriverUpdateBatch) -> Self {
         let mut metadata = Self::default();
 
         for event in &batch.events {
@@ -168,7 +168,7 @@ impl BatchPublicationMetadata {
 
 impl CodeModeService {
     /// Execute a new code-mode cell. Spawns a live JS runtime worker, performs
-    /// an initial background drain, and returns the first published
+    /// an initial background update, and returns the first published
     /// `ExecRunResult` suitable for the LLM.
     pub async fn execute<F, Fut>(
         &self,
@@ -360,20 +360,20 @@ impl CodeModeService {
         });
 
         loop {
-            let drain_outcome = {
+            let driver_update = {
                 let mut driver = host_handle.driver_handle.lock().await;
                 driver
-                    .drain_event_batch(publication_tracker.next_idle_timeout())
+                    .next_update(publication_tracker.next_idle_timeout())
                     .await
             };
 
-            match drain_outcome {
-                Ok(DriverDrainOutcome::Batch(batch)) => {
+            match driver_update {
+                Ok(DriverUpdate::Batch(batch)) => {
                     let batch_metadata = BatchPublicationMetadata::from_batch(&batch);
                     publication_tracker.observe_batch(&batch_metadata);
 
                     match self
-                        .apply_batch_to_session(&session_id, &cell_id, batch)
+                        .update_session_from_batch(&session_id, &cell_id, batch)
                         .await
                     {
                         Ok(disposition) => {
@@ -512,9 +512,9 @@ impl CodeModeService {
                         }
                     }
                 }
-                Ok(DriverDrainOutcome::PendingTool { batch, request }) => {
+                Ok(DriverUpdate::PendingTool { batch, request }) => {
                     match self
-                        .apply_batch_to_session(&session_id, &cell_id, batch)
+                        .update_session_from_batch(&session_id, &cell_id, batch)
                         .await
                     {
                         Ok(CellDisposition::Terminal) => {
@@ -647,7 +647,7 @@ impl CodeModeService {
                         }
                     }
                 }
-                Ok(DriverDrainOutcome::Idle) => {
+                Ok(DriverUpdate::Idle) => {
                     if !publication_tracker.should_auto_flush_now() {
                         continue;
                     }
@@ -755,11 +755,11 @@ impl CodeModeService {
         }
     }
 
-    async fn apply_batch_to_session(
+    async fn update_session_from_batch(
         &self,
         session_id: &str,
         cell_id: &str,
-        batch: DriverDrainBatch,
+        batch: DriverUpdateBatch,
     ) -> Result<CellDisposition, crate::tools::ToolError> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(session_id).ok_or_else(|| {
@@ -768,17 +768,17 @@ impl CodeModeService {
 
         let active_cell = session.active_cell.as_mut().ok_or_else(|| {
             crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was terminated before the drain completed.",
+                "Code mode cell `{}` was terminated before the background state update completed.",
                 cell_id
             ))
         })?;
         if active_cell.cell_id != cell_id {
             return Err(crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was superseded before the drain completed.",
+                "Code mode cell `{}` was superseded before the background state update completed.",
                 cell_id
             )));
         }
-        active_cell.apply_drain_batch(&batch);
+        active_cell.update_from_batch(&batch);
 
         if let Some(ref terminal) = batch.terminal_result {
             session.stored_values = terminal.1.clone();
@@ -796,8 +796,8 @@ impl CodeModeService {
         progress_kind: Option<ExecProgressKind>,
         flush_value: Option<Value>,
     ) -> ExecRunResult {
-        let snapshot = cell.drain_snapshot();
-        let render = snapshot.render_state();
+        let snapshot = cell.state_snapshot();
+        let render = snapshot.build_render_state();
         let nested_tool_calls = cell.nested_tool_call_count();
         let lifecycle = match cell.status {
             CellStatus::Completed => ExecLifecycle::Completed,
@@ -977,7 +977,7 @@ impl CodeModeService {
             let msg = err.to_string().to_lowercase();
             if msg.contains("cancel")
                 || msg.contains("interrupted")
-                || msg.contains("terminated before the drain completed")
+                || msg.contains("terminated before the background state update completed")
             {
                 TraceStatus::Cancelled
             } else {
@@ -999,8 +999,8 @@ impl CodeModeService {
             return None;
         }
 
-        let snapshot = active_cell.drain_snapshot();
-        let render = snapshot.render_state();
+        let snapshot = active_cell.state_snapshot();
+        let render = snapshot.build_render_state();
         let nested_tool_calls = active_cell.nested_tool_call_count();
 
         active_cell.status = CellStatus::Failed;
