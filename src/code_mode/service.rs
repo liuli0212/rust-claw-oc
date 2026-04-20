@@ -13,6 +13,7 @@ use super::cell::{ActiveCellHandle, CellStatus};
 use super::driver::{CellDriver, CellDriverControl, DriverDrainBatch, DriverDrainOutcome};
 use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 use super::runtime;
+use crate::trace::TraceStatus;
 
 #[derive(Debug, Default, Clone)]
 pub struct CodeModeService {
@@ -352,15 +353,17 @@ impl CodeModeService {
     {
         let mut initial_summary_tx = Some(initial_summary_tx);
         let mut publication_tracker = PublicationTracker::new(auto_flush_ms);
+        let mut final_trace_status = TraceStatus::Ok;
+        let mut final_trace_summary: Option<String> = None;
+        let mut final_trace_attrs = serde_json::json!({
+            "cell_id": cell_id.clone(),
+        });
 
         loop {
             let drain_outcome = {
                 let mut driver = host_handle.driver_handle.lock().await;
                 driver
-                    .drain_event_batch_with_request(
-                        &mut invoke_tool,
-                        publication_tracker.next_idle_timeout(),
-                    )
+                    .drain_event_batch(publication_tracker.next_idle_timeout())
                     .await
             };
 
@@ -381,6 +384,13 @@ impl CodeModeService {
                                 {
                                     Ok(summary) => Some(summary),
                                     Err(err) => {
+                                        final_trace_status =
+                                            Self::trace_status_from_host_error(&err);
+                                        final_trace_summary = Some(err.to_string());
+                                        final_trace_attrs = serde_json::json!({
+                                            "cell_id": cell_id.clone(),
+                                            "error": err.to_string(),
+                                        });
                                         if let Some(tx) = initial_summary_tx.take() {
                                             let _ = tx.send(Err(err));
                                         }
@@ -404,6 +414,13 @@ impl CodeModeService {
                                         Some(summary)
                                     }
                                     Err(err) => {
+                                        final_trace_status =
+                                            Self::trace_status_from_host_error(&err);
+                                        final_trace_summary = Some(err.to_string());
+                                        final_trace_attrs = serde_json::json!({
+                                            "cell_id": cell_id.clone(),
+                                            "error": err.to_string(),
+                                        });
                                         if let Some(tx) = initial_summary_tx.take() {
                                             let _ = tx.send(Err(err));
                                         }
@@ -425,6 +442,13 @@ impl CodeModeService {
                                         Some(summary)
                                     }
                                     Err(err) => {
+                                        final_trace_status =
+                                            Self::trace_status_from_host_error(&err);
+                                        final_trace_summary = Some(err.to_string());
+                                        final_trace_attrs = serde_json::json!({
+                                            "cell_id": cell_id.clone(),
+                                            "error": err.to_string(),
+                                        });
                                         if let Some(tx) = initial_summary_tx.take() {
                                             let _ = tx.send(Err(err));
                                         }
@@ -437,17 +461,36 @@ impl CodeModeService {
 
                             if let Some(summary) = publication {
                                 if let Err(err) = self
-                                    .store_publication_summary(&session_id, &cell_id, &summary)
+                                    .publish_summary_update(
+                                        &session_id,
+                                        &cell_id,
+                                        &host_handle,
+                                        &summary,
+                                    )
                                     .await
                                 {
+                                    final_trace_status = Self::trace_status_from_host_error(&err);
+                                    final_trace_summary = Some(err.to_string());
+                                    final_trace_attrs = serde_json::json!({
+                                        "cell_id": cell_id.clone(),
+                                        "error": err.to_string(),
+                                    });
                                     if let Some(tx) = initial_summary_tx.take() {
                                         let _ = tx.send(Err(err));
                                     }
                                     break;
                                 }
-                                host_handle.publish_update();
                                 if let Some(tx) = initial_summary_tx.take() {
                                     let _ = tx.send(Ok(summary.clone()));
+                                }
+                                if disposition == CellDisposition::Terminal {
+                                    final_trace_status = Self::trace_status_from_summary(&summary);
+                                    final_trace_summary = Self::trace_summary_from_result(&summary);
+                                    final_trace_attrs = serde_json::json!({
+                                        "cell_id": cell_id.clone(),
+                                        "lifecycle": summary.lifecycle.clone(),
+                                        "nested_tool_calls": summary.nested_tool_calls,
+                                    });
                                 }
                             }
 
@@ -456,6 +499,147 @@ impl CodeModeService {
                             }
                         }
                         Err(err) => {
+                            final_trace_status = Self::trace_status_from_host_error(&err);
+                            final_trace_summary = Some(err.to_string());
+                            final_trace_attrs = serde_json::json!({
+                                "cell_id": cell_id.clone(),
+                                "error": err.to_string(),
+                            });
+                            if let Some(tx) = initial_summary_tx.take() {
+                                let _ = tx.send(Err(err));
+                            }
+                            break;
+                        }
+                    }
+                }
+                Ok(DriverDrainOutcome::PendingTool { batch, request }) => {
+                    match self
+                        .apply_batch_to_session(&session_id, &cell_id, batch)
+                        .await
+                    {
+                        Ok(CellDisposition::Terminal) => {
+                            let err = crate::tools::ToolError::ExecutionFailed(
+                                "Code mode entered a terminal state while dispatching a nested tool."
+                                    .to_string(),
+                            );
+                            final_trace_status = TraceStatus::Error;
+                            final_trace_summary = Some(err.to_string());
+                            final_trace_attrs = serde_json::json!({
+                                "cell_id": cell_id.clone(),
+                                "error": err.to_string(),
+                            });
+                            if let Some(tx) = initial_summary_tx.take() {
+                                let _ = tx.send(Err(err));
+                            }
+                            break;
+                        }
+                        Ok(CellDisposition::Continue) => {
+                            let current_summary = match self
+                                .peek_cell_summary(&session_id, &cell_id, None, None)
+                                .await
+                            {
+                                Ok(summary) => summary,
+                                Err(err) => {
+                                    final_trace_status = Self::trace_status_from_host_error(&err);
+                                    final_trace_summary = Some(err.to_string());
+                                    final_trace_attrs = serde_json::json!({
+                                        "cell_id": cell_id.clone(),
+                                        "error": err.to_string(),
+                                    });
+                                    if let Some(tx) = initial_summary_tx.take() {
+                                        let _ = tx.send(Err(err));
+                                    }
+                                    break;
+                                }
+                            };
+
+                            if let Err(err) = self
+                                .publish_summary_update(
+                                    &session_id,
+                                    &cell_id,
+                                    &host_handle,
+                                    &current_summary,
+                                )
+                                .await
+                            {
+                                final_trace_status = Self::trace_status_from_host_error(&err);
+                                final_trace_summary = Some(err.to_string());
+                                final_trace_attrs = serde_json::json!({
+                                    "cell_id": cell_id.clone(),
+                                    "error": err.to_string(),
+                                });
+                                if let Some(tx) = initial_summary_tx.take() {
+                                    let _ = tx.send(Err(err));
+                                }
+                                break;
+                            }
+
+                            let tool_result = if initial_summary_tx.is_some() {
+                                let tool_name = request.tool_name.clone();
+                                let args_json = request.args_json.clone();
+                                let mut invoke_future =
+                                    std::pin::pin!(invoke_tool(tool_name, args_json));
+                                let publish_after = Duration::from_millis(25);
+
+                                tokio::select! {
+                                    result = &mut invoke_future => result,
+                                    _ = tokio::time::sleep(publish_after) => {
+                                        if let Some(tx) = initial_summary_tx.take() {
+                                            let _ = tx.send(Ok(current_summary.clone()));
+                                        }
+                                        invoke_future.await
+                                    }
+                                }
+                            } else {
+                                invoke_tool(request.tool_name.clone(), request.args_json.clone())
+                                    .await
+                            };
+                            let completion_result = {
+                                let mut driver = host_handle.driver_handle.lock().await;
+                                driver.complete_pending_tool_call(&request, tool_result)
+                            };
+                            if let Err(err) = completion_result {
+                                final_trace_status = Self::trace_status_from_host_error(&err);
+                                final_trace_summary = Some(err.to_string());
+                                final_trace_attrs = serde_json::json!({
+                                    "cell_id": cell_id.clone(),
+                                    "request_id": request.request_id.clone(),
+                                    "error": err.to_string(),
+                                });
+                                match self
+                                    .record_host_error_in_session(&session_id, &cell_id, &err)
+                                    .await
+                                {
+                                    Some(summary) => {
+                                        let _ = self
+                                            .publish_summary_update(
+                                                &session_id,
+                                                &cell_id,
+                                                &host_handle,
+                                                &summary,
+                                            )
+                                            .await;
+                                        if let Some(tx) = initial_summary_tx.take() {
+                                            let _ = tx.send(Ok(summary));
+                                        }
+                                    }
+                                    None => {
+                                        if let Some(tx) = initial_summary_tx.take() {
+                                            let _ = tx.send(Err(err));
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            final_trace_status = Self::trace_status_from_host_error(&err);
+                            final_trace_summary = Some(err.to_string());
+                            final_trace_attrs = serde_json::json!({
+                                "cell_id": cell_id.clone(),
+                                "request_id": request.request_id.clone(),
+                                "error": err.to_string(),
+                            });
                             if let Some(tx) = initial_summary_tx.take() {
                                 let _ = tx.send(Err(err));
                             }
@@ -480,20 +664,36 @@ impl CodeModeService {
                         Ok(summary) => {
                             publication_tracker.mark_published();
                             if let Err(err) = self
-                                .store_publication_summary(&session_id, &cell_id, &summary)
+                                .publish_summary_update(
+                                    &session_id,
+                                    &cell_id,
+                                    &host_handle,
+                                    &summary,
+                                )
                                 .await
                             {
+                                final_trace_status = Self::trace_status_from_host_error(&err);
+                                final_trace_summary = Some(err.to_string());
+                                final_trace_attrs = serde_json::json!({
+                                    "cell_id": cell_id.clone(),
+                                    "error": err.to_string(),
+                                });
                                 if let Some(tx) = initial_summary_tx.take() {
                                     let _ = tx.send(Err(err));
                                 }
                                 break;
                             }
-                            host_handle.publish_update();
                             if let Some(tx) = initial_summary_tx.take() {
                                 let _ = tx.send(Ok(summary));
                             }
                         }
                         Err(err) => {
+                            final_trace_status = Self::trace_status_from_host_error(&err);
+                            final_trace_summary = Some(err.to_string());
+                            final_trace_attrs = serde_json::json!({
+                                "cell_id": cell_id.clone(),
+                                "error": err.to_string(),
+                            });
                             if let Some(tx) = initial_summary_tx.take() {
                                 let _ = tx.send(Err(err));
                             }
@@ -502,15 +702,34 @@ impl CodeModeService {
                     }
                 }
                 Err(err) => {
+                    final_trace_status = Self::trace_status_from_host_error(&err);
+                    final_trace_summary = Some(err.to_string());
+                    final_trace_attrs = serde_json::json!({
+                        "cell_id": cell_id.clone(),
+                        "error": err.to_string(),
+                    });
                     match self
                         .record_host_error_in_session(&session_id, &cell_id, &err)
                         .await
                     {
                         Some(summary) => {
                             let _ = self
-                                .store_publication_summary(&session_id, &cell_id, &summary)
+                                .publish_summary_update(
+                                    &session_id,
+                                    &cell_id,
+                                    &host_handle,
+                                    &summary,
+                                )
                                 .await;
-                            host_handle.publish_update();
+                            final_trace_status = Self::trace_status_from_summary(&summary);
+                            final_trace_summary = Self::trace_summary_from_result(&summary);
+                            final_trace_attrs = serde_json::json!({
+                                "cell_id": cell_id.clone(),
+                                "lifecycle": summary.lifecycle.clone(),
+                                "nested_tool_calls": summary.nested_tool_calls,
+                                "failure": summary.failure.clone(),
+                                "cancellation": summary.cancellation.clone(),
+                            });
                             if let Some(tx) = initial_summary_tx.take() {
                                 let _ = tx.send(Ok(summary));
                             }
@@ -529,11 +748,9 @@ impl CodeModeService {
         if let Some(span) = cell_span.take() {
             span.finish(
                 "code_mode_cell_finished",
-                crate::trace::TraceStatus::Ok,
-                None,
-                serde_json::json!({
-                    "cell_id": cell_id,
-                }),
+                final_trace_status,
+                final_trace_summary,
+                final_trace_attrs,
             );
         }
     }
@@ -592,6 +809,10 @@ impl CodeModeService {
             CellStatus::WaitingOnJsTimer { next_due_in_ms } => next_due_in_ms,
             _ => None,
         };
+        let waiting_on_tool_request_id = match &cell.status {
+            CellStatus::WaitingOnTool { request_id } => Some(request_id.clone()),
+            _ => None,
+        };
 
         ExecRunResult {
             cell_id: cell.cell_id.clone(),
@@ -605,6 +826,7 @@ impl CodeModeService {
             lifecycle,
             progress_kind: progress_kind.clone(),
             flushed: progress_kind.is_some(),
+            waiting_on_tool_request_id,
             waiting_on_timer_ms,
             notifications: render.notifications,
             failure: render.failure,
@@ -714,6 +936,56 @@ impl CodeModeService {
         Ok(())
     }
 
+    async fn publish_summary_update(
+        &self,
+        session_id: &str,
+        cell_id: &str,
+        host_handle: &SharedCellHost,
+        summary: &ExecRunResult,
+    ) -> Result<(), crate::tools::ToolError> {
+        self.store_publication_summary(session_id, cell_id, summary)
+            .await?;
+        host_handle.publish_update();
+        Ok(())
+    }
+
+    fn trace_status_from_summary(summary: &ExecRunResult) -> TraceStatus {
+        match summary.lifecycle {
+            ExecLifecycle::Completed => TraceStatus::Ok,
+            ExecLifecycle::Failed => TraceStatus::Error,
+            ExecLifecycle::Cancelled => TraceStatus::Cancelled,
+            ExecLifecycle::Running => TraceStatus::Ok,
+        }
+    }
+
+    fn trace_summary_from_result(summary: &ExecRunResult) -> Option<String> {
+        match summary.lifecycle {
+            ExecLifecycle::Completed => Some("completed".to_string()),
+            ExecLifecycle::Failed => summary.failure.clone().or(Some("failed".to_string())),
+            ExecLifecycle::Cancelled => summary
+                .cancellation
+                .clone()
+                .or(Some("cancelled".to_string())),
+            ExecLifecycle::Running => None,
+        }
+    }
+
+    fn trace_status_from_host_error(err: &crate::tools::ToolError) -> TraceStatus {
+        if matches!(err, crate::tools::ToolError::Timeout) {
+            TraceStatus::TimedOut
+        } else {
+            let msg = err.to_string().to_lowercase();
+            if msg.contains("cancel")
+                || msg.contains("interrupted")
+                || msg.contains("terminated before the drain completed")
+            {
+                TraceStatus::Cancelled
+            } else {
+                TraceStatus::Error
+            }
+        }
+    }
+
     async fn record_host_error_in_session(
         &self,
         session_id: &str,
@@ -740,6 +1012,7 @@ impl CodeModeService {
             lifecycle: ExecLifecycle::Failed,
             progress_kind: None,
             flushed: false,
+            waiting_on_tool_request_id: None,
             waiting_on_timer_ms: None,
             notifications: render.notifications,
             failure: Some(err.to_string()),
@@ -909,6 +1182,48 @@ mod tests {
         assert!(!final_summary.flushed);
         assert_eq!(final_summary.output_text, "done");
         assert_eq!(final_summary.return_value, None);
+    }
+
+    #[tokio::test]
+    async fn execute_surfaces_waiting_on_tool_for_long_nested_calls() {
+        let service = CodeModeService::default();
+
+        let summary = service
+            .execute(
+                "session-pending-tool",
+                r#"
+                    const response = await tools.echo_tool({ value: "done" });
+                    text(response.value);
+                "#,
+                None,
+                vec!["echo_tool".to_string()],
+                |_tool_name: String, _args_json: String| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+                    Ok(r#"{"value":"done"}"#.to_string())
+                },
+                None,
+            )
+            .await
+            .expect("exec should publish the waiting-on-tool snapshot");
+
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Running);
+        assert_eq!(
+            summary.waiting_on_tool_request_id.as_deref(),
+            Some("echo_tool-1")
+        );
+        assert!(summary
+            .render_output()
+            .contains("processing nested tool request"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let final_summary = service
+            .wait_with_request("session-pending-tool", Some(&summary.cell_id), Some(0))
+            .await
+            .expect("wait should observe the terminal summary");
+
+        assert_eq!(&final_summary.lifecycle, &ExecLifecycle::Completed);
+        assert_eq!(final_summary.output_text, "done");
     }
 
     #[tokio::test]

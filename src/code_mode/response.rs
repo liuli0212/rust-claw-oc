@@ -39,6 +39,7 @@ pub struct ExecRunResult {
     pub lifecycle: ExecLifecycle,
     pub progress_kind: Option<ExecProgressKind>,
     pub flushed: bool,
+    pub waiting_on_tool_request_id: Option<String>,
     pub waiting_on_timer_ms: Option<u64>,
     pub notifications: Vec<String>,
     pub failure: Option<String>,
@@ -65,6 +66,8 @@ pub struct DrainRenderState {
     pub flush_value: Option<Value>,
     pub lifecycle: ExecLifecycle,
     pub progress_kind: Option<ExecProgressKind>,
+    pub waiting_on_tool_request_id: Option<String>,
+    pub waiting_on_timer_ms: Option<u64>,
     pub failure: Option<String>,
     pub cancellation: Option<String>,
 }
@@ -78,6 +81,8 @@ impl DrainRenderState {
             flush_value: result.flush_value.clone(),
             lifecycle: result.lifecycle.clone(),
             progress_kind: result.progress_kind.clone(),
+            waiting_on_tool_request_id: result.waiting_on_tool_request_id.clone(),
+            waiting_on_timer_ms: result.waiting_on_timer_ms,
             failure: result.failure.clone(),
             cancellation: result.cancellation.clone(),
         }
@@ -293,6 +298,16 @@ impl DrainRenderState {
                     cell_id, nested_tool_calls
                 )
             }
+            ExecLifecycle::Running if self.waiting_on_tool_request_id.is_some() => format!(
+                "Code mode cell `{}` is processing nested tool request {} after {} nested tool call(s). Call `wait` to poll for more output.",
+                cell_id,
+                self.waiting_on_tool_request_id.as_deref().unwrap_or("unknown"),
+                nested_tool_calls
+            ),
+            ExecLifecycle::Running if self.waiting_on_timer_ms.is_some() => format!(
+                "Code mode cell `{}` is still running in the background after {} nested tool call(s). Call `wait` to poll for more output.",
+                cell_id, nested_tool_calls
+            ),
             ExecLifecycle::Running => format!(
                 "Code mode cell `{}` is still running after {} nested tool call(s). Call `wait` to poll for more output.",
                 cell_id, nested_tool_calls
@@ -315,6 +330,7 @@ mod tests {
             lifecycle: ExecLifecycle::Failed,
             progress_kind: None,
             flushed: false,
+            waiting_on_tool_request_id: None,
             waiting_on_timer_ms: None,
             notifications: Vec::new(),
             failure: Some("ReferenceError: boom".to_string()),
@@ -339,6 +355,7 @@ mod tests {
             lifecycle: ExecLifecycle::Cancelled,
             progress_kind: None,
             flushed: false,
+            waiting_on_tool_request_id: None,
             waiting_on_timer_ms: None,
             notifications: Vec::new(),
             failure: None,
@@ -362,6 +379,7 @@ mod tests {
             lifecycle: ExecLifecycle::Running,
             progress_kind: Some(ExecProgressKind::AutoFlush),
             flushed: true,
+            waiting_on_tool_request_id: None,
             waiting_on_timer_ms: Some(125),
             notifications: Vec::new(),
             failure: None,
@@ -373,5 +391,28 @@ mod tests {
         let rendered = summary.render_output();
         assert!(rendered.contains("automatic progress update"));
         assert!(!rendered.contains("waiting on timer"));
+    }
+
+    #[test]
+    fn render_output_uses_waiting_tool_status_for_running_cells() {
+        let summary = ExecRunResult {
+            cell_id: "cell-10".to_string(),
+            output_text: String::new(),
+            return_value: None,
+            flush_value: None,
+            lifecycle: ExecLifecycle::Running,
+            progress_kind: None,
+            flushed: false,
+            waiting_on_tool_request_id: Some("echo-3".to_string()),
+            waiting_on_timer_ms: None,
+            notifications: Vec::new(),
+            failure: None,
+            cancellation: None,
+            nested_tool_calls: 3,
+            truncated: false,
+        };
+
+        let rendered = summary.render_output();
+        assert!(rendered.contains("processing nested tool request echo-3"));
     }
 }

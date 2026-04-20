@@ -665,6 +665,17 @@ impl AgentLoop {
         crate::code_mode::executor::is_code_mode_nested_tool(tool_name)
     }
 
+    fn code_mode_tool_result_status(
+        summary: &crate::code_mode::response::ExecRunResult,
+    ) -> (bool, Option<i32>, bool) {
+        match summary.lifecycle {
+            crate::code_mode::response::ExecLifecycle::Running
+            | crate::code_mode::response::ExecLifecycle::Completed => (true, Some(0), false),
+            crate::code_mode::response::ExecLifecycle::Failed => (false, Some(1), true),
+            crate::code_mode::response::ExecLifecycle::Cancelled => (false, Some(130), true),
+        }
+    }
+
     fn autopilot_denial_for_call(
         &self,
         call_name: &str,
@@ -1038,41 +1049,16 @@ impl AgentLoop {
                     iteration,
                 );
 
-                let mut tool_output = crate::tools::protocol::StructuredToolOutput::new(
+                let (ok, exit_code, is_error) = Self::code_mode_tool_result_status(&summary);
+                let tool_output = crate::tools::protocol::StructuredToolOutput::new(
                     call.name.clone(),
-                    true,
+                    ok,
                     summary.render_output(),
-                    Some(0),
+                    exit_code,
                     Some(start.elapsed().as_millis()),
                     summary.truncated,
                 )
                 .with_payload_kind("code_mode_exec");
-
-                if summary.flushed {
-                    let question = if summary.progress_kind.as_ref()
-                        == Some(&crate::code_mode::response::ExecProgressKind::AutoFlush)
-                    {
-                        "Code mode published an automatic progress update. Call `wait` to sync more output."
-                            .to_string()
-                    } else {
-                        let flush_value_str = summary
-                            .flush_value
-                            .as_ref()
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "none".to_string());
-                        format!(
-                            "Code mode flushed. Value: {}. Call `wait` to sync more output.",
-                            flush_value_str
-                        )
-                    };
-                    tool_output =
-                        tool_output.with_await_user(crate::tools::protocol::UserPromptRequest {
-                            question,
-                            context_key: format!("code_mode_flush_{}", summary.cell_id),
-                            options: vec!["continue".to_string(), "cancel".to_string()],
-                            recommendation: Some("continue".to_string()),
-                        });
-                }
 
                 let output_text = summary.render_output();
                 if !output_text.is_empty() {
@@ -1086,7 +1072,7 @@ impl AgentLoop {
 
                 ToolDispatchOutcome {
                     result,
-                    is_error: false,
+                    is_error,
                     stopped: false,
                 }
             }

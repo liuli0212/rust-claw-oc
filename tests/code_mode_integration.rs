@@ -108,12 +108,13 @@ async fn test_code_mode_full_flow_exec_flush_wait_complete() {
         task_state_store,
     );
 
-    // --- STEP 1: EXECUTE ---
-    let result1 = agent.step("Run code mode".to_string()).await.unwrap();
+    // flush no longer pauses for user input; the agent continues through the
+    // scripted wait and finish turns in the same step.
+    let result = agent.step("Run code mode".to_string()).await.unwrap();
     assert!(
-        matches!(result1, RunExit::YieldedToUser),
-        "Expected YieldedToUser, got {:?}",
-        result1
+        matches!(result, RunExit::Finished(_)),
+        "Expected Finished, got {:?}",
+        result
     );
 
     {
@@ -121,19 +122,12 @@ async fn test_code_mode_full_flow_exec_flush_wait_complete() {
         assert!(texts.iter().any(|t| t.contains("Result: echo_result")));
     }
 
-    // --- STEP 2: FINISH TASK ---
-    let result2 = agent.step("Wait for it".to_string()).await.unwrap();
-    assert!(
-        matches!(result2, RunExit::Finished(_)),
-        "Expected Finished, got {:?}",
-        result2
-    );
-
     {
         let tool_ends = output.tool_ends.lock().await;
         let errors = output.errors.lock().await;
         println!("Captured tool_ends: {:?}", *tool_ends);
         println!("Captured errors: {:?}", *errors);
+        assert!(tool_ends.iter().any(|t| t.contains("waiting_for_input")));
         assert!(tool_ends.iter().any(|t| t.contains("Resumed")));
     }
 
@@ -205,20 +199,15 @@ async fn test_code_mode_wait_timeout() {
         Arc::new(TaskStateStore::new(&session_id)),
     );
 
-    // Turn 1: exec. It will start the timer and auto-publish progress while
-    // the timer stays pending.
-    let result1 = agent.step("Start".to_string()).await.unwrap();
-    assert!(matches!(result1, RunExit::YieldedToUser));
-
-    // Turn 2: wait with 100ms timeout. The timer is far in the future, so this
-    // should return a running snapshot instead of completing the cell. The
-    // scripted LLM then closes the turn with finish_task.
-    let result2 = agent.step("Wait".to_string()).await.unwrap();
+    // The auto-flush progress update is displayed, but it no longer forces a
+    // YieldedToUser boundary; the scripted wait and finish turns can continue
+    // inside the same step.
+    let result = agent.step("Start".to_string()).await.unwrap();
 
     assert!(
-        matches!(result2, RunExit::Finished(_)),
+        matches!(result, RunExit::Finished(_)),
         "Expected the scripted finish_task turn to complete, got: {:?}",
-        result2
+        result
     );
 
     let tool_ends = output.tool_ends.lock().await;
@@ -433,14 +422,15 @@ async fn test_code_mode_timer_completion() {
 
     let exec_tool = Arc::new(rusty_claw::tools::ExecTool);
     let wait_tool = Arc::new(rusty_claw::tools::WaitTool);
-    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool];
+    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
+    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool, finish_tool];
 
-    // Register a 500ms timer and let the host auto-publish progress while it
-    // is pending.
+    // Register a short timer and let the host auto-publish progress while it
+    // is pending before a subsequent wait observes the completion.
     let code = r#"
         setTimeout(() => {
             text("Timer Fired");
-        }, 500);
+        }, 150);
         text("Running");
     "#;
 
@@ -451,21 +441,24 @@ async fn test_code_mode_timer_completion() {
                     name: "exec".to_string(),
                     args: serde_json::json!({
                         "code": code,
-                        "auto_flush_ms": 100,
+                        "auto_flush_ms": 50,
                     }),
                     id: Some("c1".to_string()),
                 },
                 Some("c1".to_string()),
             )],
         },
-        scripted_wait_turn("c2", "cell-0", 100),
-        scripted_wait_turn("c3", "cell-0", 100),
-        scripted_wait_turn("c4", "cell-0", 100),
-        scripted_wait_turn("c5", "cell-0", 100),
-        scripted_wait_turn("c6", "cell-0", 100),
-        scripted_wait_turn("c7", "cell-0", 100),
-        scripted_wait_turn("c8", "cell-0", 100),
-        scripted_wait_turn("c9", "cell-0", 100),
+        scripted_wait_turn("c2", "cell-0", 300),
+        ScenarioTurn {
+            events: vec![ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: serde_json::json!({ "summary": "Observed timer completion" }),
+                    id: Some("c3".to_string()),
+                },
+                Some("c3".to_string()),
+            )],
+        },
     ]));
 
     let output = Arc::new(CaptureOutput::new());
@@ -481,43 +474,24 @@ async fn test_code_mode_timer_completion() {
         Arc::new(TaskStateStore::new(&session_id)),
     );
 
-    // Turn 1: exec. It should yield because auto-flush publishes progress
-    // while the timer is still pending.
-    let result1 = agent.step("Start".to_string()).await.unwrap();
-    assert!(matches!(result1, RunExit::YieldedToUser));
-    {
-        let tool_ends = output.tool_ends.lock().await;
-        assert!(
-            tool_ends.iter().any(|t| t.contains("Running")),
-            "Expected 'Running' in tool_ends after exec, got: {:?}",
-            *tool_ends
-        );
-    }
+    let exit = agent.step("Start".to_string()).await.unwrap();
+    assert!(
+        matches!(exit, RunExit::Finished(_)),
+        "Expected exec, wait, and finish_task to complete in one step, got: {:?}",
+        exit
+    );
 
-    // Poll with short waits until the timer callback is observed. This avoids
-    // depending on a single fixed sleep boundary.
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
-    loop {
-        let exit = agent.step("Wait".to_string()).await.unwrap();
-        let saw_timer = {
-            let tool_ends = output.tool_ends.lock().await;
-            tool_ends.iter().any(|t| t.contains("Timer Fired"))
-        };
-        if saw_timer {
-            break;
-        }
-
-        assert!(
-            matches!(exit, RunExit::YieldedToUser),
-            "Expected timer polling to keep yielding until completion, got: {:?}",
-            exit
-        );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Timed out waiting for timer completion"
-        );
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-    }
+    let tool_ends = output.tool_ends.lock().await;
+    assert!(
+        tool_ends.iter().any(|t| t.contains("Running")),
+        "Expected 'Running' in tool_ends after exec, got: {:?}",
+        *tool_ends
+    );
+    assert!(
+        tool_ends.iter().any(|t| t.contains("Timer Fired")),
+        "Expected timer completion in tool_ends, got: {:?}",
+        *tool_ends
+    );
 
     support::temp_workspace::cleanup_session(&session_id);
 }

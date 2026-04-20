@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::future::Future;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::protocol::{RuntimeCellResult, RuntimeEvent};
+use super::protocol::{RuntimeCellResult, RuntimeEvent, ToolCallRequestEvent};
 use super::runtime;
 
 pub struct CellDriver {
@@ -15,6 +15,7 @@ pub struct CellDriver {
     command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
     worker: Option<tokio::task::JoinHandle<()>>,
     cancel_flag: Arc<AtomicBool>,
+    pending_events: VecDeque<RuntimeEvent>,
 }
 
 #[derive(Clone)]
@@ -73,6 +74,10 @@ impl DriverDrainBatch {
 #[derive(Debug)]
 pub enum DriverDrainOutcome {
     Batch(DriverDrainBatch),
+    PendingTool {
+        batch: DriverDrainBatch,
+        request: ToolCallRequestEvent,
+    },
     Idle,
 }
 
@@ -161,6 +166,7 @@ impl CellDriver {
             command_tx,
             worker: Some(worker),
             cancel_flag,
+            pending_events: VecDeque::new(),
         }
     }
 
@@ -179,24 +185,25 @@ impl CellDriver {
         }
     }
 
-    /// Drain events from the live worker, fulfilling nested tool calls via
-    /// `invoke_tool` when `ToolCallRequested` events are seen.
-    pub async fn drain_event_batch_with_request<F, Fut>(
+    /// Drain events from the live worker until a visible batch, terminal
+    /// result, pending nested tool request, or idle timeout is reached.
+    pub async fn drain_event_batch(
         &mut self,
-        invoke_tool: &mut F,
         idle_timeout: Option<Duration>,
-    ) -> Result<DriverDrainOutcome, crate::tools::ToolError>
-    where
-        F: FnMut(String, String) -> Fut,
-        Fut: Future<Output = Result<String, crate::tools::ToolError>>,
-    {
+    ) -> Result<DriverDrainOutcome, crate::tools::ToolError> {
         let mut events = Vec::new();
 
         loop {
+            while let Some(event) = self.pending_events.pop_front() {
+                if let Some(batch) = self.classify_event(&mut events, event)? {
+                    return Ok(batch);
+                }
+            }
+
             // Drain any buffered events first
             while let Ok(event) = self.event_rx.try_recv() {
-                if let Some(batch) = self.classify_event(&mut events, event, invoke_tool).await? {
-                    return Ok(DriverDrainOutcome::Batch(batch));
+                if let Some(outcome) = self.classify_event(&mut events, event)? {
+                    return Ok(outcome);
                 }
             }
 
@@ -223,66 +230,60 @@ impl CellDriver {
                 ));
             };
 
-            if let Some(batch) = self.classify_event(&mut events, event, invoke_tool).await? {
-                return Ok(DriverDrainOutcome::Batch(batch));
+            if let Some(outcome) = self.classify_event(&mut events, event)? {
+                return Ok(outcome);
             }
         }
     }
 
-    /// Classify a single event. If it's a tool request, fulfill it via
-    /// invoke_tool and send the result back to the worker.
-    async fn classify_event<F, Fut>(
+    pub fn complete_pending_tool_call(
+        &mut self,
+        request: &ToolCallRequestEvent,
+        result: Result<String, crate::tools::ToolError>,
+    ) -> Result<(), crate::tools::ToolError> {
+        let ok = result.is_ok();
+        let result_for_js = match result {
+            Ok(raw) => Ok(crate::code_mode::runtime::value::normalize_tool_result_for_js(&raw)),
+            Err(err) => Err(err),
+        };
+
+        self.tool_result_tx.send(result_for_js).map_err(|_| {
+            crate::tools::ToolError::ExecutionFailed("Tool result channel closed".to_string())
+        })?;
+        self.pending_events
+            .push_back(RuntimeEvent::ToolCallResolved {
+                seq: request.seq,
+                request_id: request.request_id.clone(),
+                ok,
+            });
+        Ok(())
+    }
+
+    fn classify_event(
         &self,
         events: &mut Vec<RuntimeEvent>,
         event: RuntimeEvent,
-        invoke_tool: &mut F,
-    ) -> Result<Option<DriverDrainBatch>, crate::tools::ToolError>
-    where
-        F: FnMut(String, String) -> Fut,
-        Fut: Future<Output = Result<String, crate::tools::ToolError>>,
-    {
+    ) -> Result<Option<DriverDrainOutcome>, crate::tools::ToolError> {
         match event {
-            RuntimeEvent::ToolCallRequested(ref req) => {
-                let tool_name = req.tool_name.clone();
-                let args_json = req.args_json.clone();
-                let req_seq = req.seq;
-                let req_id = req.request_id.clone();
-                events.push(event);
-
-                // Execute the nested tool call
-                let result = invoke_tool(tool_name, args_json).await;
-                let ok = result.is_ok();
-
-                // Normalize for JS
-                let result_for_js = match result {
-                    Ok(raw) => {
-                        Ok(crate::code_mode::runtime::value::normalize_tool_result_for_js(&raw))
-                    }
-                    Err(e) => Err(e),
-                };
-
-                // Send result back to the worker thread
-                let _ = self.tool_result_tx.send(result_for_js);
-
-                // Record the resolution event
-                events.push(RuntimeEvent::ToolCallResolved {
-                    seq: req_seq,
-                    request_id: req_id,
-                    ok,
-                });
-
-                Ok(None)
+            RuntimeEvent::ToolCallRequested(req) => {
+                events.push(RuntimeEvent::ToolCallRequested(req.clone()));
+                Ok(Some(DriverDrainOutcome::PendingTool {
+                    batch: DriverDrainBatch::progress(std::mem::take(events)),
+                    request: req,
+                }))
             }
             RuntimeEvent::WorkerCompleted(result) => match result {
-                Ok(cell_result) => Ok(Some(DriverDrainBatch::terminal(
+                Ok(cell_result) => Ok(Some(DriverDrainOutcome::Batch(DriverDrainBatch::terminal(
                     cell_result,
                     std::mem::take(events),
-                ))),
+                )))),
                 Err(err_msg) => Err(crate::tools::ToolError::ExecutionFailed(err_msg)),
             },
             RuntimeEvent::Flush { .. } | RuntimeEvent::WaitingForTimer { .. } => {
                 events.push(event);
-                Ok(Some(DriverDrainBatch::progress(std::mem::take(events))))
+                Ok(Some(DriverDrainOutcome::Batch(DriverDrainBatch::progress(
+                    std::mem::take(events),
+                ))))
             }
             event => {
                 events.push(event);

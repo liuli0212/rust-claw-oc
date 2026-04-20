@@ -397,6 +397,7 @@ where
                 lifecycle,
                 progress_kind: None,
                 flushed,
+                waiting_on_tool_request_id: None,
                 waiting_on_timer_ms: None,
                 notifications: Vec::new(),
                 failure: runtime_error,

@@ -845,3 +845,48 @@ text(response.value);
 
     cleanup_session(session_id);
 }
+
+#[tokio::test]
+async fn test_code_mode_failed_cells_emit_error_tool_envelopes() {
+    let output = Arc::new(TestOutput::new());
+    let llm = Arc::new(TestLlmClient::new());
+    let session_id = "test-code-mode-failed-envelope";
+    cleanup_session(session_id);
+
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::ExecTool)];
+
+    let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+    let mut agent = AgentLoop::new(
+        session_id.to_string(),
+        llm,
+        "test_cli".to_string(),
+        tools.clone(),
+        AgentContext::new(),
+        output,
+        Arc::new(telemetry),
+        Arc::new(crate::task_state::TaskStateStore::new(session_id)),
+    );
+
+    let outcome = agent
+        .dispatch_tool_call(
+            &crate::context::FunctionCall {
+                name: "exec".to_string(),
+                args: json!({
+                    "code": "nonExistentFunction();"
+                }),
+                id: Some("call_exec_fail".to_string()),
+            },
+            &tools,
+            5,
+            None,
+        )
+        .await;
+
+    assert!(outcome.is_error, "{}", outcome.result);
+    let envelope = ToolExecutionEnvelope::from_json_str(&outcome.result).expect("exec envelope");
+    assert!(!envelope.result.ok, "{}", outcome.result);
+    assert_eq!(envelope.result.exit_code, Some(1));
+    assert!(envelope.result.output.contains("ReferenceError"));
+
+    cleanup_session(session_id);
+}

@@ -195,6 +195,7 @@ mod tests {
             lifecycle: ExecLifecycle::Running,
             progress_kind: Some(ExecProgressKind::ExplicitFlush),
             flushed: true,
+            waiting_on_tool_request_id: None,
             waiting_on_timer_ms: None,
             notifications: Vec::new(),
             failure: None,
