@@ -5,6 +5,7 @@ use std::time::Instant;
 use rquickjs::async_with;
 use rquickjs::prelude::{Func, MutFn, Promise};
 use rquickjs::{AsyncContext, AsyncRuntime, Error, Function};
+use serde::Deserialize;
 
 use self::timers::RecordedTimerCall;
 use self::value::StoredValue;
@@ -16,6 +17,9 @@ pub mod globals;
 pub mod timers;
 pub mod value;
 
+const USER_CODE_MARKER: &str = "/*__RUSTY_CLAW_USER_CODE__*/";
+const WRAPPER_SCRIPT_TEMPLATE: &str = include_str!("wrapper.js");
+
 pub struct RunCellRequest {
     pub cell_id: String,
     pub code: String,
@@ -23,6 +27,16 @@ pub struct RunCellRequest {
     pub stored_values: HashMap<String, StoredValue>,
     pub command_rx: std::sync::mpsc::Receiver<crate::code_mode::protocol::CellCommand>,
     pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeCompletionPayload {
+    #[serde(rename = "returnValue")]
+    return_value: Option<serde_json::Value>,
+    #[serde(rename = "runtimeError")]
+    runtime_error: Option<String>,
+    #[serde(rename = "cancellationReason")]
+    cancellation_reason: Option<String>,
 }
 
 pub fn run_cell<F>(
@@ -62,7 +76,6 @@ where
         let stored_values = Arc::new(Mutex::new(stored_values));
         let nested_tool_count = Arc::new(Mutex::new(0usize));
         let timer_calls = Arc::new(Mutex::new(Vec::<RecordedTimerCall>::new()));
-        let observed_timer_calls = Arc::new(Mutex::new(0usize));
         let invoke_tool = Arc::new(Mutex::new(invoke_tool));
         let on_timer_calls_updated = Arc::new(on_timer_calls_updated);
         let visible_tools_json = serde_json::to_string(&visible_tools)
@@ -76,7 +89,6 @@ where
         let stored_values_for_script = stored_values.clone();
         let nested_tool_count_for_script = nested_tool_count.clone();
         let timer_calls_for_script = timer_calls.clone();
-        let observed_timer_calls_for_script = observed_timer_calls.clone();
         let invoke_tool_for_script = invoke_tool.clone();
         let on_timer_calls_updated_for_script = on_timer_calls_updated.clone();
 
@@ -222,7 +234,6 @@ where
                 .map_err(js_error_to_tool_error)?;
 
             let timer_calls_ref = timer_calls_for_script.clone();
-            let observed_timer_calls_ref = observed_timer_calls_for_script.clone();
             let on_timer_calls_updated_ref = on_timer_calls_updated_for_script.clone();
             let timer_clock_for_register = timer_clock_start.clone();
             globals
@@ -230,23 +241,13 @@ where
                     "__setTimeout",
                     Func::from(move |delay_ms: i32| -> rquickjs::Result<String> {
                         let delay_ms = u64::try_from(delay_ms).unwrap_or_default();
-                        let call_index = {
-                            let mut observed = observed_timer_calls_ref.lock().unwrap();
-                            let current = *observed;
-                            *observed += 1;
-                            current
-                        };
-                            let registration = {
-                                let mut timer_calls = timer_calls_ref.lock().unwrap();
-                                let registration = self::timers::register_timeout(
-                                    &mut timer_calls,
-                                    call_index,
-                                    delay_ms,
-                                    monotonic_elapsed_ms(timer_clock_for_register.as_ref()),
-                                )
-                                .map_err(|err| {
-                                    Error::new_from_js_message("timer", "resume", err.to_string())
-                            })?;
+                        let registration = {
+                            let mut timer_calls = timer_calls_ref.lock().unwrap();
+                            let registration = self::timers::register_timeout(
+                                &mut timer_calls,
+                                delay_ms,
+                                monotonic_elapsed_ms(timer_clock_for_register.as_ref()),
+                            );
                             on_timer_calls_updated_ref(timer_calls.clone());
                             registration
                         };
@@ -302,26 +303,8 @@ where
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            let timer_calls_ref = timer_calls_for_script.clone();
-            let timer_clock_for_due = timer_clock_start.clone();
-            globals
-                .set(
-                    "__dueTimersJson",
-                    Func::from(move || -> rquickjs::Result<String> {
-                        let due_timers = self::timers::due_timers(
-                            &timer_calls_ref.lock().unwrap(),
-                            monotonic_elapsed_ms(timer_clock_for_due.as_ref()),
-                        );
-                        serde_json::to_string(&due_timers).map_err(|err| {
-                            Error::new_from_js_message("timer", "json", err.to_string())
-                        })
-                    }),
-                )
-                .map_err(js_error_to_tool_error)?;
-
             // Register __wait_for_timer: blocks the worker thread for the specified duration
-            // while checking for CellCommand::Cancel from the driver. Used by the timer
-            // yield loop to pause JS execution autonomously.
+            // while checking for CellCommand::Cancel from the driver.
             let command_rx_for_resume = command_rx.clone();
             globals
                 .set(
@@ -331,13 +314,17 @@ where
                         let wait_dur = std::time::Duration::from_millis(ms as u64);
                         match rx.recv_timeout(wait_dur) {
                             Ok(crate::code_mode::protocol::CellCommand::Cancel { reason }) => {
-                                Ok(format!(r#"{{"yield":true,"cancel":true,"reason":"{}"}}"#, reason))
+                                Ok(serde_json::json!({
+                                    "cancelled": true,
+                                    "reason": reason,
+                                })
+                                .to_string())
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                Ok(r#"{"continue":true}"#.to_string())
+                                Ok(r#"{"continued":true}"#.to_string())
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                Ok(r#"{"yield":true}"#.to_string())
+                                Ok(r#"{"disconnected":true}"#.to_string())
                             }
                         }
                     }),
@@ -354,37 +341,18 @@ where
         })
         .await?;
 
-        let payload = serde_json::from_str::<serde_json::Value>(&return_payload)
+        let payload = serde_json::from_str::<RuntimeCompletionPayload>(&return_payload)
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
-        if let Some(runtime_error) = payload.get("runtimeError").and_then(serde_json::Value::as_str)
-        {
-            return Err(crate::tools::ToolError::ExecutionFailed(
-                runtime_error.to_string(),
-            ));
-        }
-        let flushed = payload
-            .get("yielded")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let return_value = payload
-            .get("returnValue")
-            .cloned()
-            .filter(|value| !value.is_null());
-        let flush_value = payload
-            .get("yieldValue")
-            .cloned()
-            .filter(|value| !value.is_null());
-        let runtime_error = payload
-            .get("runtimeError")
-            .and_then(serde_json::Value::as_str)
-            .map(String::from);
+        let return_value = payload.return_value.filter(|value| !value.is_null());
+        let runtime_error = payload.runtime_error;
+        let cancellation_reason = payload.cancellation_reason;
 
         let nested_tool_calls = *nested_tool_count.lock().unwrap();
         let stored_values = stored_values.lock().unwrap().clone();
         let lifecycle = if runtime_error.is_some() {
             super::response::ExecLifecycle::Failed
-        } else if flushed {
-            super::response::ExecLifecycle::Running
+        } else if cancellation_reason.is_some() {
+            super::response::ExecLifecycle::Cancelled
         } else {
             super::response::ExecLifecycle::Completed
         };
@@ -393,15 +361,15 @@ where
                 cell_id,
                 output_text: String::new(),
                 return_value,
-                flush_value,
+                flush_value: None,
                 lifecycle,
                 progress_kind: None,
-                flushed,
+                flushed: false,
                 waiting_on_tool_request_id: None,
                 waiting_on_timer_ms: None,
                 notifications: Vec::new(),
                 failure: runtime_error,
-                cancellation: None,
+                cancellation: cancellation_reason,
                 nested_tool_calls,
                 truncated: false,
             },
@@ -415,92 +383,14 @@ fn monotonic_elapsed_ms(start: &Instant) -> u64 {
 }
 
 fn build_wrapper_script(code: &str) -> String {
-    let mut script = String::new();
-    script.push_str("(async () => {\n");
-    script.push_str("const __allTools = JSON.parse(__allToolsJson);\n");
-    script.push_str("const tools = {};\n");
-    script.push_str("for (const toolName of __allTools) {\n");
-    script.push_str(
-        "  tools[toolName] = async (args) => { const result = JSON.parse(await __callTool(toolName, JSON.stringify(args === undefined ? null : args))); if (result && result.__rustyClawToolError) { throw String(result.__rustyClawToolError); } return result; };\n",
-    );
-    script.push_str("}\n");
-    script.push_str("globalThis.text = (value) => __text(String(value));\n");
-    script.push_str("globalThis.notify = (value) => __notify(String(value));\n");
-    script.push_str(
-        "globalThis.store = (key, value) => __store(String(key), JSON.stringify(value === undefined ? null : value));\n",
-    );
-    script.push_str(
-        "globalThis.load = (key) => { const raw = __load(String(key)); return raw == null ? undefined : JSON.parse(raw); };\n",
-    );
-    script.push_str("globalThis.exit = (value) => { throw { __rustyClawExit: true, value }; };\n");
-    script.push_str("globalThis.flush = (value) => {\n");
-    script.push_str("__flush(JSON.stringify(value));\n");
-    script.push_str("};\n");
-    script.push_str("globalThis.__allTimeoutCallbacks = {};\n");
-    script.push_str("globalThis.__dueTimeoutCallbacks = [];\n");
-    script.push_str("globalThis.__totalTimersRegistered = 0;\n");
-    script.push_str(
-        "globalThis.setTimeout = (callback, delayMs = 0) => { globalThis.__totalTimersRegistered++; if (typeof callback !== 'function') { throw new Error('setTimeout() requires a function callback'); } const normalizedDelay = Math.max(0, Math.trunc(Number(delayMs ?? 0) || 0)); const registration = JSON.parse(__setTimeout(normalizedDelay)); globalThis.__allTimeoutCallbacks[registration.timer_id] = callback; if (registration.action === 'run') { globalThis.__dueTimeoutCallbacks.push({ id: registration.timer_id, callback }); } return registration.timer_id; };\n",
-    );
-    script.push_str(
-        "globalThis.clearTimeout = (timerId) => { if (timerId == null) { return undefined; } const normalizedId = String(timerId); __clearTimeout(normalizedId); globalThis.__dueTimeoutCallbacks = globalThis.__dueTimeoutCallbacks.filter((item) => item.id !== normalizedId); return undefined; };\n",
-    );
-    script.push_str("let __result;\n");
-    script.push_str("try {\n");
-    script.push_str("  __result = await (async () => {\n");
+    let (prefix, suffix) = WRAPPER_SCRIPT_TEMPLATE
+        .split_once(USER_CODE_MARKER)
+        .expect("wrapper.js is missing the user-code marker");
+
+    let mut script = String::with_capacity(prefix.len() + code.len() + suffix.len());
+    script.push_str(prefix);
     script.push_str(code);
-    script.push_str("\n  })();\n");
-    script.push_str("} catch (err) {\n");
-    script.push_str(
-        "  if (err && err.__rustyClawExit) { return JSON.stringify({ yielded: false, yieldKind: null, returnValue: err.value === undefined ? null : err.value, yieldValue: null }); }\n",
-    );
-    script.push_str(
-        "  const __msg = (err && (err.message || err.name)) ? `${err.name || 'Error'}: ${err.message || ''}` : String(err);\n",
-    );
-    script.push_str("  const __stack = err && err.stack ? String(err.stack) : '';\n");
-    script.push_str(
-        "  return JSON.stringify({ yielded: false, yieldKind: null, runtimeError: __stack ? __msg + '\\n' + __stack : __msg });\n",
-    );
-    script.push_str("}\n");
-
-    script.push_str("while (true) {\n");
-    script.push_str("  const dueTimerIds = JSON.parse(__dueTimersJson());\n");
-    script.push_str("  for (const id of dueTimerIds) {\n");
-    script.push_str("    if (globalThis.__allTimeoutCallbacks[id] && !globalThis.__dueTimeoutCallbacks.some(c => c.id === id)) {\n");
-    script.push_str("      globalThis.__dueTimeoutCallbacks.push({ id, callback: globalThis.__allTimeoutCallbacks[id] });\n");
-    script.push_str("    }\n");
-    script.push_str("  }\n");
-
-    script.push_str("  if (globalThis.__dueTimeoutCallbacks.length > 0) {\n");
-    script.push_str("    const __batch = globalThis.__dueTimeoutCallbacks.splice(0);\n");
-    script.push_str("    for (const __timer of __batch) {\n");
-    script.push_str("      await __timer.callback();\n");
-    script.push_str("__markTimeoutComplete(__timer.id);\n");
-    script.push_str("    }\n");
-    script.push_str("    continue;\n");
-    script.push_str("  }\n");
-
-    script.push_str("  const __timerState = JSON.parse(__timerStateJson());\n");
-    script.push_str("  const __unfinishedTimerIds = Object.keys(globalThis.__allTimeoutCallbacks).filter(id => !__timerState.completed_ids?.includes(id));\n");
-    script.push_str("  if (__timerState.pending_timers > 0 || (__unfinishedTimerIds.length > 0 && globalThis.__totalTimersRegistered > 0)) {\n");
-    script.push_str("    const __yieldObj = { reason: 'timer_pending', pending_timers: __timerState.pending_timers || 1, next_timer_id: __timerState.next_timer_id, resume_after_ms: __timerState.resume_after_ms || 100 };\n");
-    script.push_str("__waiting_for_timer(__timerState.resume_after_ms || 100);\n");
-    script.push_str(
-        "    const resume = JSON.parse(__wait_for_timer(__timerState.resume_after_ms || 100));\n",
-    );
-    script.push_str("    if (resume && (resume.yield || resume.cancel)) {\n");
-    script.push_str(
-        "      return JSON.stringify({ yielded: true, yieldKind: 'timer', returnValue: null, yieldValue: __yieldObj });\n",
-    );
-    script.push_str("    }\n");
-    script.push_str("    continue;\n");
-    script.push_str("  }\n");
-    script.push_str("  break;\n");
-    script.push_str("}\n");
-    script.push_str(
-        "return JSON.stringify({ yielded: false, yieldKind: null, returnValue: __result === undefined ? null : __result, yieldValue: null });\n",
-    );
-    script.push_str("})()\n");
+    script.push_str(suffix);
     script
 }
 

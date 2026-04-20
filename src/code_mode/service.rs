@@ -1065,7 +1065,7 @@ mod tests {
                 None,
             )
             .await
-            .expect("exec should yield");
+            .expect("exec should publish the flush boundary");
         assert!(summary.flushed);
 
         let err = service
