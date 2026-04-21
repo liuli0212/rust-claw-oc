@@ -92,31 +92,47 @@ pub(crate) async fn dispatch_tool_call(
         }),
     );
 
-    let exec_result = tokio::select! {
-        result = tokio::time::timeout(
-            Duration::from_secs(90),
-            run_invocation(call, invocation, visible_tools, &config)
-        ) => {
-            match result {
-                Ok(Ok(summary)) => Ok(summary),
-                Ok(Err(err)) => Err(err),
-                Err(_) => {
-                    config
-                        .service
-                        .abort_active_cell(&config.session_id, "Code mode execution timed out.")
-                        .await;
-                    Err(crate::tools::ToolError::Timeout)
-                }
+    let is_wait = matches!(invocation, CodeModeInvocation::Wait(_));
+
+    let exec_result = if is_wait {
+        // wait is read-only: no hard timeout, no abort on cancel — just observe.
+        tokio::select! {
+            result = run_invocation(call, invocation, visible_tools, &config) => {
+                result
+            }
+            _ = config.cancel_token.notified() => {
+                Err(crate::tools::ToolError::Cancelled(
+                    "Code mode wait interrupted by user.".to_string(),
+                ))
             }
         }
-        _ = config.cancel_token.notified() => {
-            config
-                .service
-                .abort_active_cell(&config.session_id, "Code mode execution interrupted by user.")
-                .await;
-            Err(crate::tools::ToolError::Cancelled(
-                "Code mode execution interrupted by user.".to_string(),
-            ))
+    } else {
+        tokio::select! {
+            result = tokio::time::timeout(
+                Duration::from_secs(90),
+                run_invocation(call, invocation, visible_tools, &config)
+            ) => {
+                match result {
+                    Ok(Ok(summary)) => Ok(summary),
+                    Ok(Err(err)) => Err(err),
+                    Err(_) => {
+                        config
+                            .service
+                            .abort_active_cell(&config.session_id, "Code mode execution timed out.")
+                            .await;
+                        Err(crate::tools::ToolError::Timeout)
+                    }
+                }
+            }
+            _ = config.cancel_token.notified() => {
+                config
+                    .service
+                    .abort_active_cell(&config.session_id, "Code mode execution interrupted by user.")
+                    .await;
+                Err(crate::tools::ToolError::Cancelled(
+                    "Code mode execution interrupted by user.".to_string(),
+                ))
+            }
         }
     };
 

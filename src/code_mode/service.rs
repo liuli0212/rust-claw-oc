@@ -366,11 +366,7 @@ impl CodeModeService {
             )
         };
 
-        let wait_timeout = Some(
-            wait_timeout_ms
-                .map(Duration::from_millis)
-                .unwrap_or(Duration::from_secs(30)),
-        );
+        let wait_timeout = wait_timeout_ms.map(Duration::from_millis);
         let updated = host_handle
             .wait_for_update_after(revision, wait_timeout)
             .await;
