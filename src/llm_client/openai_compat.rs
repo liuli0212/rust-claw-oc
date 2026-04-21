@@ -232,9 +232,6 @@ impl LlmClient for OpenAiCompatClient {
             let mut openai_tools = Vec::new();
             for tool in tools {
                 let definition = tool.definition();
-                if definition.kind != crate::tools::ToolKind::Function {
-                    continue;
-                }
                 openai_tools.push(serde_json::json!({
                     "type": "function",
                     "function": {

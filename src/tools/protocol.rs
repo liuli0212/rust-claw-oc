@@ -35,25 +35,11 @@ pub enum ToolError {
     IoError(#[from] std::io::Error),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ToolKind {
-    Function,
-    Freeform,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FreeformToolFormat {
-    pub syntax: String,
-    pub definition: String,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
-    pub kind: ToolKind,
     pub input_schema: Option<serde_json::Value>,
-    pub freeform_format: Option<FreeformToolFormat>,
 }
 
 #[derive(Debug, Clone)]
@@ -106,9 +92,7 @@ pub trait Tool: Send + Sync {
         ToolDefinition {
             name: self.name(),
             description: self.description(),
-            kind: ToolKind::Function,
             input_schema: Some(self.parameters_schema()),
-            freeform_format: None,
         }
     }
     /// Whether this tool can modify files, state, or the outside world.

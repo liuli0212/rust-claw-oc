@@ -22,9 +22,6 @@ pub(crate) fn build_function_declarations(tools: &[Arc<dyn Tool>]) -> Vec<Functi
     let mut declarations = Vec::with_capacity(tools.len());
     for tool in tools {
         let definition = tool.definition();
-        if definition.kind != crate::tools::ToolKind::Function {
-            continue;
-        }
         let mut parameters = definition
             .input_schema
             .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));

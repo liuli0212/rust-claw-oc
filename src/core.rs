@@ -575,10 +575,6 @@ impl AgentLoop {
                     serde_json::json!({
                         "name": definition.name,
                         "description": definition.description,
-                        "kind": match definition.kind {
-                            crate::tools::ToolKind::Function => "function",
-                            crate::tools::ToolKind::Freeform => "freeform",
-                        },
                         "parameters": definition.input_schema,
                     })
                 })

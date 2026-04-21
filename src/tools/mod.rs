@@ -26,7 +26,7 @@ pub use lsp::{
 };
 pub use memory::{RagInsertTool, RagSearchTool, ReadMemoryTool, WriteMemoryTool};
 pub use protocol::{
-    clean_schema, FreeformToolFormat, Tool, ToolContext, ToolDefinition, ToolError, ToolKind,
+    clean_schema, Tool, ToolContext, ToolDefinition, ToolError,
 };
 pub use scheduler::ManageScheduleTool;
 pub use subagent::SubagentTool;
