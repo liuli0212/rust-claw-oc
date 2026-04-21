@@ -414,6 +414,7 @@ fn code_mode_tool_result_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_trace_event(
     trace_bus: &TraceBus,
     trace_ctx: Option<&TraceContext>,
