@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::runtime;
 use super::runtime::value::StoredValue;
 
 #[derive(Debug, Clone)]
@@ -46,16 +45,12 @@ pub enum RuntimeEvent {
     },
     ToolCallRequested(ToolCallRequestEvent),
 
-    ToolCallResolved {
+    ToolCallDone {
         seq: u64,
         request_id: String,
         ok: bool,
     },
     WorkerCompleted(Result<RuntimeTerminalResult, String>),
-    TimerRegistrationChanged {
-        seq: u64,
-        timer_calls: Vec<runtime::timers::RecordedTimerCall>,
-    },
 }
 
 impl RuntimeEvent {
@@ -65,8 +60,7 @@ impl RuntimeEvent {
             | Self::Notification { seq, .. }
             | Self::Flush { seq, .. }
             | Self::WaitingForTimer { seq, .. }
-            | Self::ToolCallResolved { seq, .. }
-            | Self::TimerRegistrationChanged { seq, .. } => Some(*seq),
+            | Self::ToolCallDone { seq, .. } => Some(*seq),
             Self::ToolCallRequested(request) => Some(request.seq),
             Self::WorkerCompleted(_) => None,
         }
@@ -78,8 +72,7 @@ impl RuntimeEvent {
             Self::WorkerCompleted(_)
                 | Self::WaitingForTimer { .. }
                 | Self::ToolCallRequested(_)
-                | Self::ToolCallResolved { .. }
-                | Self::TimerRegistrationChanged { .. }
+                | Self::ToolCallDone { .. }
         )
     }
 }

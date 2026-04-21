@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use super::driver::{DriverBoundary, DriverUpdate};
 use super::protocol::{max_event_seq, RuntimeEvent, RuntimeTerminalResult};
-use super::response::{CellRenderState, ExecLifecycle, ExecProgressKind, ExecRunResult};
+use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 
 const RECENT_EVENT_BUDGET_CHARS: usize = 8_000;
 
@@ -137,7 +137,7 @@ impl ActiveCellHandle {
                     request_id: request.request_id.clone(),
                 });
             }
-            RuntimeEvent::ToolCallResolved { .. } => {
+            RuntimeEvent::ToolCallDone { .. } => {
                 self.phase = CellPhase::Running;
             }
             RuntimeEvent::WaitingForTimer {
@@ -147,7 +147,7 @@ impl ActiveCellHandle {
                     next_due_in_ms: *resume_after_ms,
                 });
             }
-            RuntimeEvent::TimerRegistrationChanged { .. } | RuntimeEvent::WorkerCompleted(_) => {}
+            RuntimeEvent::WorkerCompleted(_) => {}
         }
     }
 
@@ -165,6 +165,32 @@ impl ActiveCellHandle {
             cancellation: result.cancellation_reason.clone(),
         });
     }
+}
+
+fn aggregate_events(events: &[RuntimeEvent]) -> (String, Vec<String>) {
+    let mut output_text = String::new();
+    let mut notifications = Vec::new();
+
+    for event in events {
+        match event {
+            RuntimeEvent::Text { text, .. } => {
+                if !output_text.is_empty() && !text.is_empty() {
+                    output_text.push('\n');
+                }
+                output_text.push_str(text);
+            }
+            RuntimeEvent::Notification { message, .. } => {
+                notifications.push(message.clone());
+            }
+            RuntimeEvent::Flush { .. }
+            | RuntimeEvent::ToolCallRequested(_)
+            | RuntimeEvent::ToolCallDone { .. }
+            | RuntimeEvent::WaitingForTimer { .. }
+            | RuntimeEvent::WorkerCompleted(_) => {}
+        }
+    }
+
+    (output_text, notifications)
 }
 
 #[derive(Debug, Clone)]
@@ -209,33 +235,23 @@ impl CellSnapshot {
         }
     }
 
-    pub fn build_render_state(&self) -> CellRenderState {
-        let mut state = CellRenderState::from_events(&self.recent_events);
-        state.lifecycle = self.lifecycle();
-        state.waiting_on_tool_request_id = self.waiting_on_tool_request_id().map(ToOwned::to_owned);
-        state.waiting_on_timer_ms = self.waiting_on_timer_ms();
-
-        if let Some(terminal) = &self.terminal_state {
-            state.return_value = terminal.return_value.clone();
-            state.flush_value = None;
-            state.failure = terminal.failure.clone();
-            state.cancellation = terminal.cancellation.clone();
-        }
-
-        state
-    }
-
     pub fn to_exec_result(
         &self,
         progress_kind: Option<ExecProgressKind>,
         flush_value: Option<Value>,
     ) -> ExecRunResult {
-        let render = self.build_render_state();
+        let (output_text, notifications) = aggregate_events(&self.recent_events);
+
+        let (return_value, failure, cancellation) = self
+            .terminal_state
+            .as_ref()
+            .map(|t| (t.return_value.clone(), t.failure.clone(), t.cancellation.clone()))
+            .unwrap_or_default();
 
         ExecRunResult {
             cell_id: self.cell_id.clone(),
-            output_text: render.output_text,
-            return_value: render.return_value,
+            output_text,
+            return_value,
             flush_value: if progress_kind == Some(ExecProgressKind::ExplicitFlush) {
                 flush_value
             } else {
@@ -246,9 +262,9 @@ impl CellSnapshot {
             flushed: progress_kind.is_some(),
             waiting_on_tool_request_id: self.waiting_on_tool_request_id().map(str::to_owned),
             waiting_on_timer_ms: self.waiting_on_timer_ms(),
-            notifications: render.notifications,
-            failure: render.failure,
-            cancellation: render.cancellation,
+            notifications,
+            failure,
+            cancellation,
             nested_tool_calls: self.nested_tool_calls,
             truncated: false,
         }
@@ -284,9 +300,8 @@ mod tests {
         assert_eq!(snapshot.cell_id, "test-cell");
         assert_eq!(snapshot.max_seq, 4);
 
-        let render = snapshot.build_render_state();
-        assert_eq!(render.output_text, "hello \nworld");
-        assert_eq!(render.notifications, vec!["notif"]);
-        assert_eq!(render.flush_value, Some(json!({"foo": "bar"})));
+        let result = snapshot.to_exec_result(None, None);
+        assert_eq!(result.output_text, "hello \nworld");
+        assert_eq!(result.notifications, vec!["notif"]);
     }
 }

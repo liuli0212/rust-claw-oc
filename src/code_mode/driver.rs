@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -113,7 +113,6 @@ impl CellDriver {
     /// sees the `ToolCallRequested`, calls
     /// the caller's async `invoke_tool`, and sends the result back.
     pub fn spawn_live(
-        cell_id: String,
         code: String,
         visible_tools: Vec<String>,
         stored_values: HashMap<String, runtime::value::StoredValue>,
@@ -131,14 +130,9 @@ impl CellDriver {
         let cancel_flag_for_worker = cancel_flag.clone();
 
         let event_tx_captured = event_tx.clone();
-        let next_seq = Arc::new(AtomicU64::new(0));
 
-        let next_seq_for_worker = next_seq.clone();
-
-        let cell_id_for_worker = cell_id.clone();
         let worker = tokio::task::spawn_blocking(move || {
             let request = runtime::RunCellRequest {
-                cell_id: cell_id_for_worker,
                 code,
                 visible_tools,
                 stored_values,
@@ -162,19 +156,10 @@ impl CellDriver {
                 })
             };
 
-            let event_tx_for_timer = event_tx_captured.clone();
-            let next_seq_for_timer = next_seq_for_worker.clone();
-
             let result = runtime::run_cell(
                 tokio::runtime::Handle::current(),
                 request,
                 invoke_tool,
-                move |timer_calls| {
-                    let _ = event_tx_for_timer.send(RuntimeEvent::TimerRegistrationChanged {
-                        seq: next_seq_for_timer.fetch_add(1, Ordering::Relaxed) + 1,
-                        timer_calls,
-                    });
-                },
                 event_tx_captured.clone(),
             );
 
@@ -274,7 +259,7 @@ impl CellDriver {
             crate::tools::ToolError::ExecutionFailed("Tool result channel closed".to_string())
         })?;
         self.pending_events
-            .push_back(RuntimeEvent::ToolCallResolved {
+            .push_back(RuntimeEvent::ToolCallDone {
                 seq: request.seq,
                 request_id: request.request_id.clone(),
                 ok,
@@ -321,7 +306,6 @@ mod tests {
     #[tokio::test]
     async fn test_driver_cancels_infinite_loop_and_thread_exits() {
         let mut driver = CellDriver::spawn_live(
-            "test-cell".to_string(),
             "while(true) {}".to_string(),
             vec![],
             HashMap::new(),

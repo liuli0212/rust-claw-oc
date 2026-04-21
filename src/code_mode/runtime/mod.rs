@@ -21,7 +21,6 @@ const USER_CODE_MARKER: &str = "/*__RUSTY_CLAW_USER_CODE__*/";
 const WRAPPER_SCRIPT_TEMPLATE: &str = include_str!("wrapper.js");
 
 pub struct RunCellRequest {
-    pub cell_id: String,
     pub code: String,
     pub visible_tools: Vec<String>,
     pub stored_values: HashMap<String, StoredValue>,
@@ -43,7 +42,6 @@ pub fn run_cell<F>(
     handle: tokio::runtime::Handle,
     request: RunCellRequest,
     invoke_tool: F,
-    on_timer_calls_updated: impl Fn(Vec<RecordedTimerCall>) + Send + Sync + 'static,
     event_tx: tokio::sync::mpsc::UnboundedSender<crate::code_mode::protocol::RuntimeEvent>,
 ) -> Result<RuntimeTerminalResult, crate::tools::ToolError>
 where
@@ -62,7 +60,6 @@ where
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
 
         let RunCellRequest {
-            cell_id: _cell_id,
             code,
             visible_tools,
             stored_values,
@@ -77,7 +74,6 @@ where
         let nested_tool_count = Arc::new(Mutex::new(0usize));
         let timer_calls = Arc::new(Mutex::new(Vec::<RecordedTimerCall>::new()));
         let invoke_tool = Arc::new(Mutex::new(invoke_tool));
-        let on_timer_calls_updated = Arc::new(on_timer_calls_updated);
         let visible_tools_json = serde_json::to_string(&visible_tools)
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
 
@@ -90,7 +86,6 @@ where
         let nested_tool_count_for_script = nested_tool_count.clone();
         let timer_calls_for_script = timer_calls.clone();
         let invoke_tool_for_script = invoke_tool.clone();
-        let on_timer_calls_updated_for_script = on_timer_calls_updated.clone();
 
         let return_payload = async_with!(context => |ctx| {
             let globals = ctx.globals();
@@ -234,23 +229,18 @@ where
                 .map_err(js_error_to_tool_error)?;
 
             let timer_calls_ref = timer_calls_for_script.clone();
-            let on_timer_calls_updated_ref = on_timer_calls_updated_for_script.clone();
             let timer_clock_for_register = timer_clock_start.clone();
             globals
                 .set(
                     "__setTimeout",
                     Func::from(move |delay_ms: i32| -> rquickjs::Result<String> {
                         let delay_ms = u64::try_from(delay_ms).unwrap_or_default();
-                        let registration = {
-                            let mut timer_calls = timer_calls_ref.lock().unwrap();
-                            let registration = self::timers::register_timeout(
-                                &mut timer_calls,
-                                delay_ms,
-                                monotonic_elapsed_ms(timer_clock_for_register.as_ref()),
-                            );
-                            on_timer_calls_updated_ref(timer_calls.clone());
-                            registration
-                        };
+                        let mut timer_calls = timer_calls_ref.lock().unwrap();
+                        let registration = self::timers::register_timeout(
+                            &mut timer_calls,
+                            delay_ms,
+                            monotonic_elapsed_ms(timer_clock_for_register.as_ref()),
+                        );
                         serde_json::to_string(&registration).map_err(|err| {
                             Error::new_from_js_message("timer", "json", err.to_string())
                         })
@@ -259,28 +249,24 @@ where
                 .map_err(js_error_to_tool_error)?;
 
             let timer_calls_ref = timer_calls_for_script.clone();
-            let on_timer_calls_updated_ref = on_timer_calls_updated_for_script.clone();
             globals
                 .set(
                     "__clearTimeout",
                     Func::from(move |timer_id: String| -> rquickjs::Result<()> {
                         let mut timer_calls = timer_calls_ref.lock().unwrap();
                         self::timers::clear_timeout(&mut timer_calls, &timer_id);
-                        on_timer_calls_updated_ref(timer_calls.clone());
                         Ok(())
                     }),
                 )
                 .map_err(js_error_to_tool_error)?;
 
             let timer_calls_ref = timer_calls_for_script.clone();
-            let on_timer_calls_updated_ref = on_timer_calls_updated_for_script.clone();
             globals
                 .set(
                     "__markTimeoutComplete",
                     Func::from(move |timer_id: String| -> rquickjs::Result<()> {
                         let mut timer_calls = timer_calls_ref.lock().unwrap();
                         self::timers::mark_timeout_completed(&mut timer_calls, &timer_id);
-                        on_timer_calls_updated_ref(timer_calls.clone());
                         Ok(())
                     }),
                 )

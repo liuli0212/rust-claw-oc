@@ -1,4 +1,3 @@
-use super::protocol::RuntimeEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -49,81 +48,7 @@ pub struct ExecRunResult {
 
 impl ExecRunResult {
     pub fn render_output(&self) -> String {
-        CellRenderState::from_exec_result(self).render_output(
-            &self.cell_id,
-            self.nested_tool_calls,
-            self.truncated,
-        )
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct CellRenderState {
-    pub output_text: String,
-    pub notifications: Vec<String>,
-    pub return_value: Option<Value>,
-    pub flush_value: Option<Value>,
-    pub lifecycle: ExecLifecycle,
-    pub progress_kind: Option<ExecProgressKind>,
-    pub waiting_on_tool_request_id: Option<String>,
-    pub waiting_on_timer_ms: Option<u64>,
-    pub failure: Option<String>,
-    pub cancellation: Option<String>,
-}
-
-impl CellRenderState {
-    pub fn from_exec_result(result: &ExecRunResult) -> Self {
-        Self {
-            output_text: result.output_text.clone(),
-            notifications: result.notifications.clone(),
-            return_value: result.return_value.clone(),
-            flush_value: result.flush_value.clone(),
-            lifecycle: result.lifecycle.clone(),
-            progress_kind: result.progress_kind.clone(),
-            waiting_on_tool_request_id: result.waiting_on_tool_request_id.clone(),
-            waiting_on_timer_ms: result.waiting_on_timer_ms,
-            failure: result.failure.clone(),
-            cancellation: result.cancellation.clone(),
-        }
-    }
-
-    pub fn from_events(events: &[RuntimeEvent]) -> Self {
-        let mut state = Self::default();
-
-        for event in events {
-            match event {
-                RuntimeEvent::Text { text, .. } => {
-                    state.flush_value = None;
-                    if !state.output_text.is_empty() && !text.is_empty() {
-                        state.output_text.push('\n');
-                    }
-                    state.output_text.push_str(text);
-                }
-                RuntimeEvent::Notification { message, .. } => {
-                    state.flush_value = None;
-                    state.notifications.push(message.clone());
-                }
-                RuntimeEvent::Flush { value, .. } => {
-                    state.flush_value = value.clone();
-                }
-                RuntimeEvent::ToolCallRequested(_)
-                | RuntimeEvent::ToolCallResolved { .. }
-                | RuntimeEvent::WaitingForTimer { .. }
-                | RuntimeEvent::WorkerCompleted(_)
-                | RuntimeEvent::TimerRegistrationChanged { .. } => {}
-            }
-        }
-
-        state
-    }
-
-    pub fn render_output(
-        &self,
-        cell_id: &str,
-        nested_tool_calls: usize,
-        truncated: bool,
-    ) -> String {
-        let mut lines = vec![self.default_status_line(cell_id, nested_tool_calls)];
+        let mut lines = vec![self.default_status_line()];
 
         if !self.output_text.trim().is_empty() {
             lines.push("Text output:".to_string());
@@ -146,11 +71,7 @@ impl CellRenderState {
             } else {
                 "Return value:"
             };
-            let value_to_render = if self.flush_value.is_some() {
-                self.flush_value.as_ref()
-            } else {
-                self.return_value.as_ref()
-            };
+            let value_to_render = self.flush_value.as_ref().or(self.return_value.as_ref());
 
             if let Some(value) = value_to_render {
                 let rendered = if value.is_string() {
@@ -169,41 +90,36 @@ impl CellRenderState {
 
         if !self.notifications.is_empty() {
             lines.push("Notifications:".to_string());
-            lines.extend(
-                self.notifications
-                    .iter()
-                    .map(|item| format!("- {item}"))
-                    .collect::<Vec<_>>(),
-            );
+            lines.extend(self.notifications.iter().map(|item| format!("- {item}")));
         }
 
-        if truncated {
+        if self.truncated {
             lines.push("[output truncated to stay within the code-mode budget]".to_string());
         }
 
         lines.join("\n")
     }
 
-    fn default_status_line(&self, cell_id: &str, nested_tool_calls: usize) -> String {
+    fn default_status_line(&self) -> String {
         match &self.lifecycle {
             ExecLifecycle::Cancelled => format!(
                 "Code mode cell `{}` was cancelled after {} nested tool call(s).",
-                cell_id, nested_tool_calls
+                self.cell_id, self.nested_tool_calls
             ),
             ExecLifecycle::Failed => format!(
                 "Code mode cell `{}` failed after {} nested tool call(s).",
-                cell_id, nested_tool_calls
+                self.cell_id, self.nested_tool_calls
             ),
             ExecLifecycle::Completed => format!(
                 "Code mode cell `{}` completed after {} nested tool call(s).",
-                cell_id, nested_tool_calls
+                self.cell_id, self.nested_tool_calls
             ),
             ExecLifecycle::Running
                 if self.progress_kind.as_ref() == Some(&ExecProgressKind::ExplicitFlush) =>
             {
                 format!(
                     "Code mode cell `{}` flushed after {} nested tool call(s). Call `wait` to sync more output.",
-                    cell_id, nested_tool_calls
+                    self.cell_id, self.nested_tool_calls
                 )
             }
             ExecLifecycle::Running
@@ -211,22 +127,22 @@ impl CellRenderState {
             {
                 format!(
                     "Code mode cell `{}` published an automatic progress update after {} nested tool call(s). Call `wait` to sync more output.",
-                    cell_id, nested_tool_calls
+                    self.cell_id, self.nested_tool_calls
                 )
             }
             ExecLifecycle::Running if self.waiting_on_tool_request_id.is_some() => format!(
                 "Code mode cell `{}` is processing nested tool request {} after {} nested tool call(s). Call `wait` to poll for more output.",
-                cell_id,
+                self.cell_id,
                 self.waiting_on_tool_request_id.as_deref().unwrap_or("unknown"),
-                nested_tool_calls
+                self.nested_tool_calls
             ),
             ExecLifecycle::Running if self.waiting_on_timer_ms.is_some() => format!(
                 "Code mode cell `{}` is still running in the background after {} nested tool call(s). Call `wait` to poll for more output.",
-                cell_id, nested_tool_calls
+                self.cell_id, self.nested_tool_calls
             ),
             ExecLifecycle::Running => format!(
                 "Code mode cell `{}` is still running after {} nested tool call(s). Call `wait` to poll for more output.",
-                cell_id, nested_tool_calls
+                self.cell_id, self.nested_tool_calls
             ),
         }
     }

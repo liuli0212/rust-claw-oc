@@ -263,7 +263,6 @@ impl CodeModeService {
             let cell_id = format!("cell-{}", session.next_cell_seq);
             session.next_cell_seq += 1;
             let driver = CellDriver::spawn_live(
-                cell_id.clone(),
                 code.to_string(),
                 visible_tools,
                 session.stored_values.clone(),
