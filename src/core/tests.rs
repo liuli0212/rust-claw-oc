@@ -427,7 +427,7 @@ async fn test_step_honors_cancel_during_pending_llm_stream_start() {
         tokio::spawn(async move { agent.step("Refactor the core loop".to_string()).await });
     tokio::time::sleep(Duration::from_millis(20)).await;
     cancelled.store(true, Ordering::SeqCst);
-    cancel_token.notify_waiters();
+    cancel_token.cancel();
 
     let exit = step_handle.await.unwrap().unwrap();
     let store = crate::task_state::TaskStateStore::new(session_id);

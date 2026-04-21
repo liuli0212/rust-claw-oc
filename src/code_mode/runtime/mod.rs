@@ -53,7 +53,7 @@ where
 
         let cancel_flag_clone = request.cancel_flag.clone();
         runtime.set_interrupt_handler(Some(Box::new(move || {
-            cancel_flag_clone.load(std::sync::atomic::Ordering::Relaxed)
+            cancel_flag_clone.load(std::sync::atomic::Ordering::Acquire)
         }))).await;
         let context = AsyncContext::full(&runtime)
             .await
@@ -126,7 +126,13 @@ where
                 .set(
                     "__flush",
                     Func::from(move |value_json: String| -> rquickjs::Result<()> {
-                        let flush_value = if value_json.is_empty() || value_json == "null" { None } else { Some(serde_json::from_str(&value_json).unwrap_or(serde_json::Value::Null)) };
+                        let flush_value = if value_json.is_empty() || value_json == "null" {
+                            None
+                        } else {
+                            let v = serde_json::from_str(&value_json)
+                                .map_err(|err| Error::new_from_js_message("flush", "json", err.to_string()))?;
+                            Some(v)
+                        };
                         let _ = event_tx_for_flush.send(crate::code_mode::protocol::RuntimeEvent::Flush {
                             seq: next_seq_for_flush.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                             value: flush_value,
@@ -159,7 +165,7 @@ where
                         let value = serde_json::from_str::<serde_json::Value>(&value_json).map_err(
                             |err| Error::new_from_js_message("string", "json", err.to_string()),
                         )?;
-                        store_ref.lock().unwrap().insert(key, value);
+                        store_ref.lock().unwrap_or_else(|e| e.into_inner()).insert(key, value);
                         Ok(())
                     }),
                 )
@@ -172,7 +178,7 @@ where
                     Func::from(move |key: String| -> rquickjs::Result<Option<String>> {
                         Ok(load_ref
                             .lock()
-                            .unwrap()
+                            .unwrap_or_else(|e| e.into_inner())
                             .get(&key)
                             .map(serde_json::Value::to_string))
                     }),
@@ -186,7 +192,7 @@ where
             let call_tool = Function::new(
                 ctx.clone(),
                 MutFn::from(move |tool_name: String, args_json: String| -> rquickjs::Result<String> {
-                    *call_tool_ref.lock().unwrap() += 1;
+                    *call_tool_ref.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     let seq = next_seq_for_tool.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let request_id = format!("{}-{}", tool_name, seq);
                     let _ = event_tx_for_tool.send(crate::code_mode::protocol::RuntimeEvent::ToolCallRequested(
@@ -199,7 +205,7 @@ where
                     ));
 
                     let tool_result = {
-                        let mut lock = invoke_tool_ref.lock().unwrap();
+                        let mut lock = invoke_tool_ref.lock().unwrap_or_else(|e| e.into_inner());
                         (lock)(tool_name.clone(), args_json.clone())
                     };
 
@@ -235,7 +241,7 @@ where
                     "__setTimeout",
                     Func::from(move |delay_ms: i32| -> rquickjs::Result<String> {
                         let delay_ms = u64::try_from(delay_ms).unwrap_or_default();
-                        let mut timer_calls = timer_calls_ref.lock().unwrap();
+                        let mut timer_calls = timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner());
                         let registration = self::timers::register_timeout(
                             &mut timer_calls,
                             delay_ms,
@@ -253,7 +259,7 @@ where
                 .set(
                     "__clearTimeout",
                     Func::from(move |timer_id: String| -> rquickjs::Result<()> {
-                        let mut timer_calls = timer_calls_ref.lock().unwrap();
+                        let mut timer_calls = timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner());
                         self::timers::clear_timeout(&mut timer_calls, &timer_id);
                         Ok(())
                     }),
@@ -265,7 +271,7 @@ where
                 .set(
                     "__markTimeoutComplete",
                     Func::from(move |timer_id: String| -> rquickjs::Result<()> {
-                        let mut timer_calls = timer_calls_ref.lock().unwrap();
+                        let mut timer_calls = timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner());
                         self::timers::mark_timeout_completed(&mut timer_calls, &timer_id);
                         Ok(())
                     }),
@@ -279,7 +285,7 @@ where
                     "__timerStateJson",
                     Func::from(move || -> rquickjs::Result<String> {
                         let pending = self::timers::pending_timer_state(
-                            &timer_calls_ref.lock().unwrap(),
+                            &timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner()),
                             monotonic_elapsed_ms(timer_clock_for_pending.as_ref()),
                         );
                         serde_json::to_string(&pending).map_err(|err| {
@@ -296,7 +302,7 @@ where
                 .set(
                     "__wait_for_timer",
                     Func::from(move |ms: f64| -> rquickjs::Result<String> {
-                        let rx = command_rx_for_resume.lock().unwrap();
+                        let rx = command_rx_for_resume.lock().unwrap_or_else(|e| e.into_inner());
                         let wait_dur = std::time::Duration::from_millis(ms as u64);
                         match rx.recv_timeout(wait_dur) {
                             Ok(crate::code_mode::protocol::CellCommand::Cancel { reason }) => {
@@ -333,7 +339,7 @@ where
         let runtime_error = payload.runtime_error;
         let cancellation_reason = payload.cancellation_reason;
 
-        let stored_values = stored_values.lock().unwrap().clone();
+        let stored_values = stored_values.lock().unwrap_or_else(|e| e.into_inner()).clone();
         Ok(RuntimeTerminalResult {
             return_value,
             runtime_error,

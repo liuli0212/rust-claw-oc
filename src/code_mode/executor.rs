@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::context::AgentContext;
 use crate::core::extensions::ExecutionExtension;
@@ -31,6 +31,7 @@ pub fn is_code_mode_nested_tool(tool_name: &str) -> bool {
 
 pub(crate) struct CodeModeNestedToolExecutorConfig {
     pub(crate) current_tools: Vec<Arc<dyn Tool>>,
+    pub(crate) visible_tools: Vec<String>,
     pub(crate) extensions: Vec<Arc<dyn ExecutionExtension>>,
     pub(crate) session_id: String,
     pub(crate) reply_to: String,
@@ -42,7 +43,7 @@ pub(crate) struct CodeModeNestedToolExecutorConfig {
     pub(crate) trace_bus: Arc<TraceBus>,
     pub(crate) provider: String,
     pub(crate) model: String,
-    pub(crate) cancel_token: Arc<Notify>,
+    pub(crate) cancel_token: CancellationToken,
     pub(crate) is_autopilot: bool,
     pub(crate) todos_path: PathBuf,
     pub(crate) execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
@@ -62,6 +63,7 @@ impl CodeModeNestedToolExecutor {
     pub(crate) fn new(config: CodeModeNestedToolExecutorConfig) -> Self {
         let CodeModeNestedToolExecutorConfig {
             current_tools,
+            visible_tools,
             extensions,
             session_id,
             reply_to,
@@ -78,12 +80,6 @@ impl CodeModeNestedToolExecutor {
             todos_path,
             execution_guard_state,
         } = config;
-
-        let visible_tools = current_tools
-            .iter()
-            .map(|tool| tool.name())
-            .filter(|name| is_code_mode_nested_tool(name))
-            .collect();
 
         let tool_invoker = ToolInvoker::new(ToolInvokerConfig {
             current_tools,
@@ -125,10 +121,16 @@ impl CodeModeNestedToolExecutor {
     }
 
     async fn execute(&mut self, tool_name: String, args: Value) -> Result<String, ToolError> {
-        if !is_code_mode_nested_tool(&tool_name) {
+        if !self.tool_invoker.visible_tools().contains(&tool_name) {
             return Err(ToolError::ExecutionFailed(format!(
                 "Tool `{tool_name}` is not available inside code mode."
             )));
+        }
+
+        if self.remaining_steps == 0 {
+            return Err(ToolError::ExecutionFailed(
+                "No remaining steps: nested tool call limit reached.".to_string(),
+            ));
         }
 
         if let Some(reason) = self
@@ -138,12 +140,15 @@ impl CodeModeNestedToolExecutor {
             return Err(ToolError::ExecutionFailed(reason));
         }
 
+        self.remaining_steps = self.remaining_steps.saturating_sub(1);
+        self.tool_invoker.decrement_remaining_steps();
+
         let outcome = self
             .tool_invoker
             .invoke(ToolInvocationRequest {
                 tool_name: &tool_name,
                 args: args.clone(),
-                timeout: Duration::from_secs(120),
+                timeout: Duration::from_secs(85),
                 trace_ctx: self.iteration_trace_ctx.clone(),
                 context_parent_span_id: self.parent_span_id.clone(),
                 span: Some(ToolInvocationSpanConfig {

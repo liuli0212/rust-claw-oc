@@ -109,7 +109,7 @@ impl AgentLoop {
 
             let stream_res = tokio::select! {
                 res = self.llm.stream(messages.clone(), system.clone(), current_tools.clone()) => res,
-                _ = self.cancel_token.notified() => {
+                _ = self.cancel_token.cancelled() => {
                     if let Some(span) = llm_span {
                         span.finish(
                             "llm_request_finished",
@@ -166,7 +166,7 @@ impl AgentLoop {
                                     }
                                 }
                             }
-                            _ = self.cancel_token.notified() => {
+                            _ = self.cancel_token.cancelled() => {
                                 if let Some(span) = llm_span {
                                     span.finish(
                                         "llm_request_finished",

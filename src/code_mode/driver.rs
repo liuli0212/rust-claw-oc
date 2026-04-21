@@ -15,6 +15,7 @@ pub struct CellDriver {
     command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
     worker: Option<tokio::task::JoinHandle<()>>,
     cancel_flag: Arc<AtomicBool>,
+    tool_call_in_flight: Arc<AtomicBool>,
     pending_events: VecDeque<RuntimeEvent>,
 }
 
@@ -23,16 +24,21 @@ pub struct CellDriverControl {
     tool_result_tx: std::sync::mpsc::Sender<Result<String, crate::tools::ToolError>>,
     command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
     cancel_flag: Arc<AtomicBool>,
+    tool_call_in_flight: Arc<AtomicBool>,
 }
 
 impl CellDriverControl {
     pub fn request_cancel(&self, reason: &str) {
-        self.cancel_flag.store(true, Ordering::Relaxed);
-        let _ = self
-            .tool_result_tx
-            .send(Err(crate::tools::ToolError::ExecutionFailed(
-                reason.to_string(),
-            )));
+        self.cancel_flag.store(true, Ordering::Release);
+        // Only unblock the worker's recv() if a tool call is actually waiting —
+        // sending unconditionally would corrupt the next legitimate tool result.
+        if self.tool_call_in_flight.load(Ordering::Acquire) {
+            let _ = self
+                .tool_result_tx
+                .send(Err(crate::tools::ToolError::ExecutionFailed(
+                    reason.to_string(),
+                )));
+        }
         let _ = self
             .command_tx
             .send(crate::code_mode::protocol::CellCommand::Cancel {
@@ -128,9 +134,14 @@ impl CellDriver {
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag_for_worker = cancel_flag.clone();
+        let tool_call_in_flight = Arc::new(AtomicBool::new(false));
+        let tool_call_in_flight_for_worker = tool_call_in_flight.clone();
 
         let event_tx_captured = event_tx.clone();
 
+        // spawn_blocking runs on a dedicated OS thread outside the async runtime.
+        // run_cell calls block_on internally so it can drive the QuickJS async runtime
+        // synchronously — QuickJS is not Send and cannot be moved across await points.
         let worker = tokio::task::spawn_blocking(move || {
             let request = runtime::RunCellRequest {
                 code,
@@ -148,12 +159,14 @@ impl CellDriver {
             let invoke_tool = move |_tool_name: String,
                                     _args_json: String|
                   -> Result<String, crate::tools::ToolError> {
-                // Block until the host update loop sends us the result via std channel
-                tool_result_rx.recv().unwrap_or_else(|_| {
+                tool_call_in_flight_for_worker.store(true, Ordering::Release);
+                let result = tool_result_rx.recv().unwrap_or_else(|_| {
                     Err(crate::tools::ToolError::ExecutionFailed(
                         "Tool result channel closed".to_string(),
                     ))
-                })
+                });
+                tool_call_in_flight_for_worker.store(false, Ordering::Release);
+                result
             };
 
             let result = runtime::run_cell(
@@ -174,6 +187,7 @@ impl CellDriver {
             command_tx,
             worker: Some(worker),
             cancel_flag,
+            tool_call_in_flight,
             pending_events: VecDeque::new(),
         }
     }
@@ -181,6 +195,9 @@ impl CellDriver {
     pub fn request_cancel(&mut self, reason: &str) {
         self.control_handle().request_cancel(reason);
         if let Some(worker) = self.worker.take() {
+            // abort() on a spawn_blocking handle only detaches the JoinHandle —
+            // it does NOT terminate the OS thread. The cancel_flag interrupt handler
+            // and the poisoned tool_result channel are what actually stop the thread.
             worker.abort();
         }
     }
@@ -190,6 +207,7 @@ impl CellDriver {
             tool_result_tx: self.tool_result_tx.clone(),
             command_tx: self.command_tx.clone(),
             cancel_flag: self.cancel_flag.clone(),
+            tool_call_in_flight: self.tool_call_in_flight.clone(),
         }
     }
 
@@ -228,7 +246,7 @@ impl CellDriver {
             };
 
             let Some(event) = next_event else {
-                if self.cancel_flag.load(Ordering::Relaxed) {
+                if self.cancel_flag.load(Ordering::Acquire) {
                     return Err(crate::tools::ToolError::ExecutionFailed(
                         "Code mode cell execution was cancelled.".to_string(),
                     ));
@@ -296,6 +314,12 @@ impl CellDriver {
                 Ok(None)
             }
         }
+    }
+}
+
+impl Drop for CellDriver {
+    fn drop(&mut self) {
+        self.request_cancel("driver dropped");
     }
 }
 

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 
-use super::protocol::{clean_schema, serialize_tool_envelope, Tool, ToolContext, ToolError};
+use super::protocol::{clean_schema, Tool, ToolContext, ToolError};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecArgs {
@@ -40,7 +40,7 @@ impl Tool for ExecTool {
     }
 
     fn has_side_effects(&self) -> bool {
-        false
+        true
     }
 
     async fn execute(
@@ -48,14 +48,9 @@ impl Tool for ExecTool {
         _args: serde_json::Value,
         _ctx: &ToolContext,
     ) -> Result<String, ToolError> {
-        serialize_tool_envelope(
-            "exec",
-            false,
+        Err(ToolError::ExecutionFailed(
             "The `exec` tool must be dispatched through the code-mode service.".to_string(),
-            Some(1),
-            None,
-            false,
-        )
+        ))
     }
 }
 
@@ -83,13 +78,8 @@ impl Tool for WaitTool {
         _args: serde_json::Value,
         _ctx: &ToolContext,
     ) -> Result<String, ToolError> {
-        serialize_tool_envelope(
-            "wait",
-            false,
+        Err(ToolError::ExecutionFailed(
             "The `wait` tool must be dispatched through the code-mode service.".to_string(),
-            Some(1),
-            None,
-            false,
-        )
+        ))
     }
 }

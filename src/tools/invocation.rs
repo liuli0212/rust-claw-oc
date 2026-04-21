@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::context::AgentContext;
 use crate::core::extensions::ExecutionExtension;
@@ -54,7 +54,7 @@ pub(crate) struct ToolInvokerConfig {
     pub(crate) remaining_steps: usize,
     pub(crate) session_deadline: Option<Instant>,
     pub(crate) trace_bus: Arc<TraceBus>,
-    pub(crate) cancel_token: Arc<Notify>,
+    pub(crate) cancel_token: CancellationToken,
     pub(crate) is_autopilot: bool,
     pub(crate) todos_path: PathBuf,
     pub(crate) execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
@@ -69,7 +69,7 @@ pub(crate) struct ToolInvoker {
     remaining_steps: usize,
     session_deadline: Option<Instant>,
     trace_bus: Arc<TraceBus>,
-    cancel_token: Arc<Notify>,
+    cancel_token: CancellationToken,
     is_autopilot: bool,
     todos_path: PathBuf,
     execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
@@ -91,6 +91,14 @@ impl ToolInvoker {
             todos_path: config.todos_path,
             execution_guard_state: config.execution_guard_state,
         }
+    }
+
+    pub(crate) fn decrement_remaining_steps(&mut self) {
+        self.remaining_steps = self.remaining_steps.saturating_sub(1);
+    }
+
+    pub(crate) fn visible_tools(&self) -> &[String] {
+        &self.visible_tools
     }
 
     pub(crate) fn autopilot_denial_for_call(
@@ -116,8 +124,21 @@ impl ToolInvoker {
             return None;
         }
 
-        let is_creating_todos = (call_name == "write_file" || call_name == "execute_bash")
-            && call_args.to_string().contains("TODOS.md");
+        let is_creating_todos = match call_name {
+            "write_file" => call_args
+                .get("path")
+                .and_then(|p| p.as_str())
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case("TODOS.md"))
+                .unwrap_or(false),
+            "execute_bash" => call_args
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(|cmd| cmd.contains("TODOS.md"))
+                .unwrap_or(false),
+            _ => false,
+        };
         if is_creating_todos {
             return None;
         }
@@ -218,7 +239,7 @@ impl ToolInvoker {
                     Err(err) => (format!("Timeout executing {}: {}", request.tool_name, err), true, false, TraceStatus::TimedOut, request.span.as_ref().map(|span| span.end_names.timeout)),
                 }
             }
-            _ = self.cancel_token.notified() => {
+            _ = self.cancel_token.cancelled() => {
                 ("Tool execution interrupted by user.".to_string(), true, true, TraceStatus::Cancelled, request.span.as_ref().map(|span| span.end_names.cancelled))
             }
         };

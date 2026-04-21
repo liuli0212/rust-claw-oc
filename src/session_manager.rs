@@ -10,7 +10,7 @@ type SessionEntryMap = AsyncMutex<
         String,
         (
             Arc<AsyncMutex<AgentLoop>>,
-            std::sync::Arc<tokio::sync::Notify>,
+            tokio_util::sync::CancellationToken,
             std::sync::Arc<std::sync::atomic::AtomicBool>,
         ),
     >,
@@ -97,7 +97,7 @@ impl SessionManager {
         let sessions = self.sessions.lock().await;
         if let Some((_, notify, cancelled)) = sessions.get(session_id) {
             cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-            notify.notify_waiters();
+            notify.cancel();
             tracing::info!("Cancel requested for session: {}", session_id);
         }
     }

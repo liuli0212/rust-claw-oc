@@ -215,6 +215,9 @@ fn clone_tool_error(error: &crate::tools::ToolError) -> crate::tools::ToolError 
             crate::tools::ToolError::InvalidArguments(message.clone())
         }
         crate::tools::ToolError::Timeout => crate::tools::ToolError::Timeout,
+        crate::tools::ToolError::Cancelled(reason) => {
+            crate::tools::ToolError::Cancelled(reason.clone())
+        }
         crate::tools::ToolError::IoError(err) => {
             crate::tools::ToolError::IoError(std::io::Error::new(err.kind(), err.to_string()))
         }
@@ -736,9 +739,12 @@ impl CodeModeService {
             .await;
 
         if let Some(summary) = summary.as_ref() {
-            let _ = self
+            if let Err(err) = self
                 .publish_summary_update(session_id, cell_id, host_handle, summary)
-                .await;
+                .await
+            {
+                tracing::warn!("Failed to publish host-error summary update: {}", err);
+            }
             initial_gate.publish(summary);
         } else {
             initial_gate.fail(&error);
@@ -828,18 +834,10 @@ impl CodeModeService {
     }
 
     fn trace_status_from_host_error(err: &crate::tools::ToolError) -> TraceStatus {
-        if matches!(err, crate::tools::ToolError::Timeout) {
-            TraceStatus::TimedOut
-        } else {
-            let msg = err.to_string().to_lowercase();
-            if msg.contains("cancel")
-                || msg.contains("interrupted")
-                || msg.contains("terminated before the background state update completed")
-            {
-                TraceStatus::Cancelled
-            } else {
-                TraceStatus::Error
-            }
+        match err {
+            crate::tools::ToolError::Timeout => TraceStatus::TimedOut,
+            crate::tools::ToolError::Cancelled(_) => TraceStatus::Cancelled,
+            _ => TraceStatus::Error,
         }
     }
 

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use super::executor::{
     is_code_mode_nested_tool, CodeModeNestedToolExecutor, CodeModeNestedToolExecutorConfig,
@@ -29,7 +29,7 @@ pub(crate) struct CodeModeDispatchConfig {
     pub(crate) trace_bus: Arc<TraceBus>,
     pub(crate) provider: String,
     pub(crate) model: String,
-    pub(crate) cancel_token: Arc<Notify>,
+    pub(crate) cancel_token: CancellationToken,
     pub(crate) output: Arc<dyn AgentOutput>,
     pub(crate) is_autopilot: bool,
     pub(crate) todos_path: PathBuf,
@@ -109,12 +109,12 @@ pub(crate) async fn dispatch_tool_call(
                 }
             }
         }
-        _ = config.cancel_token.notified() => {
+        _ = config.cancel_token.cancelled() => {
             config
                 .service
                 .abort_active_cell(&config.session_id, "Code mode execution interrupted by user.")
                 .await;
-            Err(crate::tools::ToolError::ExecutionFailed(
+            Err(crate::tools::ToolError::Cancelled(
                 "Code mode execution interrupted by user.".to_string(),
             ))
         }
@@ -202,15 +202,20 @@ pub(crate) async fn dispatch_tool_call(
             }
         }
         Err(err) => {
-            let is_stopped = matches!(err, crate::tools::ToolError::Timeout)
-                || err.to_string().contains("interrupted by user");
-            let (event_name, event_status) = if matches!(err, crate::tools::ToolError::Timeout) {
-                ("code_mode_exec_terminated", TraceStatus::TimedOut)
-            } else if err.to_string().contains("interrupted by user") {
-                ("code_mode_exec_terminated", TraceStatus::Cancelled)
-            } else {
-                ("code_mode_exec_finished", TraceStatus::Error)
-            };
+            let is_stopped = matches!(
+                err,
+                crate::tools::ToolError::Timeout | crate::tools::ToolError::Cancelled(_)
+            );
+            let (event_name, event_status, termination_reason) =
+                match &err {
+                    crate::tools::ToolError::Timeout => {
+                        ("code_mode_exec_terminated", TraceStatus::TimedOut, "timeout")
+                    }
+                    crate::tools::ToolError::Cancelled(_) => {
+                        ("code_mode_exec_terminated", TraceStatus::Cancelled, "cancelled")
+                    }
+                    _ => ("code_mode_exec_finished", TraceStatus::Error, "runtime_error"),
+                };
 
             record_trace_event(
                 config.trace_bus.as_ref(),
@@ -227,13 +232,7 @@ pub(crate) async fn dispatch_tool_call(
                     "model": config.model,
                     "source_length": source_length,
                     "requested_cell_id": requested_cell_id,
-                    "termination_reason": if matches!(err, crate::tools::ToolError::Timeout) {
-                        "timeout"
-                    } else if err.to_string().contains("interrupted by user") {
-                        "cancelled"
-                    } else {
-                        "runtime_error"
-                    },
+                    "termination_reason": termination_reason,
                     "error": err.to_string(),
                 }),
             );
@@ -283,6 +282,7 @@ async fn run_invocation(
             let nested_executor = Arc::new(tokio::sync::Mutex::new(
                 CodeModeNestedToolExecutor::new(CodeModeNestedToolExecutorConfig {
                     current_tools: config.current_tools.clone(),
+                    visible_tools: visible_tools.clone(),
                     extensions: config.extensions.clone(),
                     session_id: config.session_id.clone(),
                     reply_to: config.reply_to.clone(),

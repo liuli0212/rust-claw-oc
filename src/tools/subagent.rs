@@ -343,7 +343,7 @@ impl SubagentTool {
         );
 
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_notify = Arc::new(tokio::sync::Notify::new());
+        let cancel_notify = tokio_util::sync::CancellationToken::new();
         let built = crate::session::factory::build_subagent_session(
             ctx,
             self.llm.clone(),

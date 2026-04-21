@@ -15,7 +15,7 @@
   function parseToolResult(raw) {
     const result = JSON.parse(raw);
     if (result && result.__rustyClawToolError) {
-      throw String(result.__rustyClawToolError);
+      throw new Error(result.__rustyClawToolError);
     }
     return result;
   }
@@ -37,8 +37,11 @@
       }
 
       timerCallbacks.delete(timerId);
-      await callback();
-      __markTimeoutComplete(timerId);
+      try {
+        await callback();
+      } finally {
+        __markTimeoutComplete(timerId);
+      }
     }
   }
 
@@ -56,7 +59,7 @@
         return null;
       }
 
-      const resumeAfterMs = timerState.resume_after_ms || 100;
+      const resumeAfterMs = timerState.resume_after_ms ?? 100;
       __waiting_for_timer(resumeAfterMs);
 
       const waitResult = JSON.parse(__wait_for_timer(resumeAfterMs));

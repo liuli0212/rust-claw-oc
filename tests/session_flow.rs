@@ -467,13 +467,13 @@ async fn test_cancel_task() {
         for _ in 0..200 {
             if !output_for_cancel.tool_starts.lock().await.is_empty() {
                 cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                cancel_token.notify_waiters();
+                cancel_token.cancel();
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         cancelled_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        cancel_token.notify_waiters();
+        cancel_token.cancel();
     });
 
     let result = tokio::time::timeout(

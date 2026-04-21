@@ -29,6 +29,8 @@ pub enum ToolError {
     InvalidArguments(String),
     #[error("Timeout")]
     Timeout,
+    #[error("Cancelled: {0}")]
+    Cancelled(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 }
