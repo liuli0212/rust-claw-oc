@@ -66,6 +66,7 @@ impl SkillToolPolicy {
             .iter()
             .map(|n| self.canonical_name(n))
             .collect();
+        let code_mode_companion_allowed = allowed.iter().any(|name| name == "exec");
 
         base_tools
             .into_iter()
@@ -75,7 +76,7 @@ impl SkillToolPolicy {
                 if RUNTIME_TOOLS.contains(&name.as_str()) {
                     return true;
                 }
-                allowed.contains(&name)
+                allowed.contains(&name) || (name == "wait" && code_mode_companion_allowed)
             })
             .collect()
     }
@@ -96,6 +97,7 @@ impl SkillToolPolicy {
             .map(|n| self.canonical_name(n))
             .collect();
         allowed.contains(&tool_name.to_string())
+            || (tool_name == "wait" && allowed.iter().any(|name| name == "exec"))
     }
 }
 
@@ -141,6 +143,15 @@ mod tests {
         assert!(policy.can_call("read_file", &skill));
         assert!(policy.can_call("execute_bash", &skill));
         assert!(!policy.can_call("write_file", &skill));
+    }
+
+    #[test]
+    fn test_wait_is_allowed_when_exec_is_whitelisted() {
+        let policy = SkillToolPolicy::new();
+        let skill = make_skill(vec!["exec"]);
+        assert!(policy.can_call("exec", &skill));
+        assert!(policy.can_call("wait", &skill));
+        assert!(!policy.can_call("read_file", &skill));
     }
 
     #[test]

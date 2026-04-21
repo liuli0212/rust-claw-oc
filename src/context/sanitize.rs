@@ -102,6 +102,8 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
     };
     let evidence_kind = envelope.effects.evidence_kind.as_deref();
     let payload_kind = envelope.effects.payload_kind.as_deref();
+    let is_code_mode_payload =
+        payload_kind == Some("code_mode_exec") || matches!(tool_name, "exec" | "wait");
 
     match (payload_kind, tool_name) {
         (Some("plan"), _) | (_, "task_plan") => {
@@ -129,6 +131,12 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
         }
         (Some("skill"), _) | (_, "skill" | "use_skill") => {
             envelope.result.output = "Skill loaded.".to_string();
+        }
+        _ if is_code_mode_payload => {
+            if envelope.result.output.chars().count() > 1_500 {
+                envelope.result.output =
+                    truncate_chars_with_marker(&envelope.result.output, 700, 400);
+            }
         }
         (_, "write_file" | "patch_file") => {}
         _ => {
@@ -246,5 +254,36 @@ mod tests {
 
         let result = skill_response.response["result"].as_str().unwrap();
         assert!(result.contains("\"output\":\"Skill loaded.\""));
+    }
+
+    #[test]
+    fn strip_response_payload_preserves_code_mode_exec_envelope() {
+        let mut exec_response = FunctionResponse {
+            name: "exec".to_string(),
+            id: None,
+            response: serde_json::json!({
+                "result": serde_json::json!({
+                    "ok": true,
+                    "tool_name": "exec",
+                    "payload_kind": "code_mode_exec",
+                    "output": format!("Code mode cell `cell_1` completed.\n{}", "A".repeat(4_000)),
+                    "duration_ms": 12,
+                    "truncated": true
+                }).to_string()
+            }),
+        };
+
+        strip_response_payload(&mut exec_response);
+
+        let stripped = exec_response.response["result"].as_str().unwrap();
+        let envelope = ToolExecutionEnvelope::from_json_str(stripped).expect("exec envelope");
+        assert_eq!(
+            envelope.effects.payload_kind.as_deref(),
+            Some("code_mode_exec")
+        );
+        assert!(envelope.result.output.contains("Code mode cell `cell_1`"));
+        assert!(envelope.result.output.contains("stripped"));
+        assert!(!stripped.contains("\"duration_ms\""));
+        assert!(!stripped.contains("\"truncated\""));
     }
 }

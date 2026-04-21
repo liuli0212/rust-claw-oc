@@ -1,5 +1,15 @@
 # Rusty-Claw Code Mode Design
 
+## Implementation Status
+
+- [x] Phase 1 foundations: `ToolDefinition` / `ToolKind`, provider capability reporting, capability-gated code-mode prompt notices, and `code_mode` module scaffolding are implemented.
+- [x] Phase 2 minimal exec runtime and guarded nested dispatch are implemented.
+- [x] Phase 3 minimal `wait` / yield-resume semantics are implemented.
+- [x] Phase 4 hardening items such as richer trace coverage, history/sanitization updates, and broader tests are implemented.
+- [x] Phase 5 safe non-terminal drain lifecycle is implemented, including service-owned live workers and non-blocking `wait` polling via `wait_timeout_ms`.
+- [x] Phase 6 replay removal and event-driven architecture: all replay state (`ResumeState`, `OutputBuffer`, `NotificationBuffer`, `CellResumeState`, `CellResumeProgressDelta`) is deleted. Runtime now emits structured `RuntimeEvent` via `event_tx` channel. `yield_control` is a non-blocking event emission that does not terminate JS execution.
+- [x] Phase 7 channel-based tool bridge: nested tool calls now use a synchronous-to-async channel bridge. The worker thread in `spawn_blocking` blocks on a tool result channel while the drain loop fulfills requests. This removes the need for `'static` closures and simplifies orchestration.
+
 ## 1. Goal
 
 Introduce a Codex-style "Code Mode" into `rust-claw-oc` so the model can orchestrate multiple tool calls inside a single LLM turn by emitting JavaScript source to a dedicated runtime, while still preserving ordinary direct tool calls as a first-class path.
@@ -1048,22 +1058,23 @@ Exit criteria:
 
 ## Phase 3: Wait / Yield
 
-- Add `WaitTool`
-- add `yield_control()`
-- add timed yielding and resumable cells
-- support session-scoped stored values
+- [x] Add `WaitTool`
+- [x] add `yield_control()`
+- [x] add resumable cells
+- [x] support session-scoped stored values
+- [x] add timed yielding helpers such as `setTimeout()`-driven resume flows
 
 Exit criteria:
 
-- long-running `exec` can yield and resume safely
+- [x] long-running `exec` can yield and resume safely
 
 ## Phase 4: Hardening
 
-- add timeout helpers
-- add output truncation/token budget controls
-- add trace/event-log visibility
-- add allow-list / policy guards
-- expand tests
+- [x] add timeout helpers
+- [x] add output truncation/token budget controls
+- [x] add trace/event-log visibility
+- [x] add allow-list / policy guards
+- [x] expand tests
 
 ## 17. Testing Strategy
 
@@ -1221,3 +1232,786 @@ The most important implementation choices are:
 7. roll out in phases, with provider/runtime/context feasibility validated first
 
 If we follow this plan, Rusty-Claw will gain the main advantage of Codex code mode, lower orchestration latency and richer within-turn execution, without sacrificing the safety and observability already built into the project.
+
+## 21. Live-Cell Migration Plan (No Replay Fallback)
+
+This section defines the next implementation step after the current replay-style `wait` / yield milestone.
+
+The chosen target architecture is:
+
+- one live runtime worker per active code-mode cell
+- `wait` attaches to the same live cell and drains incremental events
+- no replay-based resume path
+- no attempt to reconstruct JS state after a worker exits
+
+If a live cell crashes, is cancelled, or otherwise terminates unexpectedly, it is considered failed and cannot be resumed.
+
+### 21.1 Target Semantics
+
+The target user-visible semantics should be:
+
+- each `exec` creates a fresh `cell_id` and a dedicated live runtime worker
+- at most one live code-mode cell exists per session in the initial implementation
+- different sessions may execute concurrently, but the same session remains single-owner and its top-level `step()` executions are serialized through `SessionManager`
+- `wait` validates the optional `cell_id`, connects to the same live cell, and returns only new output / status since the last drain
+- runtime events are delivered monotonically by per-cell sequence number, and `wait` drains only not-yet-delivered items
+- `yield_control(value)` emits a host-visible yield event but does not re-run the script on the next `wait`
+- local JS variables, closures, and pending promises remain valid only while that live worker remains alive
+- `store/load` remain the only explicit session-scoped persistence boundary across cells
+- `reply_to` and concrete `AgentOutput` sinks are invocation-scoped routing data and are not part of the durable live-cell state
+- `setTimeout()` and `clearTimeout()` remain JS runtime features and must not be reset by `wait`
+- a separate host-side slice timer may yield control back to the model, and that host timer may be refreshed on `wait`
+- if a cell becomes terminal after the last drain, `wait` returns the sticky terminal snapshot and clears the active cell handle
+- once a cell reaches `completed`, `failed`, or `cancelled`, later `wait` calls must return a terminal response instead of attempting recovery
+
+This architecture intentionally does not include a replay fallback.
+
+### 21.2 Non-Goals for This Migration
+
+To keep the migration bounded, the first live-cell implementation should not attempt:
+
+- multiple concurrent live cells in one session
+- heap snapshots or VM serialization
+- replay-based recovery after runtime failure
+- cross-process persistence of an in-flight JS runtime
+- background execution APIs outside tool-mediated host services
+
+### 21.3 Primary Refactor Workstreams
+
+#### 21.3.1 Extract Nested Tool Execution from `AgentLoop`
+
+The highest-priority refactor is to separate guarded nested tool execution from the current `AgentLoop` re-entry path.
+
+Deliverables:
+
+- add a reusable code-mode nested tool executor abstraction
+- move tool lookup, extension-enriched `ToolContext` construction, trace/span linkage, autopilot checks, timeout handling, and cancellation handling into that abstraction
+- remove the current `unsafe` pointer-based callback path from `dispatch_exec_tool_call`
+
+This should become the stable boundary used by the live runtime worker whenever JS calls `await tools.some_tool(...)`.
+
+#### 21.3.2 Replace Replay State with Live Cell Handles
+
+`CodeModeService` should stop storing replay metadata such as:
+
+- recorded nested tool calls
+- suppressed output counters
+- skipped yield counters
+- replay-oriented timer reconstruction state
+
+Instead, service state should converge on:
+
+- `next_cell_seq`
+- session-scoped `stored_values`
+- `active_cell: Option<ActiveCellHandle>`
+
+`ActiveCellHandle` should contain at least:
+
+- `cell_id`
+- broker command channel
+- background driver handle
+- buffered event log or drain snapshot handle
+- visible tool metadata
+- last-known status and drain cursor metadata
+- sticky terminal snapshot metadata
+
+#### 21.3.3 Move Runtime Semantics to Event-Driven Yielding
+
+The runtime should stop modeling `yield_control()` as a thrown exception that terminates the current JS execution attempt.
+
+Instead, the runtime should emit structured events such as:
+
+- `Text`
+- `Notification`
+- `Yield`
+- `ToolCallRequest`
+- `ToolCallResolved`
+- `Completed`
+- `Failed`
+- `Cancelled`
+
+The service should consume these events, fulfill nested tool calls through the guarded executor, and expose incremental drains to `exec` / `wait` callers.
+
+#### 21.3.4 Separate Host Slice Timing from JS Timer Semantics
+
+Two timer concepts must remain distinct:
+
+- JS timers
+  - `setTimeout()` / `clearTimeout()` inside the runtime
+  - preserve script semantics
+  - are not reset just because `wait` is called
+- host slice timer
+  - determines when control is yielded back to the model
+  - may be refreshed by `wait`
+  - should not mutate JS callback deadlines
+
+This split is required to avoid conflating runtime semantics with polling semantics.
+
+### 21.4 Proposed Module and Type Changes
+
+The migration should keep the existing top-level entry points, but refactor internals around a live worker model.
+
+Each active cell should be managed by a background `CellDriver` or equivalent broker task that owns the JS runtime, nested tool bridge, and undrained event buffer between `exec` / `wait` calls.
+
+Files that should be changed deliberately:
+
+- `src/core/step_helpers.rs`
+  - replace the current code-mode nested callback bridge with an executor object or closure that does not require `unsafe` re-entry into `AgentLoop`
+  - keep the top-level `dispatch_exec_tool_call` contract stable for the rest of the loop
+- `src/code_mode/service.rs`
+  - replace `PendingCellState` replay metadata with `ActiveCellHandle`
+  - manage worker lifecycle, drain behavior, and terminal cleanup
+- `src/code_mode/runtime/mod.rs`
+  - keep one live runtime active until completion, failure, or cancellation
+  - emit events instead of encoding yields through exceptions that force re-entry
+- `src/code_mode/runtime/callbacks.rs`
+  - define the runtime-to-host event types and nested tool request / response structures
+- `src/code_mode/runtime/timers.rs`
+  - keep JS callback timing logic only
+  - remove replay reconstruction helpers once the migration is complete
+- `src/code_mode/response.rs`
+  - adapt response rendering to live statuses such as `running`, `completed`, `failed`, and `cancelled`
+- `src/session/factory.rs`
+  - keep `exec` / `wait` visibility rules paired for restricted sessions and subagents
+- `src/context/sanitize.rs`
+  - keep envelope-aware stripping compatible with longer-lived live-cell outputs
+- `src/context/history.rs`
+  - ensure compaction still summarizes large `exec` outputs safely
+- `src/telegram/output.rs`
+  - verify live-cell output remains readable on chat surfaces
+
+New helper modules are acceptable if they simplify the service boundary, for example:
+
+- `src/code_mode/driver.rs`
+- `src/code_mode/executor.rs`
+- `src/code_mode/runtime/events.rs`
+
+### 21.4.1 Session Ownership and Concurrency Contract
+
+The live-cell architecture is session-scoped, not frontend-scoped.
+
+Rules:
+
+- `SessionManager` remains the only supported owner for top-level `AgentLoop` instances
+- exactly one `Arc<AsyncMutex<AgentLoop>>` may exist per `session_id`
+- different `session_id` values may execute concurrently
+- the same `session_id` must serialize top-level `step()` execution behind its session mutex
+- a live code-mode cell belongs to the session's `CodeModeService`, never to a specific frontend adapter such as CLI, Telegram, ACP, scheduler, or Discord
+- the initial live-cell implementation supports exactly one active or terminal-undrained cell per session
+- frontends may choose their own busy-message behavior if they cannot obtain the session lock quickly, but they must not create a second independent loop for the same session
+
+Consequences:
+
+- `exec` must fail fast if the session already has a nonterminal or terminal-undrained cell
+- `wait` is the only supported way to continue or collect that existing cell
+- same-session concurrency is a product-level busy state, not a second runtime
+
+### 21.4.2 Invocation Context Contract
+
+The design must separate durable session state from per-call routing state.
+
+Session-scoped state:
+
+- transcript and history
+- task state
+- `CodeModeService`
+- session-scoped `stored_values`
+- active cell handle
+- session cancellation primitives
+- long-lived tool inventory
+
+Invocation-scoped state:
+
+- `reply_to`
+- concrete `AgentOutput`
+- current top-level trace parent / span linkage
+- per-call waiting hints such as a preferred drain timeout or slice refresh value
+
+Rules:
+
+- nested code-mode `ToolContext` values must be built from the current invocation context plus durable session state at dispatch time
+- a live cell must not hold a long-lived pointer to a concrete `AgentOutput`; it appends events to its buffered drain state, and the current `exec` or `wait` caller renders those events
+- if the same session is resumed from a different frontend, the new invocation context becomes authoritative for that call only
+- implementation must stop relying on constructor-time `reply_to` alone for nested code-mode dispatch; the current invocation context must be available when nested tools execute
+
+### 21.4.3 Runtime-Service Protocol
+
+Each active cell should be represented by a background `CellDriver` task.
+
+The driver owns:
+
+- the JS runtime
+- JS timer state
+- the nested tool bridge
+- an ordered, bounded event buffer
+- the latest cell status snapshot
+
+`CodeModeService` interacts with the driver through commands and drain results rather than directly babysitting the runtime inside a single `exec` or `wait` call.
+
+Suggested command and event shapes:
+
+```rust
+enum CellCommand {
+    Drain {
+        wait_for_event: bool,
+        wait_timeout_ms: Option<u64>,
+        refresh_slice_ms: Option<u64>,
+    },
+    ToolResult {
+        request_id: u64,
+        outcome: Result<String, ToolErrorPayload>,
+    },
+    Cancel {
+        reason: String,
+    },
+}
+
+enum RuntimeEvent {
+    Text {
+        seq: u64,
+        chunk: String,
+    },
+    Notification {
+        seq: u64,
+        message: String,
+    },
+    Yield {
+        seq: u64,
+        kind: YieldKind,
+        value: Option<serde_json::Value>,
+        resume_after_ms: Option<u64>,
+    },
+    ToolCallRequest {
+        seq: u64,
+        request_id: u64,
+        tool_name: String,
+        args_json: String,
+    },
+    ToolCallResolved {
+        seq: u64,
+        request_id: u64,
+        outcome: Result<String, ToolErrorPayload>,
+    },
+    Completed {
+        seq: u64,
+        return_value: Option<serde_json::Value>,
+    },
+    Failed {
+        seq: u64,
+        error: String,
+    },
+    Cancelled {
+        seq: u64,
+        reason: String,
+    },
+}
+```
+
+Protocol invariants:
+
+- `seq` is strictly monotonic within one cell
+- exactly one terminal event exists per cell: `Completed`, `Failed`, or `Cancelled`
+- no later user-visible events may be appended after a terminal event
+- `ToolCallRequest` is an internal control event for the service / driver handshake and is not rendered directly to the model
+- a matching `ToolCallResolved` must be delivered exactly once for each `ToolCallRequest`
+- `yield_control()` appends a `Yield` event but does not imply that the driver pauses or exits
+- the driver may continue running and may continue servicing nested tools and timers between `wait` calls
+- the buffered event log must remain bounded; if undrained output exceeds the configured budget, the service must mark the drain result as truncated and append an explicit truncation marker instead of growing without limit
+
+Drain semantics:
+
+- `exec` is defined as spawn + initial drain
+- `wait` sends `CellCommand::Drain` to the existing driver
+- if `wait_for_event` is true, the driver may block up to `wait_timeout_ms` while waiting for at least one new user-visible event or a terminal transition
+- if no new event arrives before the timeout and the cell is still nonterminal, the drain result may be empty but must still return the current status snapshot
+- `refresh_slice_ms` affects only the host slice timer and must not mutate JS timer deadlines
+- once a terminal event has been drained, the service clears the active cell handle
+
+### 21.4.4 Lifecycle and State Machine
+
+Recommended cell status model:
+
+```rust
+enum CellStatus {
+    Starting,
+    Running,
+    WaitingOnTool { request_id: u64 },
+    WaitingOnJsTimer { next_due_in_ms: Option<u64> },
+    Completed,
+    Failed,
+    Cancelled,
+}
+```
+
+State rules:
+
+- `Yield` is an event, not a terminal state
+- `WaitingOnTool` and `WaitingOnJsTimer` are nonterminal states
+- `Completed`, `Failed`, and `Cancelled` are terminal states
+- terminal states are sticky until the final drain is collected and the active cell handle is cleared
+
+Operation matrix:
+
+- no active cell + `exec`
+  - spawn a new driver, begin initial drain, and register the active cell
+- no active cell + `wait`
+  - return a structured error indicating that no code-mode cell is active for the session
+- nonterminal active cell + `exec`
+  - reject the call and instruct the caller to `wait` or cancel the active cell first
+- nonterminal active cell + `wait` with no `cell_id`
+  - drain the current active cell
+- nonterminal active cell + `wait` with a matching `cell_id`
+  - drain the specified active cell
+- nonterminal active cell + `wait` with a mismatched `cell_id`
+  - return a structured mismatch error
+- terminal-undrained active cell + `wait`
+  - return the sticky terminal snapshot and clear the active cell handle after a successful drain
+- terminal-undrained active cell + `exec`
+  - reject the call and require the caller to collect the terminal result with `wait` or reset the session
+- `cancel_session` while a live cell exists
+  - cancel both the top-level run and the cell driver, then transition the cell to `Cancelled`
+- session reset or `/new` while a live cell exists
+  - cancel the driver, wait for shutdown, clear the active cell handle, and then proceed with ordinary session-reset behavior
+
+### 21.5 Incremental Delivery Plan
+
+#### Phase A: Lock the Live-Cell Contract
+
+Deliverables:
+
+- document the live-cell semantics in this design doc and prompt notices
+- define the session ownership, invocation-context, runtime-protocol, and lifecycle contracts in this design doc
+- define the new internal status and event types
+- keep the external `exec` / `wait` tool schema unchanged
+
+Exit criteria:
+
+- the intended semantics are explicit
+- there is no ambiguity about whether `wait` re-runs JS
+- session ownership, busy-state behavior, and frontend handoff rules are explicit
+- terminal state handling and drain semantics are explicit
+- prompt instructions align with the new live-cell model
+
+#### Phase B: Extract Guarded Nested Tool Execution
+
+Deliverables:
+
+- move nested code-mode tool execution into a reusable executor abstraction
+- preserve trace parentage, sandbox context, autopilot denials, extension enrichment, and cancellation semantics
+- remove `unsafe` callback bridging from the code-mode path
+
+Exit criteria:
+
+- nested tools still behave exactly once per live runtime request
+- existing guardrails still apply
+- trace output still reflects the exec -> nested tool parent-child relationship
+
+#### Phase C: Introduce Live Cell Service Scaffolding
+
+Deliverables:
+
+- add a background `CellDriver` or equivalent broker task per active cell
+- add worker command and event channels
+- add `ActiveCellHandle`
+- teach `CodeModeService::execute()` to spawn and register a live worker
+- keep one active cell per session
+
+Exit criteria:
+
+- `execute()` creates a live cell instead of storing replay state
+- service can track whether a session has an active cell
+- terminal cleanup removes the active cell reliably
+
+#### Phase D: Convert Runtime Yielding to Event Emission
+
+Deliverables:
+
+- replace throw-based `yield_control()` handling with event-driven yielding
+- allow the runtime to continue across multiple `wait` calls without re-running the script
+- ensure nested tool requests are fulfilled through the service-managed bridge
+
+Exit criteria:
+
+- a multi-yield script preserves local JS state between waits
+- output is monotonic and not duplicated by replay
+- runtime completion produces one terminal result
+
+#### Phase E: Add Poll/Drain Semantics and Host Slice Timing
+
+Deliverables:
+
+- implement `wait` as a drain on an existing live cell
+- add host-side slice timing and yield hints
+- ensure JS timers and host slice timers remain independent
+
+Exit criteria:
+
+- `wait` never re-runs the original JS source
+- calling `wait` may refresh host slice timing but must not change JS timer deadlines
+- incremental output remains stable and comprehensible
+
+#### Phase F: Remove Replay-Specific State and Tests
+
+Deliverables:
+
+- delete replay-oriented service/runtime code paths
+- replace replay-oriented tests with live-cell lifecycle tests
+- simplify service state, runtime helpers, and timer utilities
+
+Exit criteria:
+
+- there is no replay fallback path left in the live-cell implementation
+- there are no replay counters or recorded nested-call state fields left in steady-state service state
+- documentation and tests describe only the live-cell semantics
+
+### 21.6 Suggested PR Breakdown
+
+A practical PR sequence is:
+
+1. executor extraction and no-`unsafe` nested dispatch cleanup
+2. live-cell status and runtime event type introduction
+3. `CodeModeService` live worker scaffolding and active-cell tracking
+4. runtime event-driven `yield_control()` and live nested tool bridge
+5. `wait` drain semantics, host slice timing, and response rendering
+6. replay-state removal, test rewrites, and final doc/prompt cleanup
+
+Each PR should preserve a runnable tree and keep `cargo test` green.
+
+### 21.7 Testing Plan for the Migration
+
+#### Unit Tests
+
+- host slice timer refreshes on `wait`
+- JS timers do not refresh on `wait`
+- runtime events are serialized and drained in order
+- terminal cell states reject further `wait`
+- session lifecycle helpers reject illegal `exec` / `wait` combinations by state
+
+#### Runtime Tests
+
+- `yield_control()` yields without requiring a later JS replay
+- local variables survive across multiple waits within one live cell
+- `setTimeout()` callbacks fire according to original JS deadlines
+- nested tool promise resolution continues working after one or more yields
+- the driver can continue handling nested tool requests even while no `wait` call is active
+
+#### Service Tests
+
+- `exec` creates one active live cell per session
+- `wait` returns only incremental output from the same cell
+- cancelling a live cell tears down the worker and clears service state
+- runtime failure clears the active cell and returns a terminal error
+- restricted-session tool filtering still keeps `wait` paired with `exec`
+- same-session concurrent calls are serialized or busy-fail predictably
+- different sessions do not share active-cell state
+- a frontend handoff updates invocation-scoped routing without corrupting session-scoped code-mode state
+
+#### Integration Tests
+
+- a multi-yield script produces monotonic output without duplication
+- nested side-effecting tools still obey autopilot and sandbox protections
+- trace spans preserve the hierarchy between iteration, `exec`, and nested tools
+- top-level `finish_task` still works after code-mode completion
+- CLI and Telegram style sessions can run concurrently without sharing code-mode state
+
+### 21.8 Acceptance Criteria
+
+The migration is complete when all of the following are true:
+
+- `wait` does not re-run JS source
+- one live cell can yield multiple times while preserving local JS state
+- nested tool dispatch no longer relies on `unsafe` re-entry into `AgentLoop`
+- replay-specific service state has been removed
+- user-visible output is incremental, bounded, and understandable
+- trace, extension, sandbox, and autopilot semantics remain intact for nested calls
+- failed or cancelled cells terminate cleanly with no hidden recovery path
+- same-session execution is serialized while different sessions may still run concurrently
+- invocation-scoped `reply_to` / output routing can change between turns without corrupting session-scoped code-mode state
+- the background driver can continue servicing nested tools and timers between `wait` calls
+
+At that point, the live-cell model becomes the sole supported implementation for code-mode `wait` / yield behavior.
+
+## 22. Post-Replay Event-Driven Architecture (Phase 6)
+
+This section documents the current architecture after the replay-removal refactor. It supersedes the transitional replay-based implementation described in Phase 5 and replaces the migration plan in Section 21 with the delivered result.
+
+### 22.1 Design Summary
+
+The code-mode runtime is now fully event-driven. Each `exec` call spawns a single live JS runtime worker that runs to completion (or flush) without ever being re-executed. All output, notifications, flush/timer-wait signals, tool requests, and terminal events flow through a typed `RuntimeEvent` channel (`tokio::sync::mpsc::unbounded_channel`). There is no replay fallback.
+
+Key properties:
+
+- **One live worker per cell.** The JS runtime runs once. Local variables, closures, and pending promises remain valid for the lifetime of the worker.
+- **`flush()` is non-throwing.** It emits a `RuntimeEvent::Flush` event and allows the host drain loop to surface `await_user`; execution can later be resumed with `wait`.
+- **`text()` output is streamed as events.** Each `text(value)` call emits a `RuntimeEvent::Text` event. Output accumulates in the event log, not in an in-runtime buffer.
+- **No replay counters.** `ResumeState`, `OutputBuffer`, `NotificationBuffer`, `CellResumeState`, `CellResumeProgressDelta`, and all suppressed-call counters have been deleted.
+- **Drain semantics are pure event consumption.** `exec` spawns + does an initial drain. `wait` drains the same live cell's event buffer. Neither re-runs JS.
+
+### 22.2 Module Responsibilities
+
+#### `src/code_mode/runtime/mod.rs` — JS Runtime
+
+Owns the `rquickjs` execution. Provides `run_cell()` which:
+
+1. Creates an `AsyncRuntime` + `AsyncContext`.
+2. Registers global functions (`__text`, `__notify`, `__flush`, `__waiting_for_timer`, `__store`, `__load`, `__callTool`, `__setTimeout`, `__clearTimeout`, `__markTimeoutComplete`, `__timerStateJson`, `__dueTimersJson`, `__wait_for_resume`).
+3. Wraps user code in an async IIFE via `build_wrapper_script()`.
+4. Executes the wrapped script to completion (including timer callback draining).
+5. Returns `(ExecRunResult, HashMap<String, StoredValue>)`.
+
+All side-effect globals communicate through:
+
+- `event_tx: UnboundedSender<RuntimeEvent>` — for streaming `Text`, `Notification`, `Yield`, and `ToolCallRequested` events to the driver/service layer.
+- `next_seq: Arc<AtomicUsize>` — monotonic sequence counter shared across all event-emitting globals within one cell.
+- `invoke_tool: Arc<Mutex<F>>` — synchronous nested tool invocation closure (called within the blocking `rquickjs` context).
+
+##### Deleted from this module:
+
+- `OutputBuffer` / `NotificationBuffer` — output is no longer buffered in-runtime; each `text()` call sends an event immediately.
+- `ResumeState` fields (`replayed_tool_calls`, `recorded_timer_calls`, `skipped_yields`, `suppressed_text_calls`, `suppressed_notification_calls`) — no replay means no suppression counters.
+- `RunCellMetadata` fields (`total_text_calls`, `total_notification_calls`, `newly_recorded_tool_calls`) — metadata tracking for replay advancement is gone.
+
+##### `ResumeState` and `RunCellMetadata`
+
+Both structs still exist but are empty (`#[derive(Default)]`). They are retained as zero-cost placeholders to avoid churn in function signatures during the transition. They may be fully removed in a future cleanup pass.
+
+#### `src/code_mode/protocol.rs` — Event and Command Types
+
+Defines the typed channel protocol:
+
+```rust
+enum RuntimeEvent {
+    Text { seq, text },
+    Notification { seq, message },
+    Yield { seq, kind, value, resume_after_ms },
+    ToolCallRequested(ToolCallRequestEvent),
+    ToolCallResolved { seq, request_id, ok },
+    Completed { seq, return_value },
+    Failed { seq, error },
+    Cancelled { seq, reason },
+    WorkerCompleted(Result<RuntimeCellResult, String>),
+    TimerRegistrationChanged { seq, timer_calls },
+}
+
+enum CellCommand {
+    ToolResult { request_id: String, outcome },
+    Drain(DrainRequest),
+    Cancel { reason },
+}
+```
+
+Key changes from the replay era:
+
+- `RuntimeEvent` now derives `Clone` directly (no manual impl).
+- `Text` field is named `text` (was `chunk`).
+- `request_id` is `String` (was `u64`), formatted as `"{tool_name}-{seq}"`.
+- `RuntimeCellResult` is a 2-tuple `(ExecRunResult, HashMap<String, StoredValue>)` — the third `RunCellMetadata` element is removed.
+- `ToolCallRequestEvent` (renamed from `ToolCallRequest`) carries `request_id: String`.
+
+#### `src/code_mode/driver.rs` — CellDriver (Background Broker)
+
+Manages the background worker task and provides drain semantics.
+
+```
+CellDriver::spawn() / spawn_live()
+  → tokio::spawn worker thread
+    → runtime::run_cell(code, invoke_tool, event_tx)
+      → JS runs: text(), yield_control(), tools.X(), etc.
+      → each JS global → event_tx.send(RuntimeEvent::*)
+      → invoke_tool() for nested tools (synchronous within rquickjs)
+      → script completes → WorkerCompleted event
+  → driver.drain_event_batch_with_request()
+    → consumes events from event_rx
+    → fulfills nested tool calls via invoke_tool callback
+    → returns DriverDrainBatch { events, terminal_result }
+```
+
+Deleted from this module:
+
+- `WorkerRuntimeState` — the worker no longer needs a shared state struct; it uses captured locals.
+- `SharedCommandReceiver` / `std::sync::mpsc` — replaced with `tokio::sync::mpsc::unbounded_channel`.
+- `resume_progress: Arc<Mutex<CellResumeProgressDelta>>` — no replay progress tracking.
+- `DriverDrainBatch.resume_progress` field — removed.
+
+#### `src/code_mode/cell.rs` — ActiveCellHandle and Snapshots
+
+Tracks the per-session active cell state:
+
+```rust
+struct ActiveCellHandle {
+    cell_id: String,
+    status: CellStatus,
+    events: Vec<RuntimeEvent>,       // full event log
+    last_summary: Option<ExecRunResult>,
+}
+```
+
+Deleted from this module:
+
+- `CellResumeState` — replay-oriented state (replayed tool calls, suppressed counters, skipped yields).
+- `CellResumeProgressDelta` — incremental replay progress for advancing resume state between drains.
+- All `advance_with_yield`, `advance_with_progress`, `runtime_resume_state` methods.
+- `code`, `visible_tools` fields from `ActiveCellHandle` — no longer needed since the worker is never re-spawned.
+
+Retained:
+
+- `CellStatus` enum (now uses `request_id: String` instead of `u64` for `WaitingOnTool`).
+- `CellDrainSnapshot` for rendering output to the LLM.
+- `recent_visible_events()` for bounded event window rendering.
+
+#### `src/code_mode/service.rs` — CodeModeService
+
+Session-scoped service that owns cell lifecycle.
+
+```rust
+struct SessionState {
+    next_cell_seq: u64,
+    stored_values: HashMap<String, StoredValue>,
+    active_cell: Option<ActiveCellHandle>,
+    live_driver: Option<SharedCellDriver>,
+}
+```
+
+Provides `execute_live()` which:
+
+1. Allocates a `cell_id`.
+2. Spawns a `CellDriver::spawn_live()`.
+3. Performs an initial drain via `driver.drain_event_batch_with_request()`.
+4. Registers `ActiveCellHandle` and `live_driver` in `SessionState`.
+5. Returns a `CellDrainSnapshot`.
+
+Deleted from this module:
+
+- `PendingDrainBatch`, `PendingDrainResolution` — intermediate drain resolution helpers for replay-based progress tracking.
+- `RuntimeBatchInvocation::for_pending_cell()` — replay-oriented cell re-spawn helper.
+- `resume_state` field from `RuntimeBatchInvocation`.
+- The original `execute()` method — replaced by `execute_live()`.
+- All replay-specific `wait` / `wait_with_request` method bodies — replaced by live drain.
+
+#### `src/code_mode/executor.rs` — Guarded Nested Tool Executor
+
+Standalone executor for nested tool calls from JS. Preserves all AgentLoop guardrails:
+
+- Autopilot / TODOS gating
+- Repeated-action / reflection-strike loop protection
+- Trace span parentage propagation
+- Extension-based `ToolContext` enrichment
+- Timeout and cancellation handling
+
+This module is unchanged by the replay removal. It was already extracted as a clean boundary during Phase B of the live-cell migration.
+
+#### `src/code_mode/response.rs` — Output Rendering
+
+`DrainRenderState::from_events()` builds a render state from the event stream:
+
+- Accumulates `Text` events into `output_text`.
+- Collects `Notification` events.
+- Captures terminal state from `Yield`, `Completed`, `Failed`, `Cancelled` events.
+
+The `render_output()` / `render_output_with_status()` methods produce the final LLM-visible string.
+
+Key change: `Text` field matching now uses `text` instead of `chunk`.
+
+### 22.3 `flush()` / Timer Wait Semantics
+
+The `flush(value?)` and timer wait bridge work as follows:
+
+1. JS calls `flush(value)` to publish a host-visible checkpoint.
+2. The wrapper script calls `__flush(JSON.stringify(value))`.
+3. `__flush` sends `RuntimeEvent::Flush { value, ... }` via `event_tx`.
+4. For pending timers, the wrapper script emits `RuntimeEvent::WaitingForTimer { resume_after_ms, ... }` via `__waiting_for_timer(...)` and blocks on `__wait_for_resume()`.
+5. `wait` sends `CellCommand::Drain(...)`, unblocking the worker and letting it continue from the same runtime state.
+
+This means:
+
+- `flush()` emits a host-visible drain event without throwing a JS exception.
+- Timer waits preserve runtime-local state and resume only through `wait`.
+- The LLM receives accumulated text/notifications plus flush status in each drain batch.
+
+### 22.4 Data Flow: `exec` Call
+
+```
+LLM emits exec({code})
+  → AgentLoop.dispatch_exec_tool_call()
+    → CodeModeService.execute_live()
+      → CellDriver::spawn_live()
+        → tokio::spawn worker thread
+          → runtime::run_cell(code, invoke_tool, event_tx)
+            → JS runs: text(), yield_control(), tools.X(), etc.
+            → each JS global → event_tx.send(RuntimeEvent::*)
+            → invoke_tool() for nested tools (synchronous within rquickjs)
+            → script completes → WorkerCompleted event
+      → driver.drain_event_batch_with_request(initial_drain)
+        → consumes events from event_rx
+        → returns DriverDrainBatch
+    → ActiveCellHandle.record_driver_update()
+    → snapshot.render_state().render_output()
+  → StructuredToolOutput envelope → LLM context
+```
+
+### 22.5 Data Flow: `wait` Call
+
+```
+LLM emits wait({cell_id?, wait_timeout_ms?, refresh_slice_ms?})
+  → AgentLoop.dispatch_exec_tool_call()
+    → CodeModeService.wait_with_request()
+      → validates cell_id against active_cell
+      → acquires live_driver lock
+      → driver.drain_event_batch_with_request(drain_request)
+        → if wait_for_event: blocks up to wait_timeout_ms
+        → if refresh_slice_ms: returns progress after slice
+        → on terminal: returns DriverDrainBatch with terminal_result
+      → ActiveCellHandle.record_driver_update()
+      → snapshot.render_state().render_output()
+    → cleared active_cell if terminal
+  → StructuredToolOutput envelope → LLM context
+```
+
+### 22.6 Timer Semantics (Unchanged)
+
+JS timers (`setTimeout` / `clearTimeout`) remain runtime-internal:
+
+- `setTimeout(callback, delayMs)` registers a timer via `register_timeout()`.
+- If `delayMs == 0`, the callback is pushed to `__dueTimeoutCallbacks` and executed inline after the main script body.
+- If the timer is pending (future), it is not executed. The wrapper script detects pending timers and returns a `yielded: true, yieldKind: 'timer'` result.
+- Timer state is communicated to the service via `RuntimeEvent::TimerRegistrationChanged`.
+- Host slice timing (`refresh_slice_ms` in `DrainRequest`) is independent of JS timer deadlines.
+
+- [x] `wait_with_request()` implementation wired to driver drain loop.
+- [x] `step_helpers.rs` integration for `execute` and `wait`.
+- [x] Cleanup of stale `ResumeState`, `RunCellMetadata`, and `ReplayState` structs.
+- [x] Channel-based tool bridge to avoid `'static` lifetime requirements.
+- [x] Updated test suite (17/17 passing) and clean clippy status.
+
+## 23. Channel-Based Tool Bridge Implementation
+
+To bridge between the synchronous `rquickjs` execution context (running in `tokio::task::spawn_blocking`) and the asynchronous `AgentLoop` (which handles nested tool dispatch), we implemented a message-passing bridge:
+
+1.  **Request Flow**: When JS calls `tools.read_file()`, the runtime's native `__callTool` writes a `RuntimeEvent::ToolCallRequested` to the `event_tx` channel.
+2.  **Worker Suspension**: The worker thread then calls `tool_result_rx.recv()`, which is a blocking call on a `std::sync::mpsc` channel, effectively suspending the JS execution.
+3.  **Host Dispatch**: The `CellDriver::drain_event_batch_with_request` loop sees the `ToolCallRequested` event, uses the provided `invoke_tool` async closure to execute the tool in the host's async context.
+4.  **Resumption**: Once the host has the result, it sends it back to the worker via `tool_result_tx.send()`. The worker thread wakes up and resumes JS execution with the result.
+
+This pattern allows `AgentLoop` to use its own stateful, async closures (capturing `&mut self` for autopilot and hit-counting) without needing to satisfy the `'static` bound.
+
+## 24. Next Steps
+
+**Phase 3 (Integration & Event-Driven Migration) Completed**:
+- [x] Map Code Mode flush/timer-wait events to tool output `await_user` effect.
+- [x] Fix event propagation in `ActiveCellHandle::record_driver_update` for flush/timer states.
+- [x] Fix `to_completion()` drain requests and blocking logic.
+- [x] Implement rendered text output emission to `AgentOutput`.
+- [x] Verify full lifecycle with integration tests.
+
+Focused work for the next phase:
+
+- [ ] **Production Hardening**:
+    - [ ] Add explicit timeout monitoring at the `CodeModeService` level for long-running workers.
+    - [ ] Implement graceful termination for orphaned workers.
+    - [ ] Refine error reporting for nested tool failures.
+- [ ] **Performance Optimization**:
+    - [ ] Profile `rquickjs` context initialization overhead.
+    - [ ] Optimize large output buffering to avoid excessive string copying.
+- [ ] **Expanded Capabilities**:
+    - [x] Multi-cell session testing (Verified state persistence across turns).
+    - [ ] Parallel tool call support inside `exec` (concurrent nested dispatch).

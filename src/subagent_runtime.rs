@@ -1143,7 +1143,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::context::{FunctionCall, Message};
-    use crate::llm_client::{LlmError, StreamEvent};
+    use crate::llm_client::{LlmCapabilities, LlmError, StreamEvent};
 
     struct FinishImmediatelyLlm;
 
@@ -1155,6 +1155,15 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "test"
+        }
+
+        fn capabilities(&self) -> LlmCapabilities {
+            LlmCapabilities {
+                function_tools: true,
+                custom_tools: false,
+                parallel_tool_calls: true,
+                supports_code_mode: true,
+            }
         }
 
         async fn stream(
@@ -1187,6 +1196,15 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "test"
+        }
+
+        fn capabilities(&self) -> LlmCapabilities {
+            LlmCapabilities {
+                function_tools: true,
+                custom_tools: false,
+                parallel_tool_calls: true,
+                supports_code_mode: true,
+            }
         }
 
         async fn stream(

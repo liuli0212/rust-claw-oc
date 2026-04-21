@@ -244,6 +244,7 @@ pub fn filter_subagent_tools(
     allow_subagent_tool: bool,
 ) -> Vec<Arc<dyn Tool>> {
     let runtime_tools = ["finish_task", "task_plan"];
+    let code_mode_companion_allowed = allowed.iter().any(|tool| tool == "exec");
     let mut accepted = Vec::new();
 
     for tool in base_tools {
@@ -258,6 +259,7 @@ pub fn filter_subagent_tools(
         if !restrict_to_allowed_tools
             || runtime_tools.contains(&name.as_str())
             || allowed.contains(&name)
+            || (name == "wait" && code_mode_companion_allowed)
         {
             accepted.push(tool.clone());
         }
@@ -372,7 +374,7 @@ pub fn build_subagent_session(
             parent_span_id: trace.parent_span_id.clone(),
         });
     }
-    agent_loop.add_extension(Box::new(
+    agent_loop.add_extension(Arc::new(
         crate::skills::runtime::SkillRuntime::with_session_seed(
             sub_session_id.clone(),
             skill_session_seed,
@@ -436,10 +438,10 @@ pub fn build_agent_session(
         telemetry,
         task_state_store,
     );
-    agent_loop.add_extension(Box::new(
+    agent_loop.add_extension(Arc::new(
         crate::skills::runtime::SkillRuntime::new_for_session(session_id.to_string()),
     ));
-    agent_loop.add_extension(Box::new(
+    agent_loop.add_extension(Arc::new(
         crate::subagent_notification::SubagentNotificationExtension::new(
             session_id,
             subagent_runtime.clone(),
@@ -462,7 +464,7 @@ pub fn build_agent_session(
                     .to_string());
             }
 
-            agent_loop.add_extension(Box::new(crate::sandbox_extension::SandboxExtension::new(
+            agent_loop.add_extension(Arc::new(crate::sandbox_extension::SandboxExtension::new(
                 std::sync::Arc::new(enforcer),
             )));
             tracing::info!("Sandbox extension registered (level={:?})", level);
@@ -527,6 +529,15 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "test-provider"
+        }
+
+        fn capabilities(&self) -> crate::llm_client::LlmCapabilities {
+            crate::llm_client::LlmCapabilities {
+                function_tools: true,
+                custom_tools: false,
+                parallel_tool_calls: true,
+                supports_code_mode: true,
+            }
         }
 
         async fn stream(
@@ -684,6 +695,21 @@ mod tests {
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"write_file".to_string()));
         assert!(names.contains(&"finish_task".to_string()));
+        assert!(!names.contains(&"read_file".to_string()));
+    }
+
+    #[test]
+    fn test_filter_subagent_tools_keeps_wait_when_exec_is_whitelisted() {
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(MockTool("exec")),
+            Arc::new(MockTool("wait")),
+            Arc::new(MockTool("read_file")),
+        ];
+
+        let filtered = filter_subagent_tools(&tools, &["exec".to_string()], true, false);
+        let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"exec".to_string()));
+        assert!(names.contains(&"wait".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
     }
 

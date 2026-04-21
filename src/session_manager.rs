@@ -94,11 +94,34 @@ impl SessionManager {
     }
 
     pub async fn cancel_session(&self, session_id: &str) {
-        let sessions = self.sessions.lock().await;
-        if let Some((_, notify, cancelled)) = sessions.get(session_id) {
+        let session_entry = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(session_id).map(|(agent, notify, cancelled)| {
+                (agent.clone(), notify.clone(), cancelled.clone())
+            })
+        };
+
+        if let Some((agent, notify, cancelled)) = session_entry {
             cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
             notify.notify_waiters();
             tracing::info!("Cancel requested for session: {}", session_id);
+
+            // If the agent is not currently inside step(), this cancel came from
+            // the idle prompt. In that state no foreground dispatch loop exists
+            // to observe cancel_token, so clean up any background code-mode cell
+            // directly. If step() is running, avoid blocking on its mutex; the
+            // running loop will handle the same cancel notification.
+            if let Ok(agent_guard) = agent.try_lock() {
+                let aborted = agent_guard
+                    .abort_active_code_mode("Session cancelled by user.")
+                    .await;
+                if aborted {
+                    tracing::info!(
+                        "Aborted active code-mode cell for idle session: {}",
+                        session_id
+                    );
+                }
+            }
         }
     }
 
@@ -329,6 +352,15 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "test"
+        }
+
+        fn capabilities(&self) -> crate::llm_client::LlmCapabilities {
+            crate::llm_client::LlmCapabilities {
+                function_tools: true,
+                custom_tools: false,
+                parallel_tool_calls: true,
+                supports_code_mode: true,
+            }
         }
 
         async fn stream(

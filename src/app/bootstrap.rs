@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::memory::WorkspaceMemory;
 use crate::rag::VectorStore;
 use crate::tools::{
-    BashTool, PatchFileTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool,
-    SendFileTool, TavilySearchTool, Tool, WebFetchTool, WriteFileTool, WriteMemoryTool,
+    BashTool, ExecTool, PatchFileTool, RagInsertTool, RagSearchTool, ReadFileTool, ReadMemoryTool,
+    SendFileTool, TavilySearchTool, Tool, WaitTool, WebFetchTool, WriteFileTool, WriteMemoryTool,
 };
 
 pub struct AppBootstrap {
@@ -18,6 +18,8 @@ pub fn build_app_bootstrap() -> Result<AppBootstrap, Box<dyn std::error::Error>>
 
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(BashTool::new()),
+        Arc::new(ExecTool),
+        Arc::new(WaitTool),
         Arc::new(WriteFileTool),
         Arc::new(ReadFileTool),
         Arc::new(PatchFileTool),

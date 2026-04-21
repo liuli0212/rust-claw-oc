@@ -404,6 +404,13 @@ impl AgentLoop {
             current_tools = ext.before_tool_resolution(current_tools).await;
         }
 
+        if !self.llm.capabilities().supports_code_mode {
+            current_tools.retain(|tool| {
+                let name = tool.name();
+                name != "exec" && name != "wait"
+            });
+        }
+
         current_tools
     }
 
@@ -592,7 +599,28 @@ impl AgentLoop {
         }
         self.context.skill_instructions = draft.skill_instructions.clone();
         self.context.skill_state_summary = draft.skill_state_summary.clone();
-        self.context.execution_notices = draft.execution_notices.clone();
+
+        let mut execution_notices = draft.execution_notices;
+        let code_mode_visible = self.llm.capabilities().supports_code_mode
+            && current_tools
+                .iter()
+                .any(|tool| matches!(tool.name().as_str(), "exec" | "wait"));
+        if code_mode_visible {
+            let available_nested_tools: Vec<String> = current_tools
+                .iter()
+                .map(|tool| tool.name())
+                .filter(|name| Self::is_code_mode_nested_tool(name))
+                .collect();
+            let code_mode_notice =
+                crate::code_mode::description::execution_notice(&available_nested_tools);
+            execution_notices = Some(match execution_notices {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{existing}\n\n{code_mode_notice}")
+                }
+                _ => code_mode_notice,
+            });
+        }
+        self.context.execution_notices = execution_notices;
 
         let max_tokens = self.context.max_history_tokens;
         let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
@@ -633,8 +661,33 @@ impl AgentLoop {
         None
     }
 
-    pub(super) async fn dispatch_tool_call(
+    fn is_code_mode_nested_tool(tool_name: &str) -> bool {
+        crate::code_mode::executor::is_code_mode_nested_tool(tool_name)
+    }
+
+    fn build_tool_invoker(
         &self,
+        current_tools: &[Arc<dyn Tool>],
+        remaining_steps: usize,
+    ) -> crate::tools::invocation::ToolInvoker {
+        crate::tools::invocation::ToolInvoker::new(crate::tools::invocation::ToolInvokerConfig {
+            current_tools: current_tools.to_vec(),
+            visible_tools: current_tools.iter().map(|tool| tool.name()).collect(),
+            extensions: self.extensions.clone(),
+            session_id: self.session_id.clone(),
+            reply_to: self.reply_to.clone(),
+            remaining_steps,
+            session_deadline: self.session_deadline,
+            trace_bus: self.trace_bus.clone(),
+            cancel_token: self.cancel_token.clone(),
+            is_autopilot: self.is_autopilot,
+            todos_path: self.todos_path(),
+            execution_guard_state: self.execution_guard_state.clone(),
+        })
+    }
+
+    pub(super) async fn dispatch_tool_call(
+        &mut self,
         call: &crate::context::FunctionCall,
         current_tools: &[Arc<dyn Tool>],
         remaining_steps: usize,
@@ -642,7 +695,7 @@ impl AgentLoop {
     ) -> ToolDispatchOutcome {
         let tool_opt = current_tools.iter().find(|tool| tool.name() == call.name);
 
-        if let Some(tool) = tool_opt {
+        if tool_opt.is_some() {
             tracing::info!("Executing tool '{}' with args: {}", call.name, call.args);
             self.output
                 .on_tool_start(&call.name, &call.args.to_string())
@@ -683,70 +736,101 @@ impl AgentLoop {
                 };
             }
 
-            let mut ctx =
-                crate::tools::ToolContext::new(self.session_id.clone(), self.reply_to.clone());
-            ctx.visible_tools = current_tools.iter().map(|tool| tool.name()).collect();
-            ctx.skill_budget.remaining_steps = Some(remaining_steps);
-            ctx.skill_budget.remaining_timeout_sec = self.remaining_session_timeout_sec();
-            if let Some(span) = tool_span.as_ref() {
-                if let Some(trace_ctx) = iteration_trace_ctx.as_ref() {
-                    ctx.trace = Some(crate::tools::protocol::ToolTraceContext {
-                        trace_id: trace_ctx.trace_id.clone(),
-                        run_id: trace_ctx.run_id.clone(),
-                        root_session_id: trace_ctx.root_session_id.clone(),
-                        task_id: trace_ctx.task_id.clone(),
-                        turn_id: trace_ctx.turn_id.clone(),
-                        iteration: trace_ctx.iteration,
-                        parent_span_id: Some(span.span_id().to_string()),
-                    });
+            let tool_invoker = self.build_tool_invoker(current_tools, remaining_steps);
+
+            if matches!(call.name.as_str(), "exec" | "wait") {
+                let exec_outcome = crate::code_mode::entry::dispatch_tool_call(
+                    call,
+                    crate::code_mode::entry::CodeModeDispatchConfig {
+                        current_tools: current_tools.to_vec(),
+                        extensions: self.extensions.clone(),
+                        service: self.code_mode_service.clone(),
+                        session_id: self.session_id.clone(),
+                        reply_to: self.reply_to.clone(),
+                        remaining_steps,
+                        session_deadline: self.session_deadline,
+                        iteration_trace_ctx: iteration_trace_ctx.clone(),
+                        parent_span_id: tool_span.as_ref().map(|span| span.span_id().to_string()),
+                        trace_bus: self.trace_bus.clone(),
+                        provider: self.llm.provider_name().to_string(),
+                        model: self.llm.model_name().to_string(),
+                        cancel_token: self.cancel_token.clone(),
+                        output: self.output.clone(),
+                        is_autopilot: self.is_autopilot,
+                        todos_path: self.todos_path(),
+                        execution_guard_state: self.execution_guard_state.clone(),
+                    },
+                )
+                .await;
+                if let Some(span) = tool_span.take() {
+                    span.finish(
+                        if exec_outcome.is_error {
+                            "tool_failed"
+                        } else {
+                            "tool_finished"
+                        },
+                        if exec_outcome.is_error {
+                            TraceStatus::Error
+                        } else {
+                            TraceStatus::Ok
+                        },
+                        Some(crate::context::AgentContext::truncate_chars(
+                            &exec_outcome.result,
+                            240,
+                        )),
+                        serde_json::json!({
+                            "tool_name": call.name,
+                            "result_preview": crate::context::AgentContext::truncate_chars(&exec_outcome.result, 500),
+                        }),
+                    );
                 }
-            }
-            for ext in &self.extensions {
-                ctx = ext.enrich_tool_context(ctx).await;
+                return exec_outcome;
             }
 
-            let (result, is_error, stopped, trace_status, end_name) = tokio::select! {
-                exec_res = tokio::time::timeout(
-                    Duration::from_secs(120),
-                    tool.execute(call.args.clone(), &ctx)
-                ) => {
-                    match exec_res {
-                        Ok(Ok(res)) => {
-                            tracing::info!("Tool '{}' executed successfully", call.name);
-                            (res, false, false, TraceStatus::Ok, "tool_finished")
-                        },
-                        Ok(Err(e)) => {
-                            tracing::warn!("Tool '{}' returned an error: {}", call.name, e);
-                            (format!("Tool error: {}", e), true, false, TraceStatus::Error, "tool_failed")
-                        },
-                        Err(e) => {
-                            tracing::error!("Tool '{}' timed out: {}", call.name, e);
-                            (format!("Timeout executing {}: {}", call.name, e), true, false, TraceStatus::TimedOut, "tool_timed_out")
-                        },
-                    }
-                }
-                _ = self.cancel_token.notified() => {
-                    tracing::warn!("Tool execution '{}' interrupted by user", call.name);
-                    ("Tool execution interrupted by user.".to_string(), true, true, TraceStatus::Cancelled, "tool_cancelled")
-                }
-            };
+            let outcome = tool_invoker
+                .invoke(crate::tools::invocation::ToolInvocationRequest {
+                    tool_name: &call.name,
+                    args: call.args.clone(),
+                    timeout: Duration::from_secs(120),
+                    trace_ctx: iteration_trace_ctx.clone(),
+                    context_parent_span_id: tool_span
+                        .as_ref()
+                        .map(|span| span.span_id().to_string()),
+                    span: None,
+                })
+                .await;
             if let Some(span) = tool_span.take() {
                 span.finish(
-                    end_name,
-                    trace_status,
-                    Some(crate::context::AgentContext::truncate_chars(&result, 240)),
+                    if outcome.stopped {
+                        "tool_cancelled"
+                    } else if outcome.is_error {
+                        "tool_failed"
+                    } else {
+                        "tool_finished"
+                    },
+                    if outcome.stopped {
+                        TraceStatus::Cancelled
+                    } else if outcome.is_error {
+                        TraceStatus::Error
+                    } else {
+                        TraceStatus::Ok
+                    },
+                    Some(crate::context::AgentContext::truncate_chars(
+                        &outcome.result,
+                        240,
+                    )),
                     serde_json::json!({
                         "tool_name": call.name,
-                        "result_preview": crate::context::AgentContext::truncate_chars(&result, 500),
-                        "result_size_chars": result.len(),
+                        "result_preview": crate::context::AgentContext::truncate_chars(&outcome.result, 500),
+                        "result_size_chars": outcome.result.len(),
                     }),
                 );
             }
 
             return ToolDispatchOutcome {
-                result,
-                is_error,
-                stopped,
+                result: outcome.result,
+                is_error: outcome.is_error,
+                stopped: outcome.stopped,
             };
         }
 
@@ -835,6 +919,7 @@ impl AgentLoop {
         } else {
             (0, 0)
         };
+        let tool_invoker = self.build_tool_invoker(current_tools, remaining_steps);
 
         for (mut call, thought_sig) in tool_calls_accumulated {
             if skip_remaining {
@@ -861,29 +946,14 @@ impl AgentLoop {
                 continue;
             }
 
-            if self.is_autopilot {
-                let tool_has_effects = current_tools
-                    .iter()
-                    .find(|t| t.name() == call.name)
-                    .map(|t| t.has_side_effects())
-                    .unwrap_or(true);
-                if tool_has_effects {
-                    let todos_path = self.todos_path();
-                    if !todos_path.exists() {
-                        let is_creating_todos = (call.name == "write_file"
-                            || call.name == "execute_bash")
-                            && call.args.to_string().contains("TODOS.md");
-                        if !is_creating_todos {
-                            response_parts.push(Self::build_function_response_part(
-                                call.name.clone(),
-                                call.id.clone(),
-                                serde_json::json!({ "result": "[System Error] Action Denied. Autopilot 模式下必须先创建并规划 TODOS.md。" }),
-                                thought_sig.clone(),
-                            ));
-                            continue;
-                        }
-                    }
-                }
+            if let Some(reason) = tool_invoker.autopilot_denial_for_call(&call.name, &call.args) {
+                response_parts.push(Self::build_function_response_part(
+                    call.name.clone(),
+                    call.id.clone(),
+                    serde_json::json!({ "result": reason }),
+                    thought_sig.clone(),
+                ));
+                continue;
             }
             let ToolDispatchOutcome {
                 result,
@@ -897,45 +967,19 @@ impl AgentLoop {
                     iteration_trace_ctx.clone(),
                 )
                 .await;
-            if self.is_autopilot {
-                // Use full string key for action dedup (avoids hash collisions)
-                let action_key = format!("{}:{}:{}", call.name, call.args, is_error);
-
-                self.action_history.push_back(action_key.clone());
-                if self.action_history.len() > 3 {
-                    self.action_history.pop_front();
-                }
-
-                if self.action_history.len() == 3
-                    && self.action_history.iter().all(|k| k == &action_key)
-                {
-                    self.reflection_strike += 1;
-                    self.action_history.clear();
-
-                    if self.reflection_strike >= 2 {
-                        response_parts.push(Self::build_function_response_part(
-                            call.name.clone(),
-                            call.id.clone(),
-                            serde_json::json!({
-                                "result": "[System Error] 检测到深度死循环，反思无效。",
-                                "signal": "autopilot_meltdown"
-                            }),
-                            thought_sig.clone(),
-                        ));
-                        continue;
-                    } else {
-                        response_parts.push(Self::build_function_response_part(
-                            call.name.clone(),
-                            call.id.clone(),
-                            serde_json::json!({
-                                "result": "[System Warning] 检测到你正在重复执行相同的错误动作。请立即停止当前尝试，反思失败原因，并提出全新的解决路径。",
-                                "signal": "reflection_warning"
-                            }),
-                            thought_sig.clone(),
-                        ));
-                        continue;
-                    }
-                }
+            if let Some(signal) =
+                tool_invoker.record_action_outcome(&call.name, &call.args, is_error)
+            {
+                response_parts.push(Self::build_function_response_part(
+                    call.name.clone(),
+                    call.id.clone(),
+                    serde_json::json!({
+                        "result": signal.message(),
+                        "signal": signal.signal()
+                    }),
+                    thought_sig.clone(),
+                ));
+                continue;
             }
 
             if stopped {
@@ -964,6 +1008,7 @@ impl AgentLoop {
                             .await;
                     }
                 }
+
                 if let Some(summary) = Self::extract_finish_task_summary_from_result(&result) {
                     if self.is_autopilot && self.has_uncompleted_todos() {
                         response_parts.push(Self::build_function_response_part(
@@ -1060,12 +1105,19 @@ impl AgentLoop {
             .task_state_store
             .load()
             .ok()
-            .and_then(|s| s.goal.as_ref().map(|g| format!("\nOriginal task goal: {}", g)))
+            .and_then(|s| {
+                s.goal
+                    .as_ref()
+                    .map(|g| format!("\nOriginal task goal: {}", g))
+            })
             .unwrap_or_default();
 
         let (completed, uncompleted) = self.count_todos_status();
         let todos_hint = if completed + uncompleted > 0 {
-            format!("\nTODOS progress: {} completed, {} remaining", completed, uncompleted)
+            format!(
+                "\nTODOS progress: {} completed, {} remaining",
+                completed, uncompleted
+            )
         } else {
             String::new()
         };
@@ -1156,10 +1208,7 @@ impl AgentLoop {
                 }
             }
             if error_count > 0 {
-                fallback.push_str(&format!(
-                    "  ({} 操作, {} 失败)\n",
-                    tool_count, error_count
-                ));
+                fallback.push_str(&format!("  ({} 操作, {} 失败)\n", tool_count, error_count));
             } else {
                 fallback.push_str(&format!("  ({} 操作, 均成功)\n", tool_count));
             }

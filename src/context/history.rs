@@ -392,10 +392,24 @@ fn summarize_tool_args(_tool_name: &str, args: &serde_json::Value) -> String {
 }
 
 fn compact_function_call_args_for_history(
-    _tool_name: &str,
+    tool_name: &str,
     args: &serde_json::Value,
 ) -> Option<serde_json::Value> {
     let obj = args.as_object()?;
+
+    if tool_name == "exec" {
+        let code = obj.get("code").and_then(|v| v.as_str())?;
+        return Some(serde_json::json!({
+            "code": compact_exec_code_for_history(code)
+        }));
+    }
+
+    if tool_name == "wait" {
+        return Some(match obj.get("cell_id").and_then(|v| v.as_str()) {
+            Some(cell_id) => serde_json::json!({ "cell_id": cell_id }),
+            None => serde_json::json!({}),
+        });
+    }
 
     if let Some(action) = obj.get("action").and_then(|v| v.as_str()) {
         let mut compact = serde_json::Map::new();
@@ -434,6 +448,22 @@ fn compact_function_call_args_for_history(
     }
 
     None
+}
+
+fn compact_exec_code_for_history(code: &str) -> String {
+    let char_count = code.chars().count();
+    if char_count <= 320 {
+        return code.to_string();
+    }
+
+    let head: String = code.chars().take(200).collect();
+    let tail: String = code.chars().skip(char_count.saturating_sub(80)).collect();
+    format!(
+        "{}\n... [code mode source truncated: {} chars hidden] ...\n{}",
+        head,
+        char_count.saturating_sub(280),
+        tail
+    )
 }
 
 pub(crate) fn sanitize_turn(turn: &Turn) -> Option<Turn> {
@@ -614,6 +644,9 @@ fn truncate_function_response(fr: &mut super::model::FunctionResponse) -> usize 
     // 1. Try to truncate "result" field if it's an object response
     if let Some(obj) = fr.response.as_object_mut() {
         if let Some(val) = obj.get_mut("result") {
+            if let Some(truncated) = truncate_code_mode_result_value(fr.name.as_str(), val) {
+                return truncated;
+            }
             if let Some(truncated) = truncate_large_json_value(val, MAX_RESULT_LEN) {
                 return truncated;
             }
@@ -634,6 +667,37 @@ fn truncate_function_response(fr: &mut super::model::FunctionResponse) -> usize 
     }
 
     0
+}
+
+fn truncate_code_mode_result_value(tool_name: &str, val: &mut serde_json::Value) -> Option<usize> {
+    let result_str = val.as_str()?;
+    let mut envelope = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(result_str)?;
+    let is_code_mode = envelope.effects.payload_kind.as_deref() == Some("code_mode_exec")
+        || matches!(tool_name, "exec" | "wait");
+    if !is_code_mode {
+        return None;
+    }
+
+    let char_count = envelope.result.output.chars().count();
+    if char_count <= 4_000 {
+        return None;
+    }
+
+    let head: String = envelope.result.output.chars().take(2_400).collect();
+    let tail: String = envelope
+        .result
+        .output
+        .chars()
+        .skip(char_count.saturating_sub(600))
+        .collect();
+    envelope.result.output = format!(
+        "{}\n... [Code mode history compressed: {} chars hidden] ...\n{}",
+        head,
+        char_count.saturating_sub(3_000),
+        tail
+    );
+    *val = serde_json::Value::String(serde_json::to_string(&envelope).ok()?);
+    Some(char_count.saturating_sub(3_000))
 }
 
 fn truncate_large_json_value(val: &mut serde_json::Value, max_len: usize) -> Option<usize> {
@@ -843,6 +907,43 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_turn_compacts_exec_calls_into_canonical_code_shape() {
+        let code = format!("{}\n{}", "const value = 1;".repeat(40), "return value;");
+        let turn = Turn {
+            turn_id: "turn-2".to_string(),
+            user_message: "run code".to_string(),
+            messages: vec![Message {
+                role: "model".to_string(),
+                parts: vec![Part {
+                    text: None,
+                    function_call: Some(FunctionCall {
+                        name: "exec".to_string(),
+                        args: serde_json::json!({ "code": code }),
+                        id: Some("call_exec_1".to_string()),
+                    }),
+                    function_response: None,
+                    thought_signature: None,
+                    file_data: None,
+                }],
+            }],
+        };
+
+        let (rebuilt, _) = reconstruct_turn_for_history(&turn);
+        let args = rebuilt.messages[0].parts[0]
+            .function_call
+            .as_ref()
+            .unwrap()
+            .args
+            .clone();
+
+        assert!(args.get("code").is_some());
+        assert!(args["code"]
+            .as_str()
+            .unwrap()
+            .contains("code mode source truncated"));
+    }
+
+    #[test]
     fn test_truncate_function_response_string() {
         use crate::context::model::FunctionResponse;
         let mut fr = FunctionResponse {
@@ -873,5 +974,36 @@ mod tests {
         assert!(truncated > 0);
         let result_str = fr.response["result"].as_str().unwrap();
         assert!(result_str.contains("History Object Compressed"));
+    }
+
+    #[test]
+    fn test_truncate_function_response_preserves_code_mode_exec_envelope() {
+        use crate::context::model::FunctionResponse;
+        let mut fr = FunctionResponse {
+            id: None,
+            name: "exec".to_string(),
+            response: serde_json::json!({
+                "result": serde_json::json!({
+                    "ok": true,
+                    "tool_name": "exec",
+                    "payload_kind": "code_mode_exec",
+                    "output": format!("status\n{}", "A".repeat(8_000))
+                }).to_string()
+            }),
+        };
+
+        let truncated = truncate_function_response(&mut fr);
+        assert!(truncated > 0);
+        let result_str = fr.response["result"].as_str().unwrap();
+        let envelope = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(result_str)
+            .expect("code-mode envelope");
+        assert_eq!(
+            envelope.effects.payload_kind.as_deref(),
+            Some("code_mode_exec")
+        );
+        assert!(envelope
+            .result
+            .output
+            .contains("Code mode history compressed"));
     }
 }

@@ -131,6 +131,22 @@ impl ContextAssembler {
             }
         }
 
+        // Layer 2.1: Runtime execution notices
+        // Elevated priority because it dictates tool usage rules (e.g. Code Mode syntax)
+        if let Some(execution_notices) = execution_notices {
+            if !execution_notices.trim().is_empty() {
+                candidates.push(PromptCandidate {
+                    id: "execution_notices".to_string(),
+                    kind: CandidateKind::ExecutionNotices,
+                    priority_score: 850.0,
+                    token_cost: Self::est_tokens(execution_notices),
+                    layer: 2,
+                    required: false,
+                    content: format!("--- [EXECUTION NOTICES] ---\n{execution_notices}"),
+                });
+            }
+        }
+
         // Layer 2.5: Active skill contract
         if let Some(contract) = skill_contract {
             if !contract.trim().is_empty() {
@@ -172,20 +188,6 @@ impl ContextAssembler {
                     layer: 5,
                     required: false,
                     content: format!("--- [ACTIVE SKILL STATE] ---\n{skill_state_summary}"),
-                });
-            }
-        }
-
-        if let Some(execution_notices) = execution_notices {
-            if !execution_notices.trim().is_empty() {
-                candidates.push(PromptCandidate {
-                    id: "execution_notices".to_string(),
-                    kind: CandidateKind::ExecutionNotices,
-                    priority_score: 575.0,
-                    token_cost: Self::est_tokens(execution_notices),
-                    layer: 5,
-                    required: false,
-                    content: format!("--- [EXECUTION NOTICES] ---\n{execution_notices}"),
                 });
             }
         }
@@ -401,7 +403,7 @@ mod tests {
         assert!(idx_ev < idx_skill);
         assert!(idx_skill < idx_instructions);
         assert!(idx_instructions < idx_skill_state);
-        assert!(idx_skill_state < idx_notice);
+        assert!(idx_notice < idx_skill_state);
         assert!(idx_notice < idx_state);
         assert!(idx_state < idx_vol);
     }

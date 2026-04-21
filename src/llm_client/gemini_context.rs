@@ -21,13 +21,16 @@ pub(crate) fn build_function_declarations(tools: &[Arc<dyn Tool>]) -> Vec<Functi
 
     let mut declarations = Vec::with_capacity(tools.len());
     for tool in tools {
-        let mut parameters = tool.parameters_schema();
+        let definition = tool.definition();
+        let mut parameters = definition
+            .input_schema
+            .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
         let root_schema = parameters.clone();
         inline_schema_refs(&mut parameters, &root_schema, 0);
         normalize_schema_for_gemini(&mut parameters);
         declarations.push(FunctionDeclaration {
-            name: tool.name().to_string(),
-            description: tool.description().to_string(),
+            name: definition.name,
+            description: definition.description,
             parameters,
         });
     }

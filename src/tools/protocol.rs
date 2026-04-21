@@ -29,8 +29,17 @@ pub enum ToolError {
     InvalidArguments(String),
     #[error("Timeout")]
     Timeout,
+    #[error("Cancelled: {0}")]
+    Cancelled(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +88,13 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> String;
     fn parameters_schema(&self) -> serde_json::Value;
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String, ToolError>;
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name(),
+            description: self.description(),
+            input_schema: Some(self.parameters_schema()),
+        }
+    }
     /// Whether this tool can modify files, state, or the outside world.
     /// Read-only tools should return false. Default is true (conservative).
     fn has_side_effects(&self) -> bool {

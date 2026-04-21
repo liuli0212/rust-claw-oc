@@ -308,6 +308,7 @@ pub async fn run_cli_repl(
         run_cli_agent_step(session_manager.clone(), output.clone(), line).await;
     }
 
+    session_manager.cancel_session("cli").await;
     Ok(())
 }
 

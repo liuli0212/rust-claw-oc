@@ -50,6 +50,7 @@ lsp-types = "0.95"
 cron = "0.12"
 syntect = "5.2"
 ratatui = "0.29"
+rquickjs = { version = "0.11.0", features = ["futures"] }
 
 [features]
 default = ["acp"]

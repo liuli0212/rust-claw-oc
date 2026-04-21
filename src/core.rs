@@ -3,6 +3,7 @@ use crate::llm_client::{LlmClient, StreamEvent};
 use crate::tools::Tool;
 use crate::trace::{shared_bus, TraceActor, TraceContext, TraceSeed, TraceSpanHandle, TraceStatus};
 use async_trait::async_trait;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -167,16 +168,74 @@ enum StreamCollectionOutcome {
     Exit(RunExit),
 }
 
-struct ToolDispatchOutcome {
-    result: String,
-    is_error: bool,
-    stopped: bool,
+pub(crate) struct ToolDispatchOutcome {
+    pub(crate) result: String,
+    pub(crate) is_error: bool,
+    pub(crate) stopped: bool,
 }
 
 struct ActiveTrace {
     base_ctx: TraceContext,
     run_span: Option<TraceSpanHandle>,
     turn_span: Option<TraceSpanHandle>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ExecutionGuardState {
+    action_history: VecDeque<String>,
+    reflection_strike: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionGuardSignal {
+    ReflectionWarning,
+    AutopilotMeltdown,
+}
+
+impl ExecutionGuardSignal {
+    pub(crate) fn signal(self) -> &'static str {
+        match self {
+            Self::ReflectionWarning => "reflection_warning",
+            Self::AutopilotMeltdown => "autopilot_meltdown",
+        }
+    }
+
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::ReflectionWarning => {
+                "[System Warning] 检测到你正在重复执行相同的错误动作。请立即停止当前尝试，反思失败原因，并提出全新的解决路径。"
+            }
+            Self::AutopilotMeltdown => "[System Error] 检测到深度死循环，反思无效。",
+        }
+    }
+}
+
+impl ExecutionGuardState {
+    pub(crate) fn record_action_outcome(
+        &mut self,
+        call_name: &str,
+        call_args: &serde_json::Value,
+        is_error: bool,
+    ) -> Option<ExecutionGuardSignal> {
+        let action_key = format!("{}:{}:{}", call_name, call_args, is_error);
+        self.action_history.push_back(action_key.clone());
+        if self.action_history.len() > 3 {
+            self.action_history.pop_front();
+        }
+
+        if self.action_history.len() == 3 && self.action_history.iter().all(|k| k == &action_key) {
+            self.reflection_strike += 1;
+            self.action_history.clear();
+
+            if self.reflection_strike >= 2 {
+                return Some(ExecutionGuardSignal::AutopilotMeltdown);
+            }
+
+            return Some(ExecutionGuardSignal::ReflectionWarning);
+        }
+
+        None
+    }
 }
 
 pub struct AgentLoop {
@@ -192,16 +251,16 @@ pub struct AgentLoop {
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     pub is_autopilot: bool,
     pub is_subagent: bool,
-    action_history: std::collections::VecDeque<String>,
-    reflection_strike: u8,
+    execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
     autopilot_todos_completed_count: usize,
     autopilot_work_dir: Option<PathBuf>,
-    extensions: Vec<Box<dyn extensions::ExecutionExtension>>,
+    extensions: Vec<Arc<dyn extensions::ExecutionExtension>>,
     initial_energy_budget: usize,
     session_deadline: Option<Instant>,
     trace_bus: Arc<crate::trace::TraceBus>,
     trace_seed: Option<TraceSeed>,
     active_trace: Option<ActiveTrace>,
+    code_mode_service: crate::code_mode::service::CodeModeService,
 }
 
 impl AgentLoop {
@@ -233,8 +292,7 @@ impl AgentLoop {
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_autopilot: false,
             is_subagent: false,
-            action_history: std::collections::VecDeque::new(),
-            reflection_strike: 0,
+            execution_guard_state: Arc::new(std::sync::Mutex::new(ExecutionGuardState::default())),
             autopilot_todos_completed_count: 0,
             autopilot_work_dir: None,
             extensions: Vec::new(),
@@ -243,11 +301,12 @@ impl AgentLoop {
             trace_bus: shared_bus(),
             trace_seed: None,
             active_trace: None,
+            code_mode_service: crate::code_mode::service::CodeModeService::default(),
         }
     }
 
     /// Register an execution extension (e.g. SkillRuntime).
-    pub fn add_extension(&mut self, ext: Box<dyn extensions::ExecutionExtension>) {
+    pub fn add_extension(&mut self, ext: Arc<dyn extensions::ExecutionExtension>) {
         self.extensions.push(ext);
     }
 
@@ -274,6 +333,12 @@ impl AgentLoop {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.cancel_token.notify_waiters();
+    }
+
+    pub async fn abort_active_code_mode(&self, reason: &str) -> bool {
+        self.code_mode_service
+            .abort_active_cell(&self.session_id, reason)
+            .await
     }
 
     fn is_cancelled(&self) -> bool {
@@ -512,10 +577,11 @@ impl AgentLoop {
             self.tools
                 .iter()
                 .map(|t| {
+                    let definition = t.definition();
                     serde_json::json!({
-                        "name": t.name(),
-                        "description": t.description(),
-                        "parameters": t.parameters_schema(),
+                        "name": definition.name,
+                        "description": definition.description,
+                        "parameters": definition.input_schema,
                     })
                 })
                 .collect(),

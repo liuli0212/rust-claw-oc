@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rusty_claw::context::{FunctionCall, Message};
-use rusty_claw::llm_client::{LlmClient, LlmError, StreamEvent};
+use rusty_claw::llm_client::{LlmCapabilities, LlmClient, LlmError, StreamEvent};
 use rusty_claw::tools::Tool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -38,6 +38,15 @@ impl LlmClient for ScenarioLlm {
 
     fn provider_name(&self) -> &str {
         "scenario-provider"
+    }
+
+    fn capabilities(&self) -> LlmCapabilities {
+        LlmCapabilities {
+            function_tools: true,
+            custom_tools: false,
+            parallel_tool_calls: true,
+            supports_code_mode: true,
+        }
     }
 
     async fn stream(
