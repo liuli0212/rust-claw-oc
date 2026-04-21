@@ -335,6 +335,12 @@ impl AgentLoop {
         self.cancel_token.notify_waiters();
     }
 
+    pub async fn abort_active_code_mode(&self, reason: &str) -> bool {
+        self.code_mode_service
+            .abort_active_cell(&self.session_id, reason)
+            .await
+    }
+
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
     }

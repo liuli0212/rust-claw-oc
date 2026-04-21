@@ -94,13 +94,18 @@ pub(crate) async fn dispatch_tool_call(
 
     let is_wait = matches!(invocation, CodeModeInvocation::Wait(_));
 
+    // Register the cancel future early so a notify_waiters() that fires
+    // between the caller's last await and our select! is not lost.
+    let cancel_notified = config.cancel_token.notified();
+    tokio::pin!(cancel_notified);
+
     let exec_result = if is_wait {
         // wait is read-only: no hard timeout, no abort on cancel — just observe.
         tokio::select! {
             result = run_invocation(call, invocation, visible_tools, &config) => {
                 result
             }
-            _ = config.cancel_token.notified() => {
+            _ = &mut cancel_notified => {
                 Err(crate::tools::ToolError::Cancelled(
                     "Code mode wait interrupted by user.".to_string(),
                 ))
@@ -124,7 +129,7 @@ pub(crate) async fn dispatch_tool_call(
                     }
                 }
             }
-            _ = config.cancel_token.notified() => {
+            _ = &mut cancel_notified => {
                 config
                     .service
                     .abort_active_cell(&config.session_id, "Code mode execution interrupted by user.")

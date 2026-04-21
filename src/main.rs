@@ -12,6 +12,7 @@ use rusty_claw::telegram;
 use rusty_claw::tools;
 use rusty_claw::ui::{TuiOutput, TuiOutputRouter};
 use std::sync::Arc;
+use std::time::Duration;
 
 const LOGO: &str = r#"
   ██████╗ ██╗   ██╗███████╗████████╗██╗   ██╗      ██████╗██╗      █████╗ ██╗    ██╗
@@ -74,8 +75,20 @@ struct CliArgs {
     command: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async_main());
+
+    // Code mode uses spawn_blocking for the JS runtime. If a worker fails to
+    // observe cancellation promptly, Tokio's default shutdown would wait
+    // indefinitely and leave the CLI stuck after printing "Exiting...".
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    result
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     let args = CliArgs::parse();
 
