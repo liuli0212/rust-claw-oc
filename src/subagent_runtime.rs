@@ -169,7 +169,7 @@ pub struct SubagentJobHandle {
     pub debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
     pub consumed_at_unix_ms: tokio::sync::RwLock<Option<u64>>,
     pub cancelled: Arc<AtomicBool>,
-    pub cancel_notify: tokio_util::sync::CancellationToken,
+    pub cancel_notify: Arc<tokio::sync::Notify>,
     /// Fired when the job reaches a terminal state (completed/failed/cancelled/timed_out).
     /// Separate from cancel_notify to avoid conflating cancellation and completion semantics.
     pub completion_notify: Arc<tokio::sync::Notify>,
@@ -186,7 +186,7 @@ impl SubagentJobHandle {
             debug: Arc::new(tokio::sync::RwLock::new(SubagentDebugSnapshot::default())),
             consumed_at_unix_ms: tokio::sync::RwLock::new(None),
             cancelled: Arc::new(AtomicBool::new(false)),
-            cancel_notify: tokio_util::sync::CancellationToken::new(),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
             completion_notify: Arc::new(tokio::sync::Notify::new()),
             task: tokio::sync::Mutex::new(None),
             trace_span: std::sync::Mutex::new(None),
@@ -503,7 +503,7 @@ impl SubagentRuntime {
             ToolError::ExecutionFailed(format!("Unknown subagent job: {}", job_id))
         })?;
         handle.cancelled.store(true, Ordering::SeqCst);
-        handle.cancel_notify.cancel();
+        handle.cancel_notify.notify_waiters();
         if let Some(task) = handle.task.lock().await.as_ref() {
             task.abort();
         }

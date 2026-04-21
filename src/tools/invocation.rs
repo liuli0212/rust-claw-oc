@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::Notify;
 
 use crate::context::AgentContext;
 use crate::core::extensions::ExecutionExtension;
@@ -54,7 +54,7 @@ pub(crate) struct ToolInvokerConfig {
     pub(crate) remaining_steps: usize,
     pub(crate) session_deadline: Option<Instant>,
     pub(crate) trace_bus: Arc<TraceBus>,
-    pub(crate) cancel_token: CancellationToken,
+    pub(crate) cancel_token: Arc<Notify>,
     pub(crate) is_autopilot: bool,
     pub(crate) todos_path: PathBuf,
     pub(crate) execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
@@ -69,7 +69,7 @@ pub(crate) struct ToolInvoker {
     remaining_steps: usize,
     session_deadline: Option<Instant>,
     trace_bus: Arc<TraceBus>,
-    cancel_token: CancellationToken,
+    cancel_token: Arc<Notify>,
     is_autopilot: bool,
     todos_path: PathBuf,
     execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
@@ -239,7 +239,7 @@ impl ToolInvoker {
                     Err(err) => (format!("Timeout executing {}: {}", request.tool_name, err), true, false, TraceStatus::TimedOut, request.span.as_ref().map(|span| span.end_names.timeout)),
                 }
             }
-            _ = self.cancel_token.cancelled() => {
+            _ = self.cancel_token.notified() => {
                 ("Tool execution interrupted by user.".to_string(), true, true, TraceStatus::Cancelled, request.span.as_ref().map(|span| span.end_names.cancelled))
             }
         };

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio_util::sync::CancellationToken;
+use tokio::sync::Notify;
 
 use super::executor::{
     is_code_mode_nested_tool, CodeModeNestedToolExecutor, CodeModeNestedToolExecutorConfig,
@@ -29,7 +29,7 @@ pub(crate) struct CodeModeDispatchConfig {
     pub(crate) trace_bus: Arc<TraceBus>,
     pub(crate) provider: String,
     pub(crate) model: String,
-    pub(crate) cancel_token: CancellationToken,
+    pub(crate) cancel_token: Arc<Notify>,
     pub(crate) output: Arc<dyn AgentOutput>,
     pub(crate) is_autopilot: bool,
     pub(crate) todos_path: PathBuf,
@@ -109,7 +109,7 @@ pub(crate) async fn dispatch_tool_call(
                 }
             }
         }
-        _ = config.cancel_token.cancelled() => {
+        _ = config.cancel_token.notified() => {
             config
                 .service
                 .abort_active_cell(&config.session_id, "Code mode execution interrupted by user.")

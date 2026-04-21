@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::Notify;
 
 pub mod extensions;
 mod step_helpers;
@@ -247,7 +247,7 @@ pub struct AgentLoop {
     output: Arc<dyn AgentOutput>,
     telemetry: Arc<crate::telemetry::TelemetryExporter>,
     task_state_store: Arc<crate::task_state::TaskStateStore>,
-    pub cancel_token: CancellationToken,
+    pub cancel_token: Arc<Notify>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     pub is_autopilot: bool,
     pub is_subagent: bool,
@@ -288,7 +288,7 @@ impl AgentLoop {
             output,
             telemetry,
             task_state_store,
-            cancel_token: CancellationToken::new(),
+            cancel_token: Arc::new(Notify::new()),
             cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_autopilot: false,
             is_subagent: false,
@@ -332,7 +332,7 @@ impl AgentLoop {
     pub fn request_cancel(&self) {
         self.cancelled
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.cancel_token.cancel();
+        self.cancel_token.notify_waiters();
     }
 
     fn is_cancelled(&self) -> bool {

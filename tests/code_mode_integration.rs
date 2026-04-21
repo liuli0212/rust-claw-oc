@@ -566,7 +566,7 @@ async fn test_code_mode_cancel_clears_active_cell_for_next_exec() {
 
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-    cancel_token.cancel();
+    cancel_token.notify_waiters();
 
     let (mut agent, first_result) = first_step.await.unwrap();
     assert!(matches!(first_result.unwrap(), RunExit::StoppedByUser));

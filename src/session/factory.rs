@@ -32,7 +32,7 @@ pub struct SubagentSessionConfig {
     pub skill_session_seed: SkillSessionSeed,
     pub debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
-    pub cancel_notify: tokio_util::sync::CancellationToken,
+    pub cancel_notify: Arc<tokio::sync::Notify>,
     pub allow_subagent_tool: bool,
 }
 
@@ -627,7 +627,7 @@ mod tests {
             Arc::new(MockTool("ask_user_question")),
         ];
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_notify = tokio_util::sync::CancellationToken::new();
+        let cancel_notify = Arc::new(tokio::sync::Notify::new());
 
         let built = build_subagent_session(
             &parent_ctx,

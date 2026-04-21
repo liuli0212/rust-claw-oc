@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::Notify;
 
 use crate::context::AgentContext;
 use crate::core::extensions::ExecutionExtension;
@@ -43,7 +43,7 @@ pub(crate) struct CodeModeNestedToolExecutorConfig {
     pub(crate) trace_bus: Arc<TraceBus>,
     pub(crate) provider: String,
     pub(crate) model: String,
-    pub(crate) cancel_token: CancellationToken,
+    pub(crate) cancel_token: Arc<Notify>,
     pub(crate) is_autopilot: bool,
     pub(crate) todos_path: PathBuf,
     pub(crate) execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
