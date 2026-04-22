@@ -245,7 +245,13 @@ impl CellSnapshot {
         let (return_value, failure, cancellation) = self
             .terminal_state
             .as_ref()
-            .map(|t| (t.return_value.clone(), t.failure.clone(), t.cancellation.clone()))
+            .map(|t| {
+                (
+                    t.return_value.clone(),
+                    t.failure.clone(),
+                    t.cancellation.clone(),
+                )
+            })
             .unwrap_or_default();
 
         ExecRunResult {

@@ -74,11 +74,12 @@ pub(crate) async fn dispatch_tool_call(
         config.trace_bus.as_ref(),
         config.iteration_trace_ctx.as_ref(),
         config.parent_span_id.clone(),
-        TraceActor::Tool,
-        "code_mode_exec_started",
-        TraceStatus::Ok,
-        Some(call.name.clone()),
-        serde_json::json!({
+        TraceEventParams {
+            actor: TraceActor::Tool,
+            name: "code_mode_exec_started",
+            status: TraceStatus::Ok,
+            summary: Some(call.name.clone()),
+            attrs: serde_json::json!({
             "tool_name": call.name,
             "outer_tool_call_id": call.id.clone(),
             "provider": config.provider.clone(),
@@ -89,7 +90,8 @@ pub(crate) async fn dispatch_tool_call(
             "auto_flush_ms": auto_flush_ms,
             "visible_nested_tools": visible_tools.len(),
             "args_preview": crate::context::AgentContext::truncate_chars(&call.args.to_string(), 500),
-        }),
+            }),
+        },
     );
 
     let is_wait = matches!(invocation, CodeModeInvocation::Wait(_));
@@ -174,11 +176,12 @@ pub(crate) async fn dispatch_tool_call(
                 config.trace_bus.as_ref(),
                 config.iteration_trace_ctx.as_ref(),
                 config.parent_span_id,
-                TraceActor::Tool,
-                event_name,
-                event_status,
-                Some(summary.cell_id.clone()),
-                serde_json::json!({
+                TraceEventParams {
+                    actor: TraceActor::Tool,
+                    name: event_name,
+                    status: event_status,
+                    summary: Some(summary.cell_id.clone()),
+                    attrs: serde_json::json!({
                     "tool_name": call.name.clone(),
                     "outer_tool_call_id": call.id.clone(),
                     "provider": config.provider,
@@ -194,7 +197,8 @@ pub(crate) async fn dispatch_tool_call(
                     "output_size_chars": summary.output_text.chars().count(),
                     "termination_reason": termination_reason,
                     "truncated": summary.truncated,
-                }),
+                    }),
+                },
             );
 
             let (ok, exit_code, is_error) = code_mode_tool_result_status(&summary);
@@ -227,26 +231,34 @@ pub(crate) async fn dispatch_tool_call(
                 err,
                 crate::tools::ToolError::Timeout | crate::tools::ToolError::Cancelled(_)
             );
-            let (event_name, event_status, termination_reason) =
-                match &err {
-                    crate::tools::ToolError::Timeout => {
-                        ("code_mode_exec_terminated", TraceStatus::TimedOut, "timeout")
-                    }
-                    crate::tools::ToolError::Cancelled(_) => {
-                        ("code_mode_exec_terminated", TraceStatus::Cancelled, "cancelled")
-                    }
-                    _ => ("code_mode_exec_finished", TraceStatus::Error, "runtime_error"),
-                };
+            let (event_name, event_status, termination_reason) = match &err {
+                crate::tools::ToolError::Timeout => (
+                    "code_mode_exec_terminated",
+                    TraceStatus::TimedOut,
+                    "timeout",
+                ),
+                crate::tools::ToolError::Cancelled(_) => (
+                    "code_mode_exec_terminated",
+                    TraceStatus::Cancelled,
+                    "cancelled",
+                ),
+                _ => (
+                    "code_mode_exec_finished",
+                    TraceStatus::Error,
+                    "runtime_error",
+                ),
+            };
 
             record_trace_event(
                 config.trace_bus.as_ref(),
                 config.iteration_trace_ctx.as_ref(),
                 config.parent_span_id,
-                TraceActor::Tool,
-                event_name,
-                event_status,
-                Some(err.to_string()),
-                serde_json::json!({
+                TraceEventParams {
+                    actor: TraceActor::Tool,
+                    name: event_name,
+                    status: event_status,
+                    summary: Some(err.to_string()),
+                    attrs: serde_json::json!({
                     "tool_name": call.name.clone(),
                     "outer_tool_call_id": call.id.clone(),
                     "provider": config.provider,
@@ -255,7 +267,8 @@ pub(crate) async fn dispatch_tool_call(
                     "requested_cell_id": requested_cell_id,
                     "termination_reason": termination_reason,
                     "error": err.to_string(),
-                }),
+                    }),
+                },
             );
 
             let result = StructuredToolOutput::new(
@@ -414,19 +427,30 @@ fn code_mode_tool_result_status(
     }
 }
 
+pub(crate) struct TraceEventParams<'a> {
+    pub actor: TraceActor,
+    pub name: &'a str,
+    pub status: TraceStatus,
+    pub summary: Option<String>,
+    pub attrs: serde_json::Value,
+}
+
 fn record_trace_event(
     trace_bus: &TraceBus,
     trace_ctx: Option<&TraceContext>,
     parent_span_id: Option<String>,
-    actor: TraceActor,
-    name: &str,
-    status: TraceStatus,
-    summary: Option<String>,
-    attrs: serde_json::Value,
+    params: TraceEventParams<'_>,
 ) {
     if let Some(trace_ctx) = trace_ctx {
         let event_ctx = trace_ctx.with_parent_span_id(parent_span_id);
-        trace_bus.record_event(&event_ctx, actor, name, status, summary, attrs);
+        trace_bus.record_event(
+            &event_ctx,
+            params.actor,
+            params.name,
+            params.status,
+            params.summary,
+            params.attrs,
+        );
     }
 }
 
