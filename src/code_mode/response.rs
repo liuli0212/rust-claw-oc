@@ -6,9 +6,10 @@ pub enum ExecOutputItem {
     Text(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecLifecycle {
+    #[default]
     Running,
     Completed,
     Failed,
@@ -20,12 +21,6 @@ pub enum ExecLifecycle {
 pub enum ExecProgressKind {
     ExplicitFlush,
     AutoFlush,
-}
-
-impl Default for ExecLifecycle {
-    fn default() -> Self {
-        Self::Running
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

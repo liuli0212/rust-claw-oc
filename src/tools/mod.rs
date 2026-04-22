@@ -25,9 +25,7 @@ pub use lsp::{
     LspHoverTool,
 };
 pub use memory::{RagInsertTool, RagSearchTool, ReadMemoryTool, WriteMemoryTool};
-pub use protocol::{
-    clean_schema, Tool, ToolContext, ToolDefinition, ToolError,
-};
+pub use protocol::{clean_schema, Tool, ToolContext, ToolDefinition, ToolError};
 pub use scheduler::ManageScheduleTool;
 pub use subagent::SubagentTool;
 pub use web::{TavilySearchTool, WebFetchTool};

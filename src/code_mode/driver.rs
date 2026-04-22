@@ -276,12 +276,11 @@ impl CellDriver {
         self.tool_result_tx.send(result_for_js).map_err(|_| {
             crate::tools::ToolError::ExecutionFailed("Tool result channel closed".to_string())
         })?;
-        self.pending_events
-            .push_back(RuntimeEvent::ToolCallDone {
-                seq: request.seq,
-                request_id: request.request_id.clone(),
-                ok,
-            });
+        self.pending_events.push_back(RuntimeEvent::ToolCallDone {
+            seq: request.seq,
+            request_id: request.request_id.clone(),
+            ok,
+        });
         Ok(())
     }
 
@@ -329,11 +328,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_cancels_infinite_loop_and_thread_exits() {
-        let mut driver = CellDriver::spawn_live(
-            "while(true) {}".to_string(),
-            vec![],
-            HashMap::new(),
-        );
+        let mut driver =
+            CellDriver::spawn_live("while(true) {}".to_string(), vec![], HashMap::new());
 
         // Allow it to start and enter the loop
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

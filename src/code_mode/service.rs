@@ -180,6 +180,12 @@ enum HostExitDisposition {
     },
 }
 
+struct RunCellParams {
+    session_id: String,
+    cell_id: String,
+    auto_flush_ms: Option<u64>,
+}
+
 struct InitialPublicationGate {
     tx: Option<oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>>,
 }
@@ -288,10 +294,12 @@ impl CodeModeService {
         tokio::spawn(async move {
             service
                 .run_cell_host(
-                    session_id_owned,
-                    cell_id_owned,
+                    RunCellParams {
+                        session_id: session_id_owned,
+                        cell_id: cell_id_owned,
+                        auto_flush_ms,
+                    },
                     host_handle_for_task,
-                    auto_flush_ms,
                     invoke_tool,
                     initial_summary_tx,
                     cell_span,
@@ -397,10 +405,8 @@ impl CodeModeService {
 
     async fn run_cell_host<F, Fut>(
         self,
-        session_id: String,
-        cell_id: String,
+        params: RunCellParams,
         host_handle: SharedCellHost,
-        auto_flush_ms: Option<u64>,
         mut invoke_tool: F,
         initial_summary_tx: oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>,
         mut cell_span: Option<crate::trace::TraceSpanHandle>,
@@ -411,10 +417,10 @@ impl CodeModeService {
         let mut initial_gate = InitialPublicationGate::new(initial_summary_tx);
         let disposition = self
             .perform_cell_host_loop(
-                &session_id,
-                &cell_id,
+                &params.session_id,
+                &params.cell_id,
                 &host_handle,
-                auto_flush_ms,
+                params.auto_flush_ms,
                 &mut invoke_tool,
                 &mut initial_gate,
             )
@@ -422,7 +428,7 @@ impl CodeModeService {
 
         if let Some(span) = cell_span.take() {
             let (status, summary, attrs) =
-                Self::trace_finish_from_disposition(&cell_id, &disposition);
+                Self::trace_finish_from_disposition(&params.cell_id, &disposition);
             span.finish("code_mode_cell_finished", status, summary, attrs);
         }
     }
