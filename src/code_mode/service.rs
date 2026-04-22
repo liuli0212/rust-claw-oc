@@ -948,17 +948,13 @@ mod tests {
 
         async fn execute(
             &self,
-            args: serde_json::Value,
+            _args: serde_json::Value,
             _ctx: &ToolContext,
         ) -> Result<String, ToolError> {
             if self.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             }
-            let value = args
-                .get("value")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("done");
-            Ok(serde_json::json!({ "value": value }).to_string())
+            Ok(r#"{"value":"done"}"#.to_string())
         }
     }
 
@@ -984,20 +980,15 @@ mod tests {
                 )),
             },
         );
-        Box::new(move |cell_id, event_tx, cancel_flag| {
-            Arc::new(crate::code_mode::host::ExecutorCellRuntimeHost {
-                cell_id,
-                visible_tools: visible_tools.clone(),
-                tool_executor: Arc::new(Mutex::new(executor)),
-                trace_ctx: None,
-                parent_span_id: None,
-                outer_tool_call_id: None,
-                provider: "test-provider".to_string(),
-                model: "test-model".to_string(),
-                event_tx,
-                cancel_flag,
-            })
-        })
+        crate::code_mode::host::create_executor_host_builder(
+            visible_tools,
+            Arc::new(Mutex::new(executor)),
+            None,
+            None,
+            None,
+            "test-provider".to_string(),
+            "test-model".to_string(),
+        )
     }
 
     #[tokio::test]

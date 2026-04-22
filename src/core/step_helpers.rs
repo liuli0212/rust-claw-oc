@@ -609,7 +609,7 @@ impl AgentLoop {
             let available_nested_tools: Vec<String> = current_tools
                 .iter()
                 .map(|tool| tool.name())
-                .filter(|name| Self::is_code_mode_nested_tool(name))
+                .filter(|name| crate::tools::invocation::is_code_mode_nested_tool(name))
                 .collect();
             let code_mode_notice =
                 crate::code_mode::description::execution_notice(&available_nested_tools);
@@ -659,10 +659,6 @@ impl AgentLoop {
 
         *consecutive_empty_responses = 0;
         None
-    }
-
-    fn is_code_mode_nested_tool(tool_name: &str) -> bool {
-        crate::tools::invocation::is_code_mode_nested_tool(tool_name)
     }
 
     fn build_tool_executor_with_budget(

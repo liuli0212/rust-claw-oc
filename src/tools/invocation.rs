@@ -32,10 +32,10 @@ pub(crate) enum ToolCallOrigin {
         call_id: Option<String>,
     },
     CodeModeNested {
-        cell_id: Option<String>,
+        cell_id: String,
         outer_tool_call_id: Option<String>,
-        request_id: Option<String>,
-        seq: Option<u64>,
+        request_id: String,
+        seq: u64,
     },
 }
 

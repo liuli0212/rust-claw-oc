@@ -14,19 +14,16 @@ use crate::trace::{TraceActor, TraceContext};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeToolRequest {
-    pub(crate) cell_id: String,
     pub(crate) seq: u64,
     pub(crate) request_id: String,
     pub(crate) tool_name: String,
     pub(crate) args_json: String,
-    pub(crate) outer_tool_call_id: Option<String>,
 }
 
 #[async_trait]
 pub(crate) trait CellRuntimeHost: Send + Sync {
     fn visible_tool_names(&self) -> Vec<String>;
     fn emit_event(&self, event: RuntimeEvent);
-    fn cancellation_reason(&self) -> Option<String>;
     async fn call_tool(
         &self,
         request: RuntimeToolRequest,
@@ -59,16 +56,16 @@ pub(crate) fn create_executor_host_builder(
 }
 
 pub(crate) struct ExecutorCellRuntimeHost {
-    pub(crate) cell_id: String,
-    pub(crate) visible_tools: Vec<String>,
-    pub(crate) tool_executor: Arc<tokio::sync::Mutex<UnifiedToolExecutor>>,
-    pub(crate) trace_ctx: Option<TraceContext>,
-    pub(crate) parent_span_id: Option<String>,
-    pub(crate) outer_tool_call_id: Option<String>,
-    pub(crate) provider: String,
-    pub(crate) model: String,
-    pub(crate) event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-    pub(crate) cancel_flag: Arc<AtomicBool>,
+    cell_id: String,
+    visible_tools: Vec<String>,
+    tool_executor: Arc<tokio::sync::Mutex<UnifiedToolExecutor>>,
+    trace_ctx: Option<TraceContext>,
+    parent_span_id: Option<String>,
+    outer_tool_call_id: Option<String>,
+    provider: String,
+    model: String,
+    event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl ExecutorCellRuntimeHost {
@@ -87,9 +84,9 @@ impl ExecutorCellRuntimeHost {
     ) -> ToolInvocationSpanConfig {
         let attrs = serde_json::json!({
             "tool_name": request.tool_name,
-            "cell_id": request.cell_id,
+            "cell_id": self.cell_id,
             "request_id": request.request_id,
-            "outer_tool_call_id": request.outer_tool_call_id,
+            "outer_tool_call_id": self.outer_tool_call_id,
             "provider": self.provider,
             "model": self.model,
         });
@@ -124,21 +121,10 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
         let _ = self.event_tx.send(event);
     }
 
-    fn cancellation_reason(&self) -> Option<String> {
-        self.cancel_flag
-            .load(Ordering::Acquire)
-            .then(|| "Code mode cell execution was cancelled.".to_string())
-    }
-
     async fn call_tool(
         &self,
-        mut request: RuntimeToolRequest,
+        request: RuntimeToolRequest,
     ) -> Result<String, crate::tools::ToolError> {
-        request.cell_id = self.cell_id.clone();
-        if request.outer_tool_call_id.is_none() {
-            request.outer_tool_call_id = self.outer_tool_call_id.clone();
-        }
-
         self.emit_event(RuntimeEvent::ToolCallRequested(ToolCallRequestEvent {
             seq: request.seq,
             request_id: request.request_id.clone(),
@@ -157,9 +143,11 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
             }
         };
 
-        if let Some(reason) = self.cancellation_reason() {
+        if self.cancel_flag.load(Ordering::Acquire) {
             self.emit_tool_done(&request, false);
-            return Err(crate::tools::ToolError::Cancelled(reason));
+            return Err(crate::tools::ToolError::Cancelled(
+                "Code mode cell execution was cancelled.".to_string(),
+            ));
         }
 
         let outcome = {
@@ -169,10 +157,10 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
                     tool_name: request.tool_name.clone(),
                     args: args.clone(),
                     origin: ToolCallOrigin::CodeModeNested {
-                        cell_id: Some(request.cell_id.clone()),
-                        outer_tool_call_id: request.outer_tool_call_id.clone(),
-                        request_id: Some(request.request_id.clone()),
-                        seq: Some(request.seq),
+                        cell_id: self.cell_id.clone(),
+                        outer_tool_call_id: self.outer_tool_call_id.clone(),
+                        request_id: request.request_id.clone(),
+                        seq: request.seq,
                     },
                     timeout: Duration::from_secs(85),
                     trace_ctx: self.trace_ctx.clone(),
@@ -196,7 +184,6 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
 pub(crate) struct EventBridgeHost {
     pub(crate) visible_tools: Vec<String>,
     pub(crate) event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-    pub(crate) cancel_flag: Arc<AtomicBool>,
 }
 
 #[cfg(test)]
@@ -210,27 +197,10 @@ impl CellRuntimeHost for EventBridgeHost {
         let _ = self.event_tx.send(event);
     }
 
-    fn cancellation_reason(&self) -> Option<String> {
-        self.cancel_flag
-            .load(Ordering::Acquire)
-            .then(|| "Code mode cell execution was cancelled.".to_string())
-    }
-
     async fn call_tool(
         &self,
-        request: RuntimeToolRequest,
+        _request: RuntimeToolRequest,
     ) -> Result<String, crate::tools::ToolError> {
-        self.emit_event(RuntimeEvent::ToolCallRequested(ToolCallRequestEvent {
-            seq: request.seq,
-            request_id: request.request_id.clone(),
-            tool_name: request.tool_name.clone(),
-            args_json: request.args_json.clone(),
-        }));
-        self.emit_event(RuntimeEvent::ToolCallDone {
-            seq: request.seq,
-            request_id: request.request_id,
-            ok: false,
-        });
         Err(crate::tools::ToolError::ExecutionFailed(
             "test event bridge host cannot execute tools".to_string(),
         ))

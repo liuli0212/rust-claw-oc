@@ -98,20 +98,14 @@ impl DriverUpdate {
 
 impl CellDriver {
     #[cfg(test)]
-    pub fn spawn_live(
-        _cell_id: String,
-        code: String,
-        visible_tools: Vec<String>,
-        stored_values: HashMap<String, runtime::value::StoredValue>,
-    ) -> Self {
+    fn spawn_live(code: String) -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let host = Arc::new(crate::code_mode::host::EventBridgeHost {
-            visible_tools,
+            visible_tools: Vec::new(),
             event_tx: event_tx.clone(),
-            cancel_flag: cancel_flag.clone(),
         });
-        Self::spawn_live_with_host(code, stored_values, host, event_tx, event_rx, cancel_flag)
+        Self::spawn_live_with_host(code, HashMap::new(), host, event_tx, event_rx, cancel_flag)
     }
 
     pub(crate) fn spawn_live_with_host(
@@ -268,12 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_driver_cancels_infinite_loop_and_thread_exits() {
-        let mut driver = CellDriver::spawn_live(
-            "test-cell".to_string(),
-            "while(true) {}".to_string(),
-            vec![],
-            HashMap::new(),
-        );
+        let mut driver = CellDriver::spawn_live("while(true) {}".to_string());
 
         // Allow it to start and enter the loop
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

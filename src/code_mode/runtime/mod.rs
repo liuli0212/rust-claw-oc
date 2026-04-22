@@ -70,8 +70,6 @@ pub(crate) fn run_cell(
         let timer_calls = Arc::new(Mutex::new(Vec::<RecordedTimerCall>::new()));
         let visible_tools_json = serde_json::to_string(&host.visible_tool_names())
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
-        let _ = host.cancellation_reason();
-
         let command_rx = Arc::new(Mutex::new(command_rx));
         let timer_clock_start = Arc::new(Instant::now());
 
@@ -192,12 +190,10 @@ pub(crate) fn run_cell(
                     let request_id = format!("{}-{}", tool_name, seq);
                     let host = host_for_tool.clone();
                     let request = crate::code_mode::host::RuntimeToolRequest {
-                        cell_id: String::new(),
                         seq,
                         request_id,
                         tool_name: tool_name.clone(),
                         args_json: args_json.clone(),
-                        outer_tool_call_id: None,
                     };
 
                     async move {
