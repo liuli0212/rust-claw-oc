@@ -271,6 +271,35 @@ impl Tool for MutatingTool {
     }
 }
 
+struct NamedCountingTool {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for NamedCountingTool {
+    fn name(&self) -> String {
+        self.name.to_string()
+    }
+
+    fn description(&self) -> String {
+        format!("count calls to {}", self.name)
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({})
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &crate::tools::ToolContext,
+    ) -> Result<String, crate::tools::ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "ok": true }).to_string())
+    }
+}
+
 struct ContextTaggingExtension;
 
 #[async_trait]
@@ -752,6 +781,131 @@ await tools.mutating_tool({ path: "unsafe.txt" });
     assert!(
         envelope.result.output.contains("Action Denied")
             || outcome.result.contains("Action Denied"),
+        "{}",
+        outcome.result
+    );
+
+    cleanup_session(session_id);
+}
+
+#[tokio::test]
+async fn test_code_mode_nested_hidden_tools_are_rejected_before_execution() {
+    let output = Arc::new(TestOutput::new());
+    let llm = Arc::new(TestLlmClient::new());
+    let session_id = "test-code-mode-hidden-nested-tool";
+    cleanup_session(session_id);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(crate::tools::ExecTool),
+        Arc::new(NamedCountingTool {
+            name: "finish_task",
+            calls: calls.clone(),
+        }),
+    ];
+
+    let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+    let mut agent = AgentLoop::new(
+        session_id.to_string(),
+        llm,
+        "test_cli".to_string(),
+        tools.clone(),
+        AgentContext::new(),
+        output,
+        Arc::new(telemetry),
+        Arc::new(crate::task_state::TaskStateStore::new(session_id)),
+    );
+
+    let outcome = agent
+        .dispatch_tool_call(
+            &crate::context::FunctionCall {
+                name: "exec".to_string(),
+                args: json!({
+                    "code": r#"
+const raw = await __callTool("finish_task", "{}");
+const parsed = JSON.parse(raw);
+text(parsed.__rustyClawToolError || raw);
+"#
+                }),
+                id: Some("call_exec_hidden".to_string()),
+            },
+            &tools,
+            5,
+            None,
+        )
+        .await;
+
+    assert!(!outcome.is_error, "{}", outcome.result);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let envelope = ToolExecutionEnvelope::from_json_str(&outcome.result).expect("exec envelope");
+    assert!(
+        envelope
+            .result
+            .output
+            .contains("not available inside code mode"),
+        "{}",
+        outcome.result
+    );
+
+    cleanup_session(session_id);
+}
+
+#[tokio::test]
+async fn test_code_mode_nested_step_budget_exhaustion_is_reported() {
+    let output = Arc::new(TestOutput::new());
+    let llm = Arc::new(TestLlmClient::new());
+    let session_id = "test-code-mode-nested-step-budget";
+    cleanup_session(session_id);
+
+    let captured_contexts = Arc::new(Mutex::new(Vec::new()));
+    let echo_tool = Arc::new(ContextCapturingTool {
+        contexts: captured_contexts.clone(),
+    });
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::ExecTool), echo_tool];
+
+    let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+    let mut agent = AgentLoop::new(
+        session_id.to_string(),
+        llm,
+        "test_cli".to_string(),
+        tools.clone(),
+        AgentContext::new(),
+        output,
+        Arc::new(telemetry),
+        Arc::new(crate::task_state::TaskStateStore::new(session_id)),
+    );
+
+    let outcome = agent
+        .dispatch_tool_call(
+            &crate::context::FunctionCall {
+                name: "exec".to_string(),
+                args: json!({
+                    "code": r#"
+await tools.echo_tool({ value: "first" });
+try {
+  await tools.echo_tool({ value: "second" });
+  text("unexpected success");
+} catch (err) {
+  text(String(err));
+}
+"#
+                }),
+                id: Some("call_exec_budget".to_string()),
+            },
+            &tools,
+            1,
+            None,
+        )
+        .await;
+
+    assert!(!outcome.is_error, "{}", outcome.result);
+    assert_eq!(captured_contexts.lock().unwrap().len(), 1);
+    let envelope = ToolExecutionEnvelope::from_json_str(&outcome.result).expect("exec envelope");
+    assert!(
+        envelope
+            .result
+            .output
+            .contains("nested tool call limit reached"),
         "{}",
         outcome.result
     );
