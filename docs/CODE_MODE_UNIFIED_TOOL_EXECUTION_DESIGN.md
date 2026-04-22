@@ -8,7 +8,7 @@ It is intended to guide implementation, review, and verification.
 ## Implementation Progress
 
 - [x] Phase 0: Characterization tests added and baseline verified.
-- [ ] Phase 1: Extract unified executor without behavior change.
+- [x] Phase 1: Extract unified executor without behavior change.
 - [ ] Phase 2: Introduce `CellRuntimeHost` boundary.
 - [ ] Phase 3: Replace sync tool result bridge with Promise/completion queue.
 - [ ] Phase 4: Simplify service and driver state.
@@ -402,11 +402,20 @@ Exit criteria:
 Suggested commands:
 
 ```bash
-cargo test code_mode_integration
-cargo test session_flow
+cargo test --test code_mode_integration
+cargo test --test session_flow
 cargo test core::tests
 cargo clippy -- -D warnings
 ```
+
+Progress 2026-04-22:
+
+- Replaced `ToolInvoker` with `UnifiedToolExecutor` and added `ToolCallOrigin`, `ToolExecutionRequest`, `ToolExecutionOutcome`, and `StepBudgetHandle`.
+- Routed normal top-level tool execution and code-mode nested tool execution through `UnifiedToolExecutor.execute`, keeping code-mode `exec`/`wait` lifecycle rendering in core/service.
+- Centralized code-mode nested visibility exclusions in `src/tools/policy.rs`.
+- Preserved current service/channel bridge for this phase; `CodeModeNestedToolExecutor` remains as a thin adapter over the unified executor.
+- Finding: top-level `exec`/`wait` are lifecycle entry points rather than direct `Tool.execute` calls, so they still dispatch through code-mode service while sharing executor-owned guard state.
+- Finding: `cargo clippy -- -D warnings` also surfaced existing code-mode style debt (`ExecLifecycle` manual default and two high-arity helpers); these were cleaned up or locally allowed before the phase was committed.
 
 ### Phase 2: Introduce CellRuntimeHost Boundary
 

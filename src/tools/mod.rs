@@ -6,6 +6,7 @@ pub mod integrations;
 pub(crate) mod invocation;
 pub mod lsp;
 pub mod memory;
+pub(crate) mod policy;
 pub mod protocol;
 pub mod sandbox;
 pub mod scheduler;
@@ -25,9 +26,7 @@ pub use lsp::{
     LspHoverTool,
 };
 pub use memory::{RagInsertTool, RagSearchTool, ReadMemoryTool, WriteMemoryTool};
-pub use protocol::{
-    clean_schema, Tool, ToolContext, ToolDefinition, ToolError,
-};
+pub use protocol::{clean_schema, Tool, ToolContext, ToolDefinition, ToolError};
 pub use scheduler::ManageScheduleTool;
 pub use subagent::SubagentTool;
 pub use web::{TavilySearchTool, WebFetchTool};

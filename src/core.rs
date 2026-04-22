@@ -172,6 +172,7 @@ pub(crate) struct ToolDispatchOutcome {
     pub(crate) result: String,
     pub(crate) is_error: bool,
     pub(crate) stopped: bool,
+    pub(crate) guard_signal: Option<ExecutionGuardSignal>,
 }
 
 struct ActiveTrace {

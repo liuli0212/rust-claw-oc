@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -12,10 +12,67 @@ use crate::tools::{Tool, ToolContext};
 use crate::trace::{TraceActor, TraceBus, TraceContext, TraceStatus};
 
 #[derive(Debug, Clone)]
-pub(crate) struct ToolInvocationOutcome {
+pub(crate) enum ToolCallOrigin {
+    TopLevel {
+        call_id: Option<String>,
+    },
+    CodeModeNested {
+        cell_id: Option<String>,
+        outer_tool_call_id: Option<String>,
+        request_id: Option<String>,
+        seq: Option<u64>,
+    },
+}
+
+impl ToolCallOrigin {
+    fn hidden_tool_message(&self, tool_name: &str) -> String {
+        match self {
+            Self::CodeModeNested { .. } => {
+                format!("Tool `{tool_name}` is not available inside code mode.")
+            }
+            Self::TopLevel { .. } => {
+                format!("Tool `{tool_name}` is not visible in this execution context.")
+            }
+        }
+    }
+
+    fn exhausted_budget_message(&self) -> String {
+        match self {
+            Self::CodeModeNested { .. } => {
+                "No remaining steps: nested tool call limit reached.".to_string()
+            }
+            Self::TopLevel { .. } => "No remaining steps: tool call limit reached.".to_string(),
+        }
+    }
+
+    fn trace_attrs(&self) -> Value {
+        match self {
+            Self::TopLevel { call_id } => serde_json::json!({
+                "origin": "top_level",
+                "call_id": call_id,
+            }),
+            Self::CodeModeNested {
+                cell_id,
+                outer_tool_call_id,
+                request_id,
+                seq,
+            } => serde_json::json!({
+                "origin": "code_mode_nested",
+                "cell_id": cell_id,
+                "outer_tool_call_id": outer_tool_call_id,
+                "request_id": request_id,
+                "seq": seq,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolExecutionOutcome {
     pub(crate) result: String,
     pub(crate) is_error: bool,
     pub(crate) stopped: bool,
+    pub(crate) guard_signal: Option<ExecutionGuardSignal>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -36,54 +93,89 @@ pub(crate) struct ToolInvocationSpanConfig {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ToolInvocationRequest<'a> {
-    pub(crate) tool_name: &'a str,
+pub(crate) struct ToolExecutionRequest {
+    pub(crate) tool_name: String,
     pub(crate) args: Value,
+    pub(crate) origin: ToolCallOrigin,
     pub(crate) timeout: Duration,
     pub(crate) trace_ctx: Option<TraceContext>,
     pub(crate) context_parent_span_id: Option<String>,
     pub(crate) span: Option<ToolInvocationSpanConfig>,
 }
 
-pub(crate) struct ToolInvokerConfig {
+#[derive(Debug, Clone)]
+pub(crate) struct StepBudgetHandle(Arc<Mutex<StepBudgetState>>);
+
+#[derive(Debug)]
+pub(crate) struct StepBudgetState {
+    remaining_steps: usize,
+}
+
+impl StepBudgetHandle {
+    pub(crate) fn new(remaining_steps: usize) -> Self {
+        Self(Arc::new(Mutex::new(StepBudgetState { remaining_steps })))
+    }
+
+    pub(crate) fn remaining_steps(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remaining_steps
+    }
+
+    fn try_consume(&self) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.remaining_steps == 0 {
+            return false;
+        }
+        state.remaining_steps -= 1;
+        true
+    }
+}
+
+pub(crate) struct UnifiedToolExecutorConfig {
     pub(crate) current_tools: Vec<Arc<dyn Tool>>,
     pub(crate) visible_tools: Vec<String>,
     pub(crate) extensions: Vec<Arc<dyn ExecutionExtension>>,
     pub(crate) session_id: String,
     pub(crate) reply_to: String,
-    pub(crate) remaining_steps: usize,
+    pub(crate) step_budget: StepBudgetHandle,
     pub(crate) session_deadline: Option<Instant>,
     pub(crate) trace_bus: Arc<TraceBus>,
     pub(crate) cancel_token: Arc<Notify>,
     pub(crate) is_autopilot: bool,
     pub(crate) todos_path: PathBuf,
-    pub(crate) execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
+    pub(crate) execution_guard_state: Arc<Mutex<ExecutionGuardState>>,
 }
 
-pub(crate) struct ToolInvoker {
+#[derive(Clone)]
+pub(crate) struct UnifiedToolExecutor {
     current_tools: Vec<Arc<dyn Tool>>,
     visible_tools: Vec<String>,
     extensions: Vec<Arc<dyn ExecutionExtension>>,
     session_id: String,
     reply_to: String,
-    remaining_steps: usize,
+    step_budget: StepBudgetHandle,
     session_deadline: Option<Instant>,
     trace_bus: Arc<TraceBus>,
     cancel_token: Arc<Notify>,
     is_autopilot: bool,
     todos_path: PathBuf,
-    execution_guard_state: Arc<std::sync::Mutex<ExecutionGuardState>>,
+    execution_guard_state: Arc<Mutex<ExecutionGuardState>>,
 }
 
-impl ToolInvoker {
-    pub(crate) fn new(config: ToolInvokerConfig) -> Self {
+impl UnifiedToolExecutor {
+    pub(crate) fn new(config: UnifiedToolExecutorConfig) -> Self {
         Self {
             current_tools: config.current_tools,
             visible_tools: config.visible_tools,
             extensions: config.extensions,
             session_id: config.session_id,
             reply_to: config.reply_to,
-            remaining_steps: config.remaining_steps,
+            step_budget: config.step_budget,
             session_deadline: config.session_deadline,
             trace_bus: config.trace_bus,
             cancel_token: config.cancel_token,
@@ -93,12 +185,8 @@ impl ToolInvoker {
         }
     }
 
-    pub(crate) fn decrement_remaining_steps(&mut self) {
-        self.remaining_steps = self.remaining_steps.saturating_sub(1);
-    }
-
-    pub(crate) fn visible_tools(&self) -> &[String] {
-        &self.visible_tools
+    pub(crate) fn remaining_steps(&self) -> usize {
+        self.step_budget.remaining_steps()
     }
 
     pub(crate) fn autopilot_denial_for_call(
@@ -148,31 +236,14 @@ impl ToolInvoker {
         )
     }
 
-    pub(crate) fn record_action_outcome(
-        &self,
-        call_name: &str,
-        call_args: &Value,
-        is_error: bool,
-    ) -> Option<ExecutionGuardSignal> {
-        if !self.is_autopilot {
-            return None;
-        }
-
-        let mut guard_state = self
-            .execution_guard_state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard_state.record_action_outcome(call_name, call_args, is_error)
-    }
-
-    pub(crate) async fn prepare_tool_context(
+    async fn prepare_tool_context(
         &self,
         trace_ctx: Option<&TraceContext>,
         parent_span_id: Option<String>,
     ) -> ToolContext {
         let mut ctx = ToolContext::new(self.session_id.clone(), self.reply_to.clone());
         ctx.visible_tools = self.visible_tools.clone();
-        ctx.skill_budget.remaining_steps = Some(self.remaining_steps);
+        ctx.skill_budget.remaining_steps = Some(self.remaining_steps());
         ctx.skill_budget.remaining_timeout_sec = self.remaining_session_timeout_sec();
         if let Some(trace_ctx) = trace_ctx {
             ctx.trace = Some(crate::tools::protocol::ToolTraceContext {
@@ -191,19 +262,63 @@ impl ToolInvoker {
         ctx
     }
 
-    pub(crate) async fn invoke(&self, request: ToolInvocationRequest<'_>) -> ToolInvocationOutcome {
+    pub(crate) async fn execute(&self, request: ToolExecutionRequest) -> ToolExecutionOutcome {
         let Some(tool) = self
             .current_tools
             .iter()
             .find(|tool| tool.name() == request.tool_name)
         else {
-            return ToolInvocationOutcome {
+            return ToolExecutionOutcome {
                 result: format!("Tool not found: {}", request.tool_name),
                 is_error: true,
                 stopped: false,
+                guard_signal: None,
             };
         };
 
+        if !self.visible_tools.contains(&request.tool_name) {
+            return ToolExecutionOutcome {
+                result: request.origin.hidden_tool_message(&request.tool_name),
+                is_error: true,
+                stopped: false,
+                guard_signal: None,
+            };
+        }
+
+        if let Some(reason) = self.autopilot_denial_for_call(&request.tool_name, &request.args) {
+            return ToolExecutionOutcome {
+                result: reason,
+                is_error: true,
+                stopped: false,
+                guard_signal: None,
+            };
+        }
+
+        if !self.step_budget.try_consume() {
+            return ToolExecutionOutcome {
+                result: request.origin.exhausted_budget_message(),
+                is_error: true,
+                stopped: false,
+                guard_signal: None,
+            };
+        }
+
+        let mut outcome = self.invoke_tool(tool.clone(), &request).await;
+        if let Some(signal) =
+            self.record_action_outcome(&request.tool_name, &request.args, outcome.is_error)
+        {
+            outcome.result = signal.message().to_string();
+            outcome.is_error = true;
+            outcome.guard_signal = Some(signal);
+        }
+        outcome
+    }
+
+    async fn invoke_tool(
+        &self,
+        tool: Arc<dyn Tool>,
+        request: &ToolExecutionRequest,
+    ) -> ToolExecutionOutcome {
         let mut invocation_span = request.span.as_ref().and_then(|span_config| {
             request.trace_ctx.as_ref().map(|trace_ctx| {
                 let span_ctx =
@@ -251,20 +366,41 @@ impl ToolInvoker {
                 Some(AgentContext::truncate_chars(&result, 240)),
                 merge_trace_attrs(
                     span_config.end_attrs,
-                    serde_json::json!({
-                        "tool_name": request.tool_name,
-                        "result_preview": AgentContext::truncate_chars(&result, 500),
-                        "result_size_chars": result.chars().count(),
-                    }),
+                    merge_trace_attrs(
+                        request.origin.trace_attrs(),
+                        serde_json::json!({
+                            "tool_name": request.tool_name,
+                            "result_preview": AgentContext::truncate_chars(&result, 500),
+                            "result_size_chars": result.chars().count(),
+                        }),
+                    ),
                 ),
             );
         }
 
-        ToolInvocationOutcome {
+        ToolExecutionOutcome {
             result,
             is_error,
             stopped,
+            guard_signal: None,
         }
+    }
+
+    pub(crate) fn record_action_outcome(
+        &self,
+        call_name: &str,
+        call_args: &Value,
+        is_error: bool,
+    ) -> Option<ExecutionGuardSignal> {
+        if !self.is_autopilot {
+            return None;
+        }
+
+        let mut guard_state = self
+            .execution_guard_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard_state.record_action_outcome(call_name, call_args, is_error)
     }
 
     fn remaining_session_timeout_sec(&self) -> Option<u64> {

@@ -4,9 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use super::executor::{
-    is_code_mode_nested_tool, CodeModeNestedToolExecutor, CodeModeNestedToolExecutorConfig,
-};
+use super::executor::{CodeModeNestedToolExecutor, CodeModeNestedToolExecutorConfig};
 use crate::code_mode::response::{ExecLifecycle, ExecProgressKind};
 use crate::context::FunctionCall;
 use crate::core::extensions::ExecutionExtension;
@@ -67,7 +65,7 @@ pub(crate) async fn dispatch_tool_call(
         .current_tools
         .iter()
         .map(|tool| tool.name())
-        .filter(|name| is_code_mode_nested_tool(name))
+        .filter(|name| crate::tools::policy::is_code_mode_nested_tool(name))
         .collect();
 
     record_trace_event(
@@ -220,6 +218,7 @@ pub(crate) async fn dispatch_tool_call(
                 result,
                 is_error,
                 stopped: false,
+                guard_signal: None,
             }
         }
         Err(err) => {
@@ -227,16 +226,23 @@ pub(crate) async fn dispatch_tool_call(
                 err,
                 crate::tools::ToolError::Timeout | crate::tools::ToolError::Cancelled(_)
             );
-            let (event_name, event_status, termination_reason) =
-                match &err {
-                    crate::tools::ToolError::Timeout => {
-                        ("code_mode_exec_terminated", TraceStatus::TimedOut, "timeout")
-                    }
-                    crate::tools::ToolError::Cancelled(_) => {
-                        ("code_mode_exec_terminated", TraceStatus::Cancelled, "cancelled")
-                    }
-                    _ => ("code_mode_exec_finished", TraceStatus::Error, "runtime_error"),
-                };
+            let (event_name, event_status, termination_reason) = match &err {
+                crate::tools::ToolError::Timeout => (
+                    "code_mode_exec_terminated",
+                    TraceStatus::TimedOut,
+                    "timeout",
+                ),
+                crate::tools::ToolError::Cancelled(_) => (
+                    "code_mode_exec_terminated",
+                    TraceStatus::Cancelled,
+                    "cancelled",
+                ),
+                _ => (
+                    "code_mode_exec_finished",
+                    TraceStatus::Error,
+                    "runtime_error",
+                ),
+            };
 
             record_trace_event(
                 config.trace_bus.as_ref(),
@@ -274,6 +280,7 @@ pub(crate) async fn dispatch_tool_call(
                 result,
                 is_error: true,
                 stopped: is_stopped,
+                guard_signal: None,
             }
         }
     }
@@ -371,6 +378,7 @@ fn parse_invocation(
             result: format!("Tool `{}` is not a code-mode entry tool.", call.name),
             is_error: true,
             stopped: false,
+            guard_signal: None,
         }),
     }
 }
@@ -401,6 +409,7 @@ fn invalid_argument_outcome(
         result,
         is_error: true,
         stopped: false,
+        guard_signal: None,
     }
 }
 
@@ -414,6 +423,7 @@ fn code_mode_tool_result_status(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_trace_event(
     trace_bus: &TraceBus,
     trace_ctx: Option<&TraceContext>,

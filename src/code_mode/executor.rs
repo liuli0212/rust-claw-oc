@@ -9,25 +9,11 @@ use crate::context::AgentContext;
 use crate::core::extensions::ExecutionExtension;
 use crate::core::ExecutionGuardState;
 use crate::tools::invocation::{
-    ToolInvocationEndNames, ToolInvocationRequest, ToolInvocationSpanConfig, ToolInvoker,
-    ToolInvokerConfig,
+    StepBudgetHandle, ToolCallOrigin, ToolExecutionRequest, ToolInvocationEndNames,
+    ToolInvocationSpanConfig, UnifiedToolExecutor, UnifiedToolExecutorConfig,
 };
 use crate::tools::{Tool, ToolError};
 use crate::trace::{TraceActor, TraceBus, TraceContext};
-
-pub fn is_code_mode_nested_tool(tool_name: &str) -> bool {
-    !matches!(
-        tool_name,
-        "exec"
-            | "wait"
-            | "finish_task"
-            | "ask_user_question"
-            | "subagent"
-            | "task_plan"
-            | "manage_schedule"
-            | "send_telegram_message"
-    )
-}
 
 pub(crate) struct CodeModeNestedToolExecutorConfig {
     pub(crate) current_tools: Vec<Arc<dyn Tool>>,
@@ -50,8 +36,7 @@ pub(crate) struct CodeModeNestedToolExecutorConfig {
 }
 
 pub(crate) struct CodeModeNestedToolExecutor {
-    tool_invoker: ToolInvoker,
-    remaining_steps: usize,
+    tool_executor: UnifiedToolExecutor,
     iteration_trace_ctx: Option<TraceContext>,
     parent_span_id: Option<String>,
     outer_tool_call_id: Option<String>,
@@ -81,13 +66,13 @@ impl CodeModeNestedToolExecutor {
             execution_guard_state,
         } = config;
 
-        let tool_invoker = ToolInvoker::new(ToolInvokerConfig {
+        let tool_executor = UnifiedToolExecutor::new(UnifiedToolExecutorConfig {
             current_tools,
             visible_tools,
             extensions,
             session_id,
             reply_to,
-            remaining_steps,
+            step_budget: StepBudgetHandle::new(remaining_steps),
             session_deadline,
             trace_bus,
             cancel_token,
@@ -97,8 +82,7 @@ impl CodeModeNestedToolExecutor {
         });
 
         Self {
-            tool_invoker,
-            remaining_steps,
+            tool_executor,
             iteration_trace_ctx,
             parent_span_id,
             outer_tool_call_id,
@@ -121,33 +105,17 @@ impl CodeModeNestedToolExecutor {
     }
 
     async fn execute(&mut self, tool_name: String, args: Value) -> Result<String, ToolError> {
-        if !self.tool_invoker.visible_tools().contains(&tool_name) {
-            return Err(ToolError::ExecutionFailed(format!(
-                "Tool `{tool_name}` is not available inside code mode."
-            )));
-        }
-
-        if self.remaining_steps == 0 {
-            return Err(ToolError::ExecutionFailed(
-                "No remaining steps: nested tool call limit reached.".to_string(),
-            ));
-        }
-
-        if let Some(reason) = self
-            .tool_invoker
-            .autopilot_denial_for_call(&tool_name, &args)
-        {
-            return Err(ToolError::ExecutionFailed(reason));
-        }
-
-        self.remaining_steps = self.remaining_steps.saturating_sub(1);
-        self.tool_invoker.decrement_remaining_steps();
-
         let outcome = self
-            .tool_invoker
-            .invoke(ToolInvocationRequest {
-                tool_name: &tool_name,
+            .tool_executor
+            .execute(ToolExecutionRequest {
+                tool_name: tool_name.clone(),
                 args: args.clone(),
+                origin: ToolCallOrigin::CodeModeNested {
+                    cell_id: None,
+                    outer_tool_call_id: self.outer_tool_call_id.clone(),
+                    request_id: None,
+                    seq: None,
+                },
                 timeout: Duration::from_secs(85),
                 trace_ctx: self.iteration_trace_ctx.clone(),
                 context_parent_span_id: self.parent_span_id.clone(),
@@ -160,7 +128,7 @@ impl CodeModeNestedToolExecutor {
                         "provider": self.provider.clone(),
                         "model": self.model.clone(),
                         "args_preview": AgentContext::truncate_chars(&args.to_string(), 500),
-                        "remaining_steps": self.remaining_steps,
+                        "remaining_steps": self.tool_executor.remaining_steps().saturating_sub(1),
                     }),
                     end_names: ToolInvocationEndNames {
                         success: "code_mode_nested_tool_finished",
@@ -177,13 +145,6 @@ impl CodeModeNestedToolExecutor {
                 }),
             })
             .await;
-
-        if let Some(signal) =
-            self.tool_invoker
-                .record_action_outcome(&tool_name, &args, outcome.is_error)
-        {
-            return Err(ToolError::ExecutionFailed(signal.message().to_string()));
-        }
 
         if outcome.stopped || outcome.is_error {
             return Err(ToolError::ExecutionFailed(outcome.result));

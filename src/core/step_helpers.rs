@@ -662,35 +662,56 @@ impl AgentLoop {
     }
 
     fn is_code_mode_nested_tool(tool_name: &str) -> bool {
-        crate::code_mode::executor::is_code_mode_nested_tool(tool_name)
+        crate::tools::policy::is_code_mode_nested_tool(tool_name)
     }
 
-    fn build_tool_invoker(
+    fn build_tool_executor_with_budget(
         &self,
         current_tools: &[Arc<dyn Tool>],
-        remaining_steps: usize,
-    ) -> crate::tools::invocation::ToolInvoker {
-        crate::tools::invocation::ToolInvoker::new(crate::tools::invocation::ToolInvokerConfig {
-            current_tools: current_tools.to_vec(),
-            visible_tools: current_tools.iter().map(|tool| tool.name()).collect(),
-            extensions: self.extensions.clone(),
-            session_id: self.session_id.clone(),
-            reply_to: self.reply_to.clone(),
-            remaining_steps,
-            session_deadline: self.session_deadline,
-            trace_bus: self.trace_bus.clone(),
-            cancel_token: self.cancel_token.clone(),
-            is_autopilot: self.is_autopilot,
-            todos_path: self.todos_path(),
-            execution_guard_state: self.execution_guard_state.clone(),
-        })
+        step_budget: crate::tools::invocation::StepBudgetHandle,
+    ) -> crate::tools::invocation::UnifiedToolExecutor {
+        crate::tools::invocation::UnifiedToolExecutor::new(
+            crate::tools::invocation::UnifiedToolExecutorConfig {
+                current_tools: current_tools.to_vec(),
+                visible_tools: current_tools.iter().map(|tool| tool.name()).collect(),
+                extensions: self.extensions.clone(),
+                session_id: self.session_id.clone(),
+                reply_to: self.reply_to.clone(),
+                step_budget,
+                session_deadline: self.session_deadline,
+                trace_bus: self.trace_bus.clone(),
+                cancel_token: self.cancel_token.clone(),
+                is_autopilot: self.is_autopilot,
+                todos_path: self.todos_path(),
+                execution_guard_state: self.execution_guard_state.clone(),
+            },
+        )
     }
 
+    #[cfg(test)]
     pub(super) async fn dispatch_tool_call(
         &mut self,
         call: &crate::context::FunctionCall,
         current_tools: &[Arc<dyn Tool>],
         remaining_steps: usize,
+        iteration_trace_ctx: Option<crate::trace::TraceContext>,
+    ) -> ToolDispatchOutcome {
+        let step_budget = crate::tools::invocation::StepBudgetHandle::new(remaining_steps);
+        let tool_executor = self.build_tool_executor_with_budget(current_tools, step_budget);
+        self.dispatch_tool_call_with_executor(
+            call,
+            current_tools,
+            tool_executor,
+            iteration_trace_ctx,
+        )
+        .await
+    }
+
+    pub(super) async fn dispatch_tool_call_with_executor(
+        &mut self,
+        call: &crate::context::FunctionCall,
+        current_tools: &[Arc<dyn Tool>],
+        tool_executor: crate::tools::invocation::UnifiedToolExecutor,
         iteration_trace_ctx: Option<crate::trace::TraceContext>,
     ) -> ToolDispatchOutcome {
         let tool_opt = current_tools.iter().find(|tool| tool.name() == call.name);
@@ -708,7 +729,7 @@ impl AgentLoop {
                     serde_json::json!({
                         "tool_name": call.name,
                         "args_preview": crate::context::AgentContext::truncate_chars(&call.args.to_string(), 500),
-                        "remaining_steps": remaining_steps,
+                        "remaining_steps": tool_executor.remaining_steps(),
                         "timeout_sec": 120,
                     }),
                 )
@@ -733,13 +754,12 @@ impl AgentLoop {
                     result: "Tool execution interrupted by user.".to_string(),
                     is_error: true,
                     stopped: true,
+                    guard_signal: None,
                 };
             }
 
-            let tool_invoker = self.build_tool_invoker(current_tools, remaining_steps);
-
             if matches!(call.name.as_str(), "exec" | "wait") {
-                let exec_outcome = crate::code_mode::entry::dispatch_tool_call(
+                let mut exec_outcome = crate::code_mode::entry::dispatch_tool_call(
                     call,
                     crate::code_mode::entry::CodeModeDispatchConfig {
                         current_tools: current_tools.to_vec(),
@@ -747,7 +767,7 @@ impl AgentLoop {
                         service: self.code_mode_service.clone(),
                         session_id: self.session_id.clone(),
                         reply_to: self.reply_to.clone(),
-                        remaining_steps,
+                        remaining_steps: tool_executor.remaining_steps(),
                         session_deadline: self.session_deadline,
                         iteration_trace_ctx: iteration_trace_ctx.clone(),
                         parent_span_id: tool_span.as_ref().map(|span| span.span_id().to_string()),
@@ -762,6 +782,15 @@ impl AgentLoop {
                     },
                 )
                 .await;
+                if let Some(signal) = tool_executor.record_action_outcome(
+                    &call.name,
+                    &call.args,
+                    exec_outcome.is_error,
+                ) {
+                    exec_outcome.result = signal.message().to_string();
+                    exec_outcome.is_error = true;
+                    exec_outcome.guard_signal = Some(signal);
+                }
                 if let Some(span) = tool_span.take() {
                     span.finish(
                         if exec_outcome.is_error {
@@ -787,10 +816,13 @@ impl AgentLoop {
                 return exec_outcome;
             }
 
-            let outcome = tool_invoker
-                .invoke(crate::tools::invocation::ToolInvocationRequest {
-                    tool_name: &call.name,
+            let outcome = tool_executor
+                .execute(crate::tools::invocation::ToolExecutionRequest {
+                    tool_name: call.name.clone(),
                     args: call.args.clone(),
+                    origin: crate::tools::invocation::ToolCallOrigin::TopLevel {
+                        call_id: call.id.clone(),
+                    },
                     timeout: Duration::from_secs(120),
                     trace_ctx: iteration_trace_ctx.clone(),
                     context_parent_span_id: tool_span
@@ -831,6 +863,7 @@ impl AgentLoop {
                 result: outcome.result,
                 is_error: outcome.is_error,
                 stopped: outcome.stopped,
+                guard_signal: outcome.guard_signal,
             };
         }
 
@@ -838,6 +871,7 @@ impl AgentLoop {
             result: format!("Tool not found: {}", call.name),
             is_error: true,
             stopped: false,
+            guard_signal: None,
         }
     }
 
@@ -919,7 +953,8 @@ impl AgentLoop {
         } else {
             (0, 0)
         };
-        let tool_invoker = self.build_tool_invoker(current_tools, remaining_steps);
+        let step_budget = crate::tools::invocation::StepBudgetHandle::new(remaining_steps);
+        let tool_executor = self.build_tool_executor_with_budget(current_tools, step_budget);
 
         for (mut call, thought_sig) in tool_calls_accumulated {
             if skip_remaining {
@@ -946,7 +981,7 @@ impl AgentLoop {
                 continue;
             }
 
-            if let Some(reason) = tool_invoker.autopilot_denial_for_call(&call.name, &call.args) {
+            if let Some(reason) = tool_executor.autopilot_denial_for_call(&call.name, &call.args) {
                 response_parts.push(Self::build_function_response_part(
                     call.name.clone(),
                     call.id.clone(),
@@ -959,17 +994,16 @@ impl AgentLoop {
                 result,
                 is_error,
                 stopped,
+                guard_signal,
             } = self
-                .dispatch_tool_call(
+                .dispatch_tool_call_with_executor(
                     &call,
                     current_tools,
-                    remaining_steps,
+                    tool_executor.clone(),
                     iteration_trace_ctx.clone(),
                 )
                 .await;
-            if let Some(signal) =
-                tool_invoker.record_action_outcome(&call.name, &call.args, is_error)
-            {
+            if let Some(signal) = guard_signal {
                 response_parts.push(Self::build_function_response_part(
                     call.name.clone(),
                     call.id.clone(),

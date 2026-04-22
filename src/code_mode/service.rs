@@ -395,6 +395,7 @@ impl CodeModeService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_cell_host<F, Fut>(
         self,
         session_id: String,
