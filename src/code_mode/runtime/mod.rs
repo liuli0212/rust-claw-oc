@@ -182,6 +182,8 @@ pub(crate) fn run_cell(
             let host_for_tool = host_for_script.clone();
             let next_seq_for_tool = next_seq_for_script_captured.clone();
             let call_tool_ref = nested_tool_count_for_script.clone();
+            // __callTool is a Promise bridge into the host. Runtime owns only
+            // request construction; visibility, policy, and execution stay in Rust host code.
             let call_tool = Function::new(
                 ctx.clone(),
                 Async(move |tool_name: String, args_json: String| {

@@ -153,6 +153,8 @@ pub(crate) struct UnifiedToolExecutorConfig {
 
 #[derive(Clone)]
 pub(crate) struct UnifiedToolExecutor {
+    // Shared policy boundary for top-level tool calls and code-mode nested calls.
+    // Every successful path reaches Tool::execute through this type.
     current_tools: Vec<Arc<dyn Tool>>,
     visible_tools: Vec<String>,
     extensions: Vec<Arc<dyn ExecutionExtension>>,

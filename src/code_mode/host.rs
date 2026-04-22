@@ -24,6 +24,8 @@ pub(crate) struct RuntimeToolRequest {
 
 #[async_trait]
 pub(crate) trait CellRuntimeHost: Send + Sync {
+    // Runtime-facing boundary: QuickJS can emit events and request tools here,
+    // but it never sees the real tool registry or service session state.
     fn visible_tool_names(&self) -> Vec<String>;
 
     fn emit_event(&self, event: RuntimeEvent);

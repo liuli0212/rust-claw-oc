@@ -12,7 +12,7 @@ It is intended to guide implementation, review, and verification.
 - [x] Phase 2: Introduce `CellRuntimeHost` boundary.
 - [x] Phase 3: Replace sync tool result bridge with Promise/completion queue.
 - [x] Phase 4: Simplify service and driver state.
-- [ ] Phase 5: Documentation and trace cleanup.
+- [x] Phase 5: Documentation and trace cleanup.
 
 The main decision is:
 
@@ -36,9 +36,9 @@ The main decision is:
 - Do not move user-output rendering or top-level turn effects into the executor.
 - Do not require every migration step to replace the QuickJS bridge immediately. The final architecture should, but early steps may preserve behavior behind compatibility wrappers.
 
-## Current Architecture
+## Previous Architecture
 
-Current nested code-mode calls flow like this:
+Before this refactor, nested code-mode calls flowed like this:
 
 ```text
 JS tools.foo(args)
@@ -520,12 +520,20 @@ Exit criteria:
 - The architecture is reflected in docs and code comments.
 - Trace output still identifies top-level tool calls and nested code-mode tool calls separately.
 
+Progress 2026-04-22:
+
+- Updated `docs/CODE_MODE_DESIGN.md` to mark Phase 7's channel bridge as superseded and Phase 8's unified execution path as complete.
+- Refreshed the primary code-mode data-flow documentation so nested tools are described as `runtime -> CellRuntimeHost -> UnifiedToolExecutor -> Tool.execute`.
+- Preserved existing trace event names for dashboard compatibility; nested calls remain distinguishable through `ToolCallOrigin::CodeModeNested` and the `code_mode_nested_tool_*` event names.
+- Added ownership comments at the runtime/host/executor boundary.
+- Finding: no trace event rename was needed for this refactor; changing ownership without changing event names kept the compatibility surface smaller.
+
 ## Verification Matrix
 
 | Area | Required Verification |
 | --- | --- |
-| Basic code mode | `cargo test code_mode_integration` |
-| Session behavior | `cargo test session_flow` |
+| Basic code mode | `cargo test --test code_mode_integration` |
+| Session behavior | `cargo test --test session_flow` |
 | Core dispatch | `cargo test core::tests` |
 | Service unit tests | `cargo test code_mode::service` |
 | Driver/runtime unit tests | `cargo test code_mode::driver` and `cargo test code_mode::runtime` if present |

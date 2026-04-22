@@ -8,7 +8,8 @@
 - [x] Phase 4 hardening items such as richer trace coverage, history/sanitization updates, and broader tests are implemented.
 - [x] Phase 5 safe non-terminal drain lifecycle is implemented, including service-owned live workers and non-blocking `wait` polling via `wait_timeout_ms`.
 - [x] Phase 6 replay removal and event-driven architecture: all replay state (`ResumeState`, `OutputBuffer`, `NotificationBuffer`, `CellResumeState`, `CellResumeProgressDelta`) is deleted. Runtime now emits structured `RuntimeEvent` via `event_tx` channel. `yield_control` is a non-blocking event emission that does not terminate JS execution.
-- [x] Phase 7 channel-based tool bridge: nested tool calls now use a synchronous-to-async channel bridge. The worker thread in `spawn_blocking` blocks on a tool result channel while the drain loop fulfills requests. This removes the need for `'static` closures and simplifies orchestration.
+- [x] Phase 7 channel-based tool bridge: completed as an intermediate bridge and now superseded by Phase 8. The old `tool_result_tx` / `tool_result_rx` relay has been removed.
+- [x] Phase 8 unified tool execution refactor: service-owned nested tool fulfillment is replaced with `runtime -> CellRuntimeHost -> UnifiedToolExecutor -> Tool.execute`, as specified in [`CODE_MODE_UNIFIED_TOOL_EXECUTION_DESIGN.md`](CODE_MODE_UNIFIED_TOOL_EXECUTION_DESIGN.md).
 
 ## 1. Goal
 
@@ -618,13 +619,13 @@ Responsibilities:
 - spawn runtime cells
 - manage `wait`
 - manage stored values across `exec` calls in one agent session
-- relay nested tool calls to host dispatch
+- record nested tool request/done events for summaries and wait/flush publication
 - support terminate/cancel
 
 Non-responsibilities:
 
 - `CodeModeService` should not become the owner of AgentLoop guardrail state
-- it should delegate guarded nested dispatch back to an AgentLoop-owned host implementation
+- it should not fulfill nested tool calls; `CellRuntimeHost` delegates guarded nested dispatch to `UnifiedToolExecutor`
 
 ### 9.1 Suggested Traits
 
@@ -647,7 +648,8 @@ pub trait CodeModeTurnHost: Send + Sync {
 }
 ```
 
-This is close to `codex-rs` and maps cleanly onto current `dispatch_tool_call()`.
+This sketch was the earlier host-adapter direction and maps cleanly onto `dispatch_tool_call()`.
+The implemented Phase 8 boundary is `CellRuntimeHost`, which owns runtime-facing host calls and delegates actual tool execution to `UnifiedToolExecutor`.
 
 `invoke_tool(...)` should be implemented as guarded nested dispatch, not as a thin wrapper around `tool.execute(...)`.
 
@@ -660,14 +662,15 @@ At minimum, the guarded nested dispatch path must preserve:
 - timeout and cancellation behavior
 - trace/span parentage using `parent_span_id`
 
-Recommended ownership split:
+Implemented ownership split:
 
 - runtime/service layer:
   - cell lifecycle
-  - pending tool promises
+  - runtime events
   - wait/terminate behavior
 - AgentLoop host adapter:
-  - guarded nested dispatch
+  - runtime-facing `CellRuntimeHost`
+  - guarded nested dispatch through `UnifiedToolExecutor`
   - access to mutable run/autopilot state
   - trace parent propagation
   - top-level output/effect integration policy
@@ -1330,7 +1333,8 @@ Instead, the runtime should emit structured events such as:
 - `Failed`
 - `Cancelled`
 
-The service should consume these events, fulfill nested tool calls through the guarded executor, and expose incremental drains to `exec` / `wait` callers.
+The runtime host should fulfill nested tool calls through `UnifiedToolExecutor`.
+The service consumes the resulting request/done/progress events and exposes incremental drains to `exec` / `wait` callers.
 
 #### 21.3.4 Separate Host Slice Timing from JS Timer Semantics
 
@@ -1763,7 +1767,7 @@ All side-effect globals communicate through:
 
 - `event_tx: UnboundedSender<RuntimeEvent>` — for streaming `Text`, `Notification`, `Yield`, and `ToolCallRequested` events to the driver/service layer.
 - `next_seq: Arc<AtomicUsize>` — monotonic sequence counter shared across all event-emitting globals within one cell.
-- `invoke_tool: Arc<Mutex<F>>` — synchronous nested tool invocation closure (called within the blocking `rquickjs` context).
+- `CellRuntimeHost` — runtime-facing host boundary for visible tool names, event emission, cancellation, and async nested tool calls.
 
 ##### Deleted from this module:
 
@@ -1815,21 +1819,21 @@ Manages the background worker task and provides drain semantics.
 ```
 CellDriver::spawn() / spawn_live()
   → tokio::spawn worker thread
-    → runtime::run_cell(code, invoke_tool, event_tx)
+    → runtime::run_cell(code, host)
       → JS runs: text(), yield_control(), tools.X(), etc.
-      → each JS global → event_tx.send(RuntimeEvent::*)
-      → invoke_tool() for nested tools (synchronous within rquickjs)
+      → each JS global → host.emit_event(RuntimeEvent::*)
+      → tools.X() → CellRuntimeHost.call_tool()
+        → UnifiedToolExecutor.execute()
       → script completes → WorkerCompleted event
-  → driver.drain_event_batch_with_request()
+  → driver.next_update()
     → consumes events from event_rx
-    → fulfills nested tool calls via invoke_tool callback
-    → returns DriverDrainBatch { events, terminal_result }
+    → returns DriverUpdate { batch, boundary }
 ```
 
 Deleted from this module:
 
 - `WorkerRuntimeState` — the worker no longer needs a shared state struct; it uses captured locals.
-- `SharedCommandReceiver` / `std::sync::mpsc` — replaced with `tokio::sync::mpsc::unbounded_channel`.
+- stale tool-result relay channels — nested tool completion is now returned through the host Promise path.
 - `resume_progress: Arc<Mutex<CellResumeProgressDelta>>` — no replay progress tracking.
 - `DriverDrainBatch.resume_progress` field — removed.
 
@@ -1933,17 +1937,18 @@ This means:
 ```
 LLM emits exec({code})
   → AgentLoop.dispatch_exec_tool_call()
-    → CodeModeService.execute_live()
+    → CodeModeService.execute()
       → CellDriver::spawn_live()
         → tokio::spawn worker thread
-          → runtime::run_cell(code, invoke_tool, event_tx)
+          → runtime::run_cell(code, CellRuntimeHost)
             → JS runs: text(), yield_control(), tools.X(), etc.
-            → each JS global → event_tx.send(RuntimeEvent::*)
-            → invoke_tool() for nested tools (synchronous within rquickjs)
+            → each JS global → CellRuntimeHost.emit_event(RuntimeEvent::*)
+            → tools.X() → CellRuntimeHost.call_tool()
+              → UnifiedToolExecutor.execute()
             → script completes → WorkerCompleted event
-      → driver.drain_event_batch_with_request(initial_drain)
+      → driver.next_update(initial timeout)
         → consumes events from event_rx
-        → returns DriverDrainBatch
+        → returns DriverUpdate
     → ActiveCellHandle.record_driver_update()
     → snapshot.render_state().render_output()
   → StructuredToolOutput envelope → LLM context
@@ -1957,10 +1962,10 @@ LLM emits wait({cell_id?, wait_timeout_ms?, refresh_slice_ms?})
     → CodeModeService.wait_with_request()
       → validates cell_id against active_cell
       → acquires live_driver lock
-      → driver.drain_event_batch_with_request(drain_request)
+      → driver.next_update(wait timeout)
         → if wait_for_event: blocks up to wait_timeout_ms
-        → if refresh_slice_ms: returns progress after slice
-        → on terminal: returns DriverDrainBatch with terminal_result
+        → if auto/explicit flush boundary: returns progress
+        → on terminal: returns DriverUpdate with terminal_result
       → ActiveCellHandle.record_driver_update()
       → snapshot.render_state().render_output()
     → cleared active_cell if terminal
@@ -1980,19 +1985,19 @@ JS timers (`setTimeout` / `clearTimeout`) remain runtime-internal:
 - [x] `wait_with_request()` implementation wired to driver drain loop.
 - [x] `step_helpers.rs` integration for `execute` and `wait`.
 - [x] Cleanup of stale `ResumeState`, `RunCellMetadata`, and `ReplayState` structs.
-- [x] Channel-based tool bridge to avoid `'static` lifetime requirements.
+- [x] Unified host/executor nested tool bridge replacing the intermediate channel bridge.
 - [x] Updated test suite (17/17 passing) and clean clippy status.
 
-## 23. Channel-Based Tool Bridge Implementation
+## 23. Unified Tool Execution Bridge Implementation
 
-To bridge between the synchronous `rquickjs` execution context (running in `tokio::task::spawn_blocking`) and the asynchronous `AgentLoop` (which handles nested tool dispatch), we implemented a message-passing bridge:
+The earlier channel-based tool bridge was an intermediate implementation. It has been superseded by the unified runtime host path:
 
-1.  **Request Flow**: When JS calls `tools.read_file()`, the runtime's native `__callTool` writes a `RuntimeEvent::ToolCallRequested` to the `event_tx` channel.
-2.  **Worker Suspension**: The worker thread then calls `tool_result_rx.recv()`, which is a blocking call on a `std::sync::mpsc` channel, effectively suspending the JS execution.
-3.  **Host Dispatch**: The `CellDriver::drain_event_batch_with_request` loop sees the `ToolCallRequested` event, uses the provided `invoke_tool` async closure to execute the tool in the host's async context.
-4.  **Resumption**: Once the host has the result, it sends it back to the worker via `tool_result_tx.send()`. The worker thread wakes up and resumes JS execution with the result.
+1. **Request Flow**: When JS calls `tools.read_file()`, the runtime's async `__callTool` creates a `RuntimeToolRequest` and awaits `CellRuntimeHost::call_tool`.
+2. **Host Dispatch**: `ExecutorCellRuntimeHost` emits `RuntimeEvent::ToolCallRequested`, parses JSON arguments, and calls `UnifiedToolExecutor.execute` with `ToolCallOrigin::CodeModeNested`.
+3. **Policy Boundary**: `UnifiedToolExecutor` owns visibility, step budget, autopilot, guard state, timeout, cancellation, tracing, and `ToolContext` enrichment before invoking `Tool.execute`.
+4. **Promise Completion**: The host emits `RuntimeEvent::ToolCallDone` exactly once, then resolves the JavaScript Promise with normalized tool output or a structured tool error.
 
-This pattern allows `AgentLoop` to use its own stateful, async closures (capturing `&mut self` for autopilot and hit-counting) without needing to satisfy the `'static` bound.
+`CodeModeService` no longer fulfills nested tools. It records runtime events, maintains cell snapshots, and publishes `exec` / `wait` summaries.
 
 ## 24. Next Steps
 
