@@ -105,6 +105,18 @@ impl Tool for WebFetchTool {
                 .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
         }
 
+        let output_path = if let Some(path) = &parsed.output_path {
+            if let Some(sandbox) = &ctx.sandbox {
+                let policy = sandbox.default_policy();
+                sandbox
+                    .check_path_access(std::path::Path::new(path), true, policy)
+                    .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
+            }
+            Some(std::path::PathBuf::from(path))
+        } else {
+            None
+        };
+
         let max_chars = parsed.max_chars.unwrap_or(12_000).clamp(500, 50_000);
 
         let mut response = self
@@ -179,22 +191,18 @@ impl Tool for WebFetchTool {
             (rendered, false)
         };
 
-        if let Some(path) = &parsed.output_path {
-            if let Some(sandbox) = &ctx.sandbox {
-                let policy = sandbox.default_policy();
-                sandbox
-                    .check_path_access(std::path::Path::new(path), true, policy)
-                    .map_err(|v| ToolError::ExecutionFailed(v.to_string()))?;
-            }
-
-            let path_buf = std::path::PathBuf::from(path);
+        if let Some(path_buf) = &output_path {
             if let Some(parent) = path_buf.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     ToolError::ExecutionFailed(format!("Failed to create directory: {}", e))
                 })?;
             }
-            std::fs::write(&path_buf, &content).map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to write to file {}: {}", path, e))
+            std::fs::write(path_buf, &content).map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "Failed to write to file {}: {}",
+                    path_buf.display(),
+                    e
+                ))
             })?;
 
             return serialize_tool_envelope(
@@ -202,7 +210,7 @@ impl Tool for WebFetchTool {
                 true,
                 format!(
                     "Successfully fetched and saved content to {}. Length: {} chars.",
-                    path,
+                    path_buf.display(),
                     content.len()
                 ),
                 Some(0),
@@ -335,8 +343,6 @@ mod tests {
     use super::*;
     use crate::tools::sandbox::{SandboxEnforcer, SandboxLevel, SandboxPolicy};
     use std::sync::Arc;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn test_web_fetch_tool_rejects_non_http_url() {
@@ -357,17 +363,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_web_fetch_tool_blocks_hidden_output_path_in_sandbox() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = socket.read(&mut buf).await;
-                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nContent-Type: text/plain\r\n\r\nhello world";
-                let _ = socket.write_all(response).await;
-            }
-        });
-
         let dir = tempfile::tempdir().unwrap();
         let hidden_dir = dir.path().join("hidden");
         let output_path = hidden_dir.join("page.txt");
@@ -387,7 +382,7 @@ mod tests {
         let err = tool
             .execute(
                 serde_json::json!({
-                    "url": format!("http://{}/", addr),
+                    "url": "http://127.0.0.1/",
                     "output_path": output_path,
                 }),
                 &ctx,

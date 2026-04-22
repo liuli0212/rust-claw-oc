@@ -1,7 +1,8 @@
 //! Sandbox enforcement for tool execution.
 //!
-//! Provides OS-level isolation via Bubblewrap (`bwrap`) for high-risk tools
-//! like `execute_bash`, and application-level path/network guards for file
+//! Provides OS-level isolation via Bubblewrap (`bwrap`) on Linux and
+//! Apple Seatbelt (`sandbox-exec`) on macOS for high-risk tools like
+//! `execute_bash`, plus application-level path/network guards for file
 //! and web tools.
 
 use serde::Deserialize;
@@ -97,7 +98,7 @@ pub struct SandboxPolicy {
     pub readonly_paths: Vec<PathBuf>,
     /// Whether to isolate the network namespace.
     pub isolate_network: bool,
-    /// Whether to isolate the PID namespace.
+    /// Whether to isolate the PID namespace (Linux only; ignored on macOS).
     pub isolate_pid: bool,
     /// Clear all environment variables before entering the sandbox.
     pub clear_env: bool,
@@ -105,7 +106,7 @@ pub struct SandboxPolicy {
     pub keep_env: Vec<String>,
     /// Domain allowlist for application-level network guards.
     pub allowed_domains: Vec<String>,
-    /// Paths to hide by overlaying with tmpfs.
+    /// Paths to hide by overlaying with tmpfs (Linux) or explicit deny (macOS).
     pub hidden_paths: Vec<PathBuf>,
 }
 
@@ -222,7 +223,14 @@ impl SandboxPolicy {
         }
 
         if self.isolate_pid {
-            lines.push("- PID Namespace: Isolated".to_string());
+            if cfg!(target_os = "macos") {
+                lines.push(
+                    "- PID Namespace: Isolation requested but not supported on macOS (ignored)"
+                        .to_string(),
+                );
+            } else {
+                lines.push("- PID Namespace: Isolated".to_string());
+            }
         }
 
         if !self.hidden_paths.is_empty() {
@@ -236,31 +244,123 @@ impl SandboxPolicy {
     }
 }
 
+// ── OsSandbox (platform-specific backend) ────────────────────────────
+
+/// The detected OS-level sandbox backend.
+// Variants and helpers for non-current platforms are intentionally compiled in
+// for cross-platform consistency; suppress dead_code warnings.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+enum OsSandbox {
+    /// No OS-level sandbox available on this system.
+    Unavailable,
+    /// Linux: Bubblewrap (`bwrap`).
+    Bwrap(PathBuf),
+    /// macOS: Apple Seatbelt (`sandbox-exec`).
+    SeatbeltExec(PathBuf),
+}
+
+impl OsSandbox {
+    fn is_available(&self) -> bool {
+        !matches!(self, OsSandbox::Unavailable)
+    }
+
+    fn detect() -> Self {
+        // Linux: look for bwrap
+        #[cfg(target_os = "linux")]
+        if let Some(p) = Self::find_bwrap() {
+            tracing::info!("Sandbox: bwrap detected at {}", p.display());
+            return Self::Bwrap(p);
+        }
+
+        // macOS: look for sandbox-exec (Apple Seatbelt)
+        #[cfg(target_os = "macos")]
+        if let Some(p) = Self::find_sandbox_exec() {
+            tracing::info!("Sandbox: sandbox-exec detected at {}", p.display());
+            return Self::SeatbeltExec(p);
+        }
+
+        tracing::warn!(
+            "Sandbox: no OS-level sandbox backend found ({}). \
+             OS-level isolation is disabled.",
+            Self::platform_name()
+        );
+        Self::Unavailable
+    }
+
+    fn platform_name() -> &'static str {
+        if cfg!(target_os = "linux") {
+            "Linux/bwrap"
+        } else if cfg!(target_os = "macos") {
+            "macOS/sandbox-exec"
+        } else {
+            "unsupported platform"
+        }
+    }
+
+    fn unavailable_description() -> &'static str {
+        if cfg!(target_os = "linux") {
+            "Bubblewrap (`bwrap`) is unavailable"
+        } else if cfg!(target_os = "macos") {
+            "`sandbox-exec` is unavailable"
+        } else {
+            "OS-level sandbox is not supported on this platform"
+        }
+    }
+
+    fn install_hint() -> &'static str {
+        if cfg!(target_os = "linux") {
+            "Install with: apt install bubblewrap"
+        } else if cfg!(target_os = "macos") {
+            "sandbox-exec should be present at /usr/bin/sandbox-exec; set sandbox.level = \"off\" to disable"
+        } else {
+            "Set sandbox.level = \"off\" to disable the sandbox requirement"
+        }
+    }
+
+    #[allow(dead_code)]
+    fn find_bwrap() -> Option<PathBuf> {
+        let output = std::process::Command::new("which")
+            .arg("bwrap")
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+        for candidate in &["/usr/bin/bwrap", "/usr/local/bin/bwrap"] {
+            if Path::new(candidate).exists() {
+                return Some(PathBuf::from(candidate));
+            }
+        }
+        None
+    }
+
+    fn find_sandbox_exec() -> Option<PathBuf> {
+        let p = PathBuf::from("/usr/bin/sandbox-exec");
+        p.exists().then_some(p)
+    }
+}
+
 // ── SandboxEnforcer ───────────────────────────────────────────────────
 
-/// The sandbox execution engine.  Detects `bwrap` at startup, wraps
-/// commands, and enforces path/network guards.
+/// The sandbox execution engine. Detects the platform-appropriate sandbox
+/// backend at startup, wraps commands, and enforces path/network guards.
 #[derive(Debug, Clone)]
 pub struct SandboxEnforcer {
-    bwrap_path: Option<PathBuf>,
+    os_sandbox: OsSandbox,
     default_policy: SandboxPolicy,
 }
 
 impl SandboxEnforcer {
-    /// Probe the system for `bwrap` and build the enforcer with the given
-    /// default policy.
+    /// Probe the system for an OS-level sandbox backend and build the
+    /// enforcer with the given default policy.
     pub fn detect(default_policy: SandboxPolicy) -> Self {
-        let bwrap_path = Self::find_bwrap();
-        if let Some(ref path) = bwrap_path {
-            tracing::info!("Sandbox: bwrap detected at {}", path.display());
-        } else {
-            tracing::warn!(
-                "Sandbox: bwrap not found. OS-level sandbox is disabled. \
-                 Install bubblewrap to enable it."
-            );
-        }
+        let os_sandbox = OsSandbox::detect();
         Self {
-            bwrap_path,
+            os_sandbox,
             default_policy,
         }
     }
@@ -273,14 +373,14 @@ impl SandboxEnforcer {
 
     pub fn disabled_with_policy(default_policy: SandboxPolicy) -> Self {
         Self {
-            bwrap_path: None,
+            os_sandbox: OsSandbox::Unavailable,
             default_policy,
         }
     }
 
-    /// Whether bwrap-based OS isolation is available.
+    /// Whether OS-level isolation is available on this system.
     pub fn is_available(&self) -> bool {
-        self.bwrap_path.is_some()
+        self.os_sandbox.is_available()
     }
 
     /// The global default policy (from config).
@@ -294,27 +394,130 @@ impl SandboxEnforcer {
             if !summary.is_empty() {
                 summary.push('\n');
             }
-            summary.push_str(
-                "- Shell Execution: Disabled because Bubblewrap (`bwrap`) is unavailable. File and web tool restrictions still apply.",
-            );
+            summary.push_str(&format!(
+                "- Shell Execution: Disabled because {}. \
+                 File and web tool restrictions still apply.",
+                OsSandbox::unavailable_description()
+            ));
         }
         summary
     }
 
     pub fn shell_execution_error(&self) -> String {
-        "Sandbox is enabled, but Bubblewrap (`bwrap`) is unavailable. Shell execution is disabled to avoid running commands outside the sandbox. Install bubblewrap or set sandbox.level = \"off\"."
-            .to_string()
+        format!(
+            "Sandbox is enabled, but {}. Shell execution is disabled to avoid running \
+             commands outside the sandbox. {}",
+            OsSandbox::unavailable_description(),
+            OsSandbox::install_hint(),
+        )
     }
 
     // ── Command wrapping ──────────────────────────────────────────
 
-    /// Build a `bwrap`-wrapped command.  Panics if `bwrap` is not available;
-    /// callers must check `is_available()` first.
-    pub fn build_bwrap_args(&self, cmd: &str, policy: &SandboxPolicy, cwd: &Path) -> Vec<String> {
-        let bwrap = self
-            .bwrap_path
-            .as_ref()
-            .expect("build_bwrap_args called but bwrap is not available");
+    /// Build a sandboxed PTY command for `portable-pty` spawning.
+    /// Panics if no sandbox backend is available; callers must check
+    /// `is_available()` first.
+    pub fn build_pty_command(
+        &self,
+        cmd: &str,
+        policy: &SandboxPolicy,
+        cwd: &Path,
+    ) -> portable_pty::CommandBuilder {
+        match &self.os_sandbox {
+            OsSandbox::Bwrap(_) => {
+                let args = self.build_bwrap_args(cmd, policy, cwd);
+                let mut builder = portable_pty::CommandBuilder::new(&args[0]);
+                for arg in &args[1..] {
+                    builder.arg(arg);
+                }
+                // bwrap handles cwd via --chdir; don't set it on the outer process
+                builder
+            }
+            OsSandbox::SeatbeltExec(_) => {
+                let args = self.build_seatbelt_args(cmd, policy, cwd);
+                let mut builder = portable_pty::CommandBuilder::new(&args[0]);
+                for arg in &args[1..] {
+                    builder.arg(arg);
+                }
+                // sandbox-exec inherits the outer process cwd
+                builder.cwd(cwd);
+                builder
+            }
+            OsSandbox::Unavailable => {
+                panic!("build_pty_command called but no sandbox backend is available")
+            }
+        }
+    }
+
+    /// Build a `std::process::Command` for non-PTY execution inside the sandbox.
+    pub fn build_std_command(
+        &self,
+        cmd: &str,
+        policy: &SandboxPolicy,
+        cwd: &Path,
+    ) -> std::process::Command {
+        match &self.os_sandbox {
+            OsSandbox::Bwrap(_) => {
+                let args = self.build_bwrap_args(cmd, policy, cwd);
+                let mut command = std::process::Command::new(&args[0]);
+                for arg in &args[1..] {
+                    command.arg(arg);
+                }
+                command
+            }
+            OsSandbox::SeatbeltExec(_) => {
+                let args = self.build_seatbelt_args(cmd, policy, cwd);
+                let mut command = std::process::Command::new(&args[0]);
+                for arg in &args[1..] {
+                    command.arg(arg);
+                }
+                command.current_dir(cwd);
+                command
+            }
+            OsSandbox::Unavailable => {
+                panic!("build_std_command called but no sandbox backend is available")
+            }
+        }
+    }
+
+    /// Build a `tokio::process::Command` for async non-PTY execution.
+    pub fn build_tokio_command(
+        &self,
+        cmd: &str,
+        policy: &SandboxPolicy,
+        cwd: &Path,
+    ) -> tokio::process::Command {
+        match &self.os_sandbox {
+            OsSandbox::Bwrap(_) => {
+                let args = self.build_bwrap_args(cmd, policy, cwd);
+                let mut command = tokio::process::Command::new(&args[0]);
+                for arg in &args[1..] {
+                    command.arg(arg);
+                }
+                command
+            }
+            OsSandbox::SeatbeltExec(_) => {
+                let args = self.build_seatbelt_args(cmd, policy, cwd);
+                let mut command = tokio::process::Command::new(&args[0]);
+                for arg in &args[1..] {
+                    command.arg(arg);
+                }
+                command.current_dir(cwd);
+                command
+            }
+            OsSandbox::Unavailable => {
+                panic!("build_tokio_command called but no sandbox backend is available")
+            }
+        }
+    }
+
+    // ── Linux: Bubblewrap argument builder ───────────────────────
+
+    fn build_bwrap_args(&self, cmd: &str, policy: &SandboxPolicy, cwd: &Path) -> Vec<String> {
+        let bwrap = match &self.os_sandbox {
+            OsSandbox::Bwrap(p) => p,
+            _ => panic!("build_bwrap_args called but bwrap is not available"),
+        };
 
         let mut args: Vec<String> = Vec::new();
         args.push(bwrap.display().to_string());
@@ -395,51 +598,163 @@ impl SandboxEnforcer {
         args
     }
 
-    /// Build a `CommandBuilder` for portable-pty spawning inside bwrap.
-    pub fn build_pty_command(
-        &self,
-        cmd: &str,
-        policy: &SandboxPolicy,
-        cwd: &Path,
-    ) -> portable_pty::CommandBuilder {
-        let bwrap_args = self.build_bwrap_args(cmd, policy, cwd);
-        // bwrap_args[0] is the bwrap binary itself
-        let mut builder = portable_pty::CommandBuilder::new(&bwrap_args[0]);
-        for arg in &bwrap_args[1..] {
-            builder.arg(arg);
+    // ── macOS: Apple Seatbelt argument builder ────────────────────
+
+    /// Build the `sandbox-exec` argument list for macOS.
+    fn build_seatbelt_args(&self, cmd: &str, policy: &SandboxPolicy, cwd: &Path) -> Vec<String> {
+        let sandbox_exec = match &self.os_sandbox {
+            OsSandbox::SeatbeltExec(p) => p,
+            _ => panic!("build_seatbelt_args called but sandbox-exec is not available"),
+        };
+
+        if policy.isolate_pid {
+            tracing::debug!("Sandbox: isolate_pid is not supported on macOS and will be ignored");
         }
-        // Don't set cwd on the outer process; bwrap handles it via --chdir
-        builder
+
+        // Create a session-scoped tmp dir (mirrors bwrap's per-session /tmp bind).
+        // TMPDIR is redirected here so sandboxed processes don't share the
+        // global /private/tmp with other users/processes.
+        let session_tmp = cwd.join(".tmp");
+        let _ = std::fs::create_dir_all(&session_tmp);
+
+        let profile = Self::build_sbpl_profile(policy, cwd, &session_tmp);
+
+        let mut args = vec![sandbox_exec.display().to_string(), "-p".into(), profile];
+
+        // Use `env` to set TMPDIR and optionally clear the environment.
+        // Without -i, `env` only adds/overrides the listed variables.
+        args.push("/usr/bin/env".into());
+        if policy.clear_env {
+            args.push("-i".into());
+        }
+        args.push(format!("TMPDIR={}", session_tmp.display()));
+        if policy.clear_env {
+            for env_key in &policy.keep_env {
+                if let Ok(val) = std::env::var(env_key) {
+                    args.push(format!("{}={}", env_key, val));
+                }
+            }
+        }
+
+        args.extend(["bash".into(), "-c".into(), cmd.into()]);
+        args
     }
 
-    /// Build a `std::process::Command` for non-PTY execution inside bwrap.
-    pub fn build_std_command(
-        &self,
-        cmd: &str,
-        policy: &SandboxPolicy,
-        cwd: &Path,
-    ) -> std::process::Command {
-        let bwrap_args = self.build_bwrap_args(cmd, policy, cwd);
-        let mut command = std::process::Command::new(&bwrap_args[0]);
-        for arg in &bwrap_args[1..] {
-            command.arg(arg);
-        }
-        command
-    }
+    /// Generate an SBPL (Sandbox Profile Language) profile string that
+    /// implements the given `SandboxPolicy` for Apple Seatbelt.
+    ///
+    /// `session_tmp` is the per-session temporary directory (cwd/.tmp);
+    /// it is the only writable path under /tmp so the sandbox cannot
+    /// interfere with other processes' temp files.
+    fn build_sbpl_profile(policy: &SandboxPolicy, cwd: &Path, session_tmp: &Path) -> String {
+        // Minimal Mach services required for basic bash execution.
+        // com.apple.SecurityServer is intentionally excluded so that
+        // sandboxed commands cannot access the user's Keychain.
+        let mach_services = [
+            "com.apple.system.logger",
+            "com.apple.system.opendirectoryd.api",
+            "com.apple.system.opendirectoryd.membership",
+            "com.apple.system.DirectoryService.libinfo_v1",
+            "com.apple.bsd.dirhelper",
+        ];
+        let mach_block = format!(
+            "(allow mach-lookup\n{})",
+            mach_services
+                .iter()
+                .map(|s| format!("    (global-name \"{s}\")"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
 
-    /// Build a `tokio::process::Command` for async non-PTY execution.
-    pub fn build_tokio_command(
-        &self,
-        cmd: &str,
-        policy: &SandboxPolicy,
-        cwd: &Path,
-    ) -> tokio::process::Command {
-        let bwrap_args = self.build_bwrap_args(cmd, policy, cwd);
-        let mut command = tokio::process::Command::new(&bwrap_args[0]);
-        for arg in &bwrap_args[1..] {
-            command.arg(arg);
+        let mut lines: Vec<String> = vec![
+            "(version 1)".into(),
+            "(deny default)".into(),
+            // Process operations
+            "(allow process-exec)".into(),
+            "(allow process-fork)".into(),
+            "(allow signal (target self))".into(),
+            "(allow sysctl-read)".into(),
+            // Read the root directory itself (required for basic path resolution)
+            r#"(allow file-read-data (literal "/"))"#.into(),
+            // Minimal Mach IPC (see allowlist above; no SecurityServer = no Keychain)
+            mach_block,
+            "(allow ipc-posix-shm)".into(),
+            // Core system paths (read-only)
+            r#"(allow file-read* (subpath "/usr"))"#.into(),
+            r#"(allow file-read* (subpath "/bin"))"#.into(),
+            r#"(allow file-read* (subpath "/sbin"))"#.into(),
+            r#"(allow file-read* (subpath "/System"))"#.into(),
+            r#"(allow file-read* (subpath "/Library/Apple"))"#.into(),
+            r#"(allow file-read* (subpath "/private/etc"))"#.into(),
+            // Homebrew on Apple Silicon (/opt/homebrew) and Intel (/usr/local)
+            r#"(allow file-read* (subpath "/opt"))"#.into(),
+            r#"(allow file-read* (subpath "/usr/local"))"#.into(),
+            // Filesystem metadata everywhere (needed for ls, find, stat, etc.)
+            r#"(allow file-read-metadata (subpath "/"))"#.into(),
+            // Minimal /dev access. PTY file descriptors are opened by the
+            // parent before sandbox-exec applies the profile, so avoid
+            // granting broad host /dev access.
+            r#"(allow file-read* file-write* (literal "/dev/null"))"#.into(),
+            r#"(allow file-read* (literal "/dev/zero"))"#.into(),
+            r#"(allow file-read* (literal "/dev/random"))"#.into(),
+            r#"(allow file-read* (literal "/dev/urandom"))"#.into(),
+            r#"(allow file-read* file-write* (literal "/dev/tty"))"#.into(),
+            r#"(allow file-ioctl (literal "/dev/tty"))"#.into(),
+        ];
+
+        // Session-scoped tmp: only this dir is writable under /tmp,
+        // preventing interference with other processes' temp files.
+        // TMPDIR is set to this path in build_seatbelt_args.
+        lines.push(format!(
+            r#"(allow file-read* file-write* (subpath "{}"))"#,
+            sbpl_escape(&session_tmp.display().to_string())
+        ));
+
+        // Working directory (read+write)
+        let cwd_str = cwd.display().to_string();
+        lines.push(format!(
+            r#"(allow file-read* file-write* (subpath "{}"))"#,
+            sbpl_escape(&cwd_str)
+        ));
+
+        // Extra writable paths
+        for path in &policy.writable_paths {
+            let p = path.display().to_string();
+            if p != cwd_str {
+                lines.push(format!(
+                    r#"(allow file-read* file-write* (subpath "{}"))"#,
+                    sbpl_escape(&p)
+                ));
+            }
         }
-        command
+
+        // Extra read-only paths
+        for path in &policy.readonly_paths {
+            let p = path.display().to_string();
+            lines.push(format!(
+                r#"(allow file-read* (subpath "{}"))"#,
+                sbpl_escape(&p)
+            ));
+        }
+
+        // Hidden paths: explicit deny overrides any broader allow above.
+        // SBPL evaluates rules in order and last-match-wins, so placing
+        // these denies after the allows ensures they take effect.
+        for path in &policy.hidden_paths {
+            let p = path.display().to_string();
+            lines.push(format!(
+                r#"(deny file-read* file-write* (subpath "{}"))"#,
+                sbpl_escape(&p)
+            ));
+        }
+
+        // Network: denied by default (from `deny default`).
+        // Explicitly allow when not isolating.
+        if !policy.isolate_network {
+            lines.push("(allow network*)".into());
+        }
+
+        lines.join("\n")
     }
 
     // ── Path guard ────────────────────────────────────────────────
@@ -455,7 +770,14 @@ impl SandboxEnforcer {
             return Ok(());
         }
 
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let candidate = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        };
+        let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
 
         // Always block hidden (sensitive) paths
         for hidden in &policy.hidden_paths {
@@ -486,10 +808,7 @@ impl SandboxEnforcer {
             canonical.starts_with(&allowed_canonical)
         });
 
-        // Also allow /tmp and session-scoped directories
-        let in_tmp = canonical.starts_with("/tmp");
-
-        if allowed || in_tmp {
+        if allowed {
             Ok(())
         } else {
             tracing::warn!(
@@ -543,34 +862,17 @@ impl SandboxEnforcer {
             })
         }
     }
+}
 
-    // ── Internal ──────────────────────────────────────────────────
+// ── SBPL helpers ──────────────────────────────────────────────────────
 
-    fn find_bwrap() -> Option<PathBuf> {
-        // Try `which bwrap`
-        let output = std::process::Command::new("which")
-            .arg("bwrap")
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
-        }
-        // Well-known fallback paths
-        for candidate in &["/usr/bin/bwrap", "/usr/local/bin/bwrap"] {
-            if Path::new(candidate).exists() {
-                return Some(PathBuf::from(candidate));
-            }
-        }
-        None
-    }
+/// Escape a path string for embedding in an SBPL profile (double-quoted).
+fn sbpl_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Extract the domain from a URL string.
 fn extract_domain(url: &str) -> String {
-    // Strip any scheme (http://, https://, ftp://, etc.)
     let without_scheme = if let Some(pos) = url.find("://") {
         &url[pos + 3..]
     } else {
@@ -593,8 +895,8 @@ fn extract_domain(url: &str) -> String {
 pub struct SandboxConfig {
     /// Global level: "off" | "restricted" | "strict"
     pub level: Option<String>,
-    /// Block startup if bwrap is missing.
-    pub require_bwrap: Option<bool>,
+    /// Block startup if the OS sandbox backend is missing.
+    pub require_os_sandbox: Option<bool>,
     /// Extra writable directories.
     pub writable_paths: Option<Vec<String>>,
     /// Sensitive directories to hide.
@@ -713,6 +1015,23 @@ impl SandboxConfig {
 mod tests {
     use super::*;
 
+    // Test constructors that bypass OS detection for platform-agnostic tests.
+    impl SandboxEnforcer {
+        fn new_bwrap_for_testing(bwrap_path: PathBuf, policy: SandboxPolicy) -> Self {
+            Self {
+                os_sandbox: OsSandbox::Bwrap(bwrap_path),
+                default_policy: policy,
+            }
+        }
+
+        fn new_seatbelt_for_testing(sandbox_exec_path: PathBuf, policy: SandboxPolicy) -> Self {
+            Self {
+                os_sandbox: OsSandbox::SeatbeltExec(sandbox_exec_path),
+                default_policy: policy,
+            }
+        }
+    }
+
     #[test]
     fn test_sandbox_level_tighten_monotonic() {
         assert_eq!(
@@ -806,7 +1125,6 @@ mod tests {
     #[test]
     fn test_check_path_access_blocks_hidden() {
         let enforcer = SandboxEnforcer::disabled();
-        // Create a temp dir to simulate the hidden path
         let tmp = std::env::temp_dir().join("fake_ssh");
         let _ = std::fs::create_dir_all(&tmp);
         let test_file = tmp.join("id_rsa");
@@ -833,6 +1151,36 @@ mod tests {
         assert!(enforcer
             .check_path_access(Path::new("/etc/passwd"), true, &policy)
             .is_ok());
+    }
+
+    #[test]
+    fn test_check_path_access_blocks_global_tmp_write_by_default() {
+        let enforcer = SandboxEnforcer::disabled();
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Restricted,
+            writable_paths: vec![PathBuf::from("/workspace")],
+            ..Default::default()
+        };
+        let result = enforcer.check_path_access(
+            Path::new("/private/tmp/rusty_claw_global_tmp_probe"),
+            true,
+            &policy,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_path_access_allows_new_relative_file_under_cwd() {
+        let enforcer = SandboxEnforcer::disabled();
+        let cwd = std::env::current_dir().unwrap();
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Restricted,
+            writable_paths: vec![cwd],
+            ..Default::default()
+        };
+        let result =
+            enforcer.check_path_access(Path::new("new_sandbox_relative_file.txt"), true, &policy);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -880,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enforcer_prompt_summary_mentions_shell_disabled_without_bwrap() {
+    fn test_enforcer_prompt_summary_mentions_shell_disabled_without_sandbox() {
         let enforcer = SandboxEnforcer::disabled_with_policy(SandboxPolicy {
             level: SandboxLevel::Restricted,
             writable_paths: vec![PathBuf::from("/workspace")],
@@ -889,23 +1237,21 @@ mod tests {
         });
         let summary = enforcer.prompt_summary();
         assert!(summary.contains("Shell Execution: Disabled"));
-        assert!(summary.contains("Bubblewrap (`bwrap`) is unavailable"));
         assert!(summary.contains("github.com"));
     }
 
     #[test]
     fn test_build_bwrap_args_basic_shape() {
-        // Even without bwrap installed, we can test with a fake path
-        let enforcer = SandboxEnforcer {
-            bwrap_path: Some(PathBuf::from("/usr/bin/bwrap")),
-            default_policy: SandboxPolicy::default(),
-        };
+        let enforcer = SandboxEnforcer::new_bwrap_for_testing(
+            PathBuf::from("/usr/bin/bwrap"),
+            SandboxPolicy::default(),
+        );
         let policy = SandboxPolicy {
             level: SandboxLevel::Restricted,
             isolate_pid: true,
             clear_env: true,
             keep_env: vec!["PATH".into()],
-            hidden_paths: vec![], // skip actual paths for test
+            hidden_paths: vec![],
             ..Default::default()
         };
         let args = enforcer.build_bwrap_args("echo hello", &policy, Path::new("/tmp/test_cwd"));
@@ -914,9 +1260,129 @@ mod tests {
         assert!(args.contains(&"--clearenv".to_string()));
         assert!(args.contains(&"--die-with-parent".to_string()));
         assert!(args.contains(&"--new-session".to_string()));
-        // Last args should be the actual command
         let last_three: Vec<&str> = args[args.len() - 3..].iter().map(|s| s.as_str()).collect();
         assert_eq!(last_three, vec!["bash", "-c", "echo hello"]);
+    }
+
+    #[test]
+    fn test_build_seatbelt_args_basic_shape() {
+        let enforcer = SandboxEnforcer::new_seatbelt_for_testing(
+            PathBuf::from("/usr/bin/sandbox-exec"),
+            SandboxPolicy::default(),
+        );
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Restricted,
+            isolate_network: false,
+            hidden_paths: vec![],
+            ..Default::default()
+        };
+        let args = enforcer.build_seatbelt_args("echo hello", &policy, Path::new("/tmp/test_cwd"));
+        assert_eq!(args[0], "/usr/bin/sandbox-exec");
+        assert_eq!(args[1], "-p");
+        // args[2] is the SBPL profile string
+        let profile = &args[2];
+        assert!(profile.contains("(version 1)"));
+        assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(allow network*)"));
+        // cwd and session tmp both present
+        assert!(profile.contains("/tmp/test_cwd"));
+        assert!(profile.contains("/tmp/test_cwd/.tmp"));
+        // No global /private/tmp access
+        assert!(!profile.contains("subpath \"/private/tmp\""));
+        // No unrestricted mach-lookup
+        assert!(!profile.contains("(allow mach-lookup)"));
+        // No mach-register
+        assert!(!profile.contains("mach-register"));
+        // Needs file-read-data "/" for basic path resolution
+        assert!(profile.contains("file-read-data (literal \"/\")"));
+        // env is used to set TMPDIR
+        assert!(args.contains(&"/usr/bin/env".to_string()));
+        assert!(args.iter().any(|a| a.starts_with("TMPDIR=")));
+        // Last three args should be the shell invocation
+        let last_three: Vec<&str> = args[args.len() - 3..].iter().map(|s| s.as_str()).collect();
+        assert_eq!(last_three, vec!["bash", "-c", "echo hello"]);
+    }
+
+    #[test]
+    fn test_build_seatbelt_args_network_isolated() {
+        let enforcer = SandboxEnforcer::new_seatbelt_for_testing(
+            PathBuf::from("/usr/bin/sandbox-exec"),
+            SandboxPolicy::default(),
+        );
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Strict,
+            isolate_network: true,
+            hidden_paths: vec![],
+            ..Default::default()
+        };
+        let args = enforcer.build_seatbelt_args("echo hello", &policy, Path::new("/tmp/test_cwd"));
+        let profile = &args[2];
+        assert!(!profile.contains("(allow network*)"));
+    }
+
+    #[test]
+    fn test_build_seatbelt_args_clear_env() {
+        let enforcer = SandboxEnforcer::new_seatbelt_for_testing(
+            PathBuf::from("/usr/bin/sandbox-exec"),
+            SandboxPolicy::default(),
+        );
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Strict,
+            clear_env: true,
+            keep_env: vec!["PATH".into()],
+            hidden_paths: vec![],
+            ..Default::default()
+        };
+        let args = enforcer.build_seatbelt_args("echo hello", &policy, Path::new("/tmp/test_cwd"));
+        // env is always present (for TMPDIR), with -i when clear_env is set
+        assert!(args.contains(&"/usr/bin/env".to_string()));
+        assert!(args.contains(&"-i".to_string()));
+        assert!(args.iter().any(|a| a.starts_with("TMPDIR=")));
+    }
+
+    #[test]
+    fn test_sbpl_profile_contains_hidden_path_deny() {
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Restricted,
+            hidden_paths: vec![PathBuf::from("/Users/test/.ssh")],
+            ..Default::default()
+        };
+        let profile = SandboxEnforcer::build_sbpl_profile(
+            &policy,
+            Path::new("/workspace"),
+            Path::new("/workspace/.tmp"),
+        );
+        assert!(profile.contains(r#"(deny file-read* file-write* (subpath "/Users/test/.ssh"))"#));
+    }
+
+    #[test]
+    fn test_sbpl_profile_writable_and_readonly_paths() {
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Restricted,
+            writable_paths: vec![PathBuf::from("/data/output")],
+            readonly_paths: vec![PathBuf::from("/data/input")],
+            hidden_paths: vec![],
+            ..Default::default()
+        };
+        let profile = SandboxEnforcer::build_sbpl_profile(
+            &policy,
+            Path::new("/workspace"),
+            Path::new("/workspace/.tmp"),
+        );
+        assert!(profile.contains(r#"(allow file-read* file-write* (subpath "/data/output"))"#));
+        assert!(profile.contains(r#"(allow file-read* (subpath "/data/input"))"#));
+    }
+
+    #[test]
+    fn test_sbpl_escape_special_chars() {
+        assert_eq!(
+            sbpl_escape(r#"/path/with "quotes""#),
+            r#"/path/with \"quotes\""#
+        );
+        assert_eq!(
+            sbpl_escape(r#"/path\with\backslash"#),
+            r#"/path\\with\\backslash"#
+        );
     }
 
     #[test]

@@ -514,7 +514,7 @@ Action needed: Please modify your action to operate within the allowed directori
 level = "restricted"
 
 # 是否在 bwrap 不可用时阻止执行（false = 降级为 unrestricted）
-require_bwrap = false
+require_os_sandbox = false
 
 # 额外的可写目录
 writable_paths = ["/data/shared"]
@@ -553,7 +553,7 @@ force_strict = false      # 是否强制所有 subagent 用 strict 模式
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct SandboxConfig {
     pub level: Option<String>,          // "off" | "restricted" | "strict"
-    pub require_bwrap: Option<bool>,
+    pub require_os_sandbox: Option<bool>,
     pub writable_paths: Option<Vec<String>>,
     pub hidden_paths: Option<Vec<String>>,
     pub allowed_domains: Option<Vec<String>>,
@@ -611,7 +611,7 @@ src/
 │         No                               │
 │          │                               │
 │          ▼                               │
-│  config.require_bwrap?                   │
+│  config.require_os_sandbox?              │
 │          │                               │
 │    Yes ──┤──→ 启动失败，打印安装指南        │
 │          │                               │
@@ -706,7 +706,7 @@ async fn test_bash_tool_can_write_to_workdir_in_sandbox() {
 > [!TIP]
 > **最佳实践**
 
-- 在服务器部署时，建议将 `level` 设为 `"strict"` 并开启 `require_bwrap = true`
+- 在服务器部署时，建议将 `level` 设为 `"strict"` 并开启 `require_os_sandbox = true`
 - 在本地开发时，建议使用 `"restricted"` 以平衡安全与便利
 - 对于 Autopilot 模式（无人值守），强烈建议使用 `"strict"` 模式
 

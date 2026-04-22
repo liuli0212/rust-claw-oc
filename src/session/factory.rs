@@ -458,10 +458,17 @@ pub fn build_agent_session(
             let policy = sandbox_config.build_default_policy(&work_dir);
             let enforcer = crate::tools::sandbox::SandboxEnforcer::detect(policy);
 
-            if sandbox_config.require_bwrap.unwrap_or(false) && !enforcer.is_available() {
-                return Err("Sandbox: bwrap is required but not found. \
-                     Install with: apt install bubblewrap"
-                    .to_string());
+            if sandbox_config.require_os_sandbox.unwrap_or(false) && !enforcer.is_available() {
+                let hint = if cfg!(target_os = "linux") {
+                    "Install with: apt install bubblewrap"
+                } else if cfg!(target_os = "macos") {
+                    "sandbox-exec should be present at /usr/bin/sandbox-exec on macOS"
+                } else {
+                    "OS-level sandboxing is not supported on this platform"
+                };
+                return Err(format!(
+                    "Sandbox: OS-level isolation is required but not available. {hint}"
+                ));
             }
 
             agent_loop.add_extension(Arc::new(crate::sandbox_extension::SandboxExtension::new(

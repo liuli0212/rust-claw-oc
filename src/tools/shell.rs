@@ -62,7 +62,7 @@ async fn execute_shell_inner(
     let effective_cwd = cwd.unwrap_or_else(|| Path::new("."));
 
     let mut cmd = if let (Some(sb), Some(pol)) = (sandbox.filter(|s| s.is_available()), policy) {
-        tracing::info!("shell: executing in bwrap sandbox");
+        tracing::info!("shell: executing in OS sandbox");
         sb.build_tokio_command(command, pol, effective_cwd)
     } else {
         let mut c = Command::new("bash");
@@ -164,8 +164,6 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
-        assert!(err
-            .to_string()
-            .contains("Bubblewrap (`bwrap`) is unavailable"));
+        assert!(err.to_string().contains("Shell execution is disabled"));
     }
 }

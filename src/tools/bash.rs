@@ -113,9 +113,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
-        assert!(err
-            .to_string()
-            .contains("Bubblewrap (`bwrap`) is unavailable"));
+        assert!(err.to_string().contains("Shell execution is disabled"));
     }
 }
 
@@ -206,7 +204,7 @@ impl Tool for BashTool {
         let mut cmd = if let Some(sandbox) = ctx.sandbox.as_ref().filter(|s| s.is_available()) {
             let policy = sandbox.default_policy();
             tracing::info!(
-                "BashTool: executing in bwrap sandbox (level={:?})",
+                "BashTool: executing in OS sandbox (level={:?})",
                 policy.level
             );
             sandbox.build_pty_command(&cmd_str, policy, work_dir_path)
