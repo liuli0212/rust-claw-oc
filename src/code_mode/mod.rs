@@ -2,7 +2,6 @@ pub mod cell;
 pub mod description;
 pub mod driver;
 pub mod entry;
-pub mod executor;
 pub mod host;
 pub mod protocol;
 pub mod response;

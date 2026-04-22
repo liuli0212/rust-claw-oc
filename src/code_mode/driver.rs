@@ -9,36 +9,22 @@ use super::runtime;
 
 pub struct CellDriver {
     event_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
-    /// Channel for sending tool results back to the worker thread.
-    tool_result_tx: std::sync::mpsc::Sender<Result<String, crate::tools::ToolError>>,
     /// Channel for sending commands (like resume) to the worker thread.
     command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
     worker: Option<tokio::task::JoinHandle<()>>,
     cancel_flag: Arc<AtomicBool>,
-    tool_call_in_flight: Arc<AtomicBool>,
     pending_events: VecDeque<RuntimeEvent>,
 }
 
 #[derive(Clone)]
 pub struct CellDriverControl {
-    tool_result_tx: std::sync::mpsc::Sender<Result<String, crate::tools::ToolError>>,
     command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
     cancel_flag: Arc<AtomicBool>,
-    tool_call_in_flight: Arc<AtomicBool>,
 }
 
 impl CellDriverControl {
     pub fn request_cancel(&self, reason: &str) {
         self.cancel_flag.store(true, Ordering::Release);
-        // Only unblock the worker's recv() if a tool call is actually waiting —
-        // sending unconditionally would corrupt the next legitimate tool result.
-        if self.tool_call_in_flight.load(Ordering::Acquire) {
-            let _ = self
-                .tool_result_tx
-                .send(Err(crate::tools::ToolError::ExecutionFailed(
-                    reason.to_string(),
-                )));
-        }
         let _ = self
             .command_tx
             .send(crate::code_mode::protocol::CellCommand::Cancel {
@@ -128,7 +114,7 @@ impl CellDriver {
         Self::spawn_live_with_host(code, stored_values, host, event_tx, event_rx, cancel_flag)
     }
 
-    pub fn spawn_live_with_host(
+    pub(crate) fn spawn_live_with_host(
         code: String,
         stored_values: HashMap<String, runtime::value::StoredValue>,
         host: Arc<dyn crate::code_mode::host::CellRuntimeHost>,
@@ -136,15 +122,10 @@ impl CellDriver {
         event_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
         cancel_flag: Arc<AtomicBool>,
     ) -> Self {
-        let (tool_result_tx, _tool_result_rx) =
-            std::sync::mpsc::channel::<Result<String, crate::tools::ToolError>>();
-
         let (command_tx, command_rx) =
             std::sync::mpsc::channel::<crate::code_mode::protocol::CellCommand>();
 
         let cancel_flag_for_worker = cancel_flag.clone();
-        let tool_call_in_flight = Arc::new(AtomicBool::new(false));
-
         let event_tx_captured = event_tx.clone();
 
         // spawn_blocking runs on a dedicated OS thread outside the async runtime.
@@ -168,11 +149,9 @@ impl CellDriver {
 
         Self {
             event_rx,
-            tool_result_tx,
             command_tx,
             worker: Some(worker),
             cancel_flag,
-            tool_call_in_flight,
             pending_events: VecDeque::new(),
         }
     }
@@ -182,17 +161,15 @@ impl CellDriver {
         if let Some(worker) = self.worker.take() {
             // abort() on a spawn_blocking handle only detaches the JoinHandle —
             // it does NOT terminate the OS thread. The cancel_flag interrupt handler
-            // and the poisoned tool_result channel are what actually stop the thread.
+            // and timer cancel command are what actually stop cooperative runtime work.
             worker.abort();
         }
     }
 
     pub fn control_handle(&self) -> CellDriverControl {
         CellDriverControl {
-            tool_result_tx: self.tool_result_tx.clone(),
             command_tx: self.command_tx.clone(),
             cancel_flag: self.cancel_flag.clone(),
-            tool_call_in_flight: self.tool_call_in_flight.clone(),
         }
     }
 
@@ -245,28 +222,6 @@ impl CellDriver {
                 return Ok(outcome);
             }
         }
-    }
-
-    pub fn complete_pending_tool_call(
-        &mut self,
-        request: &ToolCallRequestEvent,
-        result: Result<String, crate::tools::ToolError>,
-    ) -> Result<(), crate::tools::ToolError> {
-        let ok = result.is_ok();
-        let result_for_js = match result {
-            Ok(raw) => Ok(crate::code_mode::runtime::value::normalize_tool_result_for_js(&raw)),
-            Err(err) => Err(err),
-        };
-
-        self.tool_result_tx.send(result_for_js).map_err(|_| {
-            crate::tools::ToolError::ExecutionFailed("Tool result channel closed".to_string())
-        })?;
-        self.pending_events.push_back(RuntimeEvent::ToolCallDone {
-            seq: request.seq,
-            request_id: request.request_id.clone(),
-            ok,
-        });
-        Ok(())
     }
 
     fn classify_event(

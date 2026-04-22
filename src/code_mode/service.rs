@@ -229,7 +229,7 @@ impl CodeModeService {
     /// Execute a new code-mode cell. Spawns a live JS runtime worker, performs
     /// an initial background update, and returns the first published
     /// `ExecRunResult` suitable for the LLM.
-    pub async fn execute(
+    pub(crate) async fn execute(
         &self,
         session_id: &str,
         code: &str,

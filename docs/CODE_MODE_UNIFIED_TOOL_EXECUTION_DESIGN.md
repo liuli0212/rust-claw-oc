@@ -11,7 +11,7 @@ It is intended to guide implementation, review, and verification.
 - [x] Phase 1: Extract unified executor without behavior change.
 - [x] Phase 2: Introduce `CellRuntimeHost` boundary.
 - [x] Phase 3: Replace sync tool result bridge with Promise/completion queue.
-- [ ] Phase 4: Simplify service and driver state.
+- [x] Phase 4: Simplify service and driver state.
 - [ ] Phase 5: Documentation and trace cleanup.
 
 The main decision is:
@@ -494,6 +494,15 @@ Exit criteria:
 
 - Driver state describes runtime execution, not tool result routing.
 - Service state describes cell snapshots and publications, not tool dispatch.
+
+Progress 2026-04-22:
+
+- Removed the obsolete `tool_result_tx`/`tool_result_rx` bridge, `tool_call_in_flight`, and `CellDriver::complete_pending_tool_call`.
+- Deleted the temporary `src/code_mode/executor.rs` adapter now that nested execution goes through `CellRuntimeHost -> UnifiedToolExecutor`.
+- Simplified `CellDriverControl::request_cancel` so cancellation only marks the shared flag and sends a timer/runtime cancel command.
+- Kept `DriverBoundary::PendingTool` as an event publication boundary; it no longer implies service-side fulfillment.
+- Narrowed host-facing service/driver APIs to crate visibility so private runtime host types do not leak through public interfaces.
+- Finding: after this cleanup, `cargo clippy -- -D warnings` no longer reports the Phase 3 private-interface/dead-code warnings.
 
 ### Phase 5: Documentation and Trace Cleanup
 
