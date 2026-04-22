@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::sync::Notify;
 
-use crate::context::AgentContext;
 use crate::core::extensions::ExecutionExtension;
 use crate::core::{ExecutionGuardSignal, ExecutionGuardState};
 use crate::tools::{Tool, ToolContext};
-use crate::trace::{TraceActor, TraceBus, TraceContext, TraceStatus};
+use crate::trace::TraceContext;
 
 pub(crate) fn is_code_mode_nested_tool(tool_name: &str) -> bool {
     !matches!(
@@ -26,26 +25,19 @@ pub(crate) fn is_code_mode_nested_tool(tool_name: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum ToolCallOrigin {
-    TopLevel {
-        call_id: Option<String>,
-    },
-    CodeModeNested {
-        cell_id: String,
-        outer_tool_call_id: Option<String>,
-        request_id: String,
-        seq: u64,
-    },
+    TopLevel,
+    CodeModeNested,
 }
 
 impl ToolCallOrigin {
     fn hidden_tool_message(&self, tool_name: &str) -> String {
         match self {
-            Self::CodeModeNested { .. } => {
+            Self::CodeModeNested => {
                 format!("Tool `{tool_name}` is not available inside code mode.")
             }
-            Self::TopLevel { .. } => {
+            Self::TopLevel => {
                 format!("Tool `{tool_name}` is not visible in this execution context.")
             }
         }
@@ -53,61 +45,36 @@ impl ToolCallOrigin {
 
     fn exhausted_budget_message(&self) -> String {
         match self {
-            Self::CodeModeNested { .. } => {
+            Self::CodeModeNested => {
                 "No remaining steps: nested tool call limit reached.".to_string()
             }
-            Self::TopLevel { .. } => "No remaining steps: tool call limit reached.".to_string(),
-        }
-    }
-
-    fn trace_attrs(&self) -> Value {
-        match self {
-            Self::TopLevel { call_id } => serde_json::json!({
-                "origin": "top_level",
-                "call_id": call_id,
-            }),
-            Self::CodeModeNested {
-                cell_id,
-                outer_tool_call_id,
-                request_id,
-                seq,
-            } => serde_json::json!({
-                "origin": "code_mode_nested",
-                "cell_id": cell_id,
-                "outer_tool_call_id": outer_tool_call_id,
-                "request_id": request_id,
-                "seq": seq,
-            }),
+            Self::TopLevel => "No remaining steps: tool call limit reached.".to_string(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ToolExecutionOutcome {
     pub(crate) result: String,
     pub(crate) is_error: bool,
     pub(crate) stopped: bool,
+    pub(crate) timed_out: bool,
     pub(crate) guard_signal: Option<ExecutionGuardSignal>,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ToolInvocationEndNames {
-    pub(crate) success: &'static str,
-    pub(crate) error: &'static str,
-    pub(crate) timeout: &'static str,
-    pub(crate) cancelled: &'static str,
+impl ToolExecutionOutcome {
+    fn error(result: String) -> Self {
+        Self {
+            result,
+            is_error: true,
+            stopped: false,
+            timed_out: false,
+            guard_signal: None,
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ToolInvocationSpanConfig {
-    pub(crate) actor: TraceActor,
-    pub(crate) start_name: &'static str,
-    pub(crate) start_attrs: Value,
-    pub(crate) end_names: ToolInvocationEndNames,
-    pub(crate) end_attrs: Value,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ToolExecutionRequest {
     pub(crate) tool_name: String,
     pub(crate) args: Value,
@@ -115,7 +82,6 @@ pub(crate) struct ToolExecutionRequest {
     pub(crate) timeout: Duration,
     pub(crate) trace_ctx: Option<TraceContext>,
     pub(crate) context_parent_span_id: Option<String>,
-    pub(crate) span: Option<ToolInvocationSpanConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +123,6 @@ pub(crate) struct UnifiedToolExecutorConfig {
     pub(crate) reply_to: String,
     pub(crate) step_budget: StepBudgetHandle,
     pub(crate) session_deadline: Option<Instant>,
-    pub(crate) trace_bus: Arc<TraceBus>,
     pub(crate) cancel_token: Arc<Notify>,
     pub(crate) is_autopilot: bool,
     pub(crate) todos_path: PathBuf,
@@ -175,7 +140,6 @@ pub(crate) struct UnifiedToolExecutor {
     reply_to: String,
     step_budget: StepBudgetHandle,
     session_deadline: Option<Instant>,
-    trace_bus: Arc<TraceBus>,
     cancel_token: Arc<Notify>,
     is_autopilot: bool,
     todos_path: PathBuf,
@@ -192,7 +156,6 @@ impl UnifiedToolExecutor {
             reply_to: config.reply_to,
             step_budget: config.step_budget,
             session_deadline: config.session_deadline,
-            trace_bus: config.trace_bus,
             cancel_token: config.cancel_token,
             is_autopilot: config.is_autopilot,
             todos_path: config.todos_path,
@@ -283,39 +246,21 @@ impl UnifiedToolExecutor {
             .iter()
             .find(|tool| tool.name() == request.tool_name)
         else {
-            return ToolExecutionOutcome {
-                result: format!("Tool not found: {}", request.tool_name),
-                is_error: true,
-                stopped: false,
-                guard_signal: None,
-            };
+            return ToolExecutionOutcome::error(format!("Tool not found: {}", request.tool_name));
         };
 
         if !self.visible_tools.contains(&request.tool_name) {
-            return ToolExecutionOutcome {
-                result: request.origin.hidden_tool_message(&request.tool_name),
-                is_error: true,
-                stopped: false,
-                guard_signal: None,
-            };
+            return ToolExecutionOutcome::error(
+                request.origin.hidden_tool_message(&request.tool_name),
+            );
         }
 
         if let Some(reason) = self.autopilot_denial_for_call(&request.tool_name, &request.args) {
-            return ToolExecutionOutcome {
-                result: reason,
-                is_error: true,
-                stopped: false,
-                guard_signal: None,
-            };
+            return ToolExecutionOutcome::error(reason);
         }
 
         if !self.step_budget.try_consume() {
-            return ToolExecutionOutcome {
-                result: request.origin.exhausted_budget_message(),
-                is_error: true,
-                stopped: false,
-                guard_signal: None,
-            };
+            return ToolExecutionOutcome::error(request.origin.exhausted_budget_message());
         }
 
         let mut outcome = self.invoke_tool(tool.clone(), &request).await;
@@ -334,69 +279,34 @@ impl UnifiedToolExecutor {
         tool: Arc<dyn Tool>,
         request: &ToolExecutionRequest,
     ) -> ToolExecutionOutcome {
-        let mut invocation_span = request.span.as_ref().and_then(|span_config| {
-            request.trace_ctx.as_ref().map(|trace_ctx| {
-                let span_ctx =
-                    trace_ctx.with_parent_span_id(request.context_parent_span_id.clone());
-                (
-                    self.trace_bus.start_span(
-                        &span_ctx,
-                        span_config.actor.clone(),
-                        span_config.start_name,
-                        span_config.start_attrs.clone(),
-                    ),
-                    span_config.clone(),
-                )
-            })
-        });
-
-        let tool_ctx_parent_span_id = invocation_span
-            .as_ref()
-            .map(|(span, _)| span.span_id().to_string())
-            .or_else(|| request.context_parent_span_id.clone());
         let ctx = self
-            .prepare_tool_context(request.trace_ctx.as_ref(), tool_ctx_parent_span_id)
+            .prepare_tool_context(
+                request.trace_ctx.as_ref(),
+                request.context_parent_span_id.clone(),
+            )
             .await;
 
-        let (result, is_error, stopped, trace_status, end_name) = tokio::select! {
+        let (result, is_error, stopped, timed_out) = tokio::select! {
             exec_res = tokio::time::timeout(
                 request.timeout,
                 tool.execute(request.args.clone(), &ctx)
             ) => {
                 match exec_res {
-                    Ok(Ok(res)) => (res, false, false, TraceStatus::Ok, request.span.as_ref().map(|span| span.end_names.success)),
-                    Ok(Err(err)) => (format!("Tool error: {}", err), true, false, TraceStatus::Error, request.span.as_ref().map(|span| span.end_names.error)),
-                    Err(err) => (format!("Timeout executing {}: {}", request.tool_name, err), true, false, TraceStatus::TimedOut, request.span.as_ref().map(|span| span.end_names.timeout)),
+                    Ok(Ok(res)) => (res, false, false, false),
+                    Ok(Err(err)) => (format!("Tool error: {}", err), true, false, false),
+                    Err(err) => (format!("Timeout executing {}: {}", request.tool_name, err), true, false, true),
                 }
             }
             _ = self.cancel_token.notified() => {
-                ("Tool execution interrupted by user.".to_string(), true, true, TraceStatus::Cancelled, request.span.as_ref().map(|span| span.end_names.cancelled))
+                ("Tool execution interrupted by user.".to_string(), true, true, false)
             }
         };
-
-        if let Some((span, span_config)) = invocation_span.take() {
-            span.finish(
-                end_name.unwrap_or(span_config.end_names.success),
-                trace_status,
-                Some(AgentContext::truncate_chars(&result, 240)),
-                merge_trace_attrs(
-                    span_config.end_attrs,
-                    merge_trace_attrs(
-                        request.origin.trace_attrs(),
-                        serde_json::json!({
-                            "tool_name": request.tool_name,
-                            "result_preview": AgentContext::truncate_chars(&result, 500),
-                            "result_size_chars": result.chars().count(),
-                        }),
-                    ),
-                ),
-            );
-        }
 
         ToolExecutionOutcome {
             result,
             is_error,
             stopped,
+            timed_out,
             guard_signal: None,
         }
     }
@@ -423,15 +333,5 @@ impl UnifiedToolExecutor {
             let remaining = deadline.saturating_duration_since(Instant::now());
             remaining.as_secs().max(1)
         })
-    }
-}
-
-fn merge_trace_attrs(base: Value, extra: Value) -> Value {
-    match (base, extra) {
-        (Value::Object(mut base), Value::Object(extra)) => {
-            base.extend(extra);
-            Value::Object(base)
-        }
-        (_, extra) => extra,
     }
 }

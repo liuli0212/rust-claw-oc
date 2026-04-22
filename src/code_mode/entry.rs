@@ -316,7 +316,6 @@ async fn run_invocation(
                     reply_to: config.reply_to.clone(),
                     step_budget: StepBudgetHandle::new(config.remaining_steps),
                     session_deadline: config.session_deadline,
-                    trace_bus: config.trace_bus.clone(),
                     cancel_token: config.cancel_token.clone(),
                     is_autopilot: config.is_autopilot,
                     todos_path: config.todos_path.clone(),
@@ -327,11 +326,11 @@ async fn run_invocation(
             let host_builder = crate::code_mode::host::create_executor_host_builder(
                 visible_tools,
                 tool_executor,
+                config.trace_bus.clone(),
                 config.iteration_trace_ctx.clone(),
                 cell_span_id,
                 call.id.clone(),
-                config.provider.clone(),
-                config.model.clone(),
+                (config.provider.clone(), config.model.clone()),
             );
 
             config

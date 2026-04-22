@@ -675,7 +675,6 @@ impl AgentLoop {
                 reply_to: self.reply_to.clone(),
                 step_budget,
                 session_deadline: self.session_deadline,
-                trace_bus: self.trace_bus.clone(),
                 cancel_token: self.cancel_token.clone(),
                 is_autopilot: self.is_autopilot,
                 todos_path: self.todos_path(),
@@ -816,15 +815,12 @@ impl AgentLoop {
                 .execute(crate::tools::invocation::ToolExecutionRequest {
                     tool_name: call.name.clone(),
                     args: call.args.clone(),
-                    origin: crate::tools::invocation::ToolCallOrigin::TopLevel {
-                        call_id: call.id.clone(),
-                    },
+                    origin: crate::tools::invocation::ToolCallOrigin::TopLevel,
                     timeout: Duration::from_secs(120),
                     trace_ctx: iteration_trace_ctx.clone(),
                     context_parent_span_id: tool_span
                         .as_ref()
                         .map(|span| span.span_id().to_string()),
-                    span: None,
                 })
                 .await;
             if let Some(span) = tool_span.take() {

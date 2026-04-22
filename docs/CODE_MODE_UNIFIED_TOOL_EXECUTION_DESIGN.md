@@ -100,8 +100,8 @@ The executor is the only owner of actual tool invocation policy. The service obs
 | Component | Owns | Must Not Own |
 | --- | --- | --- |
 | `runtime` | QuickJS setup, JS globals, wrapper script, stored value functions, timer functions, Promise bridge | Real tool list, policy decisions, trace policy |
-| `CellRuntimeHost` | Runtime-to-agent boundary, `ToolCallRequested` and `ToolCallDone` events, cancellation view, executor call | Session map, long-term cell publication policy |
-| `UnifiedToolExecutor` | Tool lookup, visibility, step budget, autopilot, guard, timeout, cancellation, trace span, `ToolContext`, real `Tool.execute` | JS runtime details, service session map, UI rendering |
+| `CellRuntimeHost` | Runtime-to-agent boundary, `ToolCallRequested` and `ToolCallDone` events, cancellation view, nested trace span, executor call | Session map, long-term cell publication policy |
+| `UnifiedToolExecutor` | Tool lookup, visibility, step budget, autopilot, guard, timeout, cancellation, `ToolContext`, real `Tool.execute` | JS runtime details, service session map, UI rendering, caller-specific trace span naming |
 | `CodeModeService` | Active cell, stored values, snapshots, wait/flush/auto_flush, abort, terminal cleanup | Direct nested tool fulfillment |
 | `AgentLoop` / core | LLM turn loop, output rendering, top-level tool result effects, context recording | Code-mode runtime internals |
 
@@ -114,15 +114,8 @@ Suggested final types:
 
 ```rust
 pub(crate) enum ToolCallOrigin {
-    TopLevel {
-        call_id: Option<String>,
-    },
-    CodeModeNested {
-        cell_id: String,
-        outer_tool_call_id: Option<String>,
-        request_id: String,
-        seq: u64,
-    },
+    TopLevel,
+    CodeModeNested,
 }
 
 pub(crate) struct ToolExecutionRequest {
@@ -131,14 +124,14 @@ pub(crate) struct ToolExecutionRequest {
     pub(crate) origin: ToolCallOrigin,
     pub(crate) timeout: std::time::Duration,
     pub(crate) trace_ctx: Option<crate::trace::TraceContext>,
-    pub(crate) parent_span_id: Option<String>,
-    pub(crate) span: Option<ToolInvocationSpanConfig>,
+    pub(crate) context_parent_span_id: Option<String>,
 }
 
 pub(crate) struct ToolExecutionOutcome {
     pub(crate) result: String,
     pub(crate) is_error: bool,
     pub(crate) stopped: bool,
+    pub(crate) timed_out: bool,
 }
 ```
 
@@ -153,7 +146,6 @@ pub(crate) struct UnifiedToolExecutor {
     reply_to: String,
     step_budget: StepBudgetHandle,
     session_deadline: Option<std::time::Instant>,
-    trace_bus: std::sync::Arc<crate::trace::TraceBus>,
     cancel_token: std::sync::Arc<tokio::sync::Notify>,
     is_autopilot: bool,
     todos_path: std::path::PathBuf,
@@ -179,7 +171,7 @@ Required behavior:
 - `execute` applies autopilot denial before consuming the step.
 - `execute` invokes exactly one `Tool.execute(args, &ToolContext).await` on success path.
 - `execute` applies timeout and cancellation around the real tool future.
-- `execute` records trace spans using origin-specific names and attributes.
+- `execute` propagates trace context and parent span id into `ToolContext`; callers own user-facing trace span names and attributes.
 - `execute` enriches `ToolContext` through all `ExecutionExtension`s before calling the tool.
 - `execute` returns a raw tool output string; callers decide how to render or record it.
 
@@ -527,6 +519,12 @@ Progress 2026-04-22:
 - Preserved existing trace event names for dashboard compatibility; nested calls remain distinguishable through `ToolCallOrigin::CodeModeNested` and the `code_mode_nested_tool_*` event names.
 - Added ownership comments at the runtime/host/executor boundary.
 - Finding: no trace event rename was needed for this refactor; changing ownership without changing event names kept the compatibility surface smaller.
+
+Progress 2026-04-22 simplification pass:
+
+- Removed the per-origin span configuration wrapper from `UnifiedToolExecutor`; top-level dispatch and `CellRuntimeHost` now own their own span names while the executor still passes the selected parent span through `ToolContext`.
+- Reduced `ToolCallOrigin` to the only distinction the executor needs: top-level versus code-mode nested. Cell/request metadata stays at the host trace boundary.
+- Finding: keeping publication state in `CodeModeService` as direct helper functions and keeping invocation trace naming at the caller removes several structs without changing the runtime event contract.
 
 ## Verification Matrix
 

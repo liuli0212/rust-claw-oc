@@ -6,11 +6,8 @@ use async_trait::async_trait;
 
 use super::protocol::{RuntimeEvent, ToolCallRequestEvent};
 use crate::context::AgentContext;
-use crate::tools::invocation::{
-    ToolCallOrigin, ToolExecutionRequest, ToolInvocationEndNames, ToolInvocationSpanConfig,
-    UnifiedToolExecutor,
-};
-use crate::trace::{TraceActor, TraceContext};
+use crate::tools::invocation::{ToolCallOrigin, ToolExecutionRequest, UnifiedToolExecutor};
+use crate::trace::{TraceActor, TraceBus, TraceContext, TraceStatus};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeToolRequest {
@@ -33,17 +30,19 @@ pub(crate) trait CellRuntimeHost: Send + Sync {
 pub(crate) fn create_executor_host_builder(
     visible_tools: Vec<String>,
     tool_executor: Arc<tokio::sync::Mutex<UnifiedToolExecutor>>,
+    trace_bus: Arc<TraceBus>,
     trace_ctx: Option<TraceContext>,
     parent_span_id: Option<String>,
     outer_tool_call_id: Option<String>,
-    provider: String,
-    model: String,
+    provider_model: (String, String),
 ) -> crate::code_mode::service::HostBuilder {
+    let (provider, model) = provider_model;
     Box::new(move |cell_id, event_tx, cancel_flag| {
         Arc::new(ExecutorCellRuntimeHost {
             cell_id,
             visible_tools,
             tool_executor,
+            trace_bus,
             trace_ctx,
             parent_span_id,
             outer_tool_call_id,
@@ -59,6 +58,7 @@ pub(crate) struct ExecutorCellRuntimeHost {
     cell_id: String,
     visible_tools: Vec<String>,
     tool_executor: Arc<tokio::sync::Mutex<UnifiedToolExecutor>>,
+    trace_bus: Arc<TraceBus>,
     trace_ctx: Option<TraceContext>,
     parent_span_id: Option<String>,
     outer_tool_call_id: Option<String>,
@@ -77,37 +77,15 @@ impl ExecutorCellRuntimeHost {
         });
     }
 
-    fn span_config(
-        &self,
-        request: &RuntimeToolRequest,
-        args: &serde_json::Value,
-    ) -> ToolInvocationSpanConfig {
-        let attrs = serde_json::json!({
+    fn tool_trace_attrs(&self, request: &RuntimeToolRequest) -> serde_json::Value {
+        serde_json::json!({
             "tool_name": request.tool_name,
             "cell_id": self.cell_id,
             "request_id": request.request_id,
             "outer_tool_call_id": self.outer_tool_call_id,
             "provider": self.provider,
             "model": self.model,
-        });
-        let mut start_attrs = attrs.clone();
-        start_attrs.as_object_mut().unwrap().insert(
-            "args_preview".to_string(),
-            serde_json::json!(AgentContext::truncate_chars(&args.to_string(), 500)),
-        );
-
-        ToolInvocationSpanConfig {
-            actor: TraceActor::Tool,
-            start_name: "code_mode_nested_tool_started",
-            start_attrs,
-            end_names: ToolInvocationEndNames {
-                success: "code_mode_nested_tool_finished",
-                error: "code_mode_nested_tool_failed",
-                timeout: "code_mode_nested_tool_timed_out",
-                cancelled: "code_mode_nested_tool_cancelled",
-            },
-            end_attrs: attrs,
-        }
+        })
     }
 }
 
@@ -150,25 +128,72 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
             ));
         }
 
+        let trace_attrs = self.tool_trace_attrs(&request);
+        let mut start_attrs = trace_attrs.clone();
+        if let Some(attrs) = start_attrs.as_object_mut() {
+            attrs.insert(
+                "args_preview".to_string(),
+                serde_json::json!(AgentContext::truncate_chars(&args.to_string(), 500)),
+            );
+        }
+        let tool_span = self.trace_ctx.as_ref().map(|trace_ctx| {
+            let span_ctx = trace_ctx.with_parent_span_id(self.parent_span_id.clone());
+            self.trace_bus.start_span(
+                &span_ctx,
+                TraceActor::Tool,
+                "code_mode_nested_tool_started",
+                start_attrs,
+            )
+        });
+        let context_parent_span_id = tool_span
+            .as_ref()
+            .map(|span| span.span_id().to_string())
+            .or_else(|| self.parent_span_id.clone());
+
         let outcome = {
             let executor = self.tool_executor.lock().await;
             executor
                 .execute(ToolExecutionRequest {
                     tool_name: request.tool_name.clone(),
                     args: args.clone(),
-                    origin: ToolCallOrigin::CodeModeNested {
-                        cell_id: self.cell_id.clone(),
-                        outer_tool_call_id: self.outer_tool_call_id.clone(),
-                        request_id: request.request_id.clone(),
-                        seq: request.seq,
-                    },
+                    origin: ToolCallOrigin::CodeModeNested,
                     timeout: Duration::from_secs(85),
                     trace_ctx: self.trace_ctx.clone(),
-                    context_parent_span_id: self.parent_span_id.clone(),
-                    span: Some(self.span_config(&request, &args)),
+                    context_parent_span_id,
                 })
                 .await
         };
+
+        if let Some(span) = tool_span {
+            let (event_name, status) = if outcome.stopped {
+                ("code_mode_nested_tool_cancelled", TraceStatus::Cancelled)
+            } else if outcome.timed_out {
+                ("code_mode_nested_tool_timed_out", TraceStatus::TimedOut)
+            } else if outcome.is_error {
+                ("code_mode_nested_tool_failed", TraceStatus::Error)
+            } else {
+                ("code_mode_nested_tool_finished", TraceStatus::Ok)
+            };
+            let mut end_attrs = trace_attrs;
+            if let Some(attrs) = end_attrs.as_object_mut() {
+                attrs.insert("origin".to_string(), serde_json::json!("code_mode_nested"));
+                attrs.insert("seq".to_string(), serde_json::json!(request.seq));
+                attrs.insert(
+                    "result_preview".to_string(),
+                    serde_json::json!(AgentContext::truncate_chars(&outcome.result, 500)),
+                );
+                attrs.insert(
+                    "result_size_chars".to_string(),
+                    serde_json::json!(outcome.result.chars().count()),
+                );
+            }
+            span.finish(
+                event_name,
+                status,
+                Some(AgentContext::truncate_chars(&outcome.result, 240)),
+                end_attrs,
+            );
+        }
 
         let ok = !outcome.stopped && !outcome.is_error;
         self.emit_tool_done(&request, ok);

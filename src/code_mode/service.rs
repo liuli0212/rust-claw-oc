@@ -23,6 +23,7 @@ pub struct CodeModeService {
 
 type SharedCellDriver = Arc<Mutex<CellDriver>>;
 type SharedCellHost = Arc<CellHostHandle>;
+type InitialSummaryTx = Option<oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>>;
 
 const INITIAL_NESTED_TOOL_PUBLICATION_DELAY: Duration = Duration::from_millis(150);
 
@@ -106,12 +107,6 @@ impl PublicationTracker {
         }
     }
 
-    fn observe_batch(&mut self, metadata: &BatchPublicationMetadata) {
-        if let Some(seq) = metadata.latest_progress_seq {
-            self.latest_progress_seq = self.latest_progress_seq.max(seq);
-        }
-    }
-
     fn has_unpublished_progress(&self) -> bool {
         self.latest_progress_seq > self.last_published_progress_seq
     }
@@ -137,35 +132,24 @@ impl PublicationTracker {
         self.last_published_progress_seq = self.latest_progress_seq;
         self.last_published_at = Instant::now();
     }
-}
 
-#[derive(Debug, Clone, Default)]
-struct BatchPublicationMetadata {
-    explicit_flush_value: Option<Option<Value>>,
-    latest_progress_seq: Option<u64>,
-}
-
-impl BatchPublicationMetadata {
-    fn from_batch(batch: &DriverEventBatch) -> Self {
-        let mut metadata = Self::default();
-
+    fn observe_batch(&mut self, batch: &DriverEventBatch) -> Option<Option<Value>> {
+        let mut explicit_flush_value = None;
         for event in &batch.events {
             match event {
                 crate::code_mode::protocol::RuntimeEvent::Text { seq, .. }
                 | crate::code_mode::protocol::RuntimeEvent::Notification { seq, .. } => {
-                    metadata.latest_progress_seq =
-                        Some(metadata.latest_progress_seq.unwrap_or_default().max(*seq));
+                    self.latest_progress_seq = self.latest_progress_seq.max(*seq);
                 }
                 crate::code_mode::protocol::RuntimeEvent::Flush { seq, value } => {
-                    metadata.explicit_flush_value = Some(value.clone());
-                    metadata.latest_progress_seq =
-                        Some(metadata.latest_progress_seq.unwrap_or_default().max(*seq));
+                    explicit_flush_value = Some(value.clone());
+                    self.latest_progress_seq = self.latest_progress_seq.max(*seq);
                 }
                 _ => {}
             }
         }
 
-        metadata
+        explicit_flush_value
     }
 }
 
@@ -177,34 +161,7 @@ enum HostExitDisposition {
     HostError {
         error: crate::tools::ToolError,
         summary: Option<ExecRunResult>,
-        request_id: Option<String>,
     },
-}
-
-struct InitialPublicationGate {
-    tx: Option<oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>>,
-}
-
-impl InitialPublicationGate {
-    fn new(tx: oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>) -> Self {
-        Self { tx: Some(tx) }
-    }
-
-    fn is_pending(&self) -> bool {
-        self.tx.is_some()
-    }
-
-    fn publish(&mut self, summary: &ExecRunResult) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(Ok(summary.clone()));
-        }
-    }
-
-    fn fail(&mut self, error: &crate::tools::ToolError) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(Err(clone_tool_error(error)));
-        }
-    }
 }
 
 fn clone_tool_error(error: &crate::tools::ToolError) -> crate::tools::ToolError {
@@ -222,6 +179,24 @@ fn clone_tool_error(error: &crate::tools::ToolError) -> crate::tools::ToolError 
         crate::tools::ToolError::IoError(err) => {
             crate::tools::ToolError::IoError(std::io::Error::new(err.kind(), err.to_string()))
         }
+    }
+}
+
+fn publish_initial(
+    tx: &mut Option<oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>>,
+    summary: &ExecRunResult,
+) {
+    if let Some(tx) = tx.take() {
+        let _ = tx.send(Ok(summary.clone()));
+    }
+}
+
+fn fail_initial(
+    tx: &mut Option<oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>>,
+    error: &crate::tools::ToolError,
+) {
+    if let Some(tx) = tx.take() {
+        let _ = tx.send(Err(clone_tool_error(error)));
     }
 }
 
@@ -414,14 +389,14 @@ impl CodeModeService {
         initial_summary_tx: oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>,
         mut cell_span: Option<crate::trace::TraceSpanHandle>,
     ) {
-        let mut initial_gate = InitialPublicationGate::new(initial_summary_tx);
+        let mut initial_summary_tx = Some(initial_summary_tx);
         let disposition = self
             .perform_cell_host_loop(
                 &session_id,
                 &cell_id,
                 &host_handle,
                 auto_flush_ms,
-                &mut initial_gate,
+                &mut initial_summary_tx,
             )
             .await;
 
@@ -438,7 +413,7 @@ impl CodeModeService {
         cell_id: &str,
         host_handle: &SharedCellHost,
         auto_flush_ms: Option<u64>,
-        initial_gate: &mut InitialPublicationGate,
+        initial_summary_tx: &mut InitialSummaryTx,
     ) -> HostExitDisposition {
         let mut publication_tracker = PublicationTracker::new(auto_flush_ms);
         let mut pending_initial_tool_summary: Option<(ExecRunResult, Instant)> = None;
@@ -466,9 +441,8 @@ impl CodeModeService {
                             session_id,
                             cell_id,
                             host_handle,
-                            initial_gate,
+                            initial_summary_tx,
                             err,
-                            None,
                         )
                         .await;
                 }
@@ -476,7 +450,7 @@ impl CodeModeService {
 
             if matches!(update.boundary, DriverBoundary::Idle) {
                 if let Some((summary, publish_at)) = pending_initial_tool_summary.as_ref() {
-                    if initial_gate.is_pending() && Instant::now() >= *publish_at {
+                    if initial_summary_tx.is_some() && Instant::now() >= *publish_at {
                         let summary = summary.clone();
                         pending_initial_tool_summary = None;
                         if let Err(err) = self
@@ -484,12 +458,12 @@ impl CodeModeService {
                                 session_id,
                                 cell_id,
                                 host_handle,
-                                initial_gate,
+                                initial_summary_tx,
                                 &summary,
                             )
                             .await
                         {
-                            return Self::fail_and_exit(initial_gate, err, None);
+                            return Self::fail_and_exit(initial_summary_tx, err);
                         }
                         continue;
                     }
@@ -504,7 +478,7 @@ impl CodeModeService {
                     .await
                 {
                     Ok(summary) => summary,
-                    Err(err) => return Self::fail_and_exit(initial_gate, err, None),
+                    Err(err) => return Self::fail_and_exit(initial_summary_tx, err),
                 };
                 publication_tracker.mark_published();
 
@@ -513,32 +487,29 @@ impl CodeModeService {
                         session_id,
                         cell_id,
                         host_handle,
-                        initial_gate,
+                        initial_summary_tx,
                         &summary,
                     )
                     .await
                 {
-                    return Self::fail_and_exit(initial_gate, err, None);
+                    return Self::fail_and_exit(initial_summary_tx, err);
                 }
                 continue;
             }
 
-            let batch_metadata = BatchPublicationMetadata::from_batch(&update.batch);
-            publication_tracker.observe_batch(&batch_metadata);
+            let explicit_flush_value = publication_tracker.observe_batch(&update.batch);
 
             let snapshot = match self
                 .record_driver_update_in_session(session_id, cell_id, &update)
                 .await
             {
                 Ok(snapshot) => snapshot,
-                Err(err) => return Self::fail_and_exit(initial_gate, err, None),
+                Err(err) => return Self::fail_and_exit(initial_summary_tx, err),
             };
 
             match update.boundary {
                 DriverBoundary::Progress => {
-                    let publication = if let Some(flush_value) =
-                        batch_metadata.explicit_flush_value.clone()
-                    {
+                    let publication = if let Some(flush_value) = explicit_flush_value {
                         publication_tracker.mark_published();
                         Some(
                             snapshot
@@ -558,12 +529,12 @@ impl CodeModeService {
                                 session_id,
                                 cell_id,
                                 host_handle,
-                                initial_gate,
+                                initial_summary_tx,
                                 &summary,
                             )
                             .await
                         {
-                            return Self::fail_and_exit(initial_gate, err, None);
+                            return Self::fail_and_exit(initial_summary_tx, err);
                         }
                     }
                 }
@@ -573,7 +544,7 @@ impl CodeModeService {
                             "Code mode entered a terminal state while dispatching a nested tool."
                                 .to_string(),
                         );
-                        return Self::fail_and_exit(initial_gate, err, None);
+                        return Self::fail_and_exit(initial_summary_tx, err);
                     }
 
                     let current_summary = snapshot.to_exec_result(None, None);
@@ -581,9 +552,9 @@ impl CodeModeService {
                         .publish_summary_update(session_id, cell_id, host_handle, &current_summary)
                         .await
                     {
-                        return Self::fail_and_exit(initial_gate, err, None);
+                        return Self::fail_and_exit(initial_summary_tx, err);
                     }
-                    if initial_gate.is_pending() {
+                    if initial_summary_tx.is_some() {
                         pending_initial_tool_summary = Some((
                             current_summary,
                             Instant::now() + INITIAL_NESTED_TOOL_PUBLICATION_DELAY,
@@ -597,12 +568,12 @@ impl CodeModeService {
                             session_id,
                             cell_id,
                             host_handle,
-                            initial_gate,
+                            initial_summary_tx,
                             &summary,
                         )
                         .await
                     {
-                        return Self::fail_and_exit(initial_gate, err, None);
+                        return Self::fail_and_exit(initial_summary_tx, err);
                     }
 
                     return HostExitDisposition::Terminal { summary };
@@ -715,15 +686,13 @@ impl CodeModeService {
     }
 
     fn fail_and_exit(
-        initial_gate: &mut InitialPublicationGate,
+        initial_summary_tx: &mut InitialSummaryTx,
         error: crate::tools::ToolError,
-        request_id: Option<String>,
     ) -> HostExitDisposition {
-        initial_gate.fail(&error);
+        fail_initial(initial_summary_tx, &error);
         HostExitDisposition::HostError {
             error,
             summary: None,
-            request_id,
         }
     }
 
@@ -732,9 +701,8 @@ impl CodeModeService {
         session_id: &str,
         cell_id: &str,
         host_handle: &SharedCellHost,
-        initial_gate: &mut InitialPublicationGate,
+        initial_summary_tx: &mut InitialSummaryTx,
         error: crate::tools::ToolError,
-        request_id: Option<String>,
     ) -> HostExitDisposition {
         let summary = self
             .record_host_error_in_session(session_id, cell_id, &error)
@@ -747,16 +715,12 @@ impl CodeModeService {
             {
                 tracing::warn!("Failed to publish host-error summary update: {}", err);
             }
-            initial_gate.publish(summary);
+            publish_initial(initial_summary_tx, summary);
         } else {
-            initial_gate.fail(&error);
+            fail_initial(initial_summary_tx, &error);
         }
 
-        HostExitDisposition::HostError {
-            error,
-            summary,
-            request_id,
-        }
+        HostExitDisposition::HostError { error, summary }
     }
 
     async fn publish_summary_and_unblock_initial(
@@ -764,40 +728,12 @@ impl CodeModeService {
         session_id: &str,
         cell_id: &str,
         host_handle: &SharedCellHost,
-        initial_gate: &mut InitialPublicationGate,
+        initial_summary_tx: &mut InitialSummaryTx,
         summary: &ExecRunResult,
     ) -> Result<(), crate::tools::ToolError> {
         self.publish_summary_update(session_id, cell_id, host_handle, summary)
             .await?;
-        initial_gate.publish(summary);
-        Ok(())
-    }
-
-    async fn store_publication_summary(
-        &self,
-        session_id: &str,
-        cell_id: &str,
-        summary: &ExecRunResult,
-    ) -> Result<(), crate::tools::ToolError> {
-        let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(session_id).ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(
-                "No code-mode session found for this session.".to_string(),
-            )
-        })?;
-        let active_cell = session.active_cell.as_mut().ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(
-                "No active code-mode cell to store progress for.".to_string(),
-            )
-        })?;
-        if active_cell.cell_id != cell_id {
-            return Err(crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was superseded before the publication summary was stored.",
-                cell_id
-            )));
-        }
-
-        active_cell.last_publication = Some(summary.clone());
+        publish_initial(initial_summary_tx, summary);
         Ok(())
     }
 
@@ -808,8 +744,25 @@ impl CodeModeService {
         host_handle: &SharedCellHost,
         summary: &ExecRunResult,
     ) -> Result<(), crate::tools::ToolError> {
-        self.store_publication_summary(session_id, cell_id, summary)
-            .await?;
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed(
+                "No code-mode session found for this session.".to_string(),
+            )
+        })?;
+        let active_cell = session.active_cell.as_mut().ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed(
+                "No active code-mode cell to publish progress for.".to_string(),
+            )
+        })?;
+        if active_cell.cell_id != cell_id {
+            return Err(crate::tools::ToolError::ExecutionFailed(format!(
+                "Code mode cell `{}` was superseded before the publication summary was stored.",
+                cell_id
+            )));
+        }
+
+        active_cell.last_publication = Some(summary.clone());
         host_handle.publish_update();
         Ok(())
     }
@@ -857,12 +810,8 @@ impl CodeModeService {
                     "nested_tool_calls": summary.nested_tool_calls,
                 }),
             ),
-            HostExitDisposition::HostError {
-                error,
-                summary,
-                request_id,
-            } => {
-                let mut attrs = if let Some(summary) = summary {
+            HostExitDisposition::HostError { error, summary } => {
+                let attrs = if let Some(summary) = summary {
                     serde_json::json!({
                         "cell_id": cell_id,
                         "lifecycle": summary.lifecycle.clone(),
@@ -877,10 +826,6 @@ impl CodeModeService {
                         "error": error.to_string(),
                     })
                 };
-
-                if let Some(request_id) = request_id {
-                    attrs["request_id"] = serde_json::json!(request_id);
-                }
 
                 if let Some(summary) = summary {
                     (
@@ -971,7 +916,6 @@ mod tests {
                 reply_to: "test".to_string(),
                 step_budget: crate::tools::invocation::StepBudgetHandle::new(10),
                 session_deadline: None,
-                trace_bus: crate::trace::shared_bus(),
                 cancel_token: Arc::new(Notify::new()),
                 is_autopilot: false,
                 todos_path: std::path::PathBuf::from("TODOS.md"),
@@ -983,11 +927,11 @@ mod tests {
         crate::code_mode::host::create_executor_host_builder(
             visible_tools,
             Arc::new(Mutex::new(executor)),
+            crate::trace::shared_bus(),
             None,
             None,
             None,
-            "test-provider".to_string(),
-            "test-model".to_string(),
+            ("test-provider".to_string(), "test-model".to_string()),
         )
     }
 
