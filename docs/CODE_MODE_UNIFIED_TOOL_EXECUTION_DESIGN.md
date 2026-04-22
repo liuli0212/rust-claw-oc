@@ -9,7 +9,7 @@ It is intended to guide implementation, review, and verification.
 
 - [x] Phase 0: Characterization tests added and baseline verified.
 - [x] Phase 1: Extract unified executor without behavior change.
-- [ ] Phase 2: Introduce `CellRuntimeHost` boundary.
+- [x] Phase 2: Introduce `CellRuntimeHost` boundary.
 - [ ] Phase 3: Replace sync tool result bridge with Promise/completion queue.
 - [ ] Phase 4: Simplify service and driver state.
 - [ ] Phase 5: Documentation and trace cleanup.
@@ -434,6 +434,13 @@ Exit criteria:
 - Runtime code has a single conceptual API for host calls.
 - Service code no longer knows how the runtime waits for tool results, even if the compatibility channel still exists internally.
 - Tests still pass.
+
+Progress 2026-04-22:
+
+- Added `src/code_mode/host.rs` with `CellRuntimeHost` and `RuntimeToolRequest`.
+- Routed runtime visible-tool discovery, runtime event emission, and cancellation observation through a host object instead of passing raw visible-tool/event plumbing into `runtime::run_cell`.
+- Kept the existing synchronous tool result bridge private to the driver/service path for this phase; `CellRuntimeHost::call_tool` is intentionally not wired until Phase 3.
+- Finding: the bridge can now be swapped at the runtime boundary without changing JavaScript wrapper semantics, but service still fulfills `DriverBoundary::PendingTool` until the Promise/completion work lands.
 
 ### Phase 3: Replace Sync Tool Result Bridge With Promise/Completion Queue
 

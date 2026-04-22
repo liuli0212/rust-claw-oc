@@ -20,12 +20,13 @@ pub mod value;
 const USER_CODE_MARKER: &str = "/*__RUSTY_CLAW_USER_CODE__*/";
 const WRAPPER_SCRIPT_TEMPLATE: &str = include_str!("wrapper.js");
 
-pub struct RunCellRequest {
-    pub code: String,
-    pub visible_tools: Vec<String>,
-    pub stored_values: HashMap<String, StoredValue>,
-    pub command_rx: std::sync::mpsc::Receiver<crate::code_mode::protocol::CellCommand>,
-    pub cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+pub(crate) struct RunCellRequest {
+    pub(crate) cell_id: String,
+    pub(crate) code: String,
+    pub(crate) stored_values: HashMap<String, StoredValue>,
+    pub(crate) host: Arc<dyn crate::code_mode::host::CellRuntimeHost>,
+    pub(crate) command_rx: std::sync::mpsc::Receiver<crate::code_mode::protocol::CellCommand>,
+    pub(crate) cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,11 +39,10 @@ struct RuntimeCompletionPayload {
     cancellation_reason: Option<String>,
 }
 
-pub fn run_cell<F>(
+pub(crate) fn run_cell<F>(
     handle: tokio::runtime::Handle,
     request: RunCellRequest,
     invoke_tool: F,
-    event_tx: tokio::sync::mpsc::UnboundedSender<crate::code_mode::protocol::RuntimeEvent>,
 ) -> Result<RuntimeTerminalResult, crate::tools::ToolError>
 where
     F: FnMut(String, String) -> Result<String, crate::tools::ToolError> + Send + 'static,
@@ -60,43 +60,44 @@ where
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
 
         let RunCellRequest {
+            cell_id,
             code,
-            visible_tools,
             stored_values,
+            host,
             command_rx,
             cancel_flag: _,
         } = request;
 
-        let event_tx_for_script = event_tx.clone();
         let next_seq_for_script = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let stored_values = Arc::new(Mutex::new(stored_values));
         let nested_tool_count = Arc::new(Mutex::new(0usize));
         let timer_calls = Arc::new(Mutex::new(Vec::<RecordedTimerCall>::new()));
         let invoke_tool = Arc::new(Mutex::new(invoke_tool));
-        let visible_tools_json = serde_json::to_string(&visible_tools)
+        let visible_tools_json = serde_json::to_string(&host.visible_tool_names())
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
+        let _ = host.cancellation_reason();
 
         let command_rx = Arc::new(Mutex::new(command_rx));
         let timer_clock_start = Arc::new(Instant::now());
 
-        let event_tx_for_script_captured = event_tx_for_script.clone();
         let next_seq_for_script_captured = next_seq_for_script.clone();
         let stored_values_for_script = stored_values.clone();
         let nested_tool_count_for_script = nested_tool_count.clone();
         let timer_calls_for_script = timer_calls.clone();
         let invoke_tool_for_script = invoke_tool.clone();
+        let host_for_script = host.clone();
 
         let return_payload = async_with!(context => |ctx| {
             let globals = ctx.globals();
 
-            let event_tx_for_text = event_tx_for_script_captured.clone();
+            let host_for_text = host_for_script.clone();
             let next_seq_for_text = next_seq_for_script_captured.clone();
             globals
                 .set(
                     format!("__{TEXT_FN}"),
                     Func::from(move |text: String| -> rquickjs::Result<()> {
-                        let _ = event_tx_for_text.send(crate::code_mode::protocol::RuntimeEvent::Text {
+                        host_for_text.emit_event(crate::code_mode::protocol::RuntimeEvent::Text {
                             seq: next_seq_for_text.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                             text,
                         });
@@ -105,13 +106,13 @@ where
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            let event_tx_for_notify = event_tx_for_script_captured.clone();
+            let host_for_notify = host_for_script.clone();
             let next_seq_for_notify = next_seq_for_script_captured.clone();
             globals
                 .set(
                     format!("__{NOTIFY_FN}"),
                     Func::from(move |message: String| -> rquickjs::Result<()> {
-                        let _ = event_tx_for_notify.send(crate::code_mode::protocol::RuntimeEvent::Notification {
+                        host_for_notify.emit_event(crate::code_mode::protocol::RuntimeEvent::Notification {
                             seq: next_seq_for_notify.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                             message,
                         });
@@ -120,7 +121,7 @@ where
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            let event_tx_for_flush = event_tx_for_script_captured.clone();
+            let host_for_flush = host_for_script.clone();
             let next_seq_for_flush = next_seq_for_script_captured.clone();
             globals
                 .set(
@@ -133,7 +134,7 @@ where
                                 .map_err(|err| Error::new_from_js_message("flush", "json", err.to_string()))?;
                             Some(v)
                         };
-                        let _ = event_tx_for_flush.send(crate::code_mode::protocol::RuntimeEvent::Flush {
+                        host_for_flush.emit_event(crate::code_mode::protocol::RuntimeEvent::Flush {
                             seq: next_seq_for_flush.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                             value: flush_value,
                         });
@@ -142,13 +143,13 @@ where
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            let event_tx_for_timer_wait = event_tx_for_script_captured.clone();
+            let host_for_timer_wait = host_for_script.clone();
             let next_seq_for_timer_wait = next_seq_for_script_captured.clone();
             globals
                 .set(
                     "__waiting_for_timer",
                     Func::from(move |resume_after_ms: Option<u64>| -> rquickjs::Result<()> {
-                        let _ = event_tx_for_timer_wait.send(crate::code_mode::protocol::RuntimeEvent::WaitingForTimer {
+                        host_for_timer_wait.emit_event(crate::code_mode::protocol::RuntimeEvent::WaitingForTimer {
                             seq: next_seq_for_timer_wait.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                             resume_after_ms,
                         });
@@ -185,17 +186,18 @@ where
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            let event_tx_for_tool = event_tx_for_script_captured.clone();
+            let host_for_tool = host_for_script.clone();
             let next_seq_for_tool = next_seq_for_script_captured.clone();
             let call_tool_ref = nested_tool_count_for_script.clone();
             let invoke_tool_ref = invoke_tool_for_script.clone();
+            let cell_id_for_tool = cell_id.clone();
             let call_tool = Function::new(
                 ctx.clone(),
                 MutFn::from(move |tool_name: String, args_json: String| -> rquickjs::Result<String> {
                     *call_tool_ref.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     let seq = next_seq_for_tool.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let request_id = format!("{}-{}", tool_name, seq);
-                    let _ = event_tx_for_tool.send(crate::code_mode::protocol::RuntimeEvent::ToolCallRequested(
+                    host_for_tool.emit_event(crate::code_mode::protocol::RuntimeEvent::ToolCallRequested(
                         crate::code_mode::protocol::ToolCallRequestEvent {
                             seq,
                             request_id: request_id.clone(),
@@ -203,6 +205,15 @@ where
                             args_json: args_json.clone(),
                         }
                     ));
+
+                    let _host_request = crate::code_mode::host::RuntimeToolRequest {
+                        cell_id: cell_id_for_tool.clone(),
+                        seq,
+                        request_id,
+                        tool_name: tool_name.clone(),
+                        args_json: args_json.clone(),
+                        outer_tool_call_id: None,
+                    };
 
                     let tool_result = {
                         let mut lock = invoke_tool_ref.lock().unwrap_or_else(|e| e.into_inner());

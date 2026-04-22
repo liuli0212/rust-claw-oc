@@ -119,6 +119,7 @@ impl CellDriver {
     /// sees the `ToolCallRequested`, calls
     /// the caller's async `invoke_tool`, and sends the result back.
     pub fn spawn_live(
+        cell_id: String,
         code: String,
         visible_tools: Vec<String>,
         stored_values: HashMap<String, runtime::value::StoredValue>,
@@ -138,15 +139,21 @@ impl CellDriver {
         let tool_call_in_flight_for_worker = tool_call_in_flight.clone();
 
         let event_tx_captured = event_tx.clone();
+        let host = Arc::new(crate::code_mode::host::EventBridgeHost::new(
+            visible_tools,
+            event_tx.clone(),
+            cancel_flag.clone(),
+        ));
 
         // spawn_blocking runs on a dedicated OS thread outside the async runtime.
         // run_cell calls block_on internally so it can drive the QuickJS async runtime
         // synchronously — QuickJS is not Send and cannot be moved across await points.
         let worker = tokio::task::spawn_blocking(move || {
             let request = runtime::RunCellRequest {
+                cell_id,
                 code,
-                visible_tools,
                 stored_values,
+                host,
                 command_rx,
                 cancel_flag: cancel_flag_for_worker,
             };
@@ -169,12 +176,7 @@ impl CellDriver {
                 result
             };
 
-            let result = runtime::run_cell(
-                tokio::runtime::Handle::current(),
-                request,
-                invoke_tool,
-                event_tx_captured.clone(),
-            );
+            let result = runtime::run_cell(tokio::runtime::Handle::current(), request, invoke_tool);
 
             let _ = event_tx_captured.send(RuntimeEvent::WorkerCompleted(
                 result.map_err(|e| e.to_string()),
@@ -276,12 +278,11 @@ impl CellDriver {
         self.tool_result_tx.send(result_for_js).map_err(|_| {
             crate::tools::ToolError::ExecutionFailed("Tool result channel closed".to_string())
         })?;
-        self.pending_events
-            .push_back(RuntimeEvent::ToolCallDone {
-                seq: request.seq,
-                request_id: request.request_id.clone(),
-                ok,
-            });
+        self.pending_events.push_back(RuntimeEvent::ToolCallDone {
+            seq: request.seq,
+            request_id: request.request_id.clone(),
+            ok,
+        });
         Ok(())
     }
 
@@ -330,6 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_driver_cancels_infinite_loop_and_thread_exits() {
         let mut driver = CellDriver::spawn_live(
+            "test-cell".to_string(),
             "while(true) {}".to_string(),
             vec![],
             HashMap::new(),
