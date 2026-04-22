@@ -6,7 +6,6 @@ pub mod integrations;
 pub(crate) mod invocation;
 pub mod lsp;
 pub mod memory;
-pub(crate) mod policy;
 pub mod protocol;
 pub mod sandbox;
 pub mod scheduler;

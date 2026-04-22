@@ -662,7 +662,7 @@ impl AgentLoop {
     }
 
     fn is_code_mode_nested_tool(tool_name: &str) -> bool {
-        crate::tools::policy::is_code_mode_nested_tool(tool_name)
+        crate::tools::invocation::is_code_mode_nested_tool(tool_name)
     }
 
     fn build_tool_executor_with_budget(

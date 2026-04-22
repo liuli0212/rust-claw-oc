@@ -225,6 +225,15 @@ fn clone_tool_error(error: &crate::tools::ToolError) -> crate::tools::ToolError 
     }
 }
 
+pub(crate) type HostBuilder = Box<
+    dyn FnOnce(
+            String,
+            tokio::sync::mpsc::UnboundedSender<crate::code_mode::protocol::RuntimeEvent>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) -> Arc<dyn crate::code_mode::host::CellRuntimeHost>
+        + Send,
+>;
+
 impl CodeModeService {
     /// Execute a new code-mode cell. Spawns a live JS runtime worker, performs
     /// an initial background update, and returns the first published
@@ -234,7 +243,7 @@ impl CodeModeService {
         session_id: &str,
         code: &str,
         auto_flush_ms: Option<u64>,
-        host_factory: crate::code_mode::host::ExecutorCellRuntimeHostFactory,
+        host_builder: HostBuilder,
         cell_span: Option<crate::trace::TraceSpanHandle>,
     ) -> Result<ExecRunResult, crate::tools::ToolError> {
         let (cell_id, host_handle) = {
@@ -263,7 +272,7 @@ impl CodeModeService {
             session.next_cell_seq += 1;
             let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
             let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let host = host_factory.build(cell_id.clone(), event_tx.clone(), cancel_flag.clone());
+            let host = host_builder(cell_id.clone(), event_tx.clone(), cancel_flag.clone());
             let driver = CellDriver::spawn_live_with_host(
                 code.to_string(),
                 session.stored_values.clone(),
@@ -956,7 +965,7 @@ mod tests {
     fn host_factory(
         visible_tools: Vec<String>,
         current_tools: Vec<Arc<dyn Tool>>,
-    ) -> crate::code_mode::host::ExecutorCellRuntimeHostFactory {
+    ) -> crate::code_mode::service::HostBuilder {
         let executor = crate::tools::invocation::UnifiedToolExecutor::new(
             crate::tools::invocation::UnifiedToolExecutorConfig {
                 current_tools,
@@ -975,15 +984,20 @@ mod tests {
                 )),
             },
         );
-        crate::code_mode::host::ExecutorCellRuntimeHostFactory::new(
-            visible_tools,
-            Arc::new(Mutex::new(executor)),
-            None,
-            None,
-            None,
-            "test-provider".to_string(),
-            "test-model".to_string(),
-        )
+        Box::new(move |cell_id, event_tx, cancel_flag| {
+            Arc::new(crate::code_mode::host::ExecutorCellRuntimeHost {
+                cell_id,
+                visible_tools: visible_tools.clone(),
+                tool_executor: Arc::new(Mutex::new(executor)),
+                trace_ctx: None,
+                parent_span_id: None,
+                outer_tool_call_id: None,
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                event_tx,
+                cancel_flag,
+            })
+        })
     }
 
     #[tokio::test]

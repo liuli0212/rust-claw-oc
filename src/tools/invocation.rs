@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,6 +11,20 @@ use crate::core::extensions::ExecutionExtension;
 use crate::core::{ExecutionGuardSignal, ExecutionGuardState};
 use crate::tools::{Tool, ToolContext};
 use crate::trace::{TraceActor, TraceBus, TraceContext, TraceStatus};
+
+pub(crate) fn is_code_mode_nested_tool(tool_name: &str) -> bool {
+    !matches!(
+        tool_name,
+        "exec"
+            | "wait"
+            | "finish_task"
+            | "ask_user_question"
+            | "subagent"
+            | "task_plan"
+            | "manage_schedule"
+            | "send_telegram_message"
+    )
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum ToolCallOrigin {
@@ -104,35 +119,33 @@ pub(crate) struct ToolExecutionRequest {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct StepBudgetHandle(Arc<Mutex<StepBudgetState>>);
-
-#[derive(Debug)]
-pub(crate) struct StepBudgetState {
-    remaining_steps: usize,
-}
+pub(crate) struct StepBudgetHandle(Arc<AtomicUsize>);
 
 impl StepBudgetHandle {
     pub(crate) fn new(remaining_steps: usize) -> Self {
-        Self(Arc::new(Mutex::new(StepBudgetState { remaining_steps })))
+        Self(Arc::new(AtomicUsize::new(remaining_steps)))
     }
 
     pub(crate) fn remaining_steps(&self) -> usize {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remaining_steps
+        self.0.load(Ordering::Relaxed)
     }
 
     fn try_consume(&self) -> bool {
-        let mut state = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.remaining_steps == 0 {
-            return false;
+        let mut current = self.0.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match self.0.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(v) => current = v,
+            }
         }
-        state.remaining_steps -= 1;
-        true
     }
 }
 

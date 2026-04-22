@@ -106,11 +106,11 @@ impl CellDriver {
     ) -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let host = Arc::new(crate::code_mode::host::EventBridgeHost::new(
+        let host = Arc::new(crate::code_mode::host::EventBridgeHost {
             visible_tools,
-            event_tx.clone(),
-            cancel_flag.clone(),
-        ));
+            event_tx: event_tx.clone(),
+            cancel_flag: cancel_flag.clone(),
+        });
         Self::spawn_live_with_host(code, stored_values, host, event_tx, event_rx, cancel_flag)
     }
 

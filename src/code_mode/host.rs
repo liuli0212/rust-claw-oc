@@ -24,21 +24,16 @@ pub(crate) struct RuntimeToolRequest {
 
 #[async_trait]
 pub(crate) trait CellRuntimeHost: Send + Sync {
-    // Runtime-facing boundary: QuickJS can emit events and request tools here,
-    // but it never sees the real tool registry or service session state.
     fn visible_tool_names(&self) -> Vec<String>;
-
     fn emit_event(&self, event: RuntimeEvent);
-
     fn cancellation_reason(&self) -> Option<String>;
-
     async fn call_tool(
         &self,
         request: RuntimeToolRequest,
     ) -> Result<String, crate::tools::ToolError>;
 }
 
-pub(crate) struct ExecutorCellRuntimeHostFactory {
+pub(crate) fn create_executor_host_builder(
     visible_tools: Vec<String>,
     tool_executor: Arc<tokio::sync::Mutex<UnifiedToolExecutor>>,
     trace_ctx: Option<TraceContext>,
@@ -46,19 +41,10 @@ pub(crate) struct ExecutorCellRuntimeHostFactory {
     outer_tool_call_id: Option<String>,
     provider: String,
     model: String,
-}
-
-impl ExecutorCellRuntimeHostFactory {
-    pub(crate) fn new(
-        visible_tools: Vec<String>,
-        tool_executor: Arc<tokio::sync::Mutex<UnifiedToolExecutor>>,
-        trace_ctx: Option<TraceContext>,
-        parent_span_id: Option<String>,
-        outer_tool_call_id: Option<String>,
-        provider: String,
-        model: String,
-    ) -> Self {
-        Self {
+) -> crate::code_mode::service::HostBuilder {
+    Box::new(move |cell_id, event_tx, cancel_flag| {
+        Arc::new(ExecutorCellRuntimeHost {
+            cell_id,
             visible_tools,
             tool_executor,
             trace_ctx,
@@ -66,41 +52,23 @@ impl ExecutorCellRuntimeHostFactory {
             outer_tool_call_id,
             provider,
             model,
-        }
-    }
-
-    pub(crate) fn build(
-        self,
-        cell_id: String,
-        event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-        cancel_flag: Arc<AtomicBool>,
-    ) -> Arc<dyn CellRuntimeHost> {
-        Arc::new(ExecutorCellRuntimeHost {
-            cell_id,
-            visible_tools: self.visible_tools,
-            tool_executor: self.tool_executor,
-            trace_ctx: self.trace_ctx,
-            parent_span_id: self.parent_span_id,
-            outer_tool_call_id: self.outer_tool_call_id,
-            provider: self.provider,
-            model: self.model,
             event_tx,
             cancel_flag,
         })
-    }
+    })
 }
 
 pub(crate) struct ExecutorCellRuntimeHost {
-    cell_id: String,
-    visible_tools: Vec<String>,
-    tool_executor: Arc<tokio::sync::Mutex<UnifiedToolExecutor>>,
-    trace_ctx: Option<TraceContext>,
-    parent_span_id: Option<String>,
-    outer_tool_call_id: Option<String>,
-    provider: String,
-    model: String,
-    event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-    cancel_flag: Arc<AtomicBool>,
+    pub(crate) cell_id: String,
+    pub(crate) visible_tools: Vec<String>,
+    pub(crate) tool_executor: Arc<tokio::sync::Mutex<UnifiedToolExecutor>>,
+    pub(crate) trace_ctx: Option<TraceContext>,
+    pub(crate) parent_span_id: Option<String>,
+    pub(crate) outer_tool_call_id: Option<String>,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    pub(crate) cancel_flag: Arc<AtomicBool>,
 }
 
 impl ExecutorCellRuntimeHost {
@@ -117,32 +85,31 @@ impl ExecutorCellRuntimeHost {
         request: &RuntimeToolRequest,
         args: &serde_json::Value,
     ) -> ToolInvocationSpanConfig {
+        let attrs = serde_json::json!({
+            "tool_name": request.tool_name,
+            "cell_id": request.cell_id,
+            "request_id": request.request_id,
+            "outer_tool_call_id": request.outer_tool_call_id,
+            "provider": self.provider,
+            "model": self.model,
+        });
+        let mut start_attrs = attrs.clone();
+        start_attrs.as_object_mut().unwrap().insert(
+            "args_preview".to_string(),
+            serde_json::json!(AgentContext::truncate_chars(&args.to_string(), 500)),
+        );
+
         ToolInvocationSpanConfig {
             actor: TraceActor::Tool,
             start_name: "code_mode_nested_tool_started",
-            start_attrs: serde_json::json!({
-                "tool_name": request.tool_name.clone(),
-                "cell_id": request.cell_id.clone(),
-                "request_id": request.request_id.clone(),
-                "outer_tool_call_id": request.outer_tool_call_id.clone(),
-                "provider": self.provider.clone(),
-                "model": self.model.clone(),
-                "args_preview": AgentContext::truncate_chars(&args.to_string(), 500),
-            }),
+            start_attrs,
             end_names: ToolInvocationEndNames {
                 success: "code_mode_nested_tool_finished",
                 error: "code_mode_nested_tool_failed",
                 timeout: "code_mode_nested_tool_timed_out",
                 cancelled: "code_mode_nested_tool_cancelled",
             },
-            end_attrs: serde_json::json!({
-                "tool_name": request.tool_name.clone(),
-                "cell_id": request.cell_id.clone(),
-                "request_id": request.request_id.clone(),
-                "outer_tool_call_id": request.outer_tool_call_id.clone(),
-                "provider": self.provider.clone(),
-                "model": self.model.clone(),
-            }),
+            end_attrs: attrs,
         }
     }
 }
@@ -227,24 +194,9 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
 
 #[cfg(test)]
 pub(crate) struct EventBridgeHost {
-    visible_tools: Vec<String>,
-    event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-    cancel_flag: Arc<AtomicBool>,
-}
-
-#[cfg(test)]
-impl EventBridgeHost {
-    pub(crate) fn new(
-        visible_tools: Vec<String>,
-        event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
-        cancel_flag: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            visible_tools,
-            event_tx,
-            cancel_flag,
-        }
-    }
+    pub(crate) visible_tools: Vec<String>,
+    pub(crate) event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+    pub(crate) cancel_flag: Arc<AtomicBool>,
 }
 
 #[cfg(test)]

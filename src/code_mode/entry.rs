@@ -65,7 +65,7 @@ pub(crate) async fn dispatch_tool_call(
         .current_tools
         .iter()
         .map(|tool| tool.name())
-        .filter(|name| crate::tools::policy::is_code_mode_nested_tool(name))
+        .filter(|name| crate::tools::invocation::is_code_mode_nested_tool(name))
         .collect();
 
     record_trace_event(
@@ -323,7 +323,8 @@ async fn run_invocation(
                     execution_guard_state: config.execution_guard_state.clone(),
                 },
             )));
-            let host_factory = crate::code_mode::host::ExecutorCellRuntimeHostFactory::new(
+
+            let host_builder = crate::code_mode::host::create_executor_host_builder(
                 visible_tools,
                 tool_executor,
                 config.iteration_trace_ctx.clone(),
@@ -339,7 +340,7 @@ async fn run_invocation(
                     &config.session_id,
                     &parsed.code,
                     parsed.auto_flush_ms,
-                    host_factory,
+                    host_builder,
                     cell_span,
                 )
                 .await
