@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rquickjs::async_with;
-use rquickjs::prelude::{Func, MutFn, Promise};
+use rquickjs::function::Async;
+use rquickjs::prelude::{Func, Promise};
 use rquickjs::{AsyncContext, AsyncRuntime, Error, Function};
 use serde::Deserialize;
 
@@ -21,7 +22,6 @@ const USER_CODE_MARKER: &str = "/*__RUSTY_CLAW_USER_CODE__*/";
 const WRAPPER_SCRIPT_TEMPLATE: &str = include_str!("wrapper.js");
 
 pub(crate) struct RunCellRequest {
-    pub(crate) cell_id: String,
     pub(crate) code: String,
     pub(crate) stored_values: HashMap<String, StoredValue>,
     pub(crate) host: Arc<dyn crate::code_mode::host::CellRuntimeHost>,
@@ -39,14 +39,10 @@ struct RuntimeCompletionPayload {
     cancellation_reason: Option<String>,
 }
 
-pub(crate) fn run_cell<F>(
+pub(crate) fn run_cell(
     handle: tokio::runtime::Handle,
     request: RunCellRequest,
-    invoke_tool: F,
-) -> Result<RuntimeTerminalResult, crate::tools::ToolError>
-where
-    F: FnMut(String, String) -> Result<String, crate::tools::ToolError> + Send + 'static,
-{
+) -> Result<RuntimeTerminalResult, crate::tools::ToolError> {
     handle.block_on(async move {
         let runtime = AsyncRuntime::new()
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
@@ -60,7 +56,6 @@ where
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
 
         let RunCellRequest {
-            cell_id,
             code,
             stored_values,
             host,
@@ -73,7 +68,6 @@ where
         let stored_values = Arc::new(Mutex::new(stored_values));
         let nested_tool_count = Arc::new(Mutex::new(0usize));
         let timer_calls = Arc::new(Mutex::new(Vec::<RecordedTimerCall>::new()));
-        let invoke_tool = Arc::new(Mutex::new(invoke_tool));
         let visible_tools_json = serde_json::to_string(&host.visible_tool_names())
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
         let _ = host.cancellation_reason();
@@ -85,7 +79,6 @@ where
         let stored_values_for_script = stored_values.clone();
         let nested_tool_count_for_script = nested_tool_count.clone();
         let timer_calls_for_script = timer_calls.clone();
-        let invoke_tool_for_script = invoke_tool.clone();
         let host_for_script = host.clone();
 
         let return_payload = async_with!(context => |ctx| {
@@ -189,25 +182,15 @@ where
             let host_for_tool = host_for_script.clone();
             let next_seq_for_tool = next_seq_for_script_captured.clone();
             let call_tool_ref = nested_tool_count_for_script.clone();
-            let invoke_tool_ref = invoke_tool_for_script.clone();
-            let cell_id_for_tool = cell_id.clone();
             let call_tool = Function::new(
                 ctx.clone(),
-                MutFn::from(move |tool_name: String, args_json: String| -> rquickjs::Result<String> {
+                Async(move |tool_name: String, args_json: String| {
                     *call_tool_ref.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     let seq = next_seq_for_tool.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let request_id = format!("{}-{}", tool_name, seq);
-                    host_for_tool.emit_event(crate::code_mode::protocol::RuntimeEvent::ToolCallRequested(
-                        crate::code_mode::protocol::ToolCallRequestEvent {
-                            seq,
-                            request_id: request_id.clone(),
-                            tool_name: tool_name.clone(),
-                            args_json: args_json.clone(),
-                        }
-                    ));
-
-                    let _host_request = crate::code_mode::host::RuntimeToolRequest {
-                        cell_id: cell_id_for_tool.clone(),
+                    let host = host_for_tool.clone();
+                    let request = crate::code_mode::host::RuntimeToolRequest {
+                        cell_id: String::new(),
                         seq,
                         request_id,
                         tool_name: tool_name.clone(),
@@ -215,23 +198,15 @@ where
                         outer_tool_call_id: None,
                     };
 
-                    let tool_result = {
-                        let mut lock = invoke_tool_ref.lock().unwrap_or_else(|e| e.into_inner());
-                        (lock)(tool_name.clone(), args_json.clone())
-                    };
-
-                    let result_json = match tool_result {
-                        Ok(result_json) => result_json,
-                        Err(err) => {
-                            let tool_err: crate::tools::ToolError = err;
-                            serde_json::json!({
-                                "__rustyClawToolError": tool_err.to_string()
+                    async move {
+                        match host.call_tool(request).await {
+                            Ok(result_json) => result_json,
+                            Err(err) => serde_json::json!({
+                                "__rustyClawToolError": err.to_string()
                             })
-                            .to_string()
+                            .to_string(),
                         }
-                    };
-
-                    Ok(result_json)
+                    }
                 }),
             )
             .map_err(js_error_to_tool_error)?

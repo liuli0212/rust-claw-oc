@@ -4,12 +4,12 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-use super::executor::{CodeModeNestedToolExecutor, CodeModeNestedToolExecutorConfig};
 use crate::code_mode::response::{ExecLifecycle, ExecProgressKind};
 use crate::context::FunctionCall;
 use crate::core::extensions::ExecutionExtension;
 use crate::core::{AgentOutput, ExecutionGuardState, ToolDispatchOutcome};
 use crate::tools::code_mode::{ExecArgs, WaitArgs};
+use crate::tools::invocation::{StepBudgetHandle, UnifiedToolExecutor, UnifiedToolExecutorConfig};
 use crate::tools::protocol::StructuredToolOutput;
 use crate::tools::Tool;
 use crate::trace::{TraceActor, TraceBus, TraceContext, TraceSpanHandle, TraceStatus};
@@ -307,36 +307,31 @@ async fn run_invocation(
                 )
             });
             let cell_span_id = cell_span.as_ref().map(span_id_string);
-            let nested_executor = Arc::new(tokio::sync::Mutex::new(
-                CodeModeNestedToolExecutor::new(CodeModeNestedToolExecutorConfig {
+            let tool_executor = Arc::new(tokio::sync::Mutex::new(UnifiedToolExecutor::new(
+                UnifiedToolExecutorConfig {
                     current_tools: config.current_tools.clone(),
                     visible_tools: visible_tools.clone(),
                     extensions: config.extensions.clone(),
                     session_id: config.session_id.clone(),
                     reply_to: config.reply_to.clone(),
-                    remaining_steps: config.remaining_steps,
+                    step_budget: StepBudgetHandle::new(config.remaining_steps),
                     session_deadline: config.session_deadline,
-                    iteration_trace_ctx: config.iteration_trace_ctx.clone(),
-                    parent_span_id: cell_span_id,
-                    outer_tool_call_id: call.id.clone(),
                     trace_bus: config.trace_bus.clone(),
-                    provider: config.provider.clone(),
-                    model: config.model.clone(),
                     cancel_token: config.cancel_token.clone(),
                     is_autopilot: config.is_autopilot,
                     todos_path: config.todos_path.clone(),
                     execution_guard_state: config.execution_guard_state.clone(),
-                }),
-            ));
-
-            let invoke_tool = move |tool_name: String, args_json: String| {
-                let nested_executor = nested_executor.clone();
-                async move {
-                    let mut executor = nested_executor.lock().await;
-                    let raw = executor.execute_json(tool_name, args_json).await?;
-                    Ok(crate::code_mode::runtime::value::normalize_tool_result_for_js(&raw))
-                }
-            };
+                },
+            )));
+            let host_factory = crate::code_mode::host::ExecutorCellRuntimeHostFactory::new(
+                visible_tools,
+                tool_executor,
+                config.iteration_trace_ctx.clone(),
+                cell_span_id,
+                call.id.clone(),
+                config.provider.clone(),
+                config.model.clone(),
+            );
 
             config
                 .service
@@ -344,8 +339,7 @@ async fn run_invocation(
                     &config.session_id,
                     &parsed.code,
                     parsed.auto_flush_ms,
-                    visible_tools,
-                    invoke_tool,
+                    host_factory,
                     cell_span,
                 )
                 .await

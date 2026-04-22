@@ -111,46 +111,47 @@ impl DriverUpdate {
 }
 
 impl CellDriver {
-    /// Spawn a live cell driver.
-    ///
-    /// The worker thread uses a channel-based `invoke_tool` bridge: when JS
-    /// calls `tools.X()`, the worker emits a `ToolCallRequested` event and
-    /// blocks waiting for a result on `tool_result_rx`. The host update loop
-    /// sees the `ToolCallRequested`, calls
-    /// the caller's async `invoke_tool`, and sends the result back.
+    #[cfg(test)]
     pub fn spawn_live(
-        cell_id: String,
+        _cell_id: String,
         code: String,
         visible_tools: Vec<String>,
         stored_values: HashMap<String, runtime::value::StoredValue>,
     ) -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Use a std::sync channel for tool results so the blocking worker can
-        // call recv() without entering an async runtime.
-        let (tool_result_tx, tool_result_rx) =
-            std::sync::mpsc::channel::<Result<String, crate::tools::ToolError>>();
-
-        let (command_tx, command_rx) =
-            std::sync::mpsc::channel::<crate::code_mode::protocol::CellCommand>();
-
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let cancel_flag_for_worker = cancel_flag.clone();
-        let tool_call_in_flight = Arc::new(AtomicBool::new(false));
-        let tool_call_in_flight_for_worker = tool_call_in_flight.clone();
-
-        let event_tx_captured = event_tx.clone();
         let host = Arc::new(crate::code_mode::host::EventBridgeHost::new(
             visible_tools,
             event_tx.clone(),
             cancel_flag.clone(),
         ));
+        Self::spawn_live_with_host(code, stored_values, host, event_tx, event_rx, cancel_flag)
+    }
+
+    pub fn spawn_live_with_host(
+        code: String,
+        stored_values: HashMap<String, runtime::value::StoredValue>,
+        host: Arc<dyn crate::code_mode::host::CellRuntimeHost>,
+        event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+        event_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
+        cancel_flag: Arc<AtomicBool>,
+    ) -> Self {
+        let (tool_result_tx, _tool_result_rx) =
+            std::sync::mpsc::channel::<Result<String, crate::tools::ToolError>>();
+
+        let (command_tx, command_rx) =
+            std::sync::mpsc::channel::<crate::code_mode::protocol::CellCommand>();
+
+        let cancel_flag_for_worker = cancel_flag.clone();
+        let tool_call_in_flight = Arc::new(AtomicBool::new(false));
+
+        let event_tx_captured = event_tx.clone();
 
         // spawn_blocking runs on a dedicated OS thread outside the async runtime.
         // run_cell calls block_on internally so it can drive the QuickJS async runtime
         // synchronously — QuickJS is not Send and cannot be moved across await points.
         let worker = tokio::task::spawn_blocking(move || {
             let request = runtime::RunCellRequest {
-                cell_id,
                 code,
                 stored_values,
                 host,
@@ -158,25 +159,7 @@ impl CellDriver {
                 cancel_flag: cancel_flag_for_worker,
             };
 
-            // Build a synchronous invoke_tool that simply blocks waiting for
-            // the host update loop to fulfill the tool call. The runtime's __callTool
-            // already emits the ToolCallRequested event via event_tx, so the
-            // host update loop will see it, call the real invoke_tool, and send the
-            // result back here.
-            let invoke_tool = move |_tool_name: String,
-                                    _args_json: String|
-                  -> Result<String, crate::tools::ToolError> {
-                tool_call_in_flight_for_worker.store(true, Ordering::Release);
-                let result = tool_result_rx.recv().unwrap_or_else(|_| {
-                    Err(crate::tools::ToolError::ExecutionFailed(
-                        "Tool result channel closed".to_string(),
-                    ))
-                });
-                tool_call_in_flight_for_worker.store(false, Ordering::Release);
-                result
-            };
-
-            let result = runtime::run_cell(tokio::runtime::Handle::current(), request, invoke_tool);
+            let result = runtime::run_cell(tokio::runtime::Handle::current(), request);
 
             let _ = event_tx_captured.send(RuntimeEvent::WorkerCompleted(
                 result.map_err(|e| e.to_string()),

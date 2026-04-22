@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,6 +23,8 @@ pub struct CodeModeService {
 
 type SharedCellDriver = Arc<Mutex<CellDriver>>;
 type SharedCellHost = Arc<CellHostHandle>;
+
+const INITIAL_NESTED_TOOL_PUBLICATION_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Default)]
 struct SessionState {
@@ -228,19 +229,14 @@ impl CodeModeService {
     /// Execute a new code-mode cell. Spawns a live JS runtime worker, performs
     /// an initial background update, and returns the first published
     /// `ExecRunResult` suitable for the LLM.
-    pub async fn execute<F, Fut>(
+    pub async fn execute(
         &self,
         session_id: &str,
         code: &str,
         auto_flush_ms: Option<u64>,
-        visible_tools: Vec<String>,
-        invoke_tool: F,
+        host_factory: crate::code_mode::host::ExecutorCellRuntimeHostFactory,
         cell_span: Option<crate::trace::TraceSpanHandle>,
-    ) -> Result<ExecRunResult, crate::tools::ToolError>
-    where
-        F: FnMut(String, String) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<String, crate::tools::ToolError>> + Send + 'static,
-    {
+    ) -> Result<ExecRunResult, crate::tools::ToolError> {
         let (cell_id, host_handle) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions.entry(session_id.to_string()).or_default();
@@ -265,11 +261,16 @@ impl CodeModeService {
 
             let cell_id = format!("cell-{}", session.next_cell_seq);
             session.next_cell_seq += 1;
-            let driver = CellDriver::spawn_live(
-                cell_id.clone(),
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let host = host_factory.build(cell_id.clone(), event_tx.clone(), cancel_flag.clone());
+            let driver = CellDriver::spawn_live_with_host(
                 code.to_string(),
-                visible_tools,
                 session.stored_values.clone(),
+                host,
+                event_tx,
+                event_rx,
+                cancel_flag,
             );
             let driver_control = driver.control_handle();
             let driver_handle = Arc::new(Mutex::new(driver));
@@ -293,7 +294,6 @@ impl CodeModeService {
                     cell_id_owned,
                     host_handle_for_task,
                     auto_flush_ms,
-                    invoke_tool,
                     initial_summary_tx,
                     cell_span,
                 )
@@ -396,20 +396,15 @@ impl CodeModeService {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn run_cell_host<F, Fut>(
+    async fn run_cell_host(
         self,
         session_id: String,
         cell_id: String,
         host_handle: SharedCellHost,
         auto_flush_ms: Option<u64>,
-        mut invoke_tool: F,
         initial_summary_tx: oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>,
         mut cell_span: Option<crate::trace::TraceSpanHandle>,
-    ) where
-        F: FnMut(String, String) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<String, crate::tools::ToolError>> + Send + 'static,
-    {
+    ) {
         let mut initial_gate = InitialPublicationGate::new(initial_summary_tx);
         let disposition = self
             .perform_cell_host_loop(
@@ -417,7 +412,6 @@ impl CodeModeService {
                 &cell_id,
                 &host_handle,
                 auto_flush_ms,
-                &mut invoke_tool,
                 &mut initial_gate,
             )
             .await;
@@ -429,27 +423,30 @@ impl CodeModeService {
         }
     }
 
-    async fn perform_cell_host_loop<F, Fut>(
+    async fn perform_cell_host_loop(
         &self,
         session_id: &str,
         cell_id: &str,
         host_handle: &SharedCellHost,
         auto_flush_ms: Option<u64>,
-        invoke_tool: &mut F,
         initial_gate: &mut InitialPublicationGate,
-    ) -> HostExitDisposition
-    where
-        F: FnMut(String, String) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<String, crate::tools::ToolError>> + Send + 'static,
-    {
+    ) -> HostExitDisposition {
         let mut publication_tracker = PublicationTracker::new(auto_flush_ms);
+        let mut pending_initial_tool_summary: Option<(ExecRunResult, Instant)> = None;
 
         loop {
+            let mut idle_timeout = publication_tracker.next_idle_timeout();
+            if let Some((_, publish_at)) = pending_initial_tool_summary.as_ref() {
+                let until_initial_publish = publish_at.saturating_duration_since(Instant::now());
+                idle_timeout = Some(match idle_timeout {
+                    Some(existing) => existing.min(until_initial_publish),
+                    None => until_initial_publish,
+                });
+            }
+
             let driver_update = {
                 let mut driver = host_handle.driver_handle.lock().await;
-                driver
-                    .next_update(publication_tracker.next_idle_timeout())
-                    .await
+                driver.next_update(idle_timeout).await
             };
 
             let update = match driver_update {
@@ -469,6 +466,26 @@ impl CodeModeService {
             };
 
             if matches!(update.boundary, DriverBoundary::Idle) {
+                if let Some((summary, publish_at)) = pending_initial_tool_summary.as_ref() {
+                    if initial_gate.is_pending() && Instant::now() >= *publish_at {
+                        let summary = summary.clone();
+                        pending_initial_tool_summary = None;
+                        if let Err(err) = self
+                            .publish_summary_and_unblock_initial(
+                                session_id,
+                                cell_id,
+                                host_handle,
+                                initial_gate,
+                                &summary,
+                            )
+                            .await
+                        {
+                            return Self::fail_and_exit(initial_gate, err, None);
+                        }
+                        continue;
+                    }
+                }
+
                 if !publication_tracker.should_auto_flush_now() {
                     continue;
                 }
@@ -526,6 +543,7 @@ impl CodeModeService {
                     };
 
                     if let Some(summary) = publication {
+                        pending_initial_tool_summary = None;
                         if let Err(err) = self
                             .publish_summary_and_unblock_initial(
                                 session_id,
@@ -540,7 +558,7 @@ impl CodeModeService {
                         }
                     }
                 }
-                DriverBoundary::PendingTool(request) => {
+                DriverBoundary::PendingTool(_request) => {
                     if snapshot.is_terminal() {
                         let err = crate::tools::ToolError::ExecutionFailed(
                             "Code mode entered a terminal state while dispatching a nested tool."
@@ -556,38 +574,11 @@ impl CodeModeService {
                     {
                         return Self::fail_and_exit(initial_gate, err, None);
                     }
-
-                    let tool_result = if initial_gate.is_pending() {
-                        let tool_name = request.tool_name.clone();
-                        let args_json = request.args_json.clone();
-                        let mut invoke_future = std::pin::pin!(invoke_tool(tool_name, args_json));
-                        let publish_after = Duration::from_millis(25);
-
-                        tokio::select! {
-                            result = &mut invoke_future => result,
-                            _ = tokio::time::sleep(publish_after) => {
-                                initial_gate.publish(&current_summary);
-                                invoke_future.await
-                            }
-                        }
-                    } else {
-                        invoke_tool(request.tool_name.clone(), request.args_json.clone()).await
-                    };
-                    let completion_result = {
-                        let mut driver = host_handle.driver_handle.lock().await;
-                        driver.complete_pending_tool_call(&request, tool_result)
-                    };
-                    if let Err(err) = completion_result {
-                        return self
-                            .record_and_exit_host_error(
-                                session_id,
-                                cell_id,
-                                host_handle,
-                                initial_gate,
-                                err,
-                                Some(request.request_id.clone()),
-                            )
-                            .await;
+                    if initial_gate.is_pending() {
+                        pending_initial_tool_summary = Some((
+                            current_summary,
+                            Instant::now() + INITIAL_NESTED_TOOL_PUBLICATION_DELAY,
+                        ));
                     }
                 }
                 DriverBoundary::Terminal(_) => {
@@ -921,6 +912,79 @@ impl CodeModeService {
 mod tests {
     use super::*;
     use crate::code_mode::response::{ExecLifecycle, ExecProgressKind};
+    use crate::tools::{Tool, ToolContext, ToolError};
+    use async_trait::async_trait;
+
+    struct DelayedEchoTool {
+        delay_ms: u64,
+    }
+
+    #[async_trait]
+    impl Tool for DelayedEchoTool {
+        fn name(&self) -> String {
+            "echo_tool".to_string()
+        }
+
+        fn description(&self) -> String {
+            "echo".to_string()
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+
+        fn has_side_effects(&self) -> bool {
+            false
+        }
+
+        async fn execute(
+            &self,
+            args: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<String, ToolError> {
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+            let value = args
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("done");
+            Ok(serde_json::json!({ "value": value }).to_string())
+        }
+    }
+
+    fn host_factory(
+        visible_tools: Vec<String>,
+        current_tools: Vec<Arc<dyn Tool>>,
+    ) -> crate::code_mode::host::ExecutorCellRuntimeHostFactory {
+        let executor = crate::tools::invocation::UnifiedToolExecutor::new(
+            crate::tools::invocation::UnifiedToolExecutorConfig {
+                current_tools,
+                visible_tools: visible_tools.clone(),
+                extensions: Vec::new(),
+                session_id: "service-test-session".to_string(),
+                reply_to: "test".to_string(),
+                step_budget: crate::tools::invocation::StepBudgetHandle::new(10),
+                session_deadline: None,
+                trace_bus: crate::trace::shared_bus(),
+                cancel_token: Arc::new(Notify::new()),
+                is_autopilot: false,
+                todos_path: std::path::PathBuf::from("TODOS.md"),
+                execution_guard_state: Arc::new(std::sync::Mutex::new(
+                    crate::core::ExecutionGuardState::default(),
+                )),
+            },
+        );
+        crate::code_mode::host::ExecutorCellRuntimeHostFactory::new(
+            visible_tools,
+            Arc::new(Mutex::new(executor)),
+            None,
+            None,
+            None,
+            "test-provider".to_string(),
+            "test-model".to_string(),
+        )
+    }
 
     #[tokio::test]
     async fn wait_rejects_when_no_active_cell_exists() {
@@ -946,8 +1010,7 @@ mod tests {
                 "session-a",
                 "flush({ ok: true });",
                 None,
-                Vec::new(),
-                |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
+                host_factory(Vec::new(), Vec::new()),
                 None,
             )
             .await
@@ -979,8 +1042,7 @@ mod tests {
                     }, 1_000);
                 "#,
                 None,
-                Vec::new(),
-                |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
+                host_factory(Vec::new(), Vec::new()),
                 None,
             )
             .await
@@ -993,8 +1055,7 @@ mod tests {
                 "session-b",
                 "text('next');",
                 None,
-                Vec::new(),
-                |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
+                host_factory(Vec::new(), Vec::new()),
                 None,
             )
             .await
@@ -1017,8 +1078,7 @@ mod tests {
                 "session-loop",
                 "while (true) {}",
                 None,
-                Vec::new(),
-                |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
+                host_factory(Vec::new(), Vec::new()),
                 None,
             ),
         )
@@ -1043,11 +1103,10 @@ mod tests {
                     text(response.value);
                 "#,
                 None,
-                vec!["echo_tool".to_string()],
-                |_tool_name: String, _args_json: String| async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    Ok(r#"{"value":"done"}"#.to_string())
-                },
+                host_factory(
+                    vec!["echo_tool".to_string()],
+                    vec![Arc::new(DelayedEchoTool { delay_ms: 25 })],
+                ),
                 None,
             )
             .await
@@ -1082,11 +1141,10 @@ mod tests {
                     text(response.value);
                 "#,
                 None,
-                vec!["echo_tool".to_string()],
-                |_tool_name: String, _args_json: String| async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(75)).await;
-                    Ok(r#"{"value":"done"}"#.to_string())
-                },
+                host_factory(
+                    vec!["echo_tool".to_string()],
+                    vec![Arc::new(DelayedEchoTool { delay_ms: 250 })],
+                ),
                 None,
             )
             .await
@@ -1101,7 +1159,7 @@ mod tests {
             .render_output()
             .contains("processing nested tool request"));
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let final_summary = service
             .wait_with_request("session-pending-tool", Some(&summary.cell_id), Some(0))
@@ -1125,8 +1183,7 @@ mod tests {
                     }, 20);
                 "#,
                 None,
-                Vec::new(),
-                |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
+                host_factory(Vec::new(), Vec::new()),
                 None,
             )
             .await
@@ -1151,8 +1208,7 @@ mod tests {
                     }, 40);
                 "#,
                 Some(10),
-                Vec::new(),
-                |_tool_name: String, _args_json: String| async move { Ok("null".to_string()) },
+                host_factory(Vec::new(), Vec::new()),
                 None,
             )
             .await

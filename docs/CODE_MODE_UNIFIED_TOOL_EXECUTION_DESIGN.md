@@ -10,7 +10,7 @@ It is intended to guide implementation, review, and verification.
 - [x] Phase 0: Characterization tests added and baseline verified.
 - [x] Phase 1: Extract unified executor without behavior change.
 - [x] Phase 2: Introduce `CellRuntimeHost` boundary.
-- [ ] Phase 3: Replace sync tool result bridge with Promise/completion queue.
+- [x] Phase 3: Replace sync tool result bridge with Promise/completion queue.
 - [ ] Phase 4: Simplify service and driver state.
 - [ ] Phase 5: Documentation and trace cleanup.
 
@@ -468,6 +468,15 @@ CellRuntimeHost.call_tool
 - `CodeModeService` only records and publishes runtime events.
 - Cancellation tests pass.
 - Long nested tool calls still publish running summaries.
+
+Progress 2026-04-22:
+
+- Replaced the synchronous `__callTool` callback with an rquickjs async function that returns a JavaScript Promise and awaits `CellRuntimeHost::call_tool`.
+- Added `ExecutorCellRuntimeHostFactory` and `ExecutorCellRuntimeHost`; nested calls now emit request/done events and invoke `UnifiedToolExecutor.execute` directly from the host.
+- Changed `CodeModeService` so `DriverBoundary::PendingTool` records and publishes snapshots only; it no longer invokes tools or completes pending tool calls.
+- Preserved fast-call behavior by deferring the initial "waiting on tool" publication briefly; quick nested calls can still finish and return the final/flush summary, while long calls publish `waiting_on_tool_request_id`.
+- Finding: the async QuickJS bridge needed a wider initial-publication delay than the old channel relay. `INITIAL_NESTED_TOOL_PUBLICATION_DELAY` is currently 150ms, with service coverage proving delayed calls still surface as running.
+- Finding: obsolete driver relay state (`tool_result_tx`, `tool_call_in_flight`, and `CellDriver::complete_pending_tool_call`) is now unused and produces warnings; cleanup is intentionally deferred to Phase 4.
 
 ### Phase 4: Simplify Service and Driver State
 
