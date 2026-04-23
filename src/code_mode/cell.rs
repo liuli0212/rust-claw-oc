@@ -25,7 +25,23 @@ pub struct ActiveCellHandle {
 }
 
 impl ActiveCellHandle {
-    pub fn new(cell_id: String) -> Self {
+    pub fn new(cell_id: String, initial_notification: Option<String>) -> Self {
+        let mut handle = Self {
+            cell_id,
+            phase: CellPhase::Running,
+            events: Vec::new(),
+            last_publication: None,
+        };
+        if let Some(message) = initial_notification {
+            handle
+                .events
+                .push(RuntimeEvent::Notification { seq: 0, message });
+        }
+        handle
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(cell_id: String) -> Self {
         Self {
             cell_id,
             phase: CellPhase::Running,
@@ -54,6 +70,10 @@ impl ActiveCellHandle {
 
     pub fn transition_to_failure(&mut self, error: String) {
         self.phase = CellPhase::Failed { error };
+    }
+
+    pub fn transition_to_cancelled(&mut self, reason: String) {
+        self.phase = CellPhase::Cancelled { reason };
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -256,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_active_cell_handle_collects_events_and_renders_snapshot() {
-        let mut cell = ActiveCellHandle::new("test-cell".to_string());
+        let mut cell = ActiveCellHandle::new_for_test("test-cell".to_string());
         cell.events.push(RuntimeEvent::Text {
             seq: 1,
             text: "hello ".to_string(),

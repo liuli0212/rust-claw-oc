@@ -27,6 +27,19 @@ type CellTraceFinish = (TraceStatus, Option<String>, serde_json::Value);
 
 const INITIAL_NESTED_TOOL_PUBLICATION_DELAY: Duration = Duration::from_millis(150);
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CellRuntimeBudget {
+    pub timeout_ms: u64,
+    pub deadline: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CellExecutionOptions {
+    pub auto_flush_ms: Option<u64>,
+    pub runtime: CellRuntimeBudget,
+    pub timeout_notice: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct SessionState {
     next_cell_seq: u64,
@@ -205,8 +218,8 @@ impl CodeModeService {
         &self,
         session_id: &str,
         code: &str,
-        auto_flush_ms: Option<u64>,
         host_builder: HostBuilder,
+        options: CellExecutionOptions,
         cell_span: Option<crate::trace::TraceSpanHandle>,
     ) -> Result<ExecRunResult, crate::tools::ToolError> {
         let (cell_id, host_handle) = {
@@ -247,7 +260,10 @@ impl CodeModeService {
             let driver_control = driver.control_handle();
             let driver_handle = Arc::new(Mutex::new(driver));
             let host_handle = Arc::new(CellHostHandle::new(driver_handle, driver_control));
-            session.active_cell = Some(ActiveCellHandle::new(cell_id.clone()));
+            session.active_cell = Some(ActiveCellHandle::new(
+                cell_id.clone(),
+                options.timeout_notice.clone(),
+            ));
             session.host_handle = Some(host_handle.clone());
             (cell_id, host_handle)
         };
@@ -265,7 +281,7 @@ impl CodeModeService {
                     session_id_owned,
                     cell_id_owned,
                     host_handle_for_task,
-                    auto_flush_ms,
+                    options,
                     initial_summary_tx,
                     cell_span,
                 )
@@ -373,7 +389,7 @@ impl CodeModeService {
         session_id: String,
         cell_id: String,
         host_handle: SharedCellHost,
-        auto_flush_ms: Option<u64>,
+        options: CellExecutionOptions,
         initial_summary_tx: oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>,
         mut cell_span: Option<crate::trace::TraceSpanHandle>,
     ) {
@@ -383,7 +399,7 @@ impl CodeModeService {
                 &session_id,
                 &cell_id,
                 &host_handle,
-                auto_flush_ms,
+                options,
                 &mut initial_summary_tx,
             )
             .await;
@@ -399,14 +415,31 @@ impl CodeModeService {
         session_id: &str,
         cell_id: &str,
         host_handle: &SharedCellHost,
-        auto_flush_ms: Option<u64>,
+        options: CellExecutionOptions,
         initial_summary_tx: &mut InitialSummaryTx,
     ) -> CellTraceFinish {
-        let mut publication_tracker = PublicationTracker::new(auto_flush_ms);
+        let mut publication_tracker = PublicationTracker::new(options.auto_flush_ms);
         let mut pending_initial_tool_summary: Option<(ExecRunResult, Instant)> = None;
 
         loop {
             let mut idle_timeout = publication_tracker.next_idle_timeout();
+            let now = Instant::now();
+            if now >= options.runtime.deadline {
+                return self
+                    .cancel_cell_for_runtime_deadline(
+                        session_id,
+                        cell_id,
+                        host_handle,
+                        initial_summary_tx,
+                        options.runtime.timeout_ms,
+                    )
+                    .await;
+            }
+            let until_cell_deadline = options.runtime.deadline.saturating_duration_since(now);
+            idle_timeout = Some(match idle_timeout {
+                Some(existing) => existing.min(until_cell_deadline),
+                None => until_cell_deadline,
+            });
             if let Some((_, publish_at)) = pending_initial_tool_summary.as_ref() {
                 let until_initial_publish = publish_at.saturating_duration_since(Instant::now());
                 idle_timeout = Some(match idle_timeout {
@@ -602,6 +635,34 @@ impl CodeModeService {
         Ok(active_cell.snapshot())
     }
 
+    async fn record_cell_cancellation_in_session(
+        &self,
+        session_id: &str,
+        cell_id: &str,
+        reason: String,
+    ) -> Result<CellSnapshot, crate::tools::ToolError> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions.get_mut(session_id).ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed("Session disappeared during wait.".to_string())
+        })?;
+
+        let active_cell = session.active_cell.as_mut().ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed(format!(
+                "Code mode cell `{}` was terminated before cancellation was recorded.",
+                cell_id
+            ))
+        })?;
+        if active_cell.cell_id != cell_id {
+            return Err(crate::tools::ToolError::ExecutionFailed(format!(
+                "Code mode cell `{}` was superseded before cancellation was recorded.",
+                cell_id
+            )));
+        }
+
+        active_cell.transition_to_cancelled(reason);
+        Ok(active_cell.snapshot())
+    }
+
     async fn peek_cell_summary(
         &self,
         session_id: &str,
@@ -709,6 +770,45 @@ impl CodeModeService {
                 Self::trace_finish_from_host_error(cell_id, &error)
             }
         }
+    }
+
+    async fn cancel_cell_for_runtime_deadline(
+        &self,
+        session_id: &str,
+        cell_id: &str,
+        host_handle: &SharedCellHost,
+        initial_summary_tx: &mut InitialSummaryTx,
+        cell_timeout_ms: u64,
+    ) -> CellTraceFinish {
+        let reason = format!(
+            "Code mode cell exceeded its runtime limit of {}ms and was cancelled by the system.",
+            cell_timeout_ms
+        );
+        host_handle.driver_control.request_cancel(&reason);
+
+        let snapshot = match self
+            .record_cell_cancellation_in_session(session_id, cell_id, reason)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(err) => return Self::fail_and_exit(cell_id, initial_summary_tx, err),
+        };
+        let summary = snapshot.to_exec_result(None, None);
+
+        if let Err(err) = self
+            .publish_summary_and_unblock_initial(
+                session_id,
+                cell_id,
+                host_handle,
+                initial_summary_tx,
+                &summary,
+            )
+            .await
+        {
+            return Self::fail_and_exit(cell_id, initial_summary_tx, err);
+        }
+
+        Self::trace_finish_from_summary(cell_id, &summary, None)
     }
 
     async fn publish_summary_and_unblock_initial(
@@ -871,6 +971,18 @@ mod tests {
         visible_tools: Vec<String>,
         current_tools: Vec<Arc<dyn Tool>>,
     ) -> crate::code_mode::service::HostBuilder {
+        host_factory_with_deadline(
+            visible_tools,
+            current_tools,
+            Instant::now() + Duration::from_secs(120),
+        )
+    }
+
+    fn host_factory_with_deadline(
+        visible_tools: Vec<String>,
+        current_tools: Vec<Arc<dyn Tool>>,
+        cell_deadline: Instant,
+    ) -> crate::code_mode::service::HostBuilder {
         let executor = crate::tools::invocation::UnifiedToolExecutor::new(
             crate::tools::invocation::UnifiedToolExecutorConfig {
                 current_tools,
@@ -891,11 +1003,46 @@ mod tests {
         crate::code_mode::host::create_executor_host_builder(
             visible_tools,
             Arc::new(Mutex::new(executor)),
-            crate::trace::shared_bus(),
-            None,
-            None,
-            None,
-            ("test-provider".to_string(), "test-model".to_string()),
+            crate::code_mode::host::ExecutorHostConfig {
+                trace_bus: crate::trace::shared_bus(),
+                trace_ctx: None,
+                parent_span_id: None,
+                outer_tool_call_id: None,
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                cell_deadline,
+            },
+        )
+    }
+
+    fn default_test_cell_timeout_ms() -> u64 {
+        120_000
+    }
+
+    fn default_test_cell_deadline() -> Instant {
+        Instant::now() + Duration::from_secs(120)
+    }
+
+    fn test_cell_options(
+        auto_flush_ms: Option<u64>,
+        timeout_ms: u64,
+        deadline: Instant,
+    ) -> CellExecutionOptions {
+        CellExecutionOptions {
+            auto_flush_ms,
+            runtime: CellRuntimeBudget {
+                timeout_ms,
+                deadline,
+            },
+            timeout_notice: None,
+        }
+    }
+
+    fn default_test_cell_options(auto_flush_ms: Option<u64>) -> CellExecutionOptions {
+        test_cell_options(
+            auto_flush_ms,
+            default_test_cell_timeout_ms(),
+            default_test_cell_deadline(),
         )
     }
 
@@ -922,8 +1069,8 @@ mod tests {
             .execute(
                 "session-a",
                 "flush({ ok: true });",
-                None,
                 host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(None),
                 None,
             )
             .await
@@ -954,8 +1101,8 @@ mod tests {
                         text("done");
                     }, 1_000);
                 "#,
-                None,
                 host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(None),
                 None,
             )
             .await
@@ -967,8 +1114,8 @@ mod tests {
             .execute(
                 "session-b",
                 "text('next');",
-                None,
                 host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(None),
                 None,
             )
             .await
@@ -990,8 +1137,8 @@ mod tests {
             svc_clone.execute(
                 "session-loop",
                 "while (true) {}",
-                None,
                 host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(None),
                 None,
             ),
         )
@@ -1001,6 +1148,120 @@ mod tests {
 
         let cancelled = service.abort_active_cell("session-loop", "Timeout").await;
         assert!(cancelled, "should successfully abort active cell");
+    }
+
+    #[tokio::test]
+    async fn execute_cancels_cell_at_runtime_deadline() {
+        let service = CodeModeService::default();
+        let timeout_ms = 30;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        let summary = service
+            .execute(
+                "session-deadline",
+                r#"
+                    setTimeout(() => {
+                        text("too late");
+                    }, 1_000);
+                "#,
+                host_factory_with_deadline(Vec::new(), Vec::new(), deadline),
+                test_cell_options(None, timeout_ms, deadline),
+                None,
+            )
+            .await
+            .expect("exec should publish a cancellation summary at the runtime deadline");
+
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Cancelled);
+        assert!(
+            summary
+                .cancellation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runtime limit"),
+            "unexpected cancellation: {:?}",
+            summary.cancellation
+        );
+    }
+
+    #[tokio::test]
+    async fn cell_deadline_bounds_nested_tool_runtime() {
+        let service = CodeModeService::default();
+        let timeout_ms = 40;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        let summary = service
+            .execute(
+                "session-nested-deadline",
+                r#"
+                    const response = await tools.echo_tool({ value: "done" });
+                    text(response.value);
+                "#,
+                host_factory_with_deadline(
+                    vec!["echo_tool".to_string()],
+                    vec![Arc::new(DelayedEchoTool { delay_ms: 250 })],
+                    deadline,
+                ),
+                test_cell_options(None, timeout_ms, deadline),
+                None,
+            )
+            .await
+            .expect("exec should publish a cancellation summary at the runtime deadline");
+
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Cancelled);
+        assert!(
+            summary
+                .cancellation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runtime limit"),
+            "unexpected cancellation: {:?}",
+            summary.cancellation
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_without_timeout_wakes_when_cell_deadline_cancels() {
+        let service = CodeModeService::default();
+        let timeout_ms = 40;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+        let summary = service
+            .execute(
+                "session-wait-deadline",
+                r#"
+                    flush({ stage: "started" });
+                    setTimeout(() => {
+                        text("too late");
+                    }, 1_000);
+                "#,
+                host_factory_with_deadline(Vec::new(), Vec::new(), deadline),
+                test_cell_options(None, timeout_ms, deadline),
+                None,
+            )
+            .await
+            .expect("exec should publish the initial flush");
+
+        assert!(summary.flushed);
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Running);
+
+        let waited = tokio::time::timeout(
+            Duration::from_millis(250),
+            service.wait_with_request("session-wait-deadline", Some(&summary.cell_id), None),
+        )
+        .await
+        .expect("wait should wake at the cell runtime deadline")
+        .expect("wait should return the cancellation summary");
+
+        assert_eq!(&waited.lifecycle, &ExecLifecycle::Cancelled);
+        assert!(
+            waited
+                .cancellation
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runtime limit"),
+            "unexpected cancellation: {:?}",
+            waited.cancellation
+        );
     }
 
     #[tokio::test]
@@ -1015,11 +1276,11 @@ mod tests {
                     const response = await tools.echo_tool({ value: "done" });
                     text(response.value);
                 "#,
-                None,
                 host_factory(
                     vec!["echo_tool".to_string()],
                     vec![Arc::new(DelayedEchoTool { delay_ms: 25 })],
                 ),
+                default_test_cell_options(None),
                 None,
             )
             .await
@@ -1053,11 +1314,11 @@ mod tests {
                     const response = await tools.echo_tool({ value: "done" });
                     text(response.value);
                 "#,
-                None,
                 host_factory(
                     vec!["echo_tool".to_string()],
                     vec![Arc::new(DelayedEchoTool { delay_ms: 250 })],
                 ),
+                default_test_cell_options(None),
                 None,
             )
             .await
@@ -1095,8 +1356,8 @@ mod tests {
                         text("timer done");
                     }, 20);
                 "#,
-                None,
                 host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(None),
                 None,
             )
             .await
@@ -1120,8 +1381,8 @@ mod tests {
                         text("timer done");
                     }, 40);
                 "#,
-                Some(10),
                 host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(Some(10)),
                 None,
             )
             .await

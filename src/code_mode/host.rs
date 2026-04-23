@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -8,6 +8,16 @@ use super::protocol::{RuntimeEvent, ToolCallRequest};
 use crate::context::AgentContext;
 use crate::tools::invocation::{ToolCallOrigin, ToolExecutionRequest, UnifiedToolExecutor};
 use crate::trace::{TraceActor, TraceBus, TraceContext, TraceStatus};
+
+pub(crate) struct ExecutorHostConfig {
+    pub trace_bus: Arc<TraceBus>,
+    pub trace_ctx: Option<TraceContext>,
+    pub parent_span_id: Option<String>,
+    pub outer_tool_call_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub cell_deadline: Instant,
+}
 
 #[async_trait]
 pub(crate) trait CellRuntimeHost: Send + Sync {
@@ -19,24 +29,20 @@ pub(crate) trait CellRuntimeHost: Send + Sync {
 pub(crate) fn create_executor_host_builder(
     visible_tools: Vec<String>,
     tool_executor: Arc<tokio::sync::Mutex<UnifiedToolExecutor>>,
-    trace_bus: Arc<TraceBus>,
-    trace_ctx: Option<TraceContext>,
-    parent_span_id: Option<String>,
-    outer_tool_call_id: Option<String>,
-    provider_model: (String, String),
+    config: ExecutorHostConfig,
 ) -> crate::code_mode::service::HostBuilder {
-    let (provider, model) = provider_model;
     Box::new(move |cell_id, event_tx, cancel_flag| {
         Arc::new(ExecutorCellRuntimeHost {
             cell_id,
             visible_tools,
             tool_executor,
-            trace_bus,
-            trace_ctx,
-            parent_span_id,
-            outer_tool_call_id,
-            provider,
-            model,
+            trace_bus: config.trace_bus,
+            trace_ctx: config.trace_ctx,
+            parent_span_id: config.parent_span_id,
+            outer_tool_call_id: config.outer_tool_call_id,
+            provider: config.provider,
+            model: config.model,
+            cell_deadline: config.cell_deadline,
             event_tx,
             cancel_flag,
         })
@@ -53,6 +59,7 @@ pub(crate) struct ExecutorCellRuntimeHost {
     outer_tool_call_id: Option<String>,
     provider: String,
     model: String,
+    cell_deadline: Instant,
     event_tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
     cancel_flag: Arc<AtomicBool>,
 }
@@ -107,6 +114,13 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
                 "Code mode cell execution was cancelled.".to_string(),
             ));
         }
+        let now = Instant::now();
+        if now >= self.cell_deadline {
+            self.emit_tool_done(&request);
+            return Err(crate::tools::ToolError::Cancelled(
+                "Code mode cell runtime deadline was reached.".to_string(),
+            ));
+        }
 
         let trace_attrs = self.tool_trace_attrs(&request);
         let mut start_attrs = trace_attrs.clone();
@@ -132,12 +146,14 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
 
         let outcome = {
             let executor = self.tool_executor.lock().await;
+            let remaining_cell_time = self.cell_deadline.saturating_duration_since(Instant::now());
+            let timeout = Duration::from_secs(85).min(remaining_cell_time);
             executor
                 .execute(ToolExecutionRequest {
                     tool_name: request.tool_name.clone(),
                     args: args.clone(),
                     origin: ToolCallOrigin::CodeModeNested,
-                    timeout: Duration::from_secs(85),
+                    timeout,
                     trace_ctx: self.trace_ctx.clone(),
                     context_parent_span_id,
                 })

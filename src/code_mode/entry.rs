@@ -8,7 +8,7 @@ use crate::code_mode::response::{ExecLifecycle, ExecProgressKind};
 use crate::context::FunctionCall;
 use crate::core::extensions::ExecutionExtension;
 use crate::core::{AgentOutput, ExecutionGuardState, ToolDispatchOutcome};
-use crate::tools::code_mode::{ExecArgs, WaitArgs};
+use crate::tools::code_mode::{effective_cell_timeout_ms, ExecArgs, WaitArgs};
 use crate::tools::invocation::{StepBudgetHandle, UnifiedToolExecutor, UnifiedToolExecutorConfig};
 use crate::tools::protocol::StructuredToolOutput;
 use crate::tools::Tool;
@@ -49,16 +49,30 @@ pub(crate) async fn dispatch_tool_call(
         Err(outcome) => return outcome,
     };
 
-    let (source_length, requested_cell_id, wait_timeout_ms, auto_flush_ms) = match &invocation {
+    let (
+        source_length,
+        requested_cell_id,
+        wait_timeout_ms,
+        auto_flush_ms,
+        requested_cell_timeout_ms,
+        effective_cell_timeout_ms,
+    ) = match &invocation {
         CodeModeInvocation::Exec(parsed) => (
             parsed.code.chars().count(),
             None,
             None,
             parsed.auto_flush_ms,
+            parsed.cell_timeout_ms,
+            Some(effective_cell_timeout_ms(parsed.cell_timeout_ms)),
         ),
-        CodeModeInvocation::Wait(parsed) => {
-            (0usize, parsed.cell_id.clone(), parsed.wait_timeout_ms, None)
-        }
+        CodeModeInvocation::Wait(parsed) => (
+            0usize,
+            parsed.cell_id.clone(),
+            parsed.wait_timeout_ms,
+            None,
+            None,
+            None,
+        ),
     };
 
     let visible_tools: Vec<String> = config
@@ -84,6 +98,8 @@ pub(crate) async fn dispatch_tool_call(
             "requested_cell_id": requested_cell_id,
             "wait_timeout_ms": wait_timeout_ms,
             "auto_flush_ms": auto_flush_ms,
+            "requested_cell_timeout_ms": requested_cell_timeout_ms,
+            "effective_cell_timeout_ms": effective_cell_timeout_ms,
             "visible_nested_tools": visible_tools.len(),
             "args_preview": crate::context::AgentContext::truncate_chars(&call.args.to_string(), 500),
         }),
@@ -109,9 +125,14 @@ pub(crate) async fn dispatch_tool_call(
             }
         }
     } else {
+        let exec_timeout = Duration::from_millis(
+            effective_cell_timeout_ms
+                .unwrap_or(crate::tools::code_mode::DEFAULT_CELL_TIMEOUT_MS)
+                .saturating_add(5_000),
+        );
         tokio::select! {
             result = tokio::time::timeout(
-                Duration::from_secs(90),
+                exec_timeout,
                 run_invocation(call, invocation, visible_tools, &config)
             ) => {
                 match result {
@@ -182,6 +203,8 @@ pub(crate) async fn dispatch_tool_call(
                     "cell_id": summary.cell_id.clone(),
                     "source_length": source_length,
                     "requested_cell_id": requested_cell_id,
+                    "requested_cell_timeout_ms": requested_cell_timeout_ms,
+                    "effective_cell_timeout_ms": effective_cell_timeout_ms,
                     "flushed": summary.flushed,
                     "progress_kind": summary.progress_kind.clone(),
                     "flush_value": summary.flush_value.clone(),
@@ -256,6 +279,8 @@ pub(crate) async fn dispatch_tool_call(
                     "model": config.model,
                     "source_length": source_length,
                     "requested_cell_id": requested_cell_id,
+                    "requested_cell_timeout_ms": requested_cell_timeout_ms,
+                    "effective_cell_timeout_ms": effective_cell_timeout_ms,
                     "termination_reason": termination_reason,
                     "error": err.to_string(),
                 }),
@@ -291,6 +316,20 @@ async fn run_invocation(
 ) -> Result<super::response::ExecRunResult, crate::tools::ToolError> {
     match invocation {
         CodeModeInvocation::Exec(parsed) => {
+            let effective_timeout_ms = effective_cell_timeout_ms(parsed.cell_timeout_ms);
+            let cell_timeout = Duration::from_millis(effective_timeout_ms);
+            let cell_deadline = Instant::now() + cell_timeout;
+            let timeout_notice = match parsed.cell_timeout_ms {
+                Some(requested) if requested > effective_timeout_ms => Some(format!(
+                    "Requested cell_timeout_ms {} exceeded the hard limit and was capped at {}ms.",
+                    requested, effective_timeout_ms
+                )),
+                Some(0) => Some(format!(
+                    "Requested cell_timeout_ms 0 is invalid; using the default {}ms.",
+                    effective_timeout_ms
+                )),
+                _ => None,
+            };
             let cell_span = config.iteration_trace_ctx.as_ref().map(|ctx| {
                 let span_ctx = ctx.with_parent_span_id(config.parent_span_id.clone());
                 config.trace_bus.start_span(
@@ -323,11 +362,15 @@ async fn run_invocation(
             let host_builder = crate::code_mode::host::create_executor_host_builder(
                 visible_tools,
                 tool_executor,
-                config.trace_bus.clone(),
-                config.iteration_trace_ctx.clone(),
-                cell_span_id,
-                call.id.clone(),
-                (config.provider.clone(), config.model.clone()),
+                crate::code_mode::host::ExecutorHostConfig {
+                    trace_bus: config.trace_bus.clone(),
+                    trace_ctx: config.iteration_trace_ctx.clone(),
+                    parent_span_id: cell_span_id,
+                    outer_tool_call_id: call.id.clone(),
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    cell_deadline,
+                },
             );
 
             config
@@ -335,8 +378,15 @@ async fn run_invocation(
                 .execute(
                     &config.session_id,
                     &parsed.code,
-                    parsed.auto_flush_ms,
                     host_builder,
+                    crate::code_mode::service::CellExecutionOptions {
+                        auto_flush_ms: parsed.auto_flush_ms,
+                        runtime: crate::code_mode::service::CellRuntimeBudget {
+                            timeout_ms: effective_timeout_ms,
+                            deadline: cell_deadline,
+                        },
+                        timeout_notice,
+                    },
                     cell_span,
                 )
                 .await

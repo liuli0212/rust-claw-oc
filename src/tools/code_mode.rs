@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use super::protocol::{clean_schema, Tool, ToolContext, ToolError};
 
+pub const DEFAULT_CELL_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_CELL_TIMEOUT_MS: u64 = 300_000;
+
+pub fn effective_cell_timeout_ms(requested: Option<u64>) -> u64 {
+    requested
+        .filter(|timeout| *timeout > 0)
+        .unwrap_or(DEFAULT_CELL_TIMEOUT_MS)
+        .min(MAX_CELL_TIMEOUT_MS)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecArgs {
     /// Raw JavaScript source used to orchestrate multiple nested tool calls.
@@ -12,6 +22,9 @@ pub struct ExecArgs {
     /// When set, the host may publish accumulated output while the cell keeps
     /// running in the background, even if the JS code does not call `flush()`.
     pub auto_flush_ms: Option<u64>,
+    /// Expected maximum runtime for this cell in milliseconds. Defaults to
+    /// 120000 and is capped at the hard limit of 300000.
+    pub cell_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -31,7 +44,7 @@ impl Tool for ExecTool {
     }
 
     fn description(&self) -> String {
-        "Run JavaScript code to orchestrate multiple nested tool calls within a single model turn. Prefer this for multi-step coding work such as search-read-filter-patch-verify flows. If the JS schedules timers, polling, retries, or other long-running background work, usually set `auto_flush_ms` so progress can publish without a manual `flush()`."
+        "Run JavaScript code to orchestrate multiple nested tool calls within a single model turn. Prefer this for multi-step coding work such as search-read-filter-patch-verify flows. Set `cell_timeout_ms` to the expected maximum runtime for the cell; it defaults to 120000ms and is hard-capped at 300000ms. If the JS schedules timers, polling, retries, or other long-running background work, usually set `auto_flush_ms` so progress can publish without a manual `flush()`."
             .to_string()
     }
 
