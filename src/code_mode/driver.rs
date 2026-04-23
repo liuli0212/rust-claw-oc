@@ -35,7 +35,7 @@ impl std::fmt::Debug for CellDriver {
 }
 
 #[derive(Debug)]
-pub enum DriverBoundary {
+pub enum CellStatus {
     Progress,
     PendingTool,
     Terminal(RuntimeTerminalResult),
@@ -45,7 +45,7 @@ pub enum DriverBoundary {
 #[derive(Debug)]
 pub struct DriverUpdate {
     pub events: Vec<RuntimeEvent>,
-    pub boundary: DriverBoundary,
+    pub status: CellStatus,
 }
 
 impl CellDriver {
@@ -141,7 +141,7 @@ impl CellDriver {
                     _ = tokio::time::sleep(timeout) => {
                         return Ok(DriverUpdate {
                             events: Vec::new(),
-                            boundary: DriverBoundary::Idle,
+                            status: CellStatus::Idle,
                         });
                     },
                 }
@@ -176,13 +176,13 @@ impl CellDriver {
                 events.push(RuntimeEvent::ToolCallRequested(req));
                 Ok(Some(DriverUpdate {
                     events: std::mem::take(events),
-                    boundary: DriverBoundary::PendingTool,
+                    status: CellStatus::PendingTool,
                 }))
             }
             RuntimeEvent::WorkerCompleted(result) => match result {
                 Ok(terminal_result) => Ok(Some(DriverUpdate {
                     events: std::mem::take(events),
-                    boundary: DriverBoundary::Terminal(terminal_result),
+                    status: CellStatus::Terminal(terminal_result),
                 })),
                 Err(err_msg) => Err(crate::tools::ToolError::ExecutionFailed(err_msg)),
             },
@@ -190,7 +190,7 @@ impl CellDriver {
                 events.push(event);
                 Ok(Some(DriverUpdate {
                     events: std::mem::take(events),
-                    boundary: DriverBoundary::Progress,
+                    status: CellStatus::Progress,
                 }))
             }
             event => {

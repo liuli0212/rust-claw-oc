@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 use super::cell::{ActiveCellHandle, CellSnapshot};
-use super::driver::{CellDriver, CellDriverControl, DriverBoundary, DriverUpdate};
+use super::driver::{CellDriver, CellDriverControl, CellStatus, DriverUpdate};
 use super::protocol::RuntimeEvent;
 use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 use super::runtime;
@@ -468,7 +468,7 @@ impl CodeModeService {
                 }
             };
 
-            if matches!(update.boundary, DriverBoundary::Idle) {
+            if matches!(update.status, CellStatus::Idle) {
                 if let Some((summary, publish_at)) = pending_initial_tool_summary.as_ref() {
                     if initial_summary_tx.is_some() && Instant::now() >= *publish_at {
                         let summary = summary.clone();
@@ -527,8 +527,8 @@ impl CodeModeService {
                 Err(err) => return Self::fail_and_exit(cell_id, initial_summary_tx, err),
             };
 
-            match update.boundary {
-                DriverBoundary::Progress => {
+            match update.status {
+                CellStatus::Progress => {
                     let publication = if let Some(flush_value) = explicit_flush_value {
                         publication_tracker.mark_published();
                         Some(
@@ -558,7 +558,7 @@ impl CodeModeService {
                         }
                     }
                 }
-                DriverBoundary::PendingTool => {
+                CellStatus::PendingTool => {
                     if snapshot.lifecycle() != ExecLifecycle::Running {
                         let err = crate::tools::ToolError::ExecutionFailed(
                             "Code mode entered a terminal state while dispatching a nested tool."
@@ -581,7 +581,7 @@ impl CodeModeService {
                         ));
                     }
                 }
-                DriverBoundary::Terminal(_) => {
+                CellStatus::Terminal(_) => {
                     let summary = snapshot.to_exec_result(None, None);
                     if let Err(err) = self
                         .publish_summary_and_unblock_initial(
@@ -598,7 +598,7 @@ impl CodeModeService {
 
                     return Self::trace_finish_from_summary(cell_id, &summary, None);
                 }
-                DriverBoundary::Idle => {}
+                CellStatus::Idle => {}
             }
         }
     }
@@ -628,7 +628,7 @@ impl CodeModeService {
         }
         active_cell.record_driver_update(update);
 
-        if let DriverBoundary::Terminal(terminal_result) = &update.boundary {
+        if let CellStatus::Terminal(terminal_result) = &update.status {
             session.stored_values = terminal_result.stored_values.clone();
         }
 

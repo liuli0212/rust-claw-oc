@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use super::driver::{DriverBoundary, DriverUpdate};
+use super::driver::{CellStatus, DriverUpdate};
 use super::protocol::{RuntimeEvent, RuntimeTerminalResult};
 use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 
@@ -63,7 +63,7 @@ impl ActiveCellHandle {
 
     pub fn record_driver_update(&mut self, update: &DriverUpdate) {
         self.record_event_batch(&update.events);
-        if let DriverBoundary::Terminal(result) = &update.boundary {
+        if let CellStatus::Terminal(result) = &update.status {
             self.record_terminal_result(result);
         }
     }
