@@ -9,9 +9,8 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 use super::cell::{ActiveCellHandle, CellSnapshot};
-use super::driver::{
-    CellDriver, CellDriverControl, DriverBoundary, DriverEventBatch, DriverUpdate,
-};
+use super::driver::{CellDriver, CellDriverControl, DriverBoundary, DriverUpdate};
+use super::protocol::RuntimeEvent;
 use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 use super::runtime;
 use crate::trace::TraceStatus;
@@ -134,15 +133,14 @@ impl PublicationTracker {
         self.last_published_at = Instant::now();
     }
 
-    fn observe_batch(&mut self, batch: &DriverEventBatch) -> Option<Option<Value>> {
+    fn observe_events(&mut self, events: &[RuntimeEvent]) -> Option<Option<Value>> {
         let mut explicit_flush_value = None;
-        for event in &batch.events {
+        for event in events {
             match event {
-                crate::code_mode::protocol::RuntimeEvent::Text { seq, .. }
-                | crate::code_mode::protocol::RuntimeEvent::Notification { seq, .. } => {
+                RuntimeEvent::Text { seq, .. } | RuntimeEvent::Notification { seq, .. } => {
                     self.latest_progress_seq = self.latest_progress_seq.max(*seq);
                 }
-                crate::code_mode::protocol::RuntimeEvent::Flush { seq, value } => {
+                RuntimeEvent::Flush { seq, value } => {
                     explicit_flush_value = Some(value.clone());
                     self.latest_progress_seq = self.latest_progress_seq.max(*seq);
                 }
@@ -486,7 +484,7 @@ impl CodeModeService {
                 continue;
             }
 
-            let explicit_flush_value = publication_tracker.observe_batch(&update.batch);
+            let explicit_flush_value = publication_tracker.observe_events(&update.events);
 
             let snapshot = match self
                 .record_driver_update_in_session(session_id, cell_id, &update)
@@ -527,7 +525,7 @@ impl CodeModeService {
                         }
                     }
                 }
-                DriverBoundary::PendingTool(_request) => {
+                DriverBoundary::PendingTool => {
                     if snapshot.lifecycle() != ExecLifecycle::Running {
                         let err = crate::tools::ToolError::ExecutionFailed(
                             "Code mode entered a terminal state while dispatching a nested tool."

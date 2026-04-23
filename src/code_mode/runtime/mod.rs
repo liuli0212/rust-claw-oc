@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use self::timers::RecordedTimerCall;
 use self::value::StoredValue;
-use super::protocol::RuntimeTerminalResult;
+use super::protocol::{RuntimeTerminalResult, ToolCallRequest};
 use super::runtime::globals::{LOAD_FN, NOTIFY_FN, STORE_FN, TEXT_FN};
 
 pub mod callbacks;
@@ -25,7 +25,7 @@ pub(crate) struct RunCellRequest {
     pub(crate) code: String,
     pub(crate) stored_values: HashMap<String, StoredValue>,
     pub(crate) host: Arc<dyn crate::code_mode::host::CellRuntimeHost>,
-    pub(crate) command_rx: std::sync::mpsc::Receiver<crate::code_mode::protocol::CellCommand>,
+    pub(crate) cancel_rx: std::sync::mpsc::Receiver<String>,
     pub(crate) cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -59,7 +59,7 @@ pub(crate) fn run_cell(
             code,
             stored_values,
             host,
-            command_rx,
+            cancel_rx,
             cancel_flag: _,
         } = request;
 
@@ -70,7 +70,7 @@ pub(crate) fn run_cell(
         let timer_calls = Arc::new(Mutex::new(Vec::<RecordedTimerCall>::new()));
         let visible_tools_json = serde_json::to_string(&host.visible_tool_names())
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
-        let command_rx = Arc::new(Mutex::new(command_rx));
+        let cancel_rx = Arc::new(Mutex::new(cancel_rx));
         let timer_clock_start = Arc::new(Instant::now());
 
         let next_seq_for_script_captured = next_seq_for_script.clone();
@@ -189,7 +189,7 @@ pub(crate) fn run_cell(
                     let seq = next_seq_for_tool.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let request_id = format!("{}-{}", tool_name, seq);
                     let host = host_for_tool.clone();
-                    let request = crate::code_mode::host::RuntimeToolRequest {
+                    let request = ToolCallRequest {
                         seq,
                         request_id,
                         tool_name: tool_name.clone(),
@@ -280,22 +280,20 @@ pub(crate) fn run_cell(
                 .map_err(js_error_to_tool_error)?;
 
             // Register __wait_for_timer: blocks the worker thread for the specified duration
-            // while checking for CellCommand::Cancel from the driver.
-            let command_rx_for_resume = command_rx.clone();
+            // while checking for cancellation from the driver.
+            let cancel_rx_for_timer = cancel_rx.clone();
             globals
                 .set(
                     "__wait_for_timer",
                     Func::from(move |ms: f64| -> rquickjs::Result<String> {
-                        let rx = command_rx_for_resume.lock().unwrap_or_else(|e| e.into_inner());
+                        let rx = cancel_rx_for_timer.lock().unwrap_or_else(|e| e.into_inner());
                         let wait_dur = std::time::Duration::from_millis(ms as u64);
                         match rx.recv_timeout(wait_dur) {
-                            Ok(crate::code_mode::protocol::CellCommand::Cancel { reason }) => {
-                                Ok(serde_json::json!({
-                                    "cancelled": true,
-                                    "reason": reason,
-                                })
-                                .to_string())
-                            }
+                            Ok(reason) => Ok(serde_json::json!({
+                                "cancelled": true,
+                                "reason": reason,
+                            })
+                            .to_string()),
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                                 Ok(r#"{"continued":true}"#.to_string())
                             }

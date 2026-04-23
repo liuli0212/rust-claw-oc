@@ -46,7 +46,7 @@ impl ActiveCellHandle {
     }
 
     pub fn record_driver_update(&mut self, update: &DriverUpdate) {
-        self.record_event_batch(&update.batch.events);
+        self.record_event_batch(&update.events);
         if let DriverBoundary::Terminal(result) = &update.boundary {
             self.record_terminal_result(result);
         }

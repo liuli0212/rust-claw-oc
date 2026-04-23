@@ -12,13 +12,8 @@ pub struct RuntimeTerminalResult {
     pub stored_values: HashMap<String, StoredValue>,
 }
 
-#[derive(Debug)]
-pub enum CellCommand {
-    Cancel { reason: String },
-}
-
 #[derive(Debug, Clone)]
-pub struct ToolCallRequestEvent {
+pub struct ToolCallRequest {
     pub seq: u64,
     pub request_id: String,
     pub tool_name: String,
@@ -43,12 +38,11 @@ pub enum RuntimeEvent {
         seq: u64,
         resume_after_ms: Option<u64>,
     },
-    ToolCallRequested(ToolCallRequestEvent),
+    ToolCallRequested(ToolCallRequest),
 
     ToolCallDone {
         seq: u64,
         request_id: String,
-        ok: bool,
     },
     WorkerCompleted(Result<RuntimeTerminalResult, String>),
 }

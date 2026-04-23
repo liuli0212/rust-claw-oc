@@ -192,13 +192,11 @@ Add a host boundary under `src/code_mode/host.rs` or an equivalent module.
 Suggested request type:
 
 ```rust
-pub(crate) struct RuntimeToolRequest {
-    pub(crate) cell_id: String,
+pub(crate) struct ToolCallRequest {
     pub(crate) seq: u64,
     pub(crate) request_id: String,
     pub(crate) tool_name: String,
     pub(crate) args_json: String,
-    pub(crate) outer_tool_call_id: Option<String>,
 }
 ```
 
@@ -211,11 +209,9 @@ pub(crate) trait CellRuntimeHost: Send + Sync {
 
     fn emit_event(&self, event: crate::code_mode::protocol::RuntimeEvent);
 
-    fn cancellation_reason(&self) -> Option<String>;
-
     async fn call_tool(
         &self,
-        request: RuntimeToolRequest,
+        request: ToolCallRequest,
     ) -> Result<String, crate::tools::ToolError>;
 }
 ```
@@ -310,22 +306,20 @@ Delete or retire these final-path concepts:
 `ToolCallDone` must mean:
 
 - The host finished the executor call.
-- The request has an `ok` or error outcome.
 - The JS Promise has either been resolved or is about to be resolved.
 
 Recommended event fields to preserve or add:
 
 ```rust
-RuntimeEvent::ToolCallRequested(ToolCallRequestEvent)
+RuntimeEvent::ToolCallRequested(ToolCallRequest)
 
 RuntimeEvent::ToolCallDone {
     seq: u64,
     request_id: String,
-    ok: bool,
 }
 ```
 
-If summaries need better error display, add optional `error_preview` later. Do not block the refactor on richer event payloads.
+If summaries need better error display, add optional `ok` or `error_preview` later. Do not block the refactor on richer event payloads.
 
 ## Visibility Rules
 
@@ -429,7 +423,7 @@ Exit criteria:
 
 Progress 2026-04-22:
 
-- Added `src/code_mode/host.rs` with `CellRuntimeHost` and `RuntimeToolRequest`.
+- Added `src/code_mode/host.rs` with `CellRuntimeHost` and a host-owned runtime tool request.
 - Routed runtime visible-tool discovery, runtime event emission, and cancellation observation through a host object instead of passing raw visible-tool/event plumbing into `runtime::run_cell`.
 - Kept the existing synchronous tool result bridge private to the driver/service path for this phase; `CellRuntimeHost::call_tool` is intentionally not wired until Phase 3.
 - Finding: the bridge can now be swapped at the runtime boundary without changing JavaScript wrapper semantics, but service still fulfills `DriverBoundary::PendingTool` until the Promise/completion work lands.
@@ -537,6 +531,15 @@ Progress 2026-04-23 service simplification pass:
 - Removed `HostExitDisposition`; the host loop now returns the trace finish tuple directly after publishing the terminal or error summary.
 - Inlined the one-purpose trace status/summary helpers into the two trace-finish constructors.
 - Finding: the remaining summary publication helpers are worth keeping because they preserve the lock boundary and the initial `exec` unblock behavior without duplicating notification writes in the main loop.
+
+Progress 2026-04-23 boundary simplification pass:
+
+- Removed `DriverEventBatch`; `DriverUpdate` now carries runtime events directly.
+- Kept `DriverBoundary::PendingTool` as a unit publication boundary because the request is already present in `RuntimeEvent::ToolCallRequested`.
+- Dropped unused protocol/output fields: `ToolCallDone.ok` and `ExecOutputItem`.
+- Reused `ToolCallRequest` for both host execution and the `ToolCallRequested` event, replacing the duplicate `RuntimeToolRequest` shape.
+- Replaced the one-variant `CellCommand` channel with a plain cancellation-reason channel for timer waits.
+- Finding: `entry.rs` and `host.rs` still need separate trace/event responsibilities, but small helper-only parameters could be removed without changing ownership.
 
 ## Verification Matrix
 

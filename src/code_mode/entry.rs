@@ -12,7 +12,7 @@ use crate::tools::code_mode::{ExecArgs, WaitArgs};
 use crate::tools::invocation::{StepBudgetHandle, UnifiedToolExecutor, UnifiedToolExecutorConfig};
 use crate::tools::protocol::StructuredToolOutput;
 use crate::tools::Tool;
-use crate::trace::{TraceActor, TraceBus, TraceContext, TraceSpanHandle, TraceStatus};
+use crate::trace::{TraceActor, TraceBus, TraceContext, TraceStatus};
 
 pub(crate) struct CodeModeDispatchConfig {
     pub(crate) current_tools: Vec<Arc<dyn Tool>>,
@@ -72,7 +72,6 @@ pub(crate) async fn dispatch_tool_call(
         config.trace_bus.as_ref(),
         config.iteration_trace_ctx.as_ref(),
         config.parent_span_id.clone(),
-        TraceActor::Tool,
         "code_mode_exec_started",
         TraceStatus::Ok,
         Some(call.name.clone()),
@@ -172,7 +171,6 @@ pub(crate) async fn dispatch_tool_call(
                 config.trace_bus.as_ref(),
                 config.iteration_trace_ctx.as_ref(),
                 config.parent_span_id,
-                TraceActor::Tool,
                 event_name,
                 event_status,
                 Some(summary.cell_id.clone()),
@@ -248,7 +246,6 @@ pub(crate) async fn dispatch_tool_call(
                 config.trace_bus.as_ref(),
                 config.iteration_trace_ctx.as_ref(),
                 config.parent_span_id,
-                TraceActor::Tool,
                 event_name,
                 event_status,
                 Some(err.to_string()),
@@ -306,7 +303,7 @@ async fn run_invocation(
                     }),
                 )
             });
-            let cell_span_id = cell_span.as_ref().map(span_id_string);
+            let cell_span_id = cell_span.as_ref().map(|span| span.span_id().to_string());
             let tool_executor = Arc::new(tokio::sync::Mutex::new(UnifiedToolExecutor::new(
                 UnifiedToolExecutorConfig {
                     current_tools: config.current_tools.clone(),
@@ -417,12 +414,10 @@ fn code_mode_tool_result_status(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn record_trace_event(
     trace_bus: &TraceBus,
     trace_ctx: Option<&TraceContext>,
     parent_span_id: Option<String>,
-    actor: TraceActor,
     name: &str,
     status: TraceStatus,
     summary: Option<String>,
@@ -430,10 +425,6 @@ fn record_trace_event(
 ) {
     if let Some(trace_ctx) = trace_ctx {
         let event_ctx = trace_ctx.with_parent_span_id(parent_span_id);
-        trace_bus.record_event(&event_ctx, actor, name, status, summary, attrs);
+        trace_bus.record_event(&event_ctx, TraceActor::Tool, name, status, summary, attrs);
     }
-}
-
-fn span_id_string(span: &TraceSpanHandle) -> String {
-    span.span_id().to_string()
 }

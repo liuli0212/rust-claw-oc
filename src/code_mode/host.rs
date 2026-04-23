@@ -4,27 +4,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use super::protocol::{RuntimeEvent, ToolCallRequestEvent};
+use super::protocol::{RuntimeEvent, ToolCallRequest};
 use crate::context::AgentContext;
 use crate::tools::invocation::{ToolCallOrigin, ToolExecutionRequest, UnifiedToolExecutor};
 use crate::trace::{TraceActor, TraceBus, TraceContext, TraceStatus};
-
-#[derive(Debug, Clone)]
-pub(crate) struct RuntimeToolRequest {
-    pub(crate) seq: u64,
-    pub(crate) request_id: String,
-    pub(crate) tool_name: String,
-    pub(crate) args_json: String,
-}
 
 #[async_trait]
 pub(crate) trait CellRuntimeHost: Send + Sync {
     fn visible_tool_names(&self) -> Vec<String>;
     fn emit_event(&self, event: RuntimeEvent);
-    async fn call_tool(
-        &self,
-        request: RuntimeToolRequest,
-    ) -> Result<String, crate::tools::ToolError>;
+    async fn call_tool(&self, request: ToolCallRequest) -> Result<String, crate::tools::ToolError>;
 }
 
 pub(crate) fn create_executor_host_builder(
@@ -69,15 +58,14 @@ pub(crate) struct ExecutorCellRuntimeHost {
 }
 
 impl ExecutorCellRuntimeHost {
-    fn emit_tool_done(&self, request: &RuntimeToolRequest, ok: bool) {
+    fn emit_tool_done(&self, request: &ToolCallRequest) {
         self.emit_event(RuntimeEvent::ToolCallDone {
             seq: request.seq,
             request_id: request.request_id.clone(),
-            ok,
         });
     }
 
-    fn tool_trace_attrs(&self, request: &RuntimeToolRequest) -> serde_json::Value {
+    fn tool_trace_attrs(&self, request: &ToolCallRequest) -> serde_json::Value {
         serde_json::json!({
             "tool_name": request.tool_name,
             "cell_id": self.cell_id,
@@ -99,21 +87,13 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
         let _ = self.event_tx.send(event);
     }
 
-    async fn call_tool(
-        &self,
-        request: RuntimeToolRequest,
-    ) -> Result<String, crate::tools::ToolError> {
-        self.emit_event(RuntimeEvent::ToolCallRequested(ToolCallRequestEvent {
-            seq: request.seq,
-            request_id: request.request_id.clone(),
-            tool_name: request.tool_name.clone(),
-            args_json: request.args_json.clone(),
-        }));
+    async fn call_tool(&self, request: ToolCallRequest) -> Result<String, crate::tools::ToolError> {
+        self.emit_event(RuntimeEvent::ToolCallRequested(request.clone()));
 
         let args = match serde_json::from_str::<serde_json::Value>(&request.args_json) {
             Ok(args) => args,
             Err(err) => {
-                self.emit_tool_done(&request, false);
+                self.emit_tool_done(&request);
                 return Err(crate::tools::ToolError::InvalidArguments(format!(
                     "Invalid JSON arguments for nested tool `{}`: {err}",
                     request.tool_name
@@ -122,7 +102,7 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
         };
 
         if self.cancel_flag.load(Ordering::Acquire) {
-            self.emit_tool_done(&request, false);
+            self.emit_tool_done(&request);
             return Err(crate::tools::ToolError::Cancelled(
                 "Code mode cell execution was cancelled.".to_string(),
             ));
@@ -196,7 +176,7 @@ impl CellRuntimeHost for ExecutorCellRuntimeHost {
         }
 
         let ok = !outcome.stopped && !outcome.is_error;
-        self.emit_tool_done(&request, ok);
+        self.emit_tool_done(&request);
         if ok {
             Ok(crate::code_mode::runtime::value::normalize_tool_result_for_js(&outcome.result))
         } else {
@@ -224,7 +204,7 @@ impl CellRuntimeHost for EventBridgeHost {
 
     async fn call_tool(
         &self,
-        _request: RuntimeToolRequest,
+        _request: ToolCallRequest,
     ) -> Result<String, crate::tools::ToolError> {
         Err(crate::tools::ToolError::ExecutionFailed(
             "test event bridge host cannot execute tools".to_string(),

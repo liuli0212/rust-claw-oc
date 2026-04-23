@@ -1,35 +1,28 @@
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::protocol::{RuntimeEvent, RuntimeTerminalResult, ToolCallRequestEvent};
+use super::protocol::{RuntimeEvent, RuntimeTerminalResult};
 use super::runtime;
 
 pub struct CellDriver {
     event_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
-    /// Channel for sending commands (like resume) to the worker thread.
-    command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
+    control: CellDriverControl,
     worker: Option<tokio::task::JoinHandle<()>>,
-    cancel_flag: Arc<AtomicBool>,
-    pending_events: VecDeque<RuntimeEvent>,
 }
 
 #[derive(Clone)]
 pub struct CellDriverControl {
-    command_tx: std::sync::mpsc::Sender<crate::code_mode::protocol::CellCommand>,
+    /// Channel for interrupting timer waits in the worker thread.
+    cancel_tx: std::sync::mpsc::Sender<String>,
     cancel_flag: Arc<AtomicBool>,
 }
 
 impl CellDriverControl {
     pub fn request_cancel(&self, reason: &str) {
         self.cancel_flag.store(true, Ordering::Release);
-        let _ = self
-            .command_tx
-            .send(crate::code_mode::protocol::CellCommand::Cancel {
-                reason: reason.to_string(),
-            });
+        let _ = self.cancel_tx.send(reason.to_string());
     }
 }
 
@@ -42,58 +35,17 @@ impl std::fmt::Debug for CellDriver {
 }
 
 #[derive(Debug)]
-pub struct DriverEventBatch {
-    pub events: Vec<RuntimeEvent>,
-}
-
-impl DriverEventBatch {
-    pub fn new(events: Vec<RuntimeEvent>) -> Self {
-        Self { events }
-    }
-}
-
-#[derive(Debug)]
 pub enum DriverBoundary {
     Progress,
-    PendingTool(ToolCallRequestEvent),
+    PendingTool,
     Terminal(RuntimeTerminalResult),
     Idle,
 }
 
 #[derive(Debug)]
 pub struct DriverUpdate {
-    pub batch: DriverEventBatch,
+    pub events: Vec<RuntimeEvent>,
     pub boundary: DriverBoundary,
-}
-
-impl DriverUpdate {
-    fn progress(events: Vec<RuntimeEvent>) -> Self {
-        Self {
-            batch: DriverEventBatch::new(events),
-            boundary: DriverBoundary::Progress,
-        }
-    }
-
-    fn pending_tool(events: Vec<RuntimeEvent>, request: ToolCallRequestEvent) -> Self {
-        Self {
-            batch: DriverEventBatch::new(events),
-            boundary: DriverBoundary::PendingTool(request),
-        }
-    }
-
-    fn terminal(events: Vec<RuntimeEvent>, terminal_result: RuntimeTerminalResult) -> Self {
-        Self {
-            batch: DriverEventBatch::new(events),
-            boundary: DriverBoundary::Terminal(terminal_result),
-        }
-    }
-
-    fn idle() -> Self {
-        Self {
-            batch: DriverEventBatch::new(Vec::new()),
-            boundary: DriverBoundary::Idle,
-        }
-    }
 }
 
 impl CellDriver {
@@ -116,8 +68,7 @@ impl CellDriver {
         event_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
         cancel_flag: Arc<AtomicBool>,
     ) -> Self {
-        let (command_tx, command_rx) =
-            std::sync::mpsc::channel::<crate::code_mode::protocol::CellCommand>();
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<String>();
 
         let cancel_flag_for_worker = cancel_flag.clone();
         let event_tx_captured = event_tx.clone();
@@ -130,7 +81,7 @@ impl CellDriver {
                 code,
                 stored_values,
                 host,
-                command_rx,
+                cancel_rx,
                 cancel_flag: cancel_flag_for_worker,
             };
 
@@ -143,15 +94,16 @@ impl CellDriver {
 
         Self {
             event_rx,
-            command_tx,
+            control: CellDriverControl {
+                cancel_tx,
+                cancel_flag,
+            },
             worker: Some(worker),
-            cancel_flag,
-            pending_events: VecDeque::new(),
         }
     }
 
     pub fn request_cancel(&mut self, reason: &str) {
-        self.control_handle().request_cancel(reason);
+        self.control.request_cancel(reason);
         if let Some(worker) = self.worker.take() {
             // abort() on a spawn_blocking handle only detaches the JoinHandle —
             // it does NOT terminate the OS thread. The cancel_flag interrupt handler
@@ -161,10 +113,7 @@ impl CellDriver {
     }
 
     pub fn control_handle(&self) -> CellDriverControl {
-        CellDriverControl {
-            command_tx: self.command_tx.clone(),
-            cancel_flag: self.cancel_flag.clone(),
-        }
+        self.control.clone()
     }
 
     /// Collect the next driver update from the live worker until a visible
@@ -176,12 +125,6 @@ impl CellDriver {
         let mut events = Vec::new();
 
         loop {
-            while let Some(event) = self.pending_events.pop_front() {
-                if let Some(batch) = self.classify_event(&mut events, event)? {
-                    return Ok(batch);
-                }
-            }
-
             // Drain any buffered events first
             while let Ok(event) = self.event_rx.try_recv() {
                 if let Some(outcome) = self.classify_event(&mut events, event)? {
@@ -195,14 +138,19 @@ impl CellDriver {
             let next_event = if let Some(timeout) = idle_timeout {
                 tokio::select! {
                     event = self.event_rx.recv() => event,
-                    _ = tokio::time::sleep(timeout) => return Ok(DriverUpdate::idle()),
+                    _ = tokio::time::sleep(timeout) => {
+                        return Ok(DriverUpdate {
+                            events: Vec::new(),
+                            boundary: DriverBoundary::Idle,
+                        });
+                    },
                 }
             } else {
                 self.event_rx.recv().await
             };
 
             let Some(event) = next_event else {
-                if self.cancel_flag.load(Ordering::Acquire) {
+                if self.control.cancel_flag.load(Ordering::Acquire) {
                     return Err(crate::tools::ToolError::ExecutionFailed(
                         "Code mode cell execution was cancelled.".to_string(),
                     ));
@@ -225,22 +173,25 @@ impl CellDriver {
     ) -> Result<Option<DriverUpdate>, crate::tools::ToolError> {
         match event {
             RuntimeEvent::ToolCallRequested(req) => {
-                events.push(RuntimeEvent::ToolCallRequested(req.clone()));
-                Ok(Some(DriverUpdate::pending_tool(
-                    std::mem::take(events),
-                    req,
-                )))
+                events.push(RuntimeEvent::ToolCallRequested(req));
+                Ok(Some(DriverUpdate {
+                    events: std::mem::take(events),
+                    boundary: DriverBoundary::PendingTool,
+                }))
             }
             RuntimeEvent::WorkerCompleted(result) => match result {
-                Ok(terminal_result) => Ok(Some(DriverUpdate::terminal(
-                    std::mem::take(events),
-                    terminal_result,
-                ))),
+                Ok(terminal_result) => Ok(Some(DriverUpdate {
+                    events: std::mem::take(events),
+                    boundary: DriverBoundary::Terminal(terminal_result),
+                })),
                 Err(err_msg) => Err(crate::tools::ToolError::ExecutionFailed(err_msg)),
             },
             RuntimeEvent::Flush { .. } | RuntimeEvent::WaitingForTimer { .. } => {
                 events.push(event);
-                Ok(Some(DriverUpdate::progress(std::mem::take(events))))
+                Ok(Some(DriverUpdate {
+                    events: std::mem::take(events),
+                    boundary: DriverBoundary::Progress,
+                }))
             }
             event => {
                 events.push(event);
@@ -268,7 +219,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Set the cancel flag without aborting the join handle yet
-        driver.cancel_flag.store(true, Ordering::Relaxed);
+        driver.control.cancel_flag.store(true, Ordering::Relaxed);
 
         // Take the worker handle and await it
         let worker_handle = driver.worker.take().expect("Should have worker handle");
