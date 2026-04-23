@@ -163,26 +163,7 @@ impl Tool for WebFetchTool {
 
         let mut rendered = raw_body;
         if !parsed.include_html.unwrap_or(false) {
-            // Strip tags: Replace script, style and then all other tags.
-            static RE_SCRIPT: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| {
-                    regex::Regex::new(r"(?is)<script.*?>.*?</script>").unwrap()
-                });
-            static RE_STYLE: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| {
-                    regex::Regex::new(r"(?is)<style.*?>.*?</style>").unwrap()
-                });
-            static RE_TAGS: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| regex::Regex::new(r"<[^>]*>").unwrap());
-
-            rendered = RE_SCRIPT.replace_all(&rendered, " ").to_string();
-            rendered = RE_STYLE.replace_all(&rendered, " ").to_string();
-            rendered = RE_TAGS.replace_all(&rendered, " ").to_string();
-
-            // Clean up extra whitespace/newlines
-            static RE_WS: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| regex::Regex::new(r"\n{3,}").unwrap());
-            rendered = RE_WS.replace_all(&rendered, "\n\n").to_string();
+            rendered = html_to_clean_markdown(&rendered);
         }
 
         let (content, truncated) = if rendered.chars().count() > max_chars {
@@ -338,6 +319,41 @@ impl Tool for TavilySearchTool {
     }
 }
 
+/// Convert raw HTML to clean Markdown for LLM consumption.
+///
+/// Pipeline:
+/// 1. Strip noise tags (script, style, nav, header, footer, aside, svg, noscript)
+/// 2. Convert remaining HTML → Markdown via `fast_html2md`
+/// 3. Collapse excessive blank lines
+fn html_to_clean_markdown(html: &str) -> String {
+    static RE_NOISE: once_cell::sync::Lazy<Vec<regex::Regex>> =
+        once_cell::sync::Lazy::new(|| {
+            ["script", "style", "nav", "header", "footer", "aside", "svg", "noscript", "iframe"]
+                .iter()
+                .map(|tag| {
+                    regex::Regex::new(&format!(r"(?is)<{tag}\b[^>]*>.*?</{tag}>")).unwrap()
+                })
+                .collect()
+        });
+
+    let mut cleaned = html.to_string();
+    for re in RE_NOISE.iter() {
+        cleaned = re.replace_all(&cleaned, "").to_string();
+    }
+
+    let md = html2md::rewrite_html(&cleaned, false);
+
+    static RE_BLANK_LINES: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"\n{3,}").unwrap());
+    static RE_TRAILING_WS: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"[^\S\n]+\n").unwrap());
+
+    let md = RE_BLANK_LINES.replace_all(&md, "\n\n");
+    let md = RE_TRAILING_WS.replace_all(&md, "\n");
+
+    md.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +408,47 @@ mod tests {
 
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
         assert!(err.to_string().contains("Sandbox Violation"));
+    }
+
+    #[test]
+    fn test_html_to_clean_markdown_strips_noise_and_converts() {
+        let html = r#"
+        <html>
+        <head><style>body { color: red; }</style></head>
+        <body>
+            <nav><a href="/">Home</a><a href="/about">About</a></nav>
+            <header><h1>Site Header</h1></header>
+            <main>
+                <h1>Article Title</h1>
+                <p>This is the <strong>main content</strong> of the page.</p>
+                <ul><li>Item one</li><li>Item two</li></ul>
+                <a href="https://example.com">Example Link</a>
+            </main>
+            <footer>Copyright 2024</footer>
+            <script>alert('evil');</script>
+        </body>
+        </html>"#;
+
+        let md = html_to_clean_markdown(html);
+
+        // Main content preserved as Markdown
+        assert!(md.contains("# Article Title"), "heading missing: {}", md);
+        assert!(md.contains("**main content**"), "bold missing: {}", md);
+        assert!(md.contains("Item one"), "list missing: {}", md);
+        assert!(md.contains("[Example Link]"), "link missing: {}", md);
+
+        // Noise removed
+        assert!(!md.contains("alert"), "script not stripped: {}", md);
+        assert!(!md.contains("color: red"), "style not stripped: {}", md);
+        assert!(!md.contains("Site Header"), "header not stripped: {}", md);
+        assert!(!md.contains("Copyright"), "footer not stripped: {}", md);
+    }
+
+    #[test]
+    fn test_html_to_clean_markdown_handles_plain_text() {
+        let plain = "Just some plain text with no HTML tags.";
+        let md = html_to_clean_markdown(plain);
+        assert_eq!(md, plain);
     }
 
     #[tokio::test]

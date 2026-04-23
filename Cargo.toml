@@ -52,6 +52,7 @@ cron = "0.12"
 syntect = "5.2"
 ratatui = "0.29"
 rquickjs = { version = "0.11.0", features = ["futures"] }
+fast_html2md = "0.0.61"
 
 [features]
 default = ["acp"]
