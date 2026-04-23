@@ -46,7 +46,7 @@ pub struct BrowserToolParams {
     /// Interaction details (required for action="act"). Must include kind and target_id.
     pub request: Option<BrowserActionRequest>,
 
-    /// "openclaw" (default) launches a sandboxed headless browser.
+    /// "openclaw" (default) launches a headless Chromium (--no-sandbox, suitable for containers).
     /// "chrome" attaches to an existing Chrome instance via CDP.
     pub profile: Option<String>,
 
@@ -162,7 +162,7 @@ impl BrowserTool {
 
                 Self::validate_loopback(&url)?;
 
-                let (mut browser, mut handler) = Browser::connect(&url).await.map_err(|e| {
+                let (browser, mut handler) = Browser::connect(&url).await.map_err(|e| {
                     ToolError::ExecutionFailed(format!(
                         "Failed to connect to Chrome at {}: {}",
                         url, e
@@ -180,35 +180,15 @@ impl BrowserTool {
                 // Wrap remaining fallible operations so the handler is aborted
                 // on any failure (fetch_targets, pages, new_page).
                 let attach_result = async {
-                    // fetch_targets() is required: Browser::connect only tracks targets
-                    // created after connection. Without this, existing tabs are invisible.
-                    browser.fetch_targets().await.map_err(|e| {
+                    // Open a fresh blank tab so we don't read content from
+                    // existing tabs. NOTE: the new tab still shares cookies,
+                    // localStorage, and login sessions with the user's profile.
+                    let page = browser.new_page("about:blank").await.map_err(|e| {
                         ToolError::ExecutionFailed(format!(
-                            "Failed to fetch existing targets: {}",
+                            "Failed to create initial page: {}",
                             e
                         ))
                     })?;
-
-                    // Retry pages() briefly — target attach/page initialization may
-                    // still be in progress after fetch_targets returns.
-                    let mut found = None;
-                    for _ in 0..5 {
-                        let pages = browser.pages().await.unwrap_or_default();
-                        if let Some(first) = pages.into_iter().next() {
-                            found = Some(first);
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                    let page = match found {
-                        Some(p) => p,
-                        None => browser.new_page("about:blank").await.map_err(|e| {
-                            ToolError::ExecutionFailed(format!(
-                                "Failed to create initial page: {}",
-                                e
-                            ))
-                        })?,
-                    };
                     Ok(page)
                 }
                 .await;
@@ -222,7 +202,10 @@ impl BrowserTool {
                         state.handler_handle = Some(handle);
 
                         Ok(format!(
-                            "Connected to Chrome at {}. Ready to accept commands.",
+                            "Connected to Chrome at {}. Ready to accept commands. \
+                             WARNING: this tab shares cookies and login sessions with \
+                             the user's Chrome profile — navigating to a site may use \
+                             the user's authenticated session.",
                             url
                         ))
                     }
@@ -301,8 +284,10 @@ impl Tool for BrowserTool {
 start → navigate(url) → snapshot(get element IDs) → act(click/type by ID) → snapshot(verify). \
 The snapshot action returns a numbered list of interactive elements like `[1] button \"Submit\"`. \
 Use the numeric IDs from snapshot as target_id for act. \
-Profile \"openclaw\" (default) launches a sandboxed browser. \
-Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: http://localhost:9222)."
+Profile \"openclaw\" (default) launches a headless Chromium (no OS-level sandbox; \
+do NOT load untrusted URLs without reviewing the page first). \
+Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: http://localhost:9222). \
+WARNING: chrome mode shares cookies/login sessions with the user's profile."
             .to_string()
     }
 

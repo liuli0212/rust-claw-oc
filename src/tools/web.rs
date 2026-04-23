@@ -142,45 +142,49 @@ impl Tool for WebFetchTool {
         }
 
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
         let raw_body = response
             .text()
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         if !status.is_success() {
+            let body_preview: String = raw_body.chars().take(max_chars).collect();
+            let truncated = raw_body.chars().count() > max_chars;
+            let fenced = crate::security::fence_untrusted("web_fetch", &body_preview);
             return serialize_tool_envelope(
                 "web_fetch",
                 false,
                 format!(
                     "Failed to fetch URL. HTTP: {} | URL: {} | Body: {}",
-                    status, url, raw_body
+                    status, url, fenced
                 ),
                 Some(1),
                 Some(start.elapsed().as_millis()),
-                raw_body.len() > 15_000,
+                truncated,
             );
         }
 
+        let is_html = content_type.contains("text/html") || content_type.contains("application/xhtml");
         let mut rendered = raw_body;
-        if !parsed.include_html.unwrap_or(false) {
+        if !parsed.include_html.unwrap_or(false) && is_html {
             rendered = html_to_clean_markdown(&rendered);
         }
 
-        let (raw_content, truncated) = if rendered.chars().count() > max_chars {
-            (rendered.chars().take(max_chars).collect::<String>(), true)
-        } else {
-            (rendered, false)
-        };
-
-        // output_path: save raw content to disk (not fenced), report length
-        // of the original content, and return early without sending to LLM.
+        // output_path: save full rendered content to disk (no truncation, not
+        // fenced) and return early. Truncation only applies to the LLM path.
         if let Some(path_buf) = &output_path {
             if let Some(parent) = path_buf.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     ToolError::ExecutionFailed(format!("Failed to create directory: {}", e))
                 })?;
             }
-            std::fs::write(path_buf, &raw_content).map_err(|e| {
+            std::fs::write(path_buf, &rendered).map_err(|e| {
                 ToolError::ExecutionFailed(format!(
                     "Failed to write to file {}: {}",
                     path_buf.display(),
@@ -194,13 +198,19 @@ impl Tool for WebFetchTool {
                 format!(
                     "Successfully fetched and saved content to {}. Length: {} chars.",
                     path_buf.display(),
-                    raw_content.len()
+                    rendered.len()
                 ),
                 Some(0),
                 Some(start.elapsed().as_millis()),
-                truncated,
+                false,
             );
         }
+
+        let (raw_content, truncated) = if rendered.chars().count() > max_chars {
+            (rendered.chars().take(max_chars).collect::<String>(), true)
+        } else {
+            (rendered, false)
+        };
 
         let content = crate::security::fence_untrusted("web_fetch", &raw_content);
         StructuredToolOutput::new(
@@ -453,6 +463,24 @@ mod tests {
         let plain = "Just some plain text with no HTML tags.";
         let md = html_to_clean_markdown(plain);
         assert_eq!(md, plain);
+    }
+
+    #[test]
+    fn test_content_type_detection_for_html_conversion() {
+        // Only text/html and application/xhtml should trigger markdown conversion.
+        let html_types = vec!["text/html", "text/html; charset=utf-8", "application/xhtml+xml"];
+        let non_html_types = vec!["text/plain", "application/json", "application/xml", "text/xml", ""];
+
+        for ct in &html_types {
+            let ct_lower = ct.to_lowercase();
+            let is_html = ct_lower.contains("text/html") || ct_lower.contains("application/xhtml");
+            assert!(is_html, "Expected HTML for Content-Type: {}", ct);
+        }
+        for ct in &non_html_types {
+            let ct_lower = ct.to_lowercase();
+            let is_html = ct_lower.contains("text/html") || ct_lower.contains("application/xhtml");
+            assert!(!is_html, "Should NOT be HTML for Content-Type: {}", ct);
+        }
     }
 
     #[tokio::test]

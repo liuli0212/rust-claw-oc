@@ -41,6 +41,8 @@ const INTERACTIVE_ROLES: &[&str] = &[
     "slider",
     "option",
     "treeitem",
+    "listbox",
+    "select",
 ];
 
 /// Roles that are always kept when filtering by hint (form-field family).
@@ -328,6 +330,20 @@ mod tests {
         let result = build_snapshot(&nodes, None, 100, 8000);
         assert_eq!(result.total_found, 0);
         assert!(result.output.contains("No interactive elements"));
+    }
+
+    #[test]
+    fn listbox_and_select_are_interactive() {
+        let nodes = vec![
+            make_node("listbox", "Country", 1),
+            make_node("select", "Language", 2),
+            make_node("textbox", "Name", 3),
+        ];
+
+        let result = build_snapshot(&nodes, None, 100, 8000);
+        assert_eq!(result.total_found, 3);
+        assert!(result.output.contains("listbox \"Country\""));
+        assert!(result.output.contains("select \"Language\""));
     }
 
     #[test]
