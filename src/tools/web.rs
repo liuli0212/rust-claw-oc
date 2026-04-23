@@ -21,7 +21,7 @@ pub struct TavilySearchTool {
 pub struct WebFetchArgs {
     /// URL to fetch. Must start with http:// or https://
     pub url: String,
-    /// Maximum characters to return (default: 12000, clamped to 500..50000).
+    /// Maximum characters to return (default: 10000, clamped to 500..30000).
     pub max_chars: Option<usize>,
     /// Return raw HTML when true. When false, HTML pages are converted to readable text.
     pub include_html: Option<bool>,
@@ -117,7 +117,7 @@ impl Tool for WebFetchTool {
             None
         };
 
-        let max_chars = parsed.max_chars.unwrap_or(12_000).clamp(500, 50_000);
+        let max_chars = parsed.max_chars.unwrap_or(10_000).clamp(500, 30_000);
 
         let mut response = self
             .client
@@ -166,19 +166,21 @@ impl Tool for WebFetchTool {
             rendered = html_to_clean_markdown(&rendered);
         }
 
-        let (content, truncated) = if rendered.chars().count() > max_chars {
+        let (raw_content, truncated) = if rendered.chars().count() > max_chars {
             (rendered.chars().take(max_chars).collect::<String>(), true)
         } else {
             (rendered, false)
         };
 
+        // output_path: save raw content to disk (not fenced), report length
+        // of the original content, and return early without sending to LLM.
         if let Some(path_buf) = &output_path {
             if let Some(parent) = path_buf.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     ToolError::ExecutionFailed(format!("Failed to create directory: {}", e))
                 })?;
             }
-            std::fs::write(path_buf, &content).map_err(|e| {
+            std::fs::write(path_buf, &raw_content).map_err(|e| {
                 ToolError::ExecutionFailed(format!(
                     "Failed to write to file {}: {}",
                     path_buf.display(),
@@ -192,7 +194,7 @@ impl Tool for WebFetchTool {
                 format!(
                     "Successfully fetched and saved content to {}. Length: {} chars.",
                     path_buf.display(),
-                    content.len()
+                    raw_content.len()
                 ),
                 Some(0),
                 Some(start.elapsed().as_millis()),
@@ -200,6 +202,7 @@ impl Tool for WebFetchTool {
             );
         }
 
+        let content = crate::security::fence_untrusted("web_fetch", &raw_content);
         StructuredToolOutput::new(
             "web_fetch",
             true,
@@ -306,10 +309,11 @@ impl Tool for TavilySearchTool {
             );
         }
 
+        let fenced = crate::security::fence_untrusted("web_search", &json.to_string());
         StructuredToolOutput::new(
             "web_search",
             true,
-            json.to_string(),
+            fenced,
             Some(0),
             Some(start.elapsed().as_millis()),
             false,

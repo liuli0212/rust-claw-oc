@@ -19,6 +19,7 @@ pub mod rag;
 pub mod sandbox_extension;
 pub mod scheduler;
 pub mod schema;
+pub mod security;
 pub mod session;
 pub mod session_manager;
 pub mod skills;

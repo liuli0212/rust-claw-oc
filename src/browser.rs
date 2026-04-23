@@ -391,7 +391,7 @@ Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: htt
                     }
                     output.push(']');
                 }
-                Ok(output)
+                Ok(crate::security::fence_untrusted("browser_snapshot", &output))
             }
             "act" => {
                 let state = self.state.read().await;

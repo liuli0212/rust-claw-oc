@@ -419,6 +419,49 @@ impl AgentLoop {
         full_text: &str,
         tool_calls_accumulated: &[ToolCallRecord],
     ) -> Option<RunExit> {
+        // ── Canary check BEFORE history insertion ──
+        // If the LLM leaked the canary, we must prevent the leaked text from
+        // entering the dialogue history (and thus being re-fed in later turns).
+        // Check both the text body AND tool-call arguments — the model could
+        // exfiltrate the canary through FunctionCall.args.
+        let text_without_think = Self::strip_think_blocks(full_text);
+        let trimmed_clean = text_without_think.trim();
+
+        let args_leak = tool_calls_accumulated.iter().any(|(tc, _)| {
+            crate::security::check_canary_leak(&tc.args.to_string())
+        });
+
+        if crate::security::check_canary_leak(full_text) || args_leak {
+            tracing::warn!("Canary token leaked in LLM output — possible prompt extraction attack");
+            self.output
+                .on_text("[Security] Canary leak detected — suppressing output.\n")
+                .await;
+            // Record a redacted placeholder so turn pairing stays consistent.
+            self.context.add_message_to_current_turn(Message {
+                role: "model".to_string(),
+                parts: vec![Part {
+                    text: Some("[REDACTED — canary leak detected]".to_string()),
+                    function_call: None,
+                    function_response: None,
+                    thought_signature: None,
+                    file_data: None,
+                }],
+            });
+            self.record_trace_event(
+                TraceActor::System,
+                "yielded_to_user",
+                TraceStatus::Yielded,
+                Some("Canary leak detected — output suppressed".to_string()),
+                serde_json::json!({}),
+                self.turn_span_id(),
+                None,
+            );
+            self.output.flush().await;
+            self.context.end_turn();
+            self.telemetry.end_span("agent_step");
+            return Some(RunExit::YieldedToUser);
+        }
+
         let mut parts = Vec::new();
         if !full_text.is_empty() {
             parts.push(Part {
@@ -443,9 +486,6 @@ impl AgentLoop {
             role: "model".to_string(),
             parts,
         });
-
-        let text_without_think = Self::strip_think_blocks(full_text);
-        let trimmed_clean = text_without_think.trim();
 
         if !trimmed_clean.is_empty() {
             self.output.on_text(trimmed_clean).await;
