@@ -24,6 +24,7 @@ pub struct CodeModeService {
 type SharedCellDriver = Arc<Mutex<CellDriver>>;
 type SharedCellHost = Arc<CellHostHandle>;
 type InitialSummaryTx = Option<oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>>;
+type CellTraceFinish = (TraceStatus, Option<String>, serde_json::Value);
 
 const INITIAL_NESTED_TOOL_PUBLICATION_DELAY: Duration = Duration::from_millis(150);
 
@@ -151,17 +152,6 @@ impl PublicationTracker {
 
         explicit_flush_value
     }
-}
-
-#[derive(Debug)]
-enum HostExitDisposition {
-    Terminal {
-        summary: ExecRunResult,
-    },
-    HostError {
-        error: crate::tools::ToolError,
-        summary: Option<ExecRunResult>,
-    },
 }
 
 fn clone_tool_error(error: &crate::tools::ToolError) -> crate::tools::ToolError {
@@ -390,7 +380,7 @@ impl CodeModeService {
         mut cell_span: Option<crate::trace::TraceSpanHandle>,
     ) {
         let mut initial_summary_tx = Some(initial_summary_tx);
-        let disposition = self
+        let trace_finish = self
             .perform_cell_host_loop(
                 &session_id,
                 &cell_id,
@@ -401,8 +391,7 @@ impl CodeModeService {
             .await;
 
         if let Some(span) = cell_span.take() {
-            let (status, summary, attrs) =
-                Self::trace_finish_from_disposition(&cell_id, &disposition);
+            let (status, summary, attrs) = trace_finish;
             span.finish("code_mode_cell_finished", status, summary, attrs);
         }
     }
@@ -414,7 +403,7 @@ impl CodeModeService {
         host_handle: &SharedCellHost,
         auto_flush_ms: Option<u64>,
         initial_summary_tx: &mut InitialSummaryTx,
-    ) -> HostExitDisposition {
+    ) -> CellTraceFinish {
         let mut publication_tracker = PublicationTracker::new(auto_flush_ms);
         let mut pending_initial_tool_summary: Option<(ExecRunResult, Instant)> = None;
 
@@ -463,7 +452,7 @@ impl CodeModeService {
                             )
                             .await
                         {
-                            return Self::fail_and_exit(initial_summary_tx, err);
+                            return Self::fail_and_exit(cell_id, initial_summary_tx, err);
                         }
                         continue;
                     }
@@ -478,7 +467,7 @@ impl CodeModeService {
                     .await
                 {
                     Ok(summary) => summary,
-                    Err(err) => return Self::fail_and_exit(initial_summary_tx, err),
+                    Err(err) => return Self::fail_and_exit(cell_id, initial_summary_tx, err),
                 };
                 publication_tracker.mark_published();
 
@@ -492,7 +481,7 @@ impl CodeModeService {
                     )
                     .await
                 {
-                    return Self::fail_and_exit(initial_summary_tx, err);
+                    return Self::fail_and_exit(cell_id, initial_summary_tx, err);
                 }
                 continue;
             }
@@ -504,7 +493,7 @@ impl CodeModeService {
                 .await
             {
                 Ok(snapshot) => snapshot,
-                Err(err) => return Self::fail_and_exit(initial_summary_tx, err),
+                Err(err) => return Self::fail_and_exit(cell_id, initial_summary_tx, err),
             };
 
             match update.boundary {
@@ -534,7 +523,7 @@ impl CodeModeService {
                             )
                             .await
                         {
-                            return Self::fail_and_exit(initial_summary_tx, err);
+                            return Self::fail_and_exit(cell_id, initial_summary_tx, err);
                         }
                     }
                 }
@@ -544,7 +533,7 @@ impl CodeModeService {
                             "Code mode entered a terminal state while dispatching a nested tool."
                                 .to_string(),
                         );
-                        return Self::fail_and_exit(initial_summary_tx, err);
+                        return Self::fail_and_exit(cell_id, initial_summary_tx, err);
                     }
 
                     let current_summary = snapshot.to_exec_result(None, None);
@@ -552,7 +541,7 @@ impl CodeModeService {
                         .publish_summary_update(session_id, cell_id, host_handle, &current_summary)
                         .await
                     {
-                        return Self::fail_and_exit(initial_summary_tx, err);
+                        return Self::fail_and_exit(cell_id, initial_summary_tx, err);
                     }
                     if initial_summary_tx.is_some() {
                         pending_initial_tool_summary = Some((
@@ -573,10 +562,10 @@ impl CodeModeService {
                         )
                         .await
                     {
-                        return Self::fail_and_exit(initial_summary_tx, err);
+                        return Self::fail_and_exit(cell_id, initial_summary_tx, err);
                     }
 
-                    return HostExitDisposition::Terminal { summary };
+                    return Self::trace_finish_from_summary(cell_id, &summary, None);
                 }
                 DriverBoundary::Idle => {}
             }
@@ -686,14 +675,12 @@ impl CodeModeService {
     }
 
     fn fail_and_exit(
+        cell_id: &str,
         initial_summary_tx: &mut InitialSummaryTx,
         error: crate::tools::ToolError,
-    ) -> HostExitDisposition {
+    ) -> CellTraceFinish {
         fail_initial(initial_summary_tx, &error);
-        HostExitDisposition::HostError {
-            error,
-            summary: None,
-        }
+        Self::trace_finish_from_host_error(cell_id, &error)
     }
 
     async fn record_and_exit_host_error(
@@ -703,24 +690,27 @@ impl CodeModeService {
         host_handle: &SharedCellHost,
         initial_summary_tx: &mut InitialSummaryTx,
         error: crate::tools::ToolError,
-    ) -> HostExitDisposition {
+    ) -> CellTraceFinish {
         let summary = self
             .record_host_error_in_session(session_id, cell_id, &error)
             .await;
 
-        if let Some(summary) = summary.as_ref() {
-            if let Err(err) = self
-                .publish_summary_update(session_id, cell_id, host_handle, summary)
-                .await
-            {
-                tracing::warn!("Failed to publish host-error summary update: {}", err);
+        match summary.as_ref() {
+            Some(summary) => {
+                if let Err(err) = self
+                    .publish_summary_update(session_id, cell_id, host_handle, summary)
+                    .await
+                {
+                    tracing::warn!("Failed to publish host-error summary update: {}", err);
+                }
+                publish_initial(initial_summary_tx, summary);
+                Self::trace_finish_from_summary(cell_id, summary, Some(&error))
             }
-            publish_initial(initial_summary_tx, summary);
-        } else {
-            fail_initial(initial_summary_tx, &error);
+            None => {
+                fail_initial(initial_summary_tx, &error);
+                Self::trace_finish_from_host_error(cell_id, &error)
+            }
         }
-
-        HostExitDisposition::HostError { error, summary }
     }
 
     async fn publish_summary_and_unblock_initial(
@@ -767,17 +757,17 @@ impl CodeModeService {
         Ok(())
     }
 
-    fn trace_status_from_summary(summary: &ExecRunResult) -> TraceStatus {
-        match summary.lifecycle {
-            ExecLifecycle::Completed => TraceStatus::Ok,
+    fn trace_finish_from_summary(
+        cell_id: &str,
+        summary: &ExecRunResult,
+        host_error: Option<&crate::tools::ToolError>,
+    ) -> CellTraceFinish {
+        let status = match &summary.lifecycle {
+            ExecLifecycle::Completed | ExecLifecycle::Running => TraceStatus::Ok,
             ExecLifecycle::Failed => TraceStatus::Error,
             ExecLifecycle::Cancelled => TraceStatus::Cancelled,
-            ExecLifecycle::Running => TraceStatus::Ok,
-        }
-    }
-
-    fn trace_summary_from_result(summary: &ExecRunResult) -> Option<String> {
-        match summary.lifecycle {
+        };
+        let trace_summary = match &summary.lifecycle {
             ExecLifecycle::Completed => Some("completed".to_string()),
             ExecLifecycle::Failed => summary.failure.clone().or(Some("failed".to_string())),
             ExecLifecycle::Cancelled => summary
@@ -785,63 +775,39 @@ impl CodeModeService {
                 .clone()
                 .or(Some("cancelled".to_string())),
             ExecLifecycle::Running => None,
+        };
+
+        let mut attrs = serde_json::json!({
+            "cell_id": cell_id,
+            "lifecycle": summary.lifecycle.clone(),
+            "nested_tool_calls": summary.nested_tool_calls,
+        });
+        if let Some(error) = host_error {
+            attrs["failure"] = serde_json::json!(summary.failure.clone());
+            attrs["cancellation"] = serde_json::json!(summary.cancellation.clone());
+            attrs["error"] = serde_json::json!(error.to_string());
         }
+
+        (status, trace_summary, attrs)
     }
 
-    fn trace_status_from_host_error(err: &crate::tools::ToolError) -> TraceStatus {
-        match err {
+    fn trace_finish_from_host_error(
+        cell_id: &str,
+        error: &crate::tools::ToolError,
+    ) -> CellTraceFinish {
+        let status = match error {
             crate::tools::ToolError::Timeout => TraceStatus::TimedOut,
             crate::tools::ToolError::Cancelled(_) => TraceStatus::Cancelled,
             _ => TraceStatus::Error,
-        }
-    }
-
-    fn trace_finish_from_disposition(
-        cell_id: &str,
-        disposition: &HostExitDisposition,
-    ) -> (TraceStatus, Option<String>, serde_json::Value) {
-        match disposition {
-            HostExitDisposition::Terminal { summary } => (
-                Self::trace_status_from_summary(summary),
-                Self::trace_summary_from_result(summary),
-                serde_json::json!({
-                    "cell_id": cell_id,
-                    "lifecycle": summary.lifecycle.clone(),
-                    "nested_tool_calls": summary.nested_tool_calls,
-                }),
-            ),
-            HostExitDisposition::HostError { error, summary } => {
-                let attrs = if let Some(summary) = summary {
-                    serde_json::json!({
-                        "cell_id": cell_id,
-                        "lifecycle": summary.lifecycle.clone(),
-                        "nested_tool_calls": summary.nested_tool_calls,
-                        "failure": summary.failure.clone(),
-                        "cancellation": summary.cancellation.clone(),
-                        "error": error.to_string(),
-                    })
-                } else {
-                    serde_json::json!({
-                        "cell_id": cell_id,
-                        "error": error.to_string(),
-                    })
-                };
-
-                if let Some(summary) = summary {
-                    (
-                        Self::trace_status_from_summary(summary),
-                        Self::trace_summary_from_result(summary),
-                        attrs,
-                    )
-                } else {
-                    (
-                        Self::trace_status_from_host_error(error),
-                        Some(error.to_string()),
-                        attrs,
-                    )
-                }
-            }
-        }
+        };
+        (
+            status,
+            Some(error.to_string()),
+            serde_json::json!({
+                "cell_id": cell_id,
+                "error": error.to_string(),
+            }),
+        )
     }
 
     async fn record_host_error_in_session(

@@ -532,6 +532,12 @@ Progress 2026-04-23 cell simplification pass:
 - Removed the unused `CellSnapshot.max_seq` / `RuntimeEvent::seq` snapshot plumbing.
 - Finding: `CellSnapshot` still has value as the small owned publication view returned after releasing the service lock; removing it would push more lifecycle branching back into `CodeModeService`.
 
+Progress 2026-04-23 service simplification pass:
+
+- Removed `HostExitDisposition`; the host loop now returns the trace finish tuple directly after publishing the terminal or error summary.
+- Inlined the one-purpose trace status/summary helpers into the two trace-finish constructors.
+- Finding: the remaining summary publication helpers are worth keeping because they preserve the lock boundary and the initial `exec` unblock behavior without duplicating notification writes in the main loop.
+
 ## Verification Matrix
 
 | Area | Required Verification |
