@@ -12,6 +12,12 @@ use tokio::sync::Notify;
 pub mod extensions;
 mod step_helpers;
 
+pub struct TraceEventPayload {
+    pub status: TraceStatus,
+    pub summary: Option<String>,
+    pub attrs: serde_json::Value,
+}
+
 pub struct ScopeGuard<F: FnOnce()> {
     closure: Option<F>,
 }
@@ -490,15 +496,13 @@ impl AgentLoop {
         &self,
         actor: TraceActor,
         name: &str,
-        status: TraceStatus,
-        summary: Option<String>,
-        attrs: serde_json::Value,
+        payload: TraceEventPayload,
         parent_span_id: Option<String>,
         iteration: Option<u32>,
     ) {
         if let Some(ctx) = self.trace_context_with_parent(parent_span_id, iteration) {
             self.trace_bus
-                .record_event(&ctx, actor, name, status, summary, attrs);
+                .record_event(&ctx, actor, name, payload.status, payload.summary, payload.attrs);
         }
     }
 
@@ -680,14 +684,16 @@ impl AgentLoop {
             self.record_trace_event(
                 TraceActor::Context,
                 "context_compacted",
-                TraceStatus::Ok,
-                Some(reason.clone()),
-                serde_json::json!({
-                    "compacted_turns": num_to_compact,
-                    "usage_tokens": current_usage as u64,
-                    "threshold_tokens": threshold as u64,
-                    "history_tokens": current_usage as u64,
-                }),
+                TraceEventPayload {
+                    status: TraceStatus::Ok,
+                    summary: Some(reason.clone()),
+                    attrs: serde_json::json!({
+                        "compacted_turns": num_to_compact,
+                        "usage_tokens": current_usage as u64,
+                        "threshold_tokens": threshold as u64,
+                        "history_tokens": current_usage as u64,
+                    }),
+                },
                 self.turn_span_id(),
                 None,
             );
@@ -839,9 +845,11 @@ impl AgentLoop {
         self.record_trace_event(
             TraceActor::Context,
             "context_snapshot_taken",
-            TraceStatus::Ok,
-            None,
-            serde_json::json!({}),
+            TraceEventPayload {
+                status: TraceStatus::Ok,
+                summary: None,
+                attrs: serde_json::json!({}),
+            },
             self.turn_span_id(),
             None,
         );
@@ -1029,9 +1037,11 @@ impl AgentLoop {
                 self.record_trace_event(
                     TraceActor::System,
                     "yielded_to_user",
-                    TraceStatus::Yielded,
-                    Some("Tool requested user input".to_string()),
-                    serde_json::json!({}),
+                    TraceEventPayload {
+                        status: TraceStatus::Yielded,
+                        summary: Some("Tool requested user input".to_string()),
+                        attrs: serde_json::json!({}),
+                    },
                     self.turn_span_id(),
                     Some(iteration),
                 );

@@ -496,9 +496,11 @@ impl AgentLoop {
             self.record_trace_event(
                 TraceActor::System,
                 "yielded_to_user",
-                TraceStatus::Yielded,
-                Some("No tool call was emitted".to_string()),
-                serde_json::json!({}),
+                crate::core::TraceEventPayload {
+                    status: TraceStatus::Yielded,
+                    summary: Some("No tool call was emitted".to_string()),
+                    attrs: serde_json::json!({}),
+                },
                 self.turn_span_id(),
                 None,
             );
@@ -599,11 +601,13 @@ impl AgentLoop {
             self.record_trace_event(
                 TraceActor::System,
                 "energy_depleted",
-                TraceStatus::Error,
-                Some("Energy budget exhausted".to_string()),
-                serde_json::json!({
-                    "iterations": task_state.iterations,
-                }),
+                crate::core::TraceEventPayload {
+                    status: TraceStatus::Error,
+                    summary: Some("Energy budget exhausted".to_string()),
+                    attrs: serde_json::json!({
+                        "iterations": task_state.iterations,
+                    }),
+                },
                 self.turn_span_id(),
                 None,
             );
