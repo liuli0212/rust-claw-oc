@@ -59,8 +59,8 @@ impl Tool for PatchFileTool {
                 .map_err(|v| crate::tools::ToolError::ExecutionFailed(v.to_string()))?;
         }
 
-        let mut file_content =
-            std::fs::read_to_string(&parsed.path).map_err(crate::tools::ToolError::IoError)?;
+        let mut file_content = std::fs::read_to_string(&parsed.path)
+            .map_err(|e| crate::tools::ToolError::IoError(std::sync::Arc::new(e)))?;
 
         // Validate all edits first (Atomicity)
         for (i, edit) in parsed.edits.iter().enumerate() {
@@ -105,7 +105,8 @@ impl Tool for PatchFileTool {
             file_content = file_content.replace(search_str, replace_str);
         }
 
-        std::fs::write(&parsed.path, &file_content).map_err(crate::tools::ToolError::IoError)?;
+        std::fs::write(&parsed.path, &file_content)
+            .map_err(|e| crate::tools::ToolError::IoError(std::sync::Arc::new(e)))?;
 
         crate::tools::protocol::StructuredToolOutput::new(
             "patch_file",

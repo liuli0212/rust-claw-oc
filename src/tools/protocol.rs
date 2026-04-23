@@ -21,7 +21,7 @@ pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
     schema_val
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ToolError {
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
@@ -32,7 +32,13 @@ pub enum ToolError {
     #[error("Cancelled: {0}")]
     Cancelled(String),
     #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
+    IoError(Arc<std::io::Error>),
+}
+
+impl From<std::io::Error> for ToolError {
+    fn from(err: std::io::Error) -> Self {
+        Self::IoError(Arc::new(err))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

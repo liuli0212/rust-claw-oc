@@ -82,9 +82,8 @@ impl BrowserTool {
     }
 
     fn validate_loopback(raw: &str) -> Result<(), ToolError> {
-        let parsed = Url::parse(raw).map_err(|e| {
-            ToolError::InvalidArguments(format!("Invalid debugging_url: {}", e))
-        })?;
+        let parsed = Url::parse(raw)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid debugging_url: {}", e)))?;
         let host = parsed.host_str().unwrap_or("");
         match host {
             "127.0.0.1" | "localhost" | "::1" | "[::1]" => Ok(()),
@@ -115,10 +114,7 @@ impl BrowserTool {
                     .arg("--disable-dev-shm-usage")
                     .build()
                     .map_err(|e| {
-                        ToolError::ExecutionFailed(format!(
-                            "Failed to build browser config: {}",
-                            e
-                        ))
+                        ToolError::ExecutionFailed(format!("Failed to build browser config: {}", e))
                     })?;
 
                 let (browser, mut handler) = Browser::launch(config).await.map_err(|e| {
@@ -148,18 +144,16 @@ impl BrowserTool {
             "chrome" => {
                 // Default to the most common CDP port. Users can override via
                 // debugging_url if Chrome is listening on a different port.
-                let url = debugging_url
-                    .unwrap_or_else(|| "http://localhost:9222".to_string());
+                let url = debugging_url.unwrap_or_else(|| "http://localhost:9222".to_string());
 
                 Self::validate_loopback(&url)?;
 
-                let (mut browser, mut handler) =
-                    Browser::connect(&url).await.map_err(|e| {
-                        ToolError::ExecutionFailed(format!(
-                            "Failed to connect to Chrome at {}: {}",
-                            url, e
-                        ))
-                    })?;
+                let (mut browser, mut handler) = Browser::connect(&url).await.map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "Failed to connect to Chrome at {}: {}",
+                        url, e
+                    ))
+                })?;
 
                 let handle = task::spawn(async move {
                     while let Some(h) = handler.next().await {
@@ -329,7 +323,10 @@ Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: htt
                     Ok("Browser is stopped. Call start to launch it.".to_string())
                 }
             }
-            "start" => self.handle_start(params.profile, params.debugging_url).await,
+            "start" => {
+                self.handle_start(params.profile, params.debugging_url)
+                    .await
+            }
             "stop" => self.handle_stop().await,
             "navigate" => {
                 let url = params.target_url.ok_or_else(|| {
@@ -851,7 +848,10 @@ mod tests {
     async fn test_unknown_profile_rejected() {
         let tool = BrowserTool::new();
         let res = tool
-            .execute(json!({"action": "start", "profile": "firefox"}), &test_ctx())
+            .execute(
+                json!({"action": "start", "profile": "firefox"}),
+                &test_ctx(),
+            )
             .await;
         assert!(res.is_err());
         let err = res.unwrap_err();

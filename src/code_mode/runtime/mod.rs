@@ -11,10 +11,7 @@ use serde::Deserialize;
 use self::timers::RecordedTimerCall;
 use self::value::StoredValue;
 use super::protocol::{RuntimeTerminalResult, ToolCallRequest};
-use super::runtime::globals::{LOAD_FN, NOTIFY_FN, STORE_FN, TEXT_FN};
 
-pub mod callbacks;
-pub mod globals;
 pub mod timers;
 pub mod value;
 
@@ -51,7 +48,7 @@ pub(crate) fn run_cell(
         runtime.set_interrupt_handler(Some(Box::new(move || {
             cancel_flag_clone.load(std::sync::atomic::Ordering::Acquire)
         }))).await;
-        let context = AsyncContext::full(&runtime)
+        let context: AsyncContext = AsyncContext::full(&runtime)
             .await
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
 
@@ -66,7 +63,6 @@ pub(crate) fn run_cell(
         let next_seq_for_script = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let stored_values = Arc::new(Mutex::new(stored_values));
-        let nested_tool_count = Arc::new(Mutex::new(0usize));
         let timer_calls = Arc::new(Mutex::new(Vec::<RecordedTimerCall>::new()));
         let visible_tools_json = serde_json::to_string(&host.visible_tool_names())
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
@@ -75,7 +71,6 @@ pub(crate) fn run_cell(
 
         let next_seq_for_script_captured = next_seq_for_script.clone();
         let stored_values_for_script = stored_values.clone();
-        let nested_tool_count_for_script = nested_tool_count.clone();
         let timer_calls_for_script = timer_calls.clone();
         let host_for_script = host.clone();
 
@@ -86,7 +81,7 @@ pub(crate) fn run_cell(
             let next_seq_for_text = next_seq_for_script_captured.clone();
             globals
                 .set(
-                    format!("__{TEXT_FN}"),
+                    "__text".to_string(),
                     Func::from(move |text: String| -> rquickjs::Result<()> {
                         host_for_text.emit_event(crate::code_mode::protocol::RuntimeEvent::Text {
                             seq: next_seq_for_text.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
@@ -101,7 +96,7 @@ pub(crate) fn run_cell(
             let next_seq_for_notify = next_seq_for_script_captured.clone();
             globals
                 .set(
-                    format!("__{NOTIFY_FN}"),
+                    "__notify".to_string(),
                     Func::from(move |message: String| -> rquickjs::Result<()> {
                         host_for_notify.emit_event(crate::code_mode::protocol::RuntimeEvent::Notification {
                             seq: next_seq_for_notify.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
@@ -152,7 +147,7 @@ pub(crate) fn run_cell(
             let store_ref = stored_values_for_script.clone();
             globals
                 .set(
-                    format!("__{STORE_FN}"),
+                    "__store".to_string(),
                     Func::from(move |key: String, value_json: String| -> rquickjs::Result<()> {
                         let value = serde_json::from_str::<serde_json::Value>(&value_json).map_err(
                             |err| Error::new_from_js_message("string", "json", err.to_string()),
@@ -166,7 +161,7 @@ pub(crate) fn run_cell(
             let load_ref = stored_values_for_script.clone();
             globals
                 .set(
-                    format!("__{LOAD_FN}"),
+                    "__load".to_string(),
                     Func::from(move |key: String| -> rquickjs::Result<Option<String>> {
                         Ok(load_ref
                             .lock()
@@ -179,13 +174,11 @@ pub(crate) fn run_cell(
 
             let host_for_tool = host_for_script.clone();
             let next_seq_for_tool = next_seq_for_script_captured.clone();
-            let call_tool_ref = nested_tool_count_for_script.clone();
             // __callTool is a Promise bridge into the host. Runtime owns only
             // request construction; visibility, policy, and execution stay in Rust host code.
             let call_tool = Function::new(
                 ctx.clone(),
                 Async(move |tool_name: String, args_json: String| {
-                    *call_tool_ref.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     let seq = next_seq_for_tool.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let request_id = format!("{}-{}", tool_name, seq);
                     let host = host_for_tool.clone();
