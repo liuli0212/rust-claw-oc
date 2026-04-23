@@ -30,6 +30,7 @@ pub fn build_app_bootstrap() -> Result<AppBootstrap, Box<dyn std::error::Error>>
         Arc::new(ReadMemoryTool::new(workspace_memory.clone())),
         Arc::new(WriteMemoryTool::new(workspace_memory.clone())),
         Arc::new(SendFileTool),
+        Arc::new(crate::browser::BrowserTool::new()),
     ];
 
     let lazy_lsp = Arc::new(crate::lsp_client::LazyLspClient::new(

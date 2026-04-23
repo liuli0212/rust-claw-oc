@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task;
+use tokio::task::JoinHandle;
+use url::Url;
 
 // Import chromiumoxide for CDP automation
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -13,34 +15,47 @@ use futures::StreamExt;
 
 use crate::tools::{clean_schema, Tool, ToolError};
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BrowserMode {
+    Launched,
+    Attached,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct BrowserActionRequest {
-    /// kind: click, type, fill, evaluate...
+    /// Interaction kind: "click" or "type"
     pub kind: String,
-    /// Target flattened ID from snapshot, e.g., "15"
+    /// Numeric element ID from the most recent snapshot, e.g. "5"
     pub target_id: Option<String>,
-    /// Keyboard text input
+    /// Text to type (required when kind="type")
     pub text: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone)]
 pub struct BrowserToolParams {
-    /// Action: status, start, stop, snapshot, act, navigate
+    /// One of: "status", "start", "stop", "navigate", "snapshot", "act"
     pub action: String,
 
-    /// Target URL (for navigate)
+    /// URL to navigate to (required for action="navigate"). Auto-prepends https:// if missing.
     pub target_url: Option<String>,
 
-    /// Action details (for act)
+    /// Interaction details (required for action="act"). Must include kind and target_id.
     pub request: Option<BrowserActionRequest>,
 
-    /// Profile type: 'chrome' (attach) or 'openclaw' (sandbox)
+    /// "openclaw" (default) launches a sandboxed headless browser.
+    /// "chrome" attaches to an existing Chrome instance via CDP.
     pub profile: Option<String>,
+
+    /// CDP endpoint for profile="chrome". Defaults to "http://localhost:9222".
+    pub debugging_url: Option<String>,
 }
 
 pub struct BrowserState {
     pub browser: Option<Browser>,
     pub active_page: Option<Page>,
+    pub(crate) mode: BrowserMode,
+    pub(crate) debugging_url: Option<String>,
+    handler_handle: Option<JoinHandle<()>>,
 }
 
 pub struct BrowserTool {
@@ -59,11 +74,31 @@ impl BrowserTool {
             state: Arc::new(RwLock::new(BrowserState {
                 browser: None,
                 active_page: None,
+                mode: BrowserMode::Launched,
+                debugging_url: None,
+                handler_handle: None,
             })),
         }
     }
 
-    async fn handle_start(&self) -> Result<String, ToolError> {
+    fn validate_loopback(raw: &str) -> Result<(), ToolError> {
+        let parsed = Url::parse(raw).map_err(|e| {
+            ToolError::InvalidArguments(format!("Invalid debugging_url: {}", e))
+        })?;
+        let host = parsed.host_str().unwrap_or("");
+        match host {
+            "127.0.0.1" | "localhost" | "::1" | "[::1]" => Ok(()),
+            _ => Err(ToolError::InvalidArguments(
+                "debugging_url must be a loopback address (127.0.0.1 or localhost)".to_string(),
+            )),
+        }
+    }
+
+    async fn handle_start(
+        &self,
+        profile: Option<String>,
+        debugging_url: Option<String>,
+    ) -> Result<String, ToolError> {
         let mut state = self.state.write().await;
         if state.browser.is_some() {
             return Ok(
@@ -71,39 +106,129 @@ impl BrowserTool {
             );
         }
 
-        // Configure sandbox browser
-        let config = BrowserConfig::builder()
-            .no_sandbox()
-            .arg("--disable-dev-shm-usage")
-            .build()
-            .map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to build browser config: {}", e))
-            })?;
+        let profile = profile.as_deref().unwrap_or("openclaw");
 
-        // Launch the browser process
-        let (browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to launch chromium: {}", e)))?;
+        match profile {
+            "openclaw" => {
+                let config = BrowserConfig::builder()
+                    .no_sandbox()
+                    .arg("--disable-dev-shm-usage")
+                    .build()
+                    .map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "Failed to build browser config: {}",
+                            e
+                        ))
+                    })?;
 
-        // Spawn a background task to process CDP events
-        // Without this, the browser connection will stall.
-        task::spawn(async move {
-            while let Some(h) = handler.next().await {
-                if h.is_err() {
-                    break;
+                let (browser, mut handler) = Browser::launch(config).await.map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Failed to launch chromium: {}", e))
+                })?;
+
+                let handle = task::spawn(async move {
+                    while let Some(h) = handler.next().await {
+                        if h.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                let page = browser.new_page("about:blank").await.map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Failed to create initial page: {}", e))
+                })?;
+
+                state.browser = Some(browser);
+                state.active_page = Some(page);
+                state.mode = BrowserMode::Launched;
+                state.debugging_url = None;
+                state.handler_handle = Some(handle);
+
+                Ok("Browser launched successfully and is ready to accept commands.".to_string())
+            }
+            "chrome" => {
+                // Default to the most common CDP port. Users can override via
+                // debugging_url if Chrome is listening on a different port.
+                let url = debugging_url
+                    .unwrap_or_else(|| "http://localhost:9222".to_string());
+
+                Self::validate_loopback(&url)?;
+
+                let (mut browser, mut handler) =
+                    Browser::connect(&url).await.map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "Failed to connect to Chrome at {}: {}",
+                            url, e
+                        ))
+                    })?;
+
+                let handle = task::spawn(async move {
+                    while let Some(h) = handler.next().await {
+                        if h.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Wrap remaining fallible operations so the handler is aborted
+                // on any failure (fetch_targets, pages, new_page).
+                let attach_result = async {
+                    // fetch_targets() is required: Browser::connect only tracks targets
+                    // created after connection. Without this, existing tabs are invisible.
+                    browser.fetch_targets().await.map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "Failed to fetch existing targets: {}",
+                            e
+                        ))
+                    })?;
+
+                    // Retry pages() briefly — target attach/page initialization may
+                    // still be in progress after fetch_targets returns.
+                    let mut found = None;
+                    for _ in 0..5 {
+                        let pages = browser.pages().await.unwrap_or_default();
+                        if let Some(first) = pages.into_iter().next() {
+                            found = Some(first);
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    let page = match found {
+                        Some(p) => p,
+                        None => browser.new_page("about:blank").await.map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "Failed to create initial page: {}",
+                                e
+                            ))
+                        })?,
+                    };
+                    Ok(page)
+                }
+                .await;
+
+                match attach_result {
+                    Ok(page) => {
+                        state.browser = Some(browser);
+                        state.active_page = Some(page);
+                        state.mode = BrowserMode::Attached;
+                        state.debugging_url = Some(url.clone());
+                        state.handler_handle = Some(handle);
+
+                        Ok(format!(
+                            "Connected to Chrome at {}. Ready to accept commands.",
+                            url
+                        ))
+                    }
+                    Err(e) => {
+                        handle.abort();
+                        Err(e)
+                    }
                 }
             }
-        });
-
-        // Create an initial page
-        let page = browser.new_page("about:blank").await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to create initial page: {}", e))
-        })?;
-
-        state.browser = Some(browser);
-        state.active_page = Some(page);
-
-        Ok("Browser launched successfully and is ready to accept commands.".to_string())
+            other => Err(ToolError::InvalidArguments(format!(
+                "Unknown profile: '{}'. Use 'openclaw' or 'chrome'.",
+                other
+            ))),
+        }
     }
 
     async fn handle_stop(&self) -> Result<String, ToolError> {
@@ -112,10 +237,19 @@ impl BrowserTool {
             return Ok("Browser is already stopped.".to_string());
         }
 
-        // Dropping the page and browser handles will close the connection
-        // and chromiumoxide will kill the child process cleanly.
+        // Abort the CDP event handler task to close the websocket connection.
+        // Without this, the task keeps the connection alive after stop.
+        if let Some(handle) = state.handler_handle.take() {
+            handle.abort();
+        }
+
+        // Both modes just null out the handles:
+        // - Launched: Browser::drop kills the child process
+        // - Attached: Browser::drop is a no-op (no child), so we do NOT call
+        //   browser.close() which would send CDP Browser.close and kill user's Chrome
         state.active_page = None;
         state.browser = None;
+        state.debugging_url = None;
 
         Ok("Browser stopped cleanly.".to_string())
     }
@@ -155,7 +289,13 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> String {
-        "Control web browser to navigate, extract DOM, and interact with elements. Actions: status, start, stop, navigate, snapshot, act.".to_string()
+        "Control a headless web browser. Typical workflow: \
+start → navigate(url) → snapshot(get element IDs) → act(click/type by ID) → snapshot(verify). \
+The snapshot action returns a numbered list of interactive elements like `[1] button \"Submit\"`. \
+Use the numeric IDs from snapshot as target_id for act. \
+Profile \"openclaw\" (default) launches a sandboxed browser. \
+Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: http://localhost:9222)."
+            .to_string()
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -175,12 +315,21 @@ impl Tool for BrowserTool {
             "status" => {
                 let state = self.state.read().await;
                 if state.browser.is_some() {
-                    Ok("Browser is running. Call navigate to visit a URL.".to_string())
+                    match (&state.mode, &state.debugging_url) {
+                        (BrowserMode::Attached, Some(url)) => Ok(format!(
+                            "Browser is running (attached to {}). Call navigate to visit a URL.",
+                            url
+                        )),
+                        _ => Ok(
+                            "Browser is running (launched, headless). Call navigate to visit a URL."
+                                .to_string(),
+                        ),
+                    }
                 } else {
                     Ok("Browser is stopped. Call start to launch it.".to_string())
                 }
             }
-            "start" => self.handle_start().await,
+            "start" => self.handle_start(params.profile, params.debugging_url).await,
             "stop" => self.handle_stop().await,
             "navigate" => {
                 let url = params.target_url.ok_or_else(|| {
@@ -354,6 +503,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[ignore] // requires Chromium and network access
     async fn test_browser_lifecycle() {
         let browser_tool = BrowserTool::new();
 
@@ -397,6 +547,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[ignore] // requires Chromium and network access
     async fn test_browser_flow() {
         let tool = BrowserTool::new();
 
@@ -445,6 +596,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[ignore] // requires Chromium and network access
     async fn test_google_access() {
         let tool = BrowserTool::new();
         println!("--- Starting Browser for Google ---");
@@ -472,6 +624,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[ignore] // requires Chromium and network access
     async fn test_google_search_flow() {
         let tool = BrowserTool::new();
         println!("--- Phase 1: Start & Navigate ---");
@@ -557,5 +710,181 @@ mod tests {
         tool.execute(json!({"action": "stop"}), &test_ctx())
             .await
             .unwrap();
+    }
+
+    // --- Unit tests: no external dependencies ---
+
+    #[tokio::test]
+    #[serial]
+    async fn test_status_text_when_stopped() {
+        let tool = BrowserTool::new();
+        let res = tool
+            .execute(json!({"action": "status"}), &test_ctx())
+            .await
+            .unwrap();
+        assert!(res.contains("stopped"), "Expected 'stopped' in: {}", res);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_stop_when_already_stopped() {
+        let tool = BrowserTool::new();
+        let res = tool
+            .execute(json!({"action": "stop"}), &test_ctx())
+            .await
+            .unwrap();
+        assert!(
+            res.contains("already stopped"),
+            "Expected 'already stopped' in: {}",
+            res
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_navigate_requires_browser() {
+        let tool = BrowserTool::new();
+        let res = tool
+            .execute(
+                json!({"action": "navigate", "target_url": "https://example.com"}),
+                &test_ctx(),
+            )
+            .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.to_string().contains("not running"),
+            "Expected 'not running' error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_chrome_profile_defaults_debugging_url() {
+        let tool = BrowserTool::new();
+        // No debugging_url provided — should default to http://localhost:9222
+        // and fail with a connection error (no Chrome running in test env).
+        let res = tool
+            .execute(json!({"action": "start", "profile": "chrome"}), &test_ctx())
+            .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.to_string().contains("localhost:9222"),
+            "Expected connection error mentioning localhost:9222: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_chrome_profile_rejects_non_loopback() {
+        let tool = BrowserTool::new();
+        let res = tool
+            .execute(
+                json!({
+                    "action": "start",
+                    "profile": "chrome",
+                    "debugging_url": "http://1.2.3.4:9222"
+                }),
+                &test_ctx(),
+            )
+            .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.to_string().contains("loopback"),
+            "Expected 'loopback' error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_loopback_rejects_localhost_subdomain() {
+        let tool = BrowserTool::new();
+        let res = tool
+            .execute(
+                json!({
+                    "action": "start",
+                    "profile": "chrome",
+                    "debugging_url": "http://localhost.evil.com:9222"
+                }),
+                &test_ctx(),
+            )
+            .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.to_string().contains("loopback"),
+            "Expected 'loopback' error for localhost.evil.com: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_loopback_rejects_userinfo_bypass() {
+        let tool = BrowserTool::new();
+        let res = tool
+            .execute(
+                json!({
+                    "action": "start",
+                    "profile": "chrome",
+                    "debugging_url": "http://localhost:9222@evil.example"
+                }),
+                &test_ctx(),
+            )
+            .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.to_string().contains("loopback"),
+            "Expected 'loopback' error for userinfo bypass: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_unknown_profile_rejected() {
+        let tool = BrowserTool::new();
+        let res = tool
+            .execute(json!({"action": "start", "profile": "firefox"}), &test_ctx())
+            .await;
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown profile"),
+            "Expected 'Unknown profile' error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_snapshot_requires_browser() {
+        let tool = BrowserTool::new();
+        let res = tool
+            .execute(json!({"action": "snapshot"}), &test_ctx())
+            .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_act_requires_browser() {
+        let tool = BrowserTool::new();
+        let res = tool
+            .execute(
+                json!({
+                    "action": "act",
+                    "request": {"kind": "click", "target_id": "1"}
+                }),
+                &test_ctx(),
+            )
+            .await;
+        assert!(res.is_err());
     }
 }

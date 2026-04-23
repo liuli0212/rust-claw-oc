@@ -1,6 +1,7 @@
 #[cfg(feature = "acp")]
 pub mod acp;
 pub mod app;
+pub mod browser;
 pub mod code_mode;
 pub mod config;
 pub mod context;
