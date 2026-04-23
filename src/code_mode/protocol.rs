@@ -54,18 +54,6 @@ pub enum RuntimeEvent {
 }
 
 impl RuntimeEvent {
-    pub fn seq(&self) -> Option<u64> {
-        match self {
-            Self::Text { seq, .. }
-            | Self::Notification { seq, .. }
-            | Self::Flush { seq, .. }
-            | Self::WaitingForTimer { seq, .. }
-            | Self::ToolCallDone { seq, .. } => Some(*seq),
-            Self::ToolCallRequested(request) => Some(request.seq),
-            Self::WorkerCompleted(_) => None,
-        }
-    }
-
     pub fn is_visible_in_snapshot(&self) -> bool {
         !matches!(
             self,
@@ -75,12 +63,4 @@ impl RuntimeEvent {
                 | Self::ToolCallDone { .. }
         )
     }
-}
-
-pub fn max_event_seq(events: &[RuntimeEvent]) -> u64 {
-    events
-        .iter()
-        .filter_map(RuntimeEvent::seq)
-        .max()
-        .unwrap_or(0)
 }

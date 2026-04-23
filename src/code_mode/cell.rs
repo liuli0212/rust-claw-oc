@@ -1,31 +1,19 @@
 use serde_json::Value;
 
 use super::driver::{DriverBoundary, DriverUpdate};
-use super::protocol::{max_event_seq, RuntimeEvent, RuntimeTerminalResult};
+use super::protocol::{RuntimeEvent, RuntimeTerminalResult};
 use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 
 const RECENT_EVENT_BUDGET_CHARS: usize = 8_000;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CellWaitState {
-    NestedTool { request_id: String },
-    Timer { next_due_in_ms: Option<u64> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CellPhase {
     Running,
-    Waiting(CellWaitState),
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct CellTerminalState {
-    pub return_value: Option<Value>,
-    pub failure: Option<String>,
-    pub cancellation: Option<String>,
+    WaitingOnTool { request_id: String },
+    WaitingOnTimer { next_due_in_ms: Option<u64> },
+    Completed { return_value: Option<Value> },
+    Failed { error: String },
+    Cancelled { reason: String },
 }
 
 #[derive(Debug, Clone)]
@@ -33,7 +21,6 @@ pub struct ActiveCellHandle {
     pub cell_id: String,
     pub phase: CellPhase,
     pub events: Vec<RuntimeEvent>,
-    pub terminal_state: Option<CellTerminalState>,
     pub last_publication: Option<ExecRunResult>,
 }
 
@@ -43,20 +30,16 @@ impl ActiveCellHandle {
             cell_id,
             phase: CellPhase::Running,
             events: Vec::new(),
-            terminal_state: None,
             last_publication: None,
         }
     }
 
     pub fn snapshot(&self) -> CellSnapshot {
-        let max_seq = max_event_seq(&self.events);
         let recent_events = self.recent_visible_events();
 
         CellSnapshot {
             cell_id: self.cell_id.clone(),
             phase: self.phase.clone(),
-            terminal_state: self.terminal_state.clone(),
-            max_seq,
             recent_events,
             nested_tool_calls: self.nested_tool_call_count(),
         }
@@ -70,18 +53,13 @@ impl ActiveCellHandle {
     }
 
     pub fn transition_to_failure(&mut self, error: String) {
-        self.phase = CellPhase::Failed;
-        self.terminal_state = Some(CellTerminalState {
-            return_value: None,
-            failure: Some(error),
-            cancellation: None,
-        });
+        self.phase = CellPhase::Failed { error };
     }
 
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.phase,
-            CellPhase::Completed | CellPhase::Failed | CellPhase::Cancelled
+            CellPhase::Completed { .. } | CellPhase::Failed { .. } | CellPhase::Cancelled { .. }
         )
     }
 
@@ -128,14 +106,17 @@ impl ActiveCellHandle {
             RuntimeEvent::Text { .. }
             | RuntimeEvent::Notification { .. }
             | RuntimeEvent::Flush { .. } => {
-                if matches!(self.phase, CellPhase::Waiting(_)) {
+                if matches!(
+                    self.phase,
+                    CellPhase::WaitingOnTool { .. } | CellPhase::WaitingOnTimer { .. }
+                ) {
                     self.phase = CellPhase::Running;
                 }
             }
             RuntimeEvent::ToolCallRequested(request) => {
-                self.phase = CellPhase::Waiting(CellWaitState::NestedTool {
+                self.phase = CellPhase::WaitingOnTool {
                     request_id: request.request_id.clone(),
-                });
+                };
             }
             RuntimeEvent::ToolCallDone { .. } => {
                 self.phase = CellPhase::Running;
@@ -143,27 +124,28 @@ impl ActiveCellHandle {
             RuntimeEvent::WaitingForTimer {
                 resume_after_ms, ..
             } => {
-                self.phase = CellPhase::Waiting(CellWaitState::Timer {
+                self.phase = CellPhase::WaitingOnTimer {
                     next_due_in_ms: *resume_after_ms,
-                });
+                };
             }
             RuntimeEvent::WorkerCompleted(_) => {}
         }
     }
 
     fn record_terminal_result(&mut self, result: &RuntimeTerminalResult) {
-        self.phase = if result.runtime_error.is_some() {
-            CellPhase::Failed
-        } else if result.cancellation_reason.is_some() {
-            CellPhase::Cancelled
+        self.phase = if let Some(error) = &result.runtime_error {
+            CellPhase::Failed {
+                error: error.clone(),
+            }
+        } else if let Some(reason) = &result.cancellation_reason {
+            CellPhase::Cancelled {
+                reason: reason.clone(),
+            }
         } else {
-            CellPhase::Completed
+            CellPhase::Completed {
+                return_value: result.return_value.clone(),
+            }
         };
-        self.terminal_state = Some(CellTerminalState {
-            return_value: result.return_value.clone(),
-            failure: result.runtime_error.clone(),
-            cancellation: result.cancellation_reason.clone(),
-        });
     }
 }
 
@@ -197,32 +179,25 @@ fn aggregate_events(events: &[RuntimeEvent]) -> (String, Vec<String>) {
 pub struct CellSnapshot {
     pub cell_id: String,
     pub phase: CellPhase,
-    pub terminal_state: Option<CellTerminalState>,
-    pub max_seq: u64,
     pub recent_events: Vec<RuntimeEvent>,
     pub nested_tool_calls: usize,
 }
 
 impl CellSnapshot {
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.phase,
-            CellPhase::Completed | CellPhase::Failed | CellPhase::Cancelled
-        )
-    }
-
     pub fn lifecycle(&self) -> ExecLifecycle {
-        match self.phase {
-            CellPhase::Completed => ExecLifecycle::Completed,
-            CellPhase::Failed => ExecLifecycle::Failed,
-            CellPhase::Cancelled => ExecLifecycle::Cancelled,
-            CellPhase::Running | CellPhase::Waiting(_) => ExecLifecycle::Running,
+        match &self.phase {
+            CellPhase::Completed { .. } => ExecLifecycle::Completed,
+            CellPhase::Failed { .. } => ExecLifecycle::Failed,
+            CellPhase::Cancelled { .. } => ExecLifecycle::Cancelled,
+            CellPhase::Running
+            | CellPhase::WaitingOnTool { .. }
+            | CellPhase::WaitingOnTimer { .. } => ExecLifecycle::Running,
         }
     }
 
     pub fn waiting_on_tool_request_id(&self) -> Option<&str> {
         match &self.phase {
-            CellPhase::Waiting(CellWaitState::NestedTool { request_id }) => Some(request_id),
+            CellPhase::WaitingOnTool { request_id } => Some(request_id),
             _ => None,
         }
         .map(String::as_str)
@@ -230,7 +205,7 @@ impl CellSnapshot {
 
     pub fn waiting_on_timer_ms(&self) -> Option<u64> {
         match &self.phase {
-            CellPhase::Waiting(CellWaitState::Timer { next_due_in_ms }) => *next_due_in_ms,
+            CellPhase::WaitingOnTimer { next_due_in_ms } => *next_due_in_ms,
             _ => None,
         }
     }
@@ -242,17 +217,14 @@ impl CellSnapshot {
     ) -> ExecRunResult {
         let (output_text, notifications) = aggregate_events(&self.recent_events);
 
-        let (return_value, failure, cancellation) = self
-            .terminal_state
-            .as_ref()
-            .map(|t| {
-                (
-                    t.return_value.clone(),
-                    t.failure.clone(),
-                    t.cancellation.clone(),
-                )
-            })
-            .unwrap_or_default();
+        let (return_value, failure, cancellation) = match &self.phase {
+            CellPhase::Completed { return_value } => (return_value.clone(), None, None),
+            CellPhase::Failed { error } => (None, Some(error.clone()), None),
+            CellPhase::Cancelled { reason } => (None, None, Some(reason.clone())),
+            CellPhase::Running
+            | CellPhase::WaitingOnTool { .. }
+            | CellPhase::WaitingOnTimer { .. } => (None, None, None),
+        };
 
         ExecRunResult {
             cell_id: self.cell_id.clone(),
@@ -304,7 +276,6 @@ mod tests {
 
         let snapshot = cell.snapshot();
         assert_eq!(snapshot.cell_id, "test-cell");
-        assert_eq!(snapshot.max_seq, 4);
 
         let result = snapshot.to_exec_result(None, None);
         assert_eq!(result.output_text, "hello \nworld");

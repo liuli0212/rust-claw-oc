@@ -539,7 +539,7 @@ impl CodeModeService {
                     }
                 }
                 DriverBoundary::PendingTool(_request) => {
-                    if snapshot.is_terminal() {
+                    if snapshot.lifecycle() != ExecLifecycle::Running {
                         let err = crate::tools::ToolError::ExecutionFailed(
                             "Code mode entered a terminal state while dispatching a nested tool."
                                 .to_string(),

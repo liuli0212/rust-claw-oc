@@ -526,6 +526,12 @@ Progress 2026-04-22 simplification pass:
 - Reduced `ToolCallOrigin` to the only distinction the executor needs: top-level versus code-mode nested. Cell/request metadata stays at the host trace boundary.
 - Finding: keeping publication state in `CodeModeService` as direct helper functions and keeping invocation trace naming at the caller removes several structs without changing the runtime event contract.
 
+Progress 2026-04-23 cell simplification pass:
+
+- Folded `CellWaitState` and `CellTerminalState` into `CellPhase`, so wait and terminal payloads live on the state that owns them.
+- Removed the unused `CellSnapshot.max_seq` / `RuntimeEvent::seq` snapshot plumbing.
+- Finding: `CellSnapshot` still has value as the small owned publication view returned after releasing the service lock; removing it would push more lifecycle branching back into `CodeModeService`.
+
 ## Verification Matrix
 
 | Area | Required Verification |
