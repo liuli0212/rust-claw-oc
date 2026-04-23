@@ -455,12 +455,14 @@ impl AgentLoop {
         if tool_calls_accumulated.is_empty() {
             self.record_trace_event(
                 TraceActor::System,
-                "yielded_to_user",
-                TraceStatus::Yielded,
-                Some("No tool call was emitted".to_string()),
-                serde_json::json!({}),
-                self.turn_span_id(),
-                None,
+                crate::core::TraceEventParams {
+                    name: "yielded_to_user",
+                    status: TraceStatus::Yielded,
+                    summary: Some("No tool call was emitted".to_string()),
+                    attrs: serde_json::json!({}),
+                    parent_span_id: self.turn_span_id(),
+                    iteration: None,
+                },
             );
             self.output.flush().await;
             self.context.end_turn();
@@ -558,14 +560,16 @@ impl AgentLoop {
                 .await;
             self.record_trace_event(
                 TraceActor::System,
-                "energy_depleted",
-                TraceStatus::Error,
-                Some("Energy budget exhausted".to_string()),
-                serde_json::json!({
-                    "iterations": task_state.iterations,
-                }),
-                self.turn_span_id(),
-                None,
+                  crate::core::TraceEventParams {
+                      name: "energy_depleted",
+                      status: TraceStatus::Error,
+                      summary: Some("Energy budget exhausted".to_string()),
+                      attrs: serde_json::json!({
+                          "iterations": task_state.iterations,
+                      }),
+                      parent_span_id: self.turn_span_id(),
+                      iteration: None,
+                  },
             );
 
             let summary = self.generate_status_summary().await;

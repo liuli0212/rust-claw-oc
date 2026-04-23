@@ -128,6 +128,15 @@ pub trait OutputRouter: Send + Sync {
     fn try_route(&self, reply_to: &str) -> Option<Arc<dyn AgentOutput>>;
 }
 
+pub(crate) struct TraceEventParams<'a> {
+    pub name: &'a str,
+    pub status: TraceStatus,
+    pub summary: Option<String>,
+    pub attrs: serde_json::Value,
+    pub parent_span_id: Option<String>,
+    pub iteration: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RunExit {
     Finished(String),
@@ -489,16 +498,11 @@ impl AgentLoop {
     pub(crate) fn record_trace_event(
         &self,
         actor: TraceActor,
-        name: &str,
-        status: TraceStatus,
-        summary: Option<String>,
-        attrs: serde_json::Value,
-        parent_span_id: Option<String>,
-        iteration: Option<u32>,
+        params: TraceEventParams<'_>,
     ) {
-        if let Some(ctx) = self.trace_context_with_parent(parent_span_id, iteration) {
+        if let Some(ctx) = self.trace_context_with_parent(params.parent_span_id, params.iteration) {
             self.trace_bus
-                .record_event(&ctx, actor, name, status, summary, attrs);
+                .record_event(&ctx, actor, params.name, params.status, params.summary, params.attrs);
         }
     }
 
@@ -679,17 +683,19 @@ impl AgentLoop {
             self.output.on_text(&format!("[System] {}\n", reason)).await;
             self.record_trace_event(
                 TraceActor::Context,
-                "context_compacted",
-                TraceStatus::Ok,
-                Some(reason.clone()),
-                serde_json::json!({
-                    "compacted_turns": num_to_compact,
-                    "usage_tokens": current_usage as u64,
-                    "threshold_tokens": threshold as u64,
-                    "history_tokens": current_usage as u64,
-                }),
-                self.turn_span_id(),
-                None,
+                TraceEventParams {
+                    name: "context_compacted",
+                    status: TraceStatus::Ok,
+                    summary: Some(reason.clone()),
+                    attrs: serde_json::json!({
+                        "compacted_turns": num_to_compact,
+                        "usage_tokens": current_usage as u64,
+                        "threshold_tokens": threshold as u64,
+                        "history_tokens": current_usage as u64,
+                    }),
+                    parent_span_id: self.turn_span_id(),
+                    iteration: None,
+                },
             );
         }
 
@@ -838,12 +844,14 @@ impl AgentLoop {
             .map(|active| active.base_ctx.run_id.clone());
         self.record_trace_event(
             TraceActor::Context,
-            "context_snapshot_taken",
-            TraceStatus::Ok,
-            None,
-            serde_json::json!({}),
-            self.turn_span_id(),
-            None,
+            TraceEventParams {
+                name: "context_snapshot_taken",
+                status: TraceStatus::Ok,
+                summary: None,
+                attrs: serde_json::json!({}),
+                parent_span_id: self.turn_span_id(),
+                iteration: None,
+            },
         );
         self.telemetry.start_span("agent_step", c_ids.clone());
 
@@ -1028,12 +1036,14 @@ impl AgentLoop {
             if should_yield_to_user {
                 self.record_trace_event(
                     TraceActor::System,
-                    "yielded_to_user",
-                    TraceStatus::Yielded,
-                    Some("Tool requested user input".to_string()),
-                    serde_json::json!({}),
-                    self.turn_span_id(),
-                    Some(iteration),
+                    TraceEventParams {
+                        name: "yielded_to_user",
+                        status: TraceStatus::Yielded,
+                        summary: Some("Tool requested user input".to_string()),
+                        attrs: serde_json::json!({}),
+                        parent_span_id: self.turn_span_id(),
+                        iteration: Some(iteration),
+                    },
                 );
                 if let Some(span) = iteration_span.take() {
                     span.finish(
