@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Restart rusty-claw with the newest already-built binary. Does not pull/build.
-# Usage: scripts/restart-rusty-claw [--dry-run] [-- args...]
+# Usage: scripts/restart-rusty-claw [--dry-run] [--pid PID] [-- args...]
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_NAME="rusty-claw"
 LOG_DIR="$ROOT/logs/restart"
@@ -32,35 +32,33 @@ find_pid() {
         fi
         p="$(ps -p "$p" -o ppid= 2>/dev/null | tr -d '[:space:]')"
     done
-    pgrep -f "$ROOT/target/.*/$BIN_NAME|target/.*/$BIN_NAME|/$BIN_NAME" 2>/dev/null | tail -n 1
 }
 args_from_cmd() {
-    python3 -c 'import shlex,sys; print("\0".join(shlex.split(sys.argv[1])[1:]))' "$1"
+    python3 -c 'import shlex,sys; sys.stdout.write("".join(a+"\0" for a in shlex.split(sys.argv[1])[1:]))' "$1"
 }
 main() {
     local old_pid old_cmd bin log dry_run=0
     local args=()
-    if [[ "${1:-}" == "--dry-run" ]]; then
-        dry_run=1
-        shift
-    fi
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --dry-run) dry_run=1; shift ;;
+            --pid) old_pid="${2:-}"; [[ -n "$old_pid" ]] || { echo "--pid requires a value" >&2; exit 1; }; shift 2 ;;
+            --) shift; args=("$@"); break ;;
+            *) args=("$@"); break ;;
+        esac
+    done
     bin="$(bin_path)"
-    old_pid="$(find_pid || true)"
+    old_pid="${old_pid:-$(find_pid || true)}"
     if [[ -z "$old_pid" && "$dry_run" == "1" ]]; then
         old_pid=999999
         old_cmd="$BIN_NAME"
     elif [[ -n "$old_pid" ]]; then
-        old_cmd="$(cmd_for_pid "$old_pid")"
+        old_cmd="$(cmd_for_pid "$old_pid" || true)"
     else
         echo "No running $BIN_NAME found." >&2
         exit 1
     fi
-    if [[ "${1:-}" == "--" ]]; then
-        shift
-        args=("$@")
-    elif [[ "$#" -gt 0 ]]; then
-        args=("$@")
-    else
+    if [[ "${#args[@]}" -eq 0 ]]; then
         while IFS= read -r -d '' a; do args+=("$a"); done < <(args_from_cmd "$old_cmd")
     fi
     mkdir -p "$LOG_DIR" "$(dirname "$HELPER")"
@@ -76,7 +74,6 @@ main() {
         printf ' >>%q 2>&1\n' "$log"
     } >"$HELPER"
     chmod +x "$HELPER"
-
     if [[ "$dry_run" == "1" ]]; then
         echo "Dry run only. Would restart old PID $old_pid with:"
         printf '  %q' "$bin"
