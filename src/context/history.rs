@@ -681,6 +681,12 @@ fn truncate_function_response(fr: &mut super::model::FunctionResponse) -> usize 
     const MAX_RESULT_LEN: usize = 12_000;
     const MAX_TOTAL_LEN: usize = 20_000;
 
+    // 0. Browser snapshots: aggressively strip in all history turns.
+    //    Old snapshots are useless (element IDs are stale, page state changed).
+    if let Some(chars_hidden) = strip_browser_snapshot(fr) {
+        return chars_hidden;
+    }
+
     // 1. Try to truncate "result" field if it's an object response
     if let Some(obj) = fr.response.as_object_mut() {
         if let Some(val) = obj.get_mut("result") {
@@ -738,6 +744,39 @@ fn truncate_code_mode_result_value(tool_name: &str, val: &mut serde_json::Value)
     );
     *val = serde_json::Value::String(serde_json::to_string(&envelope).ok()?);
     Some(char_count.saturating_sub(3_000))
+}
+
+/// Browser snapshots become stale as soon as an action is performed or the page navigates.
+/// Strip them aggressively in all history turns — only the current turn's snapshot matters.
+fn strip_browser_snapshot(fr: &mut super::model::FunctionResponse) -> Option<usize> {
+    // Fast path: check tool name first.
+    let is_browser_tool = fr.name == "browser";
+    if !is_browser_tool {
+        // Also check envelope payload_kind for dynamically-named tools.
+        let result_str = fr.response.get("result").and_then(|v| v.as_str())?;
+        let envelope = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(result_str)?;
+        if envelope.effects.payload_kind.as_deref() != Some("browser_snapshot") {
+            return None;
+        }
+    }
+
+    let result_val = fr.response.get("result").and_then(|v| v.as_str())?;
+    let original_chars = result_val.chars().count();
+    if original_chars <= 100 {
+        return None; // Already tiny (e.g. "Browser stopped" or error), skip.
+    }
+
+    let element_count = result_val.lines().count();
+    let replacement = format!("[browser snapshot stripped - {} elements]", element_count);
+    let hidden = original_chars.saturating_sub(replacement.len());
+
+    if let Some(obj) = fr.response.as_object_mut() {
+        obj.insert(
+            "result".to_string(),
+            serde_json::Value::String(replacement),
+        );
+    }
+    Some(hidden)
 }
 
 fn truncate_large_json_value(val: &mut serde_json::Value, max_len: usize) -> Option<usize> {

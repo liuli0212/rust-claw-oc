@@ -21,7 +21,7 @@ pub struct TavilySearchTool {
 pub struct WebFetchArgs {
     /// URL to fetch. Must start with http:// or https://
     pub url: String,
-    /// Maximum characters to return (default: 12000, clamped to 500..50000).
+    /// Maximum characters to return (default: 10000, clamped to 500..30000).
     pub max_chars: Option<usize>,
     /// Return raw HTML when true. When false, HTML pages are converted to readable text.
     pub include_html: Option<bool>,
@@ -117,7 +117,7 @@ impl Tool for WebFetchTool {
             None
         };
 
-        let max_chars = parsed.max_chars.unwrap_or(12_000).clamp(500, 50_000);
+        let max_chars = parsed.max_chars.unwrap_or(10_000).clamp(500, 30_000);
 
         let mut response = self
             .client
@@ -142,62 +142,49 @@ impl Tool for WebFetchTool {
         }
 
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
         let raw_body = response
             .text()
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         if !status.is_success() {
+            let body_preview: String = raw_body.chars().take(max_chars).collect();
+            let truncated = raw_body.chars().count() > max_chars;
+            let fenced = crate::security::fence_untrusted("web_fetch", &body_preview);
             return serialize_tool_envelope(
                 "web_fetch",
                 false,
                 format!(
                     "Failed to fetch URL. HTTP: {} | URL: {} | Body: {}",
-                    status, url, raw_body
+                    status, url, fenced
                 ),
                 Some(1),
                 Some(start.elapsed().as_millis()),
-                raw_body.len() > 15_000,
+                truncated,
             );
         }
 
+        let is_html = content_type.contains("text/html") || content_type.contains("application/xhtml");
         let mut rendered = raw_body;
-        if !parsed.include_html.unwrap_or(false) {
-            // Strip tags: Replace script, style and then all other tags.
-            static RE_SCRIPT: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| {
-                    regex::Regex::new(r"(?is)<script.*?>.*?</script>").unwrap()
-                });
-            static RE_STYLE: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| {
-                    regex::Regex::new(r"(?is)<style.*?>.*?</style>").unwrap()
-                });
-            static RE_TAGS: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| regex::Regex::new(r"<[^>]*>").unwrap());
-
-            rendered = RE_SCRIPT.replace_all(&rendered, " ").to_string();
-            rendered = RE_STYLE.replace_all(&rendered, " ").to_string();
-            rendered = RE_TAGS.replace_all(&rendered, " ").to_string();
-
-            // Clean up extra whitespace/newlines
-            static RE_WS: once_cell::sync::Lazy<regex::Regex> =
-                once_cell::sync::Lazy::new(|| regex::Regex::new(r"\n{3,}").unwrap());
-            rendered = RE_WS.replace_all(&rendered, "\n\n").to_string();
+        if !parsed.include_html.unwrap_or(false) && is_html {
+            rendered = html_to_clean_markdown(&rendered);
         }
 
-        let (content, truncated) = if rendered.chars().count() > max_chars {
-            (rendered.chars().take(max_chars).collect::<String>(), true)
-        } else {
-            (rendered, false)
-        };
-
+        // output_path: save full rendered content to disk (no truncation, not
+        // fenced) and return early. Truncation only applies to the LLM path.
         if let Some(path_buf) = &output_path {
             if let Some(parent) = path_buf.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     ToolError::ExecutionFailed(format!("Failed to create directory: {}", e))
                 })?;
             }
-            std::fs::write(path_buf, &content).map_err(|e| {
+            std::fs::write(path_buf, &rendered).map_err(|e| {
                 ToolError::ExecutionFailed(format!(
                     "Failed to write to file {}: {}",
                     path_buf.display(),
@@ -211,14 +198,21 @@ impl Tool for WebFetchTool {
                 format!(
                     "Successfully fetched and saved content to {}. Length: {} chars.",
                     path_buf.display(),
-                    content.len()
+                    rendered.len()
                 ),
                 Some(0),
                 Some(start.elapsed().as_millis()),
-                truncated,
+                false,
             );
         }
 
+        let (raw_content, truncated) = if rendered.chars().count() > max_chars {
+            (rendered.chars().take(max_chars).collect::<String>(), true)
+        } else {
+            (rendered, false)
+        };
+
+        let content = crate::security::fence_untrusted("web_fetch", &raw_content);
         StructuredToolOutput::new(
             "web_fetch",
             true,
@@ -325,10 +319,11 @@ impl Tool for TavilySearchTool {
             );
         }
 
+        let fenced = crate::security::fence_untrusted("web_search", &json.to_string());
         StructuredToolOutput::new(
             "web_search",
             true,
-            json.to_string(),
+            fenced,
             Some(0),
             Some(start.elapsed().as_millis()),
             false,
@@ -336,6 +331,41 @@ impl Tool for TavilySearchTool {
         .with_payload_kind("web_search")
         .to_json_string()
     }
+}
+
+/// Convert raw HTML to clean Markdown for LLM consumption.
+///
+/// Pipeline:
+/// 1. Strip noise tags (script, style, nav, header, footer, aside, svg, noscript)
+/// 2. Convert remaining HTML → Markdown via `fast_html2md`
+/// 3. Collapse excessive blank lines
+fn html_to_clean_markdown(html: &str) -> String {
+    static RE_NOISE: once_cell::sync::Lazy<Vec<regex::Regex>> =
+        once_cell::sync::Lazy::new(|| {
+            ["script", "style", "nav", "header", "footer", "aside", "svg", "noscript", "iframe"]
+                .iter()
+                .map(|tag| {
+                    regex::Regex::new(&format!(r"(?is)<{tag}\b[^>]*>.*?</{tag}>")).unwrap()
+                })
+                .collect()
+        });
+
+    let mut cleaned = html.to_string();
+    for re in RE_NOISE.iter() {
+        cleaned = re.replace_all(&cleaned, "").to_string();
+    }
+
+    let md = html2md::rewrite_html(&cleaned, false);
+
+    static RE_BLANK_LINES: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"\n{3,}").unwrap());
+    static RE_TRAILING_WS: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"[^\S\n]+\n").unwrap());
+
+    let md = RE_BLANK_LINES.replace_all(&md, "\n\n");
+    let md = RE_TRAILING_WS.replace_all(&md, "\n");
+
+    md.trim().to_string()
 }
 
 #[cfg(test)]
@@ -392,6 +422,65 @@ mod tests {
 
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
         assert!(err.to_string().contains("Sandbox Violation"));
+    }
+
+    #[test]
+    fn test_html_to_clean_markdown_strips_noise_and_converts() {
+        let html = r#"
+        <html>
+        <head><style>body { color: red; }</style></head>
+        <body>
+            <nav><a href="/">Home</a><a href="/about">About</a></nav>
+            <header><h1>Site Header</h1></header>
+            <main>
+                <h1>Article Title</h1>
+                <p>This is the <strong>main content</strong> of the page.</p>
+                <ul><li>Item one</li><li>Item two</li></ul>
+                <a href="https://example.com">Example Link</a>
+            </main>
+            <footer>Copyright 2024</footer>
+            <script>alert('evil');</script>
+        </body>
+        </html>"#;
+
+        let md = html_to_clean_markdown(html);
+
+        // Main content preserved as Markdown
+        assert!(md.contains("# Article Title"), "heading missing: {}", md);
+        assert!(md.contains("**main content**"), "bold missing: {}", md);
+        assert!(md.contains("Item one"), "list missing: {}", md);
+        assert!(md.contains("[Example Link]"), "link missing: {}", md);
+
+        // Noise removed
+        assert!(!md.contains("alert"), "script not stripped: {}", md);
+        assert!(!md.contains("color: red"), "style not stripped: {}", md);
+        assert!(!md.contains("Site Header"), "header not stripped: {}", md);
+        assert!(!md.contains("Copyright"), "footer not stripped: {}", md);
+    }
+
+    #[test]
+    fn test_html_to_clean_markdown_handles_plain_text() {
+        let plain = "Just some plain text with no HTML tags.";
+        let md = html_to_clean_markdown(plain);
+        assert_eq!(md, plain);
+    }
+
+    #[test]
+    fn test_content_type_detection_for_html_conversion() {
+        // Only text/html and application/xhtml should trigger markdown conversion.
+        let html_types = vec!["text/html", "text/html; charset=utf-8", "application/xhtml+xml"];
+        let non_html_types = vec!["text/plain", "application/json", "application/xml", "text/xml", ""];
+
+        for ct in &html_types {
+            let ct_lower = ct.to_lowercase();
+            let is_html = ct_lower.contains("text/html") || ct_lower.contains("application/xhtml");
+            assert!(is_html, "Expected HTML for Content-Type: {}", ct);
+        }
+        for ct in &non_html_types {
+            let ct_lower = ct.to_lowercase();
+            let is_html = ct_lower.contains("text/html") || ct_lower.contains("application/xhtml");
+            assert!(!is_html, "Should NOT be HTML for Content-Type: {}", ct);
+        }
     }
 
     #[tokio::test]

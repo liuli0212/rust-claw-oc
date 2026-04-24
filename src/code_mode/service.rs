@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 use super::cell::{ActiveCellHandle, CellSnapshot};
-use super::driver::{CellDriver, CellDriverControl, DriverBoundary, DriverUpdate};
+use super::driver::{CellDriver, CellDriverControl, CellStatus, DriverUpdate};
 use super::protocol::RuntimeEvent;
 use super::response::{ExecLifecycle, ExecProgressKind, ExecRunResult};
 use super::runtime;
@@ -46,6 +46,55 @@ struct SessionState {
     stored_values: HashMap<String, runtime::value::StoredValue>,
     active_cell: Option<ActiveCellHandle>,
     host_handle: Option<SharedCellHost>,
+}
+
+impl SessionState {
+    fn require_active_cell_mut(
+        &mut self,
+        cell_id: &str,
+    ) -> Result<&mut ActiveCellHandle, crate::tools::ToolError> {
+        let active_cell = self.active_cell.as_mut().ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed(format!(
+                "No active code-mode cell `{cell_id}` found."
+            ))
+        })?;
+        if active_cell.cell_id != cell_id {
+            return Err(crate::tools::ToolError::ExecutionFailed(format!(
+                "Code mode cell `{cell_id}` was superseded by `{}`.",
+                active_cell.cell_id
+            )));
+        }
+        Ok(active_cell)
+    }
+
+    fn require_active_cell(
+        &self,
+        cell_id: &str,
+    ) -> Result<&ActiveCellHandle, crate::tools::ToolError> {
+        let active_cell = self.active_cell.as_ref().ok_or_else(|| {
+            crate::tools::ToolError::ExecutionFailed(format!(
+                "No active code-mode cell `{cell_id}` found."
+            ))
+        })?;
+        if active_cell.cell_id != cell_id {
+            return Err(crate::tools::ToolError::ExecutionFailed(format!(
+                "Code mode cell `{cell_id}` was superseded by `{}`.",
+                active_cell.cell_id
+            )));
+        }
+        Ok(active_cell)
+    }
+}
+
+fn require_session_mut<'a>(
+    sessions: &'a mut HashMap<String, SessionState>,
+    session_id: &str,
+) -> Result<&'a mut SessionState, crate::tools::ToolError> {
+    sessions.get_mut(session_id).ok_or_else(|| {
+        crate::tools::ToolError::ExecutionFailed(
+            "No code-mode session found for this session.".to_string(),
+        )
+    })
 }
 
 struct CellHostHandle {
@@ -165,24 +214,6 @@ impl PublicationTracker {
     }
 }
 
-fn clone_tool_error(error: &crate::tools::ToolError) -> crate::tools::ToolError {
-    match error {
-        crate::tools::ToolError::ExecutionFailed(message) => {
-            crate::tools::ToolError::ExecutionFailed(message.clone())
-        }
-        crate::tools::ToolError::InvalidArguments(message) => {
-            crate::tools::ToolError::InvalidArguments(message.clone())
-        }
-        crate::tools::ToolError::Timeout => crate::tools::ToolError::Timeout,
-        crate::tools::ToolError::Cancelled(reason) => {
-            crate::tools::ToolError::Cancelled(reason.clone())
-        }
-        crate::tools::ToolError::IoError(err) => {
-            crate::tools::ToolError::IoError(std::io::Error::new(err.kind(), err.to_string()))
-        }
-    }
-}
-
 fn publish_initial(
     tx: &mut Option<oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>>,
     summary: &ExecRunResult,
@@ -197,7 +228,7 @@ fn fail_initial(
     error: &crate::tools::ToolError,
 ) {
     if let Some(tx) = tx.take() {
-        let _ = tx.send(Err(clone_tool_error(error)));
+        let _ = tx.send(Err(error.clone()));
     }
 }
 
@@ -226,17 +257,11 @@ impl CodeModeService {
             let mut sessions = self.sessions.lock().await;
             let session = sessions.entry(session_id.to_string()).or_default();
 
-            if session
-                .active_cell
-                .as_ref()
-                .is_some_and(ActiveCellHandle::is_terminal)
-            {
-                session.active_cell = None;
-                session.host_handle = None;
-            }
-
             if let Some(ref active_cell) = session.active_cell {
-                if !active_cell.is_terminal() {
+                if active_cell.is_terminal() {
+                    session.active_cell = None;
+                    session.host_handle = None;
+                } else {
                     return Err(crate::tools::ToolError::ExecutionFailed(format!(
                         "Code mode cell `{}` is still active. Call `wait` until it completes.",
                         active_cell.cell_id
@@ -468,7 +493,7 @@ impl CodeModeService {
                 }
             };
 
-            if matches!(update.boundary, DriverBoundary::Idle) {
+            if matches!(update.status, CellStatus::Idle) {
                 if let Some((summary, publish_at)) = pending_initial_tool_summary.as_ref() {
                     if initial_summary_tx.is_some() && Instant::now() >= *publish_at {
                         let summary = summary.clone();
@@ -527,8 +552,8 @@ impl CodeModeService {
                 Err(err) => return Self::fail_and_exit(cell_id, initial_summary_tx, err),
             };
 
-            match update.boundary {
-                DriverBoundary::Progress => {
+            match update.status {
+                CellStatus::Progress => {
                     let publication = if let Some(flush_value) = explicit_flush_value {
                         publication_tracker.mark_published();
                         Some(
@@ -558,7 +583,7 @@ impl CodeModeService {
                         }
                     }
                 }
-                DriverBoundary::PendingTool => {
+                CellStatus::PendingTool => {
                     if snapshot.lifecycle() != ExecLifecycle::Running {
                         let err = crate::tools::ToolError::ExecutionFailed(
                             "Code mode entered a terminal state while dispatching a nested tool."
@@ -581,7 +606,7 @@ impl CodeModeService {
                         ));
                     }
                 }
-                DriverBoundary::Terminal(_) => {
+                CellStatus::Terminal(_) => {
                     let summary = snapshot.to_exec_result(None, None);
                     if let Err(err) = self
                         .publish_summary_and_unblock_initial(
@@ -598,7 +623,7 @@ impl CodeModeService {
 
                     return Self::trace_finish_from_summary(cell_id, &summary, None);
                 }
-                DriverBoundary::Idle => {}
+                CellStatus::Idle => {}
             }
         }
     }
@@ -610,29 +635,16 @@ impl CodeModeService {
         update: &DriverUpdate,
     ) -> Result<CellSnapshot, crate::tools::ToolError> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(session_id).ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed("Session disappeared during wait.".to_string())
-        })?;
-
-        let active_cell = session.active_cell.as_mut().ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was terminated before the background state update completed.",
-                cell_id
-            ))
-        })?;
-        if active_cell.cell_id != cell_id {
-            return Err(crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was superseded before the background state update completed.",
-                cell_id
-            )));
-        }
+        let session = require_session_mut(&mut sessions, session_id)?;
+        let active_cell = session.require_active_cell_mut(cell_id)?;
         active_cell.record_driver_update(update);
+        let snapshot = active_cell.snapshot();
 
-        if let DriverBoundary::Terminal(terminal_result) = &update.boundary {
+        if let CellStatus::Terminal(terminal_result) = &update.status {
             session.stored_values = terminal_result.stored_values.clone();
         }
 
-        Ok(active_cell.snapshot())
+        Ok(snapshot)
     }
 
     async fn record_cell_cancellation_in_session(
@@ -642,23 +654,8 @@ impl CodeModeService {
         reason: String,
     ) -> Result<CellSnapshot, crate::tools::ToolError> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(session_id).ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed("Session disappeared during wait.".to_string())
-        })?;
-
-        let active_cell = session.active_cell.as_mut().ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was terminated before cancellation was recorded.",
-                cell_id
-            ))
-        })?;
-        if active_cell.cell_id != cell_id {
-            return Err(crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was superseded before cancellation was recorded.",
-                cell_id
-            )));
-        }
-
+        let session = require_session_mut(&mut sessions, session_id)?;
+        let active_cell = session.require_active_cell_mut(cell_id)?;
         active_cell.transition_to_cancelled(reason);
         Ok(active_cell.snapshot())
     }
@@ -670,24 +667,9 @@ impl CodeModeService {
         progress_kind: Option<ExecProgressKind>,
         flush_value: Option<Value>,
     ) -> Result<ExecRunResult, crate::tools::ToolError> {
-        let sessions = self.sessions.lock().await;
-        let session = sessions.get(session_id).ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(
-                "No code-mode session found for this session.".to_string(),
-            )
-        })?;
-        let active_cell = session.active_cell.as_ref().ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(
-                "No active code-mode cell to inspect. Call `exec` first.".to_string(),
-            )
-        })?;
-        if active_cell.cell_id != cell_id {
-            return Err(crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was superseded before the summary was published.",
-                cell_id
-            )));
-        }
-
+        let mut sessions = self.sessions.lock().await;
+        let session = require_session_mut(&mut sessions, session_id)?;
+        let active_cell = session.require_active_cell(cell_id)?;
         Ok(active_cell
             .snapshot()
             .to_exec_result(progress_kind, flush_value))
@@ -700,23 +682,8 @@ impl CodeModeService {
         prefer_publication: bool,
     ) -> Result<ExecRunResult, crate::tools::ToolError> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(session_id).ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(
-                "No code-mode session found for this session.".to_string(),
-            )
-        })?;
-        let active_cell = session.active_cell.as_ref().ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(
-                "No active code-mode cell to wait on. Call `exec` first.".to_string(),
-            )
-        })?;
-        if active_cell.cell_id != cell_id {
-            return Err(crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was superseded before the wait completed.",
-                cell_id
-            )));
-        }
-
+        let session = require_session_mut(&mut sessions, session_id)?;
+        let active_cell = session.require_active_cell(cell_id)?;
         let summary = if prefer_publication {
             active_cell
                 .last_publication
@@ -725,7 +692,8 @@ impl CodeModeService {
         } else {
             active_cell.snapshot().to_exec_result(None, None)
         };
-        if active_cell.is_terminal() {
+        let is_terminal = active_cell.is_terminal();
+        if is_terminal {
             session.active_cell = None;
             session.host_handle = None;
         }
@@ -833,23 +801,8 @@ impl CodeModeService {
         summary: &ExecRunResult,
     ) -> Result<(), crate::tools::ToolError> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions.get_mut(session_id).ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(
-                "No code-mode session found for this session.".to_string(),
-            )
-        })?;
-        let active_cell = session.active_cell.as_mut().ok_or_else(|| {
-            crate::tools::ToolError::ExecutionFailed(
-                "No active code-mode cell to publish progress for.".to_string(),
-            )
-        })?;
-        if active_cell.cell_id != cell_id {
-            return Err(crate::tools::ToolError::ExecutionFailed(format!(
-                "Code mode cell `{}` was superseded before the publication summary was stored.",
-                cell_id
-            )));
-        }
-
+        let session = require_session_mut(&mut sessions, session_id)?;
+        let active_cell = session.require_active_cell_mut(cell_id)?;
         active_cell.last_publication = Some(summary.clone());
         host_handle.publish_update();
         Ok(())

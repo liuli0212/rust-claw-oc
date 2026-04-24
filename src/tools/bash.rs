@@ -299,13 +299,14 @@ impl Tool for BashTool {
                     duration_ms: start.elapsed().as_millis(),
                     truncated,
                 };
-                let output = if result.stderr.trim().is_empty() {
+                let raw_output = if result.stderr.trim().is_empty() {
                     result.stdout.clone()
                 } else if result.stdout.trim().is_empty() {
                     result.stderr.clone()
                 } else {
                     format!("{}\n{}", result.stdout, result.stderr)
                 };
+                let output = crate::security::fence_untrusted("execute_bash", &raw_output);
                 let mut structured = StructuredToolOutput::new(
                     "execute_bash",
                     result.ok,

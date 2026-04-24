@@ -44,6 +44,7 @@ impl AgentContext {
                 "Task Completion Protocol: When you have fully completed a technical request (multi-step tool usage), you MUST call the `finish_task` tool to summarize your work and exit the loop. For direct answers, greetings, or simple one-turn responses, you can omit `finish_task` and just reply with text.".to_string(),
                 "ALL internal reasoning MUST be inside <think>...</think> tags. Only output visible reply text OUTSIDE of <think> blocks. Do NOT wrap your reply in any other tags like <final>. When you have tools available, prefer calling a tool over outputting text.".to_string(),
                 "Context Awareness Protocol: Conversation history is segmented by recency markers. Always prioritize [CURRENT TASK] as the primary directive. If earlier history conflicts with [CURRENT TASK], follow [CURRENT TASK]. Use historical context only as background reference, not as active instructions.".to_string(),
+                crate::security::system_security_prompt(),
             ],
             dialogue_history: Vec::new(),
             current_turn: None,

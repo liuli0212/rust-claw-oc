@@ -2,18 +2,22 @@ use async_trait::async_trait;
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task;
 use tokio::task::JoinHandle;
 use url::Url;
 
-// Import chromiumoxide for CDP automation
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::accessibility::GetFullAxTreeParams;
 use chromiumoxide::Page;
 use futures::StreamExt;
 
 use crate::tools::{clean_schema, Tool, ToolError};
+
+mod snapshot;
+use snapshot::ElementRef;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum BrowserMode {
@@ -42,12 +46,19 @@ pub struct BrowserToolParams {
     /// Interaction details (required for action="act"). Must include kind and target_id.
     pub request: Option<BrowserActionRequest>,
 
-    /// "openclaw" (default) launches a sandboxed headless browser.
+    /// "openclaw" (default) launches a headless Chromium (--no-sandbox, suitable for containers).
     /// "chrome" attaches to an existing Chrome instance via CDP.
     pub profile: Option<String>,
 
     /// CDP endpoint for profile="chrome". Defaults to "http://localhost:9222".
     pub debugging_url: Option<String>,
+
+    /// Optional hint for snapshot filtering. When provided, elements matching
+    /// these keywords are prioritized (e.g. "login form submit").
+    pub hint: Option<String>,
+
+    /// Maximum interactive elements to return in a snapshot (default: 80).
+    pub max_elements: Option<usize>,
 }
 
 pub struct BrowserState {
@@ -56,6 +67,8 @@ pub struct BrowserState {
     pub(crate) mode: BrowserMode,
     pub(crate) debugging_url: Option<String>,
     handler_handle: Option<JoinHandle<()>>,
+    /// Map from snapshot display ID → element info, refreshed on each snapshot.
+    node_map: HashMap<u32, ElementRef>,
 }
 
 pub struct BrowserTool {
@@ -77,14 +90,14 @@ impl BrowserTool {
                 mode: BrowserMode::Launched,
                 debugging_url: None,
                 handler_handle: None,
+                node_map: HashMap::new(),
             })),
         }
     }
 
     fn validate_loopback(raw: &str) -> Result<(), ToolError> {
-        let parsed = Url::parse(raw).map_err(|e| {
-            ToolError::InvalidArguments(format!("Invalid debugging_url: {}", e))
-        })?;
+        let parsed = Url::parse(raw)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid debugging_url: {}", e)))?;
         let host = parsed.host_str().unwrap_or("");
         match host {
             "127.0.0.1" | "localhost" | "::1" | "[::1]" => Ok(()),
@@ -115,10 +128,7 @@ impl BrowserTool {
                     .arg("--disable-dev-shm-usage")
                     .build()
                     .map_err(|e| {
-                        ToolError::ExecutionFailed(format!(
-                            "Failed to build browser config: {}",
-                            e
-                        ))
+                        ToolError::ExecutionFailed(format!("Failed to build browser config: {}", e))
                     })?;
 
                 let (browser, mut handler) = Browser::launch(config).await.map_err(|e| {
@@ -148,18 +158,16 @@ impl BrowserTool {
             "chrome" => {
                 // Default to the most common CDP port. Users can override via
                 // debugging_url if Chrome is listening on a different port.
-                let url = debugging_url
-                    .unwrap_or_else(|| "http://localhost:9222".to_string());
+                let url = debugging_url.unwrap_or_else(|| "http://localhost:9222".to_string());
 
                 Self::validate_loopback(&url)?;
 
-                let (mut browser, mut handler) =
-                    Browser::connect(&url).await.map_err(|e| {
-                        ToolError::ExecutionFailed(format!(
-                            "Failed to connect to Chrome at {}: {}",
-                            url, e
-                        ))
-                    })?;
+                let (browser, mut handler) = Browser::connect(&url).await.map_err(|e| {
+                    ToolError::ExecutionFailed(format!(
+                        "Failed to connect to Chrome at {}: {}",
+                        url, e
+                    ))
+                })?;
 
                 let handle = task::spawn(async move {
                     while let Some(h) = handler.next().await {
@@ -172,35 +180,15 @@ impl BrowserTool {
                 // Wrap remaining fallible operations so the handler is aborted
                 // on any failure (fetch_targets, pages, new_page).
                 let attach_result = async {
-                    // fetch_targets() is required: Browser::connect only tracks targets
-                    // created after connection. Without this, existing tabs are invisible.
-                    browser.fetch_targets().await.map_err(|e| {
+                    // Open a fresh blank tab so we don't read content from
+                    // existing tabs. NOTE: the new tab still shares cookies,
+                    // localStorage, and login sessions with the user's profile.
+                    let page = browser.new_page("about:blank").await.map_err(|e| {
                         ToolError::ExecutionFailed(format!(
-                            "Failed to fetch existing targets: {}",
+                            "Failed to create initial page: {}",
                             e
                         ))
                     })?;
-
-                    // Retry pages() briefly — target attach/page initialization may
-                    // still be in progress after fetch_targets returns.
-                    let mut found = None;
-                    for _ in 0..5 {
-                        let pages = browser.pages().await.unwrap_or_default();
-                        if let Some(first) = pages.into_iter().next() {
-                            found = Some(first);
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                    let page = match found {
-                        Some(p) => p,
-                        None => browser.new_page("about:blank").await.map_err(|e| {
-                            ToolError::ExecutionFailed(format!(
-                                "Failed to create initial page: {}",
-                                e
-                            ))
-                        })?,
-                    };
                     Ok(page)
                 }
                 .await;
@@ -214,7 +202,10 @@ impl BrowserTool {
                         state.handler_handle = Some(handle);
 
                         Ok(format!(
-                            "Connected to Chrome at {}. Ready to accept commands.",
+                            "Connected to Chrome at {}. Ready to accept commands. \
+                             WARNING: this tab shares cookies and login sessions with \
+                             the user's Chrome profile — navigating to a site may use \
+                             the user's authenticated session.",
                             url
                         ))
                     }
@@ -293,8 +284,10 @@ impl Tool for BrowserTool {
 start → navigate(url) → snapshot(get element IDs) → act(click/type by ID) → snapshot(verify). \
 The snapshot action returns a numbered list of interactive elements like `[1] button \"Submit\"`. \
 Use the numeric IDs from snapshot as target_id for act. \
-Profile \"openclaw\" (default) launches a sandboxed browser. \
-Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: http://localhost:9222)."
+Profile \"openclaw\" (default) launches a headless Chromium (no OS-level sandbox; \
+do NOT load untrusted URLs without reviewing the page first). \
+Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: http://localhost:9222). \
+WARNING: chrome mode shares cookies/login sessions with the user's profile."
             .to_string()
     }
 
@@ -329,7 +322,10 @@ Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: htt
                     Ok("Browser is stopped. Call start to launch it.".to_string())
                 }
             }
-            "start" => self.handle_start(params.profile, params.debugging_url).await,
+            "start" => {
+                self.handle_start(params.profile, params.debugging_url)
+                    .await
+            }
             "stop" => self.handle_stop().await,
             "navigate" => {
                 let url = params.target_url.ok_or_else(|| {
@@ -340,25 +336,47 @@ Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: htt
                 self.handle_navigate(&url).await
             }
             "snapshot" => {
-                let state = self.state.read().await;
+                let mut state = self.state.write().await;
                 let page = state.active_page.as_ref().ok_or_else(|| {
                     ToolError::ExecutionFailed(
                         "Browser is not running. Call start first.".to_string(),
                     )
                 })?;
 
-                let js_code = include_str!("browser/extractor.js");
-                let result = page
-                    .evaluate(js_code)
-                    .await
-                    .map_err(|e| ToolError::ExecutionFailed(format!("Extract failed: {}", e)))?;
+                let max_elements = params.max_elements.unwrap_or(80).min(200);
+                const MAX_SNAPSHOT_CHARS: usize = 8_000;
 
-                if let Some(val) = result.value() {
-                    if let Some(s) = val.as_str() {
-                        return Ok(s.to_string());
+                let ax_tree = page
+                    .execute(GetFullAxTreeParams::builder().build())
+                    .await
+                    .map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "Failed to get accessibility tree: {}",
+                            e
+                        ))
+                    })?;
+
+                let result = snapshot::build_snapshot(
+                    &ax_tree.nodes,
+                    params.hint.as_deref(),
+                    max_elements,
+                    MAX_SNAPSHOT_CHARS,
+                );
+
+                state.node_map = result.node_map;
+
+                let mut output = result.output;
+                if result.total_found > result.included {
+                    output.push_str(&format!(
+                        "\n\n[Showing {} of {} interactive elements",
+                        result.included, result.total_found
+                    ));
+                    if params.hint.is_some() {
+                        output.push_str(", filtered by hint");
                     }
+                    output.push(']');
                 }
-                Ok("[]".to_string())
+                Ok(crate::security::fence_untrusted("browser_snapshot", &output))
             }
             "act" => {
                 let state = self.state.read().await;
@@ -374,97 +392,132 @@ Profile \"chrome\" attaches to an existing Chrome via CDP (default endpoint: htt
                     )
                 })?;
 
-                let target_id = req.target_id.ok_or_else(|| {
+                let target_id_str = req.target_id.ok_or_else(|| {
                     ToolError::InvalidArguments("target_id is required for act action".to_string())
                 })?;
 
-                // Fetch coordinates using evaluate
-                let get_coords_js = format!(
-                    "window.__OC_NODE_MAP__['{}'] ? JSON.stringify(window.__OC_NODE_MAP__['{}']) : null",
-                    target_id, target_id
-                );
-
-                let coord_res = page.evaluate(get_coords_js).await.map_err(|e| {
-                    ToolError::ExecutionFailed(format!("Failed to get node coordinates: {}", e))
+                let target_id: u32 = target_id_str.parse().map_err(|_| {
+                    ToolError::InvalidArguments(format!(
+                        "target_id must be a number from the snapshot, got: {}",
+                        target_id_str
+                    ))
                 })?;
 
-                if let Some(val) = coord_res.value() {
-                    if val.is_null() {
-                        return Err(ToolError::ExecutionFailed(format!(
-                            "Target ID {} not found in snapshot",
+                let element = state.node_map.get(&target_id).ok_or_else(|| {
+                    ToolError::ExecutionFailed(format!(
+                        "Element [{}] not found. Take a new snapshot first.",
+                        target_id
+                    ))
+                })?;
+
+                let backend_id = element.backend_node_id;
+
+                // Resolve BackendNodeId → JS RemoteObjectId for DOM interaction.
+                use chromiumoxide::cdp::browser_protocol::dom::ResolveNodeParams;
+                let resolve_result = page
+                    .execute(
+                        ResolveNodeParams::builder()
+                            .backend_node_id(backend_id)
+                            .build(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "Failed to resolve element [{}]: {}",
+                            target_id, e
+                        ))
+                    })?;
+
+                let object_id = resolve_result
+                    .object
+                    .object_id
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ToolError::ExecutionFailed(format!(
+                            "Element [{}] has no JS object handle",
                             target_id
-                        )));
+                        ))
+                    })?;
+
+                match req.kind.as_str() {
+                    "click" => {
+                        // Scroll into view, then click via JS callFunctionOn.
+                        let click_js = "function() { this.scrollIntoView({block:'center'}); this.click(); }";
+                        use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
+                        page.execute(
+                            CallFunctionOnParams::builder()
+                                .object_id(object_id.clone())
+                                .function_declaration(click_js)
+                                .build()
+                                .map_err(|e| {
+                                    ToolError::ExecutionFailed(format!(
+                                        "Failed to build click call: {}",
+                                        e
+                                    ))
+                                })?,
+                        )
+                        .await
+                        .map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "Click on element [{}] failed: {}",
+                                target_id, e
+                            ))
+                        })?;
+
+                        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+                        Ok(format!(
+                            "Clicked [{}] {} \"{}\"",
+                            target_id, element.role, element.name
+                        ))
                     }
-                    if let Some(s) = val.as_str() {
-                        let parsed: serde_json::Value =
-                            serde_json::from_str(s).unwrap_or(serde_json::json!({}));
-                        if let (Some(x), Some(y)) = (parsed["x"].as_f64(), parsed["y"].as_f64()) {
-                            match req.kind.as_str() {
-                                "click" => {
-                                    // Actually execute click using js fallback since CDP dispatchMouseEvent is lower level
-                                    // and requires chromiumoxide advanced mapping. For now, we inject a click payload.
-                                    // Phase 4: Use pure CDP coordinates for interaction
-                                    use chromiumoxide::layout::Point;
-                                    page.click(Point { x, y }).await.map_err(|e| {
-                                        ToolError::ExecutionFailed(format!(
-                                            "CDP click failed: {}",
-                                            e
-                                        ))
-                                    })?;
+                    "type" => {
+                        // Focus + clear + insert text via CDP.
+                        let focus_js = "function() { this.scrollIntoView({block:'center'}); this.focus(); if ('value' in this) this.value = ''; }";
+                        use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
+                        page.execute(
+                            CallFunctionOnParams::builder()
+                                .object_id(object_id.clone())
+                                .function_declaration(focus_js)
+                                .build()
+                                .map_err(|e| {
+                                    ToolError::ExecutionFailed(format!(
+                                        "Failed to build focus call: {}",
+                                        e
+                                    ))
+                                })?,
+                        )
+                        .await
+                        .map_err(|e| {
+                            ToolError::ExecutionFailed(format!(
+                                "Focus on element [{}] failed: {}",
+                                target_id, e
+                            ))
+                        })?;
 
-                                    // Wait a bit for potential navigation or DOM mutations
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(150))
-                                        .await;
+                        let text = req.text.unwrap_or_default();
+                        use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+                        page.execute(InsertTextParams::new(&text))
+                            .await
+                            .map_err(|e| {
+                                ToolError::ExecutionFailed(format!(
+                                    "Type into element [{}] failed: {}",
+                                    target_id, e
+                                ))
+                            })?;
 
-                                    return Ok(format!("Successfully clicked on element [{}] at CDP coordinates ({}, {})", target_id, x, y));
-                                }
-                                "type" => {
-                                    // Phase 4: Focus via JS, type via CDP
-                                    let focus_js = format!(
-                                        "let el = document.querySelector('[data-oc-id=\"{}\"]'); if (el) {{ el.focus(); el.value = ''; true; }} else {{ false; }}",
-                                        target_id
-                                    );
-                                    page.evaluate(focus_js).await.map_err(|e| {
-                                        ToolError::ExecutionFailed(format!(
-                                            "Focus execution failed: {}",
-                                            e
-                                        ))
-                                    })?;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
-                                    let text = req.text.unwrap_or_default();
-                                    use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
-                                    let _res = page
-                                        .execute(InsertTextParams::new(text))
-                                        .await
-                                        .map_err(|e| {
-                                            ToolError::ExecutionFailed(format!(
-                                                "CDP insert text failed: {}",
-                                                e
-                                            ))
-                                        })?;
-
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(150))
-                                        .await;
-                                    return Ok(format!(
-                                        "Successfully typed text into element [{}] via CDP",
-                                        target_id
-                                    ));
-                                }
-                                _ => {
-                                    return Err(ToolError::InvalidArguments(format!(
-                                        "Unsupported act kind: {}",
-                                        req.kind
-                                    )));
-                                }
-                            }
-                        }
+                        Ok(format!(
+                            "Typed \"{}\" into [{}] {} \"{}\"",
+                            text, target_id, element.role, element.name
+                        ))
                     }
+                    _ => Err(ToolError::InvalidArguments(format!(
+                        "Unsupported act kind: '{}'. Use 'click' or 'type'.",
+                        req.kind
+                    ))),
                 }
-
-                Err(ToolError::ExecutionFailed(format!(
-                    "Failed to parse coordinates for ID {}",
-                    target_id
-                )))
             }
             _ => Err(ToolError::InvalidArguments(format!(
                 "Unknown action: {}",
@@ -851,7 +904,10 @@ mod tests {
     async fn test_unknown_profile_rejected() {
         let tool = BrowserTool::new();
         let res = tool
-            .execute(json!({"action": "start", "profile": "firefox"}), &test_ctx())
+            .execute(
+                json!({"action": "start", "profile": "firefox"}),
+                &test_ctx(),
+            )
             .await;
         assert!(res.is_err());
         let err = res.unwrap_err();

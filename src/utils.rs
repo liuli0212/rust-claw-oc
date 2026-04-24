@@ -16,9 +16,9 @@ pub fn truncate_log_error(log: &str) -> String {
 }
 
 pub fn truncate_tool_output(log: &str) -> String {
-    // Generous limit for LLM consumption (independent of log level)
-    // 50k chars is approx 12-15k tokens, safe for most modern contexts (128k+)
-    truncate_impl(log, 2000, 50_000)
+    // Tighter limit to reduce prompt-injection surface from untrusted content.
+    // 30k chars ≈ 7-9k tokens, still comfortable for 128k+ contexts.
+    truncate_impl(log, 1500, 30_000)
 }
 
 fn truncate_impl(log: &str, max_lines: usize, max_chars: usize) -> String {

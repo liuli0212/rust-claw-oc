@@ -268,7 +268,7 @@ It is acceptable for an intermediate phase to keep a compatibility channel behin
 
 In the final design, `CodeModeService::perform_cell_host_loop` should not invoke nested tools.
 
-For `DriverBoundary::PendingTool`, it should only:
+For `CellStatus::PendingTool`, it should only:
 
 1. Record the event in the active cell.
 2. Publish a running summary if needed.
@@ -286,7 +286,7 @@ Delete or retire these final-path concepts:
 - `tool_result_rx`
 - `tool_call_in_flight`
 - `CellDriver::complete_pending_tool_call`
-- Service-side nested tool invocation in `DriverBoundary::PendingTool`
+- Service-side nested tool invocation in `CellStatus::PendingTool`
 
 `abort_active_cell` should still:
 
@@ -426,7 +426,7 @@ Progress 2026-04-22:
 - Added `src/code_mode/host.rs` with `CellRuntimeHost` and a host-owned runtime tool request.
 - Routed runtime visible-tool discovery, runtime event emission, and cancellation observation through a host object instead of passing raw visible-tool/event plumbing into `runtime::run_cell`.
 - Kept the existing synchronous tool result bridge private to the driver/service path for this phase; `CellRuntimeHost::call_tool` is intentionally not wired until Phase 3.
-- Finding: the bridge can now be swapped at the runtime boundary without changing JavaScript wrapper semantics, but service still fulfills `DriverBoundary::PendingTool` until the Promise/completion work lands.
+- Finding: the bridge can now be swapped at the runtime boundary without changing JavaScript wrapper semantics, but service still fulfills `CellStatus::PendingTool` until the Promise/completion work lands.
 
 ### Phase 3: Replace Sync Tool Result Bridge With Promise/Completion Queue
 
@@ -438,7 +438,7 @@ Implementation tasks:
 - Spawn or drive the host async tool future without nested `block_on`.
 - Resolve or reject the Promise on the QuickJS context thread.
 - Emit `ToolCallRequested` and `ToolCallDone` from the host.
-- Remove service-side invocation from `DriverBoundary::PendingTool`.
+- Remove service-side invocation from `CellStatus::PendingTool`.
 - Remove `CellDriver::complete_pending_tool_call`.
 
 Exit criteria:
@@ -459,7 +459,7 @@ Progress 2026-04-22:
 
 - Replaced the synchronous `__callTool` callback with an rquickjs async function that returns a JavaScript Promise and awaits `CellRuntimeHost::call_tool`.
 - Added `ExecutorCellRuntimeHostFactory` and `ExecutorCellRuntimeHost`; nested calls now emit request/done events and invoke `UnifiedToolExecutor.execute` directly from the host.
-- Changed `CodeModeService` so `DriverBoundary::PendingTool` records and publishes snapshots only; it no longer invokes tools or completes pending tool calls.
+- Changed `CodeModeService` so `CellStatus::PendingTool` records and publishes snapshots only; it no longer invokes tools or completes pending tool calls.
 - Preserved fast-call behavior by deferring the initial "waiting on tool" publication briefly; quick nested calls can still finish and return the final/flush summary, while long calls publish `waiting_on_tool_request_id`.
 - Finding: the async QuickJS bridge needed a wider initial-publication delay than the old channel relay. `INITIAL_NESTED_TOOL_PUBLICATION_DELAY` is currently 150ms, with service coverage proving delayed calls still surface as running.
 - Finding: obsolete driver relay state (`tool_result_tx`, `tool_call_in_flight`, and `CellDriver::complete_pending_tool_call`) is now unused and produces warnings; cleanup is intentionally deferred to Phase 4.
@@ -472,7 +472,7 @@ Implementation tasks:
 
 - Delete `tool_result_tx`, `tool_result_rx`, and `tool_call_in_flight`.
 - Simplify `CellDriverControl::request_cancel`.
-- Revisit `DriverBoundary::PendingTool`: it may remain as a publication boundary, but it must not imply service-side fulfillment.
+- Revisit `CellStatus::PendingTool`: it may remain as a publication boundary, but it must not imply service-side fulfillment.
 - Ensure `Drop for CellDriver` still terminates infinite loops, timer waits, and pending tool work.
 - Tighten event ordering tests.
 
@@ -486,7 +486,7 @@ Progress 2026-04-22:
 - Removed the obsolete `tool_result_tx`/`tool_result_rx` bridge, `tool_call_in_flight`, and `CellDriver::complete_pending_tool_call`.
 - Deleted the temporary `src/code_mode/executor.rs` adapter now that nested execution goes through `CellRuntimeHost -> UnifiedToolExecutor`.
 - Simplified `CellDriverControl::request_cancel` so cancellation only marks the shared flag and sends a timer/runtime cancel command.
-- Kept `DriverBoundary::PendingTool` as an event publication boundary; it no longer implies service-side fulfillment.
+- Kept `CellStatus::PendingTool` as an event publication boundary; it no longer implies service-side fulfillment.
 - Narrowed host-facing service/driver APIs to crate visibility so private runtime host types do not leak through public interfaces.
 - Finding: after this cleanup, `cargo clippy -- -D warnings` no longer reports the Phase 3 private-interface/dead-code warnings.
 
@@ -535,7 +535,7 @@ Progress 2026-04-23 service simplification pass:
 Progress 2026-04-23 boundary simplification pass:
 
 - Removed `DriverEventBatch`; `DriverUpdate` now carries runtime events directly.
-- Kept `DriverBoundary::PendingTool` as a unit publication boundary because the request is already present in `RuntimeEvent::ToolCallRequested`.
+- Kept `CellStatus::PendingTool` as a unit publication boundary because the request is already present in `RuntimeEvent::ToolCallRequested`.
 - Dropped unused protocol/output fields: `ToolCallDone.ok` and `ExecOutputItem`.
 - Reused `ToolCallRequest` for both host execution and the `ToolCallRequested` event, replacing the duplicate `RuntimeToolRequest` shape.
 - Replaced the one-variant `CellCommand` channel with a plain cancellation-reason channel for timer waits.
