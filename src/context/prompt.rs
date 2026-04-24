@@ -164,15 +164,14 @@ fn build_prompt_section(title: &str, content: String, max_chars: usize) -> Optio
 pub(crate) fn build_llm_payload(
     ctx: &AgentContext,
     task_state: &crate::task_state::TaskStateSnapshot,
-    assembler: &crate::context_assembler::ContextAssembler,
+    _assembler: &crate::context_assembler::ContextAssembler,
 ) -> (
     Vec<super::model::Message>,
     Option<super::model::Message>,
     PromptReport,
 ) {
     let bpe = tiktoken_rs::cl100k_base().unwrap();
-    let (mut messages, history_tokens_used, history_turns_included, _) =
-        ctx.build_history_with_budget();
+    let mut current_turn_messages = Vec::new();
     let mut current_turn_tokens = 0;
     if let Some(turn) = &ctx.current_turn {
         if let Some(sanitized_turn) = super::history::sanitize_turn(turn) {
@@ -187,14 +186,14 @@ pub(crate) fn build_llm_payload(
                 }],
             };
             current_turn_tokens += AgentContext::estimate_tokens(&bpe, &separator);
-            messages.push(separator);
+            current_turn_messages.push(separator);
 
             current_turn_tokens += sanitized_turn
                 .messages
                 .iter()
                 .map(|m| AgentContext::estimate_tokens(&bpe, m))
                 .sum::<usize>();
-            messages.extend(sanitized_turn.messages);
+            current_turn_messages.extend(sanitized_turn.messages);
         }
     }
 
@@ -266,7 +265,14 @@ Architecture: {}
         ));
     }
 
-    let (assembled_system_text, report_data) = assembler.assemble_prompt(
+    let system_budget = ctx
+        .max_history_tokens
+        .saturating_sub(current_turn_tokens)
+        .saturating_sub(super::history::response_token_reserve(
+            ctx.max_history_tokens,
+        ));
+    let system_assembler = crate::context_assembler::ContextAssembler::new(system_budget);
+    let (assembled_system_text, report_data) = system_assembler.assemble_prompt(
         &system_static.join(
             "
 
@@ -296,6 +302,14 @@ Architecture: {}
     };
 
     let system_prompt_tokens = report_data.used_tokens;
+    let history_budget = super::history::effective_history_budget(
+        ctx.max_history_tokens,
+        system_prompt_tokens,
+        current_turn_tokens,
+    );
+    let (mut messages, history_tokens_used, history_turns_included, _) =
+        ctx.build_history_with_token_budget(history_budget);
+    messages.extend(current_turn_messages);
     let retrieved_memory_snippets = ctx.retrieved_memory_sources.len();
 
     let report = PromptReport {

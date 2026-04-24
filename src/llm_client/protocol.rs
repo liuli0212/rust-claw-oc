@@ -38,6 +38,9 @@ pub struct LlmCapabilities {
 pub trait LlmClient: Send + Sync {
     fn model_name(&self) -> &str;
     fn provider_name(&self) -> &str;
+    fn context_window(&self) -> usize {
+        crate::llm_client::policy::estimate_context_window(self.model_name())
+    }
     fn capabilities(&self) -> LlmCapabilities;
 
     async fn stream(

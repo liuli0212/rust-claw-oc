@@ -347,6 +347,7 @@ impl AgentLoop {
     }
 
     pub fn update_llm(&mut self, new_llm: Arc<dyn LlmClient>) {
+        self.context.max_history_tokens = new_llm.context_window();
         self.llm = new_llm;
     }
     pub fn update_output(&mut self, output: Arc<dyn AgentOutput>) {

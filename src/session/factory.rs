@@ -308,6 +308,7 @@ pub fn build_subagent_session(
     let _ = std::fs::create_dir_all(&session_dir);
     let transcript_path = session_dir.join("transcript.json");
     let mut context = AgentContext::new().with_transcript_path(transcript_path);
+    context.max_history_tokens = llm.context_window();
 
     let mut prompt = "You are a delegated sub-agent. Complete the assigned goal with the available tools, then call `finish_task`.".to_string();
     if !parent_context_text.trim().is_empty() {
@@ -328,7 +329,6 @@ pub fn build_subagent_session(
     }
 
     context.system_prompts.push(prompt);
-    context.max_history_tokens = 100_000;
 
     let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
     let telemetry = Arc::new(telemetry);
@@ -406,6 +406,7 @@ pub fn build_agent_session(
     output: Arc<dyn AgentOutput>,
 ) -> Result<Arc<AsyncMutex<AgentLoop>>, String> {
     let mut context = AgentContext::new().with_transcript_path(transcript_path);
+    context.max_history_tokens = llm.context_window();
     let _ = context.load_transcript().map_err(|e| e.to_string())?;
 
     let (telemetry, _telemetry_handle) = crate::telemetry::TelemetryExporter::new();
@@ -526,6 +527,7 @@ mod tests {
     struct InspectingLlm {
         pub last_system: std::sync::Mutex<Option<String>>,
         pub last_tools: std::sync::Mutex<Vec<String>>,
+        pub context_window: usize,
     }
 
     #[async_trait]
@@ -536,6 +538,10 @@ mod tests {
 
         fn provider_name(&self) -> &str {
             "test-provider"
+        }
+
+        fn context_window(&self) -> usize {
+            self.context_window
         }
 
         fn capabilities(&self) -> crate::llm_client::LlmCapabilities {
@@ -594,6 +600,7 @@ mod tests {
         let llm = Arc::new(InspectingLlm {
             last_system: std::sync::Mutex::new(None),
             last_tools: std::sync::Mutex::new(Vec::new()),
+            context_window: 42_000,
         });
         let output = Arc::new(CaptureOutput);
         let agent = build_agent_session(
@@ -606,6 +613,8 @@ mod tests {
             output,
         )
         .unwrap();
+
+        assert_eq!(agent.lock().await.context.max_history_tokens, 42_000);
 
         let mut agent = agent.lock().await;
         let exit = agent.step("/check_git_status".to_string()).await.unwrap();
@@ -627,6 +636,7 @@ mod tests {
         let llm = Arc::new(InspectingLlm {
             last_system: std::sync::Mutex::new(None),
             last_tools: std::sync::Mutex::new(Vec::new()),
+            context_window: 64_000,
         });
         let parent_ctx = crate::tools::ToolContext::new(session_id, "cli");
         let base_tools: Vec<Arc<dyn Tool>> = vec![
@@ -655,6 +665,7 @@ mod tests {
             },
         )
         .expect("subagent session should build");
+        assert_eq!(built.agent_loop.context.max_history_tokens, 64_000);
 
         let mut agent = built.agent_loop;
         let _ = agent.step("inspect".to_string()).await.unwrap();
@@ -665,6 +676,49 @@ mod tests {
         assert!(!tool_names.contains(&"subagent".to_string()));
 
         cleanup_session(session_id);
+    }
+
+    #[tokio::test]
+    async fn test_update_llm_refreshes_context_window() {
+        let session_id = "test-session-context-window-refresh";
+        cleanup_session(session_id);
+        let temp_root = std::env::temp_dir().join(format!(
+            "rusty_claw_test_{}_{}",
+            session_id,
+            std::process::id()
+        ));
+        let transcript_path =
+            crate::session::repository::SessionRegistryStore::new(temp_root.clone())
+                .transcript_path(session_id);
+
+        let llm = Arc::new(InspectingLlm {
+            last_system: std::sync::Mutex::new(None),
+            last_tools: std::sync::Mutex::new(Vec::new()),
+            context_window: 128_000,
+        });
+        let output = Arc::new(CaptureOutput);
+        let agent = build_agent_session(
+            session_id,
+            "cli",
+            llm.clone(),
+            Vec::new(),
+            crate::subagent_runtime::SubagentRuntime::new(llm.clone(), Vec::new(), 2),
+            transcript_path,
+            output,
+        )
+        .unwrap();
+
+        let replacement = Arc::new(InspectingLlm {
+            last_system: std::sync::Mutex::new(None),
+            last_tools: std::sync::Mutex::new(Vec::new()),
+            context_window: 32_000,
+        });
+        let mut agent = agent.lock().await;
+        agent.update_llm(replacement);
+        assert_eq!(agent.context.max_history_tokens, 32_000);
+
+        cleanup_session(session_id);
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[test]

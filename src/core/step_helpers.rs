@@ -1288,7 +1288,10 @@ impl AgentLoop {
             }
         }
 
-        let compressed = self.context.compress_current_turn(400 * 1024);
+        let current_turn_max_bytes = (self.context.max_history_tokens / 5)
+            .saturating_mul(4)
+            .clamp(64 * 1024, 400 * 1024);
+        let compressed = self.context.compress_current_turn(current_turn_max_bytes);
         let truncated = self.context.truncate_current_turn_tool_results(30000);
 
         if compressed > 0 || truncated > 0 {
