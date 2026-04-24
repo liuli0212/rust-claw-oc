@@ -170,7 +170,8 @@ impl Tool for WebFetchTool {
             );
         }
 
-        let is_html = content_type.contains("text/html") || content_type.contains("application/xhtml");
+        let is_html =
+            content_type.contains("text/html") || content_type.contains("application/xhtml");
         let mut rendered = raw_body;
         if !parsed.include_html.unwrap_or(false) && is_html {
             rendered = html_to_clean_markdown(&rendered);
@@ -340,15 +341,14 @@ impl Tool for TavilySearchTool {
 /// 2. Convert remaining HTML → Markdown via `fast_html2md`
 /// 3. Collapse excessive blank lines
 fn html_to_clean_markdown(html: &str) -> String {
-    static RE_NOISE: once_cell::sync::Lazy<Vec<regex::Regex>> =
-        once_cell::sync::Lazy::new(|| {
-            ["script", "style", "nav", "header", "footer", "aside", "svg", "noscript", "iframe"]
-                .iter()
-                .map(|tag| {
-                    regex::Regex::new(&format!(r"(?is)<{tag}\b[^>]*>.*?</{tag}>")).unwrap()
-                })
-                .collect()
-        });
+    static RE_NOISE: once_cell::sync::Lazy<Vec<regex::Regex>> = once_cell::sync::Lazy::new(|| {
+        [
+            "script", "style", "nav", "header", "footer", "aside", "svg", "noscript", "iframe",
+        ]
+        .iter()
+        .map(|tag| regex::Regex::new(&format!(r"(?is)<{tag}\b[^>]*>.*?</{tag}>")).unwrap())
+        .collect()
+    });
 
     let mut cleaned = html.to_string();
     for re in RE_NOISE.iter() {
@@ -468,8 +468,18 @@ mod tests {
     #[test]
     fn test_content_type_detection_for_html_conversion() {
         // Only text/html and application/xhtml should trigger markdown conversion.
-        let html_types = vec!["text/html", "text/html; charset=utf-8", "application/xhtml+xml"];
-        let non_html_types = vec!["text/plain", "application/json", "application/xml", "text/xml", ""];
+        let html_types = vec![
+            "text/html",
+            "text/html; charset=utf-8",
+            "application/xhtml+xml",
+        ];
+        let non_html_types = vec![
+            "text/plain",
+            "application/json",
+            "application/xml",
+            "text/xml",
+            "",
+        ];
 
         for ct in &html_types {
             let ct_lower = ct.to_lowercase();

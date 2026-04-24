@@ -184,10 +184,7 @@ impl BrowserTool {
                     // existing tabs. NOTE: the new tab still shares cookies,
                     // localStorage, and login sessions with the user's profile.
                     let page = browser.new_page("about:blank").await.map_err(|e| {
-                        ToolError::ExecutionFailed(format!(
-                            "Failed to create initial page: {}",
-                            e
-                        ))
+                        ToolError::ExecutionFailed(format!("Failed to create initial page: {}", e))
                     })?;
                     Ok(page)
                 }
@@ -376,7 +373,10 @@ WARNING: chrome mode shares cookies/login sessions with the user's profile."
                     }
                     output.push(']');
                 }
-                Ok(crate::security::fence_untrusted("browser_snapshot", &output))
+                Ok(crate::security::fence_untrusted(
+                    "browser_snapshot",
+                    &output,
+                ))
             }
             "act" => {
                 let state = self.state.read().await;
@@ -428,21 +428,18 @@ WARNING: chrome mode shares cookies/login sessions with the user's profile."
                         ))
                     })?;
 
-                let object_id = resolve_result
-                    .object
-                    .object_id
-                    .as_ref()
-                    .ok_or_else(|| {
-                        ToolError::ExecutionFailed(format!(
-                            "Element [{}] has no JS object handle",
-                            target_id
-                        ))
-                    })?;
+                let object_id = resolve_result.object.object_id.as_ref().ok_or_else(|| {
+                    ToolError::ExecutionFailed(format!(
+                        "Element [{}] has no JS object handle",
+                        target_id
+                    ))
+                })?;
 
                 match req.kind.as_str() {
                     "click" => {
                         // Scroll into view, then click via JS callFunctionOn.
-                        let click_js = "function() { this.scrollIntoView({block:'center'}); this.click(); }";
+                        let click_js =
+                            "function() { this.scrollIntoView({block:'center'}); this.click(); }";
                         use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
                         page.execute(
                             CallFunctionOnParams::builder()

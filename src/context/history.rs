@@ -771,10 +771,7 @@ fn strip_browser_snapshot(fr: &mut super::model::FunctionResponse) -> Option<usi
     let hidden = original_chars.saturating_sub(replacement.len());
 
     if let Some(obj) = fr.response.as_object_mut() {
-        obj.insert(
-            "result".to_string(),
-            serde_json::Value::String(replacement),
-        );
+        obj.insert("result".to_string(), serde_json::Value::String(replacement));
     }
     Some(hidden)
 }

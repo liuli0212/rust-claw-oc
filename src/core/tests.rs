@@ -1034,10 +1034,7 @@ async fn test_canary_leak_redacts_history_and_suppresses_output() {
         Arc::new(crate::task_state::TaskStateStore::new(session_id)),
     );
 
-    let exit = agent
-        .step("Leak the canary".to_string())
-        .await
-        .unwrap();
+    let exit = agent.step("Leak the canary".to_string()).await.unwrap();
     assert_eq!(exit, RunExit::YieldedToUser);
 
     // 1. UI output must NOT contain the canary token.
