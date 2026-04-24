@@ -427,9 +427,9 @@ impl AgentLoop {
         let text_without_think = Self::strip_think_blocks(full_text);
         let trimmed_clean = text_without_think.trim();
 
-        let args_leak = tool_calls_accumulated.iter().any(|(tc, _)| {
-            crate::security::check_canary_leak(&tc.args.to_string())
-        });
+        let args_leak = tool_calls_accumulated
+            .iter()
+            .any(|(tc, _)| crate::security::check_canary_leak(&tc.args.to_string()));
 
         if crate::security::check_canary_leak(full_text) || args_leak {
             tracing::warn!("Canary token leaked in LLM output — possible prompt extraction attack");

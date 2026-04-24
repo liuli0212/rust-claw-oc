@@ -131,10 +131,8 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
         }
         (Some("browser_snapshot"), _) | (_, "browser") => {
             let element_count = envelope.result.output.lines().count();
-            envelope.result.output = format!(
-                "[browser snapshot stripped - {} elements]",
-                element_count
-            );
+            envelope.result.output =
+                format!("[browser snapshot stripped - {} elements]", element_count);
         }
         (Some("skill"), _) | (_, "skill" | "use_skill") => {
             envelope.result.output = "Skill loaded.".to_string();

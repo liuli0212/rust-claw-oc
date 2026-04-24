@@ -11,6 +11,7 @@ pub struct MockTool {
     pub calls: Arc<Mutex<Vec<Value>>>,
 }
 
+#[allow(dead_code)]
 impl MockTool {
     pub fn new(name: &str, result: Result<String, String>) -> Self {
         Self {
@@ -74,10 +75,12 @@ impl Tool for MockTool {
     }
 }
 
+#[allow(dead_code)]
 pub struct BlockingTool {
     pub name: String,
 }
 
+#[allow(dead_code)]
 impl BlockingTool {
     pub fn new(name: &str) -> Self {
         Self {
