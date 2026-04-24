@@ -139,6 +139,9 @@ impl LlmClient for OpenAiCompatClient {
     fn provider_name(&self) -> &str {
         &self.provider_name
     }
+    fn context_window(&self) -> usize {
+        self.context_window
+    }
     fn capabilities(&self) -> LlmCapabilities {
         LlmCapabilities {
             function_tools: true,

@@ -105,6 +105,13 @@ impl AgentContext {
         super::history::build_history_with_budget(self)
     }
 
+    pub(crate) fn build_history_with_token_budget(
+        &self,
+        history_budget: usize,
+    ) -> (Vec<Message>, usize, usize, usize) {
+        super::history::build_history_with_token_budget(self, history_budget)
+    }
+
     pub(crate) fn turn_token_estimate(turn: &Turn, bpe: &CoreBPE) -> usize {
         token::turn_token_estimate(turn, bpe)
     }

@@ -35,7 +35,6 @@ pub(crate) fn dialogue_history_token_estimate(ctx: &AgentContext) -> usize {
 
 pub(crate) fn get_context_status(ctx: &AgentContext) -> (usize, usize, usize, usize, usize) {
     let bpe = AgentContext::get_bpe();
-    let (_, history_tokens, _, _) = ctx.build_history_with_budget();
 
     let current_turn_tokens = if let Some(turn) = &ctx.current_turn {
         AgentContext::turn_token_estimate(turn, &bpe)
@@ -47,6 +46,9 @@ pub(crate) fn get_context_status(ctx: &AgentContext) -> (usize, usize, usize, us
 
     let prompt_text = ctx.build_system_prompt();
     let system_tokens = bpe.encode_with_special_tokens(&prompt_text).len();
+    let history_budget =
+        effective_history_budget(ctx.max_history_tokens, system_tokens, current_turn_tokens);
+    let (_, history_tokens, _, _) = build_history_with_token_budget(ctx, history_budget);
     let total_tokens = history_tokens + current_turn_tokens + system_tokens;
 
     (
@@ -56,6 +58,28 @@ pub(crate) fn get_context_status(ctx: &AgentContext) -> (usize, usize, usize, us
         system_tokens,
         current_turn_tokens,
     )
+}
+
+pub(crate) fn response_token_reserve(max_tokens: usize) -> usize {
+    if max_tokens < 8_192 {
+        return max_tokens / 10;
+    }
+
+    (max_tokens / 10).clamp(4_096, 32_000)
+}
+
+pub(crate) fn effective_history_budget(
+    max_tokens: usize,
+    system_tokens: usize,
+    current_turn_tokens: usize,
+) -> usize {
+    let historical_cap = max_tokens.saturating_mul(85) / 100;
+    let reserve = response_token_reserve(max_tokens);
+    let available = max_tokens
+        .saturating_sub(system_tokens)
+        .saturating_sub(current_turn_tokens)
+        .saturating_sub(reserve);
+    historical_cap.min(available)
 }
 
 pub(crate) fn oldest_turns_for_compaction(
@@ -487,7 +511,23 @@ pub(crate) fn build_history_with_budget(
     ctx: &AgentContext,
 ) -> (Vec<super::model::Message>, usize, usize, usize) {
     let bpe = tiktoken_rs::cl100k_base().unwrap();
-    let history_budget = ctx.max_history_tokens.saturating_mul(85) / 100;
+    let prompt_text = ctx.build_system_prompt();
+    let system_tokens = bpe.encode_with_special_tokens(&prompt_text).len();
+    let current_turn_tokens = ctx
+        .current_turn
+        .as_ref()
+        .map(|turn| AgentContext::turn_token_estimate(turn, &bpe))
+        .unwrap_or(0);
+    let history_budget =
+        effective_history_budget(ctx.max_history_tokens, system_tokens, current_turn_tokens);
+    build_history_with_token_budget(ctx, history_budget)
+}
+
+pub(crate) fn build_history_with_token_budget(
+    ctx: &AgentContext,
+    history_budget: usize,
+) -> (Vec<super::model::Message>, usize, usize, usize) {
+    let bpe = tiktoken_rs::cl100k_base().unwrap();
     let mut history_blocks: Vec<(usize, Vec<super::model::Message>)> = Vec::new();
     let mut current_tokens = 0;
     let mut turns_included = 0;
@@ -851,6 +891,19 @@ fn reconstruct_turn_for_history(turn: &Turn) -> (Turn, usize) {
 mod tests {
     use super::*;
     use crate::context::model::{FunctionCall, Message, Part};
+
+    #[test]
+    fn effective_history_budget_reserves_space_for_256k_window() {
+        let budget = effective_history_budget(256_000, 10_000, 20_000);
+        assert_eq!(response_token_reserve(256_000), 25_600);
+        assert_eq!(budget, 200_400);
+    }
+
+    #[test]
+    fn effective_history_budget_caps_history_at_85_percent() {
+        let budget = effective_history_budget(256_000, 1_000, 1_000);
+        assert_eq!(budget, 217_600);
+    }
 
     #[test]
     fn reconstruct_turn_compacts_task_plan_and_path_based_calls() {
