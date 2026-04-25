@@ -569,9 +569,21 @@ impl SandboxEnforcer {
         }
 
         // ── Hide sensitive paths ──────────────────────────────────
+        // `--tmpfs` only works on directories; applying it to a regular
+        // file (e.g. /etc/shadow, ~/.npmrc) makes bwrap fail with ENOTDIR
+        // and aborts the sandboxed launch.  Route directories to --tmpfs
+        // and regular files to `--ro-bind /dev/null <path>`, which shadows
+        // the file with an empty read-only view.
         for path in &policy.hidden_paths {
-            if path.exists() {
-                args.extend(["--tmpfs".into(), path.display().to_string()]);
+            let meta = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => continue, // path does not exist in this env
+            };
+            let dest = path.display().to_string();
+            if meta.is_dir() {
+                args.extend(["--tmpfs".into(), dest]);
+            } else {
+                args.extend(["--ro-bind".into(), "/dev/null".into(), dest]);
             }
         }
 
@@ -777,11 +789,16 @@ impl SandboxEnforcer {
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(path)
         };
-        let canonical = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+        // canonicalize returns an error for non-existent paths and silently
+        // falls back to the raw path — which lets `workspace/link/newfile`
+        // bypass the prefix check even if `link` is a symlink outside the
+        // workspace.  Walk up ancestors to canonicalize the longest existing
+        // prefix, then re-append the non-existent tail.
+        let canonical = Self::resolve_for_access_check(&candidate);
 
         // Always block hidden (sensitive) paths
         for hidden in &policy.hidden_paths {
-            let hidden_canonical = std::fs::canonicalize(hidden).unwrap_or_else(|_| hidden.clone());
+            let hidden_canonical = Self::resolve_for_access_check(hidden);
             if canonical.starts_with(&hidden_canonical) {
                 tracing::warn!(
                     "Sandbox: Blocked {} access to protected path '{}'",
@@ -803,8 +820,7 @@ impl SandboxEnforcer {
 
         // Write access: must be under a writable path
         let allowed = policy.writable_paths.iter().any(|allowed_path| {
-            let allowed_canonical =
-                std::fs::canonicalize(allowed_path).unwrap_or_else(|_| allowed_path.clone());
+            let allowed_canonical = Self::resolve_for_access_check(allowed_path);
             canonical.starts_with(&allowed_canonical)
         });
 
@@ -821,6 +837,26 @@ impl SandboxEnforcer {
                 allowed: policy.writable_paths.clone(),
             })
         }
+    }
+
+    /// Canonicalize the longest existing prefix of `path`, then re-append
+    /// any non-existent tail.  This resolves symlinks in the existing
+    /// portion of the path (preventing `workspace/link/newfile` bypass
+    /// when `link` points outside the workspace) while still producing a
+    /// usable path for non-existent targets (e.g. a file about to be
+    /// created).  Falls back to the raw path only when no ancestor can
+    /// be canonicalized.
+    fn resolve_for_access_check(path: &Path) -> PathBuf {
+        for ancestor in path.ancestors() {
+            if let Ok(canonical) = std::fs::canonicalize(ancestor) {
+                return match path.strip_prefix(ancestor) {
+                    Ok(tail) if tail.as_os_str().is_empty() => canonical,
+                    Ok(tail) => canonical.join(tail),
+                    Err(_) => canonical,
+                };
+            }
+        }
+        path.to_path_buf()
     }
 
     // ── Network guard ─────────────────────────────────────────────
@@ -961,7 +997,45 @@ impl SandboxConfig {
             writable_paths.extend(extra.iter().map(|p| Self::expand_tilde(p)));
         }
 
-        let default_hidden = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.config/rusty-claw"];
+        let default_hidden = [
+            // Private keys / SSH / GPG / cloud credentials
+            "~/.ssh",
+            "~/.aws",
+            "~/.gnupg",
+            "~/.config/rusty-claw",
+            // Package manager & language-ecosystem auth tokens
+            "~/.npmrc",
+            "~/.yarnrc",
+            "~/.yarnrc.yml",
+            "~/.pypirc",
+            "~/.cargo/credentials",
+            "~/.cargo/credentials.toml",
+            "~/.gem/credentials",
+            "~/.m2/settings.xml",
+            "~/.gradle/gradle.properties",
+            // Container / orchestration credentials
+            "~/.docker",
+            "~/.kube",
+            "~/.config/helm",
+            // Generic auth / hosts
+            "~/.netrc",
+            "~/.config/gh",
+            "~/.config/hub",
+            // Shell history (may contain secrets typed at the prompt)
+            "~/.bash_history",
+            "~/.zsh_history",
+            "~/.history",
+            "~/.local/share/fish/fish_history",
+            // Browser profiles (session cookies, saved passwords)
+            "~/.mozilla",
+            "~/.config/google-chrome",
+            "~/.config/chromium",
+            "~/.config/BraveSoftware",
+            // System-level credential files
+            "/etc/shadow",
+            "/etc/gshadow",
+            "/etc/sudoers",
+        ];
         let hidden_paths: Vec<PathBuf> = self
             .hidden_paths
             .as_deref()
@@ -1184,6 +1258,91 @@ mod tests {
     }
 
     #[test]
+    fn test_check_path_access_blocks_symlink_escape_to_nonexistent() {
+        // Regression: writing to a non-existent file via a symlink that
+        // points outside the writable root must be blocked, even though
+        // `std::fs::canonicalize` fails on the non-existent leaf.
+        let enforcer = SandboxEnforcer::disabled();
+
+        let tmp = std::env::temp_dir();
+        let workspace = tmp.join(format!("claw_symlink_ws_{}", std::process::id()));
+        let outside = tmp.join(format!("claw_symlink_outside_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // workspace/escape -> outside
+        let link = workspace.join("escape");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        #[cfg(not(unix))]
+        {
+            let _ = link;
+            // Symlink creation on Windows requires privileges; skip.
+            let _ = std::fs::remove_dir_all(&workspace);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+
+        let target = workspace.join("escape").join("newfile.txt");
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Restricted,
+            writable_paths: vec![workspace.clone()],
+            ..Default::default()
+        };
+
+        let result = enforcer.check_path_access(&target, true, &policy);
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+
+        assert!(
+            result.is_err(),
+            "symlink escape to non-existent file was NOT blocked: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_default_policy_hides_common_credential_files() {
+        // Regression: the default `SandboxConfig`-built policy must cover
+        // more than just ~/.ssh — ~/.npmrc, ~/.docker, ~/.kube, shell
+        // history, /etc/shadow, etc. should all be blocked for reads.
+        let cfg = SandboxConfig {
+            level: Some("restricted".into()),
+            ..Default::default()
+        };
+        let work_dir = std::env::temp_dir();
+        let policy = cfg.build_default_policy(&work_dir);
+
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/root"));
+        let must_block = [
+            home.join(".npmrc"),
+            home.join(".docker").join("config.json"),
+            home.join(".kube").join("config"),
+            home.join(".bash_history"),
+            home.join(".zsh_history"),
+            home.join(".netrc"),
+            home.join(".pypirc"),
+            home.join(".cargo").join("credentials.toml"),
+            home.join(".config").join("gh").join("hosts.yml"),
+            PathBuf::from("/etc/shadow"),
+        ];
+
+        let enforcer = SandboxEnforcer::disabled();
+        for p in &must_block {
+            // read access should be denied (hidden_paths block both r/w)
+            let res = enforcer.check_path_access(p, false, &policy);
+            assert!(
+                res.is_err(),
+                "default policy did not block sensitive read: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
     fn test_policy_tighten_cannot_relax() {
         let parent = SandboxPolicy {
             level: SandboxLevel::Strict,
@@ -1262,6 +1421,67 @@ mod tests {
         assert!(args.contains(&"--new-session".to_string()));
         let last_three: Vec<&str> = args[args.len() - 3..].iter().map(|s| s.as_str()).collect();
         assert_eq!(last_three, vec!["bash", "-c", "echo hello"]);
+    }
+
+    #[test]
+    fn test_build_bwrap_args_hides_files_via_ro_bind_and_dirs_via_tmpfs() {
+        // Regression: --tmpfs only works on directories.  Regular files in
+        // `hidden_paths` (e.g. /etc/shadow, ~/.npmrc) must be shadowed via
+        // `--ro-bind /dev/null <path>` instead, otherwise bwrap fails with
+        // ENOTDIR at launch and blocks the whole sandbox.
+        let tmp = std::env::temp_dir().join(format!("claw_bwrap_hidden_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let hidden_dir = tmp.join("secrets_dir");
+        let hidden_file = tmp.join("secret.txt");
+        std::fs::create_dir_all(&hidden_dir).unwrap();
+        std::fs::write(&hidden_file, "top secret").unwrap();
+
+        let enforcer = SandboxEnforcer::new_bwrap_for_testing(
+            PathBuf::from("/usr/bin/bwrap"),
+            SandboxPolicy::default(),
+        );
+        let policy = SandboxPolicy {
+            level: SandboxLevel::Restricted,
+            hidden_paths: vec![hidden_dir.clone(), hidden_file.clone()],
+            ..Default::default()
+        };
+        let args = enforcer.build_bwrap_args("echo hi", &policy, Path::new("/tmp/test_cwd"));
+
+        // Find indices of the two hidden-path entries in the args list.
+        let dir_str = hidden_dir.display().to_string();
+        let file_str = hidden_file.display().to_string();
+
+        // Directory → --tmpfs <dir>
+        let dir_idx = args
+            .iter()
+            .position(|a| a == &dir_str)
+            .expect("hidden dir missing from args");
+        assert_eq!(
+            args[dir_idx - 1],
+            "--tmpfs",
+            "hidden dir should use --tmpfs, got: {:?}",
+            &args[dir_idx.saturating_sub(2)..=dir_idx]
+        );
+
+        // File → --ro-bind /dev/null <file>
+        let file_idx = args
+            .iter()
+            .position(|a| a == &file_str)
+            .expect("hidden file missing from args");
+        assert_eq!(args[file_idx - 1], "/dev/null");
+        assert_eq!(args[file_idx - 2], "--ro-bind");
+
+        // And no --tmpfs was generated for the file (would be fatal).
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1] == file_str),
+            "regular file must not receive --tmpfs: {:?}",
+            args
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
