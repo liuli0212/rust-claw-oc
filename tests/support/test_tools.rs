@@ -20,6 +20,7 @@ impl MockTool {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_results(name: &str, results: Vec<Result<String, String>>) -> Self {
         Self {
             name: name.to_string(),
@@ -74,11 +75,13 @@ impl Tool for MockTool {
     }
 }
 
+#[allow(dead_code)]
 pub struct BlockingTool {
     pub name: String,
 }
 
 impl BlockingTool {
+    #[allow(dead_code)]
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
