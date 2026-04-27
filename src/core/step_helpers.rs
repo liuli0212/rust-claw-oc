@@ -427,9 +427,9 @@ impl AgentLoop {
         let text_without_think = Self::strip_think_blocks(full_text);
         let trimmed_clean = text_without_think.trim();
 
-        let args_leak = tool_calls_accumulated.iter().any(|(tc, _)| {
-            crate::security::check_canary_leak(&tc.args.to_string())
-        });
+        let args_leak = tool_calls_accumulated
+            .iter()
+            .any(|(tc, _)| crate::security::check_canary_leak(&tc.args.to_string()));
 
         if crate::security::check_canary_leak(full_text) || args_leak {
             tracing::warn!("Canary token leaked in LLM output — possible prompt extraction attack");
@@ -651,8 +651,10 @@ impl AgentLoop {
                 .map(|tool| tool.name())
                 .filter(|name| crate::tools::invocation::is_code_mode_nested_tool(name))
                 .collect();
-            let code_mode_notice =
-                crate::code_mode::description::execution_notice(&available_nested_tools);
+            let code_mode_notice = crate::code_mode::description::execution_notice(
+                &available_nested_tools,
+                self.code_mode_format,
+            );
             execution_notices = Some(match execution_notices {
                 Some(existing) if !existing.trim().is_empty() => {
                     format!("{existing}\n\n{code_mode_notice}")
@@ -665,14 +667,25 @@ impl AgentLoop {
         let max_tokens = self.context.max_history_tokens;
         let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
         let (messages, system, _) = self.context.build_llm_payload(state, &assembler);
+        let llm_tools = self.llm_visible_tools_for_code_mode(current_tools);
 
-        self.collect_stream_response(
-            messages,
-            system,
-            current_tools.to_vec(),
-            iteration_trace_ctx,
-        )
-        .await
+        self.collect_stream_response(messages, system, llm_tools, iteration_trace_ctx)
+            .await
+    }
+
+    pub(super) fn llm_visible_tools_for_code_mode(
+        &self,
+        current_tools: &[Arc<dyn Tool>],
+    ) -> Vec<Arc<dyn Tool>> {
+        if self.code_mode_format.exposes_function_exec() {
+            return current_tools.to_vec();
+        }
+
+        current_tools
+            .iter()
+            .filter(|tool| tool.name() != "exec")
+            .cloned()
+            .collect()
     }
 
     pub(super) async fn handle_empty_iteration_response(
@@ -699,6 +712,45 @@ impl AgentLoop {
 
         *consecutive_empty_responses = 0;
         None
+    }
+
+    pub(super) fn synthesize_text_exec_tool_call(
+        &self,
+        full_text: &str,
+        tool_calls_accumulated: &[ToolCallRecord],
+    ) -> Option<(String, Vec<ToolCallRecord>)> {
+        if !self.code_mode_format.accepts_text_command() || !tool_calls_accumulated.is_empty() {
+            return None;
+        }
+
+        let visible_text = Self::strip_think_blocks(full_text);
+        let parsed = crate::code_mode::text_command::parse_text_exec_command(&visible_text)?;
+        if parsed.code.trim().is_empty() {
+            return None;
+        }
+
+        let mut args = serde_json::Map::new();
+        args.insert("code".to_string(), serde_json::Value::String(parsed.code));
+        if let Some(auto_flush_ms) = parsed.auto_flush_ms {
+            args.insert(
+                "auto_flush_ms".to_string(),
+                serde_json::Value::Number(auto_flush_ms.into()),
+            );
+        }
+        if let Some(cell_timeout_ms) = parsed.cell_timeout_ms {
+            args.insert(
+                "cell_timeout_ms".to_string(),
+                serde_json::Value::Number(cell_timeout_ms.into()),
+            );
+        }
+
+        let call = crate::context::FunctionCall {
+            name: "exec".to_string(),
+            args: serde_json::Value::Object(args),
+            id: Some(format!("text_exec_{}", uuid::Uuid::new_v4().simple())),
+        };
+
+        Some((String::new(), vec![(call, None)]))
     }
 
     fn build_tool_executor_with_budget(

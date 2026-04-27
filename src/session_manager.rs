@@ -21,6 +21,7 @@ pub struct SessionManager {
 
     llm: Arc<RwLock<Option<Arc<dyn LlmClient>>>>,
     tools: RwLock<Vec<Arc<dyn Tool>>>,
+    code_mode_format: crate::code_mode::description::CodeModeFormat,
     subagent_runtime: Arc<RwLock<Option<crate::subagent_runtime::SubagentRuntime>>>,
     routers: RwLock<Vec<Arc<dyn OutputRouter>>>,
     sessions: SessionEntryMap,
@@ -29,12 +30,25 @@ pub struct SessionManager {
 
 impl SessionManager {
     pub fn new(llm: Option<Arc<dyn LlmClient>>, tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self::new_with_code_mode_format(
+            llm,
+            tools,
+            crate::code_mode::description::CodeModeFormat::default(),
+        )
+    }
+
+    pub fn new_with_code_mode_format(
+        llm: Option<Arc<dyn LlmClient>>,
+        tools: Vec<Arc<dyn Tool>>,
+        code_mode_format: crate::code_mode::description::CodeModeFormat,
+    ) -> Self {
         let runtime = llm.as_ref().map(|llm| {
             crate::subagent_runtime::SubagentRuntime::new(llm.clone(), tools.clone(), 3)
         });
         Self {
             llm: Arc::new(RwLock::new(llm)),
             tools: RwLock::new(tools),
+            code_mode_format,
             subagent_runtime: Arc::new(RwLock::new(runtime)),
             routers: RwLock::new(Vec::new()),
             sessions: AsyncMutex::new(HashMap::new()),
@@ -175,6 +189,7 @@ impl SessionManager {
             subagent_runtime,
             transcript_path.clone(),
             output,
+            self.code_mode_format,
         )?;
         let loaded_turns = agent.lock().await.context.dialogue_history.len();
         self.registry

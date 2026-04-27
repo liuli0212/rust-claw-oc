@@ -12,7 +12,7 @@ use crate::delegation::DelegationSessionSeed;
 use crate::event_log::{AgentEvent, EventLog};
 use crate::llm_client::LlmClient;
 use crate::skills::policy::SkillToolPolicy;
-use crate::subagent_runtime::{SubagentDebugEvent, SubagentDebugSnapshot, push_recent_debug_event};
+use crate::subagent_runtime::{push_recent_debug_event, SubagentDebugEvent, SubagentDebugSnapshot};
 use crate::tools::{Tool, ToolContext};
 
 pub struct BuiltSubagentSession {
@@ -425,6 +425,7 @@ pub fn build_agent_session(
     subagent_runtime: crate::subagent_runtime::SubagentRuntime,
     transcript_path: PathBuf,
     output: Arc<dyn AgentOutput>,
+    code_mode_format: crate::code_mode::description::CodeModeFormat,
 ) -> Result<Arc<AsyncMutex<AgentLoop>>, String> {
     let mut context = AgentContext::new().with_transcript_path(transcript_path);
     context.max_history_tokens = llm.context_window();
@@ -457,6 +458,7 @@ pub fn build_agent_session(
         telemetry,
         task_state_store,
     );
+    agent_loop.set_code_mode_format(code_mode_format);
     agent_loop.add_extension(Arc::new(
         crate::skills::runtime::SkillRuntime::new_for_session(session_id.to_string()),
     ));
@@ -629,6 +631,7 @@ mod tests {
             crate::subagent_runtime::SubagentRuntime::new(llm.clone(), Vec::new(), 2),
             transcript_path,
             output,
+            crate::code_mode::description::CodeModeFormat::default(),
         )
         .unwrap();
 
@@ -723,6 +726,7 @@ mod tests {
             crate::subagent_runtime::SubagentRuntime::new(llm.clone(), Vec::new(), 2),
             transcript_path,
             output,
+            crate::code_mode::description::CodeModeFormat::default(),
         )
         .unwrap();
 

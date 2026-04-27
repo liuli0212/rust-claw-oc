@@ -1,5 +1,6 @@
 mod support;
 
+use rusty_claw::code_mode::description::CodeModeFormat;
 use rusty_claw::context::{AgentContext, FunctionCall};
 use rusty_claw::core::{AgentLoop, RunExit};
 use rusty_claw::task_state::TaskStateStore;
@@ -25,6 +26,83 @@ fn scripted_wait_turn(call_id: &str, cell_id: &str, wait_timeout_ms: u64) -> Sce
             Some(call_id.to_string()),
         )],
     }
+}
+
+#[tokio::test]
+async fn test_code_mode_text_command_form_executes_without_json_escaping() {
+    let _workspace = TempWorkspace::new();
+    let session_id = format!("test_code_mode_text_{}", uuid::Uuid::new_v4().simple());
+
+    let exec_tool = Arc::new(rusty_claw::tools::ExecTool);
+    let echo_tool = Arc::new(MockTool::new("echo_tool", Ok("echo_result".to_string())));
+    let finish_tool = Arc::new(MockTool::new(
+        "finish_task",
+        Ok("text command finished".to_string()),
+    ));
+
+    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, echo_tool.clone(), finish_tool];
+
+    let llm = Arc::new(ScenarioLlm::new(vec![
+        ScenarioTurn {
+            events: vec![ScenarioEvent::Text(
+                r#"// rusty-claw: exec
+// auto_flush_ms=50
+// cell_timeout_ms=120000
+const res = await tools.echo_tool({ text: "hello \"quoted\"", pattern: /ExecArgs\s+/ });
+text(`text-mode: ${res.output}`);
+"#
+                .to_string(),
+            )],
+        },
+        ScenarioTurn {
+            events: vec![ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: serde_json::json!({ "summary": "Text command code mode finished" }),
+                    id: Some("finish_text_mode".to_string()),
+                },
+                Some("finish_text_mode".to_string()),
+            )],
+        },
+    ]));
+
+    let output = Arc::new(CaptureOutput::new());
+    let mut agent = AgentLoop::new(
+        session_id.clone(),
+        llm,
+        "cli".to_string(),
+        tools,
+        AgentContext::new(),
+        output.clone(),
+        Arc::new(TelemetryExporter::new().0),
+        Arc::new(TaskStateStore::new(&session_id)),
+    );
+    agent.set_code_mode_format(CodeModeFormat::TextCommand);
+
+    let result = agent
+        .step("Run text command code mode".to_string())
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, RunExit::Finished(_)),
+        "Expected Finished, got {:?}",
+        result
+    );
+
+    let texts = output.texts.lock().await.join("");
+    assert!(
+        texts.contains("text-mode: echo_result"),
+        "Expected code mode output, got: {texts}"
+    );
+    assert!(
+        !texts.contains("rusty-claw: exec"),
+        "Raw text command should not be shown to the user: {texts}"
+    );
+
+    let echo_calls = echo_tool.calls.lock().await;
+    assert_eq!(echo_calls.len(), 1);
+
+    support::temp_workspace::cleanup_session(&session_id);
 }
 
 #[tokio::test]
