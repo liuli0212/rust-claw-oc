@@ -1,17 +1,17 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::Instrument;
 
+use crate::delegation::DelegationSessionSeed;
 use crate::llm_client::LlmClient;
-use crate::session::factory::{build_subagent_session, BuiltSubagentSession};
-use crate::skills::call_tree::SkillSessionSeed;
+use crate::session::factory::{BuiltSubagentSession, build_subagent_session};
 use crate::tools::protocol::ToolError;
 use crate::tools::subagent::SubagentResult;
 use crate::tools::{Tool, ToolContext};
-use crate::trace::{shared_bus, TraceActor, TraceContext, TraceSpanHandle, TraceStatus};
+use crate::trace::{TraceActor, TraceContext, TraceSpanHandle, TraceStatus, shared_bus};
 use futures::FutureExt;
 
 const UNCONSUMED_TERMINAL_JOB_TTL: Duration = Duration::from_secs(30 * 60);
@@ -36,12 +36,71 @@ pub struct SubagentExecutionRequest {
     pub allowed_tools: Vec<String>,
     pub restrict_to_allowed_tools: bool,
     pub allow_subagent_tool: bool,
-    pub skill_name: Option<String>,
-    pub lineage: Option<Vec<String>>,
-    pub effective_tools: Option<Vec<String>>,
+    pub origin: SubagentExecutionOrigin,
     pub effective_max_steps: Option<usize>,
     pub effective_timeout_sec: Option<u64>,
-    pub skill_session_seed: SkillSessionSeed,
+    pub delegation_seed: DelegationSessionSeed,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum SubagentExecutionOrigin {
+    #[default]
+    Goal,
+    Skill(SubagentSkillOrigin),
+}
+
+#[derive(Debug, Clone)]
+pub struct SubagentSkillOrigin {
+    pub name: String,
+    pub lineage: Vec<String>,
+    pub effective_tools: Vec<String>,
+}
+
+impl SubagentExecutionRequest {
+    pub fn skill_name(&self) -> Option<&str> {
+        match &self.origin {
+            SubagentExecutionOrigin::Goal => None,
+            SubagentExecutionOrigin::Skill(origin) => Some(origin.name.as_str()),
+        }
+    }
+
+    pub fn lineage(&self) -> Option<&[String]> {
+        match &self.origin {
+            SubagentExecutionOrigin::Goal => None,
+            SubagentExecutionOrigin::Skill(origin) => Some(origin.lineage.as_slice()),
+        }
+    }
+
+    pub fn effective_tools(&self) -> Option<&[String]> {
+        match &self.origin {
+            SubagentExecutionOrigin::Goal => None,
+            SubagentExecutionOrigin::Skill(origin) => Some(origin.effective_tools.as_slice()),
+        }
+    }
+
+    pub(crate) fn build_result(
+        &self,
+        ok: bool,
+        summary: String,
+        findings: Vec<String>,
+        artifacts: Vec<String>,
+        paths: SubagentRunPaths,
+    ) -> SubagentResult {
+        SubagentResult {
+            ok,
+            summary,
+            findings,
+            artifacts,
+            sub_session_id: Some(paths.sub_session_id),
+            transcript_path: Some(paths.transcript_path),
+            event_log_path: Some(paths.event_log_path),
+            skill_name: self.skill_name().map(ToString::to_string),
+            lineage: self.lineage().map(|value| value.to_vec()),
+            effective_tools: self.effective_tools().map(|value| value.to_vec()),
+            effective_max_steps: self.effective_max_steps,
+            effective_timeout_sec: self.effective_timeout_sec,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -138,6 +197,30 @@ impl SubagentJobState {
 
     pub fn is_terminal(&self) -> bool {
         !matches!(self, Self::Pending | Self::Running { .. })
+    }
+
+    pub fn summary(&self) -> Option<String> {
+        match self {
+            Self::Completed { result, .. } => Some(result.summary.clone()),
+            Self::Failed { error, partial, .. } => partial
+                .as_ref()
+                .map(|result| result.summary.clone())
+                .or_else(|| Some(error.clone())),
+            Self::Cancelled { partial, .. } | Self::TimedOut { partial, .. } => {
+                partial.as_ref().map(|result| result.summary.clone())
+            }
+            Self::Pending | Self::Running { .. } => None,
+        }
+    }
+
+    pub fn into_result(self) -> Option<SubagentResult> {
+        match self {
+            Self::Completed { result, .. } => Some(result),
+            Self::Failed { partial, .. }
+            | Self::Cancelled { partial, .. }
+            | Self::TimedOut { partial, .. } => partial,
+            Self::Pending | Self::Running { .. } => None,
+        }
     }
 
     fn finished_at_unix_ms(&self) -> Option<u64> {
@@ -249,6 +332,262 @@ struct SubagentJobRequest {
     sub_session_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentRunMode {
+    Foreground,
+    Background,
+}
+
+impl SubagentRunMode {
+    fn is_background(self) -> bool {
+        matches!(self, Self::Background)
+    }
+}
+
+fn new_subagent_id(parent_ctx: &ToolContext) -> String {
+    format!(
+        "sub_{}_{}",
+        parent_ctx.session_id,
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn make_job_meta(
+    parent_ctx: &ToolContext,
+    execution: &SubagentExecutionRequest,
+    sub_session_id: String,
+) -> SubagentJobMeta {
+    SubagentJobMeta {
+        job_id: sub_session_id.clone(),
+        parent_session_id: parent_ctx.session_id.clone(),
+        parent_reply_to: parent_ctx.reply_to.clone(),
+        sub_session_id: sub_session_id.clone(),
+        goal: execution.display_goal.clone(),
+        context: execution.context.clone(),
+        skill_name: execution.skill_name().map(ToString::to_string),
+        created_at_unix_ms: unix_ms_now(),
+        transcript_path: crate::schema::StoragePaths::session_transcript_file(&sub_session_id)
+            .display()
+            .to_string(),
+        event_log_path: crate::schema::StoragePaths::events_file(&sub_session_id)
+            .display()
+            .to_string(),
+    }
+}
+
+fn prepare_child_context_and_trace(
+    handle: &Arc<SubagentJobHandle>,
+    parent_ctx: &ToolContext,
+    execution: &SubagentExecutionRequest,
+    mode: SubagentRunMode,
+) -> ToolContext {
+    let mut child_parent_ctx = parent_ctx.clone();
+    let Some(trace) = parent_ctx.trace.clone() else {
+        return child_parent_ctx;
+    };
+
+    *handle.trace_context.lock().unwrap() = Some(trace.clone());
+    let subagent_ctx = TraceContext {
+        trace_id: trace.trace_id.clone(),
+        run_id: trace.run_id.clone(),
+        session_id: handle.meta.sub_session_id.clone(),
+        root_session_id: trace.root_session_id.clone(),
+        task_id: trace.task_id.clone(),
+        turn_id: trace.turn_id.clone(),
+        iteration: trace.iteration,
+        parent_span_id: trace.parent_span_id.clone(),
+    };
+    let subagent_span = shared_bus().start_span(
+        &subagent_ctx,
+        TraceActor::Subagent,
+        "subagent_spawned",
+        serde_json::json!({
+            "job_id": if mode.is_background() {
+                serde_json::Value::String(handle.meta.job_id.clone())
+            } else {
+                serde_json::Value::Null
+            },
+            "parent_session_id": parent_ctx.session_id,
+            "parent_reply_to": parent_ctx.reply_to,
+            "sub_session_id": handle.meta.sub_session_id,
+            "goal": handle.meta.goal,
+            "context": handle.meta.context,
+            "timeout_sec": execution.timeout_sec,
+            "max_steps": execution.max_steps,
+            "skill_name": handle.meta.skill_name,
+            "transcript_path": handle.meta.transcript_path,
+            "event_log_path": handle.meta.event_log_path,
+            "background": mode.is_background(),
+        }),
+    );
+    let subagent_span_id = subagent_span.span_id().to_string();
+    *handle.trace_span.lock().unwrap() = Some(subagent_span);
+    if let Some(child_trace) = child_parent_ctx.trace.as_mut() {
+        child_trace.parent_span_id = Some(subagent_span_id);
+    }
+    child_parent_ctx
+}
+
+pub(crate) struct SubagentRunPaths {
+    pub sub_session_id: String,
+    pub transcript_path: String,
+    pub event_log_path: String,
+}
+
+pub(crate) struct SubagentRunOutcome {
+    pub state: SubagentJobState,
+    pub trace_status: TraceStatus,
+}
+
+pub(crate) async fn execute_subagent_session(
+    execution: SubagentExecutionRequest,
+    collector: Arc<crate::session::factory::CollectorOutput>,
+    agent_loop: &mut crate::core::AgentLoop,
+    paths: SubagentRunPaths,
+    cancelled: Arc<AtomicBool>,
+) -> SubagentRunOutcome {
+    let run_result = tokio::time::timeout(
+        Duration::from_secs(execution.timeout_sec),
+        agent_loop.step(execution.initial_input.clone()),
+    )
+    .await;
+
+    // Give any in-flight async tool outputs an extra moment to flush if timeout
+    // cancelled the parent task.
+    if run_result.is_err() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let collected_text = collector.take_text().await;
+    let tool_outputs = collector.take_tool_outputs().await;
+    let artifacts = collector.take_artifacts().await;
+    let finished_at_unix_ms = unix_ms_now();
+
+    let result = |ok: bool, summary: String| {
+        execution.build_result(ok, summary, tool_outputs, artifacts, paths)
+    };
+
+    match run_result {
+        Ok(Ok(exit)) => match exit {
+            crate::core::RunExit::Finished(summary) => SubagentRunOutcome {
+                trace_status: TraceStatus::Ok,
+                state: SubagentJobState::Completed {
+                    finished_at_unix_ms,
+                    result: result(true, summary),
+                },
+            },
+            crate::core::RunExit::YieldedToUser => {
+                let summary = if let Some(skill_name) = execution.skill_name() {
+                    format!(
+                        "Delegated skill '{}' attempted to wait for user input, which is not allowed in subagents.",
+                        skill_name
+                    )
+                } else if collected_text.trim().is_empty() {
+                    "Sub-agent yielded without visible output.".to_string()
+                } else {
+                    format!("Sub-agent yielded with output: {}", collected_text.trim())
+                };
+                collector
+                    .record_failure_stage("yielded_to_user", &summary, None)
+                    .await;
+                SubagentRunOutcome {
+                    trace_status: TraceStatus::Yielded,
+                    state: SubagentJobState::Failed {
+                        finished_at_unix_ms,
+                        error: summary.clone(),
+                        partial: Some(result(false, summary)),
+                    },
+                }
+            }
+            crate::core::RunExit::RecoverableFailed(summary)
+            | crate::core::RunExit::CriticallyFailed(summary)
+            | crate::core::RunExit::AutopilotStalled(summary) => {
+                collector
+                    .record_failure_stage("finish", &summary, None)
+                    .await;
+                SubagentRunOutcome {
+                    trace_status: TraceStatus::Error,
+                    state: SubagentJobState::Failed {
+                        finished_at_unix_ms,
+                        error: summary.clone(),
+                        partial: Some(result(false, summary)),
+                    },
+                }
+            }
+            crate::core::RunExit::EnergyDepleted(summary) => {
+                collector
+                    .record_failure_stage("energy_depleted", "Sub-agent ran out of energy.", None)
+                    .await;
+                SubagentRunOutcome {
+                    trace_status: TraceStatus::Error,
+                    state: SubagentJobState::Failed {
+                        finished_at_unix_ms,
+                        error: "Sub-agent ran out of energy (iteration limit reached).".to_string(),
+                        partial: Some(result(false, summary)),
+                    },
+                }
+            }
+            crate::core::RunExit::StoppedByUser => {
+                let summary = "Sub-agent execution was interrupted.".to_string();
+                collector
+                    .record_failure_stage("cancelled", &summary, None)
+                    .await;
+                SubagentRunOutcome {
+                    trace_status: TraceStatus::Cancelled,
+                    state: SubagentJobState::Cancelled {
+                        finished_at_unix_ms,
+                        partial: Some(result(false, summary)),
+                    },
+                }
+            }
+        },
+        Ok(Err(error)) => {
+            let summary = format!("Sub-agent error: {}", error);
+            collector
+                .record_failure_stage("llm_stream_read", &error.to_string(), None)
+                .await;
+            SubagentRunOutcome {
+                trace_status: TraceStatus::Error,
+                state: SubagentJobState::Failed {
+                    finished_at_unix_ms,
+                    error: error.to_string(),
+                    partial: Some(result(false, summary)),
+                },
+            }
+        }
+        Err(_) => {
+            if cancelled.load(Ordering::SeqCst) {
+                let summary = "Sub-agent execution was interrupted.".to_string();
+                collector
+                    .record_failure_stage("cancelled", &summary, None)
+                    .await;
+                SubagentRunOutcome {
+                    trace_status: TraceStatus::Cancelled,
+                    state: SubagentJobState::Cancelled {
+                        finished_at_unix_ms,
+                        partial: Some(result(false, summary)),
+                    },
+                }
+            } else {
+                let summary = format!(
+                    "Sub-agent timed out after {}s while working on '{}'.",
+                    execution.timeout_sec, execution.display_goal
+                );
+                collector
+                    .record_failure_stage("timeout", &summary, None)
+                    .await;
+                SubagentRunOutcome {
+                    trace_status: TraceStatus::TimedOut,
+                    state: SubagentJobState::TimedOut {
+                        finished_at_unix_ms,
+                        partial: Some(result(false, summary)),
+                    },
+                }
+            }
+        }
+    }
+}
+
 impl SubagentRuntime {
     pub fn new(
         llm: Arc<dyn LlmClient>,
@@ -295,15 +634,68 @@ impl SubagentRuntime {
                 allowed_tools: Vec::new(),
                 restrict_to_allowed_tools: false,
                 allow_subagent_tool: false,
-                skill_name: None,
-                lineage: None,
-                effective_tools: None,
+                origin: SubagentExecutionOrigin::Goal,
                 effective_max_steps: None,
                 effective_timeout_sec: None,
-                skill_session_seed: SkillSessionSeed::default(),
+                delegation_seed: DelegationSessionSeed::default(),
             },
         )
         .await
+    }
+
+    pub fn base_tool_names(&self) -> Vec<String> {
+        self.inner
+            .base_tools
+            .iter()
+            .map(|tool| tool.name())
+            .collect()
+    }
+
+    pub async fn run_sync(
+        &self,
+        parent_ctx: &ToolContext,
+        execution: SubagentExecutionRequest,
+    ) -> Result<SubagentResult, ToolError> {
+        tracing::info!(
+            "Dispatching sync subagent with goal: '{}', timeout: {}s, max_steps: {}",
+            execution.display_goal,
+            execution.timeout_sec,
+            execution.max_steps
+        );
+
+        let sub_session_id = new_subagent_id(parent_ctx);
+        let meta = make_job_meta(parent_ctx, &execution, sub_session_id.clone());
+        let handle = Arc::new(SubagentJobHandle::new(meta));
+        let child_parent_ctx = prepare_child_context_and_trace(
+            &handle,
+            parent_ctx,
+            &execution,
+            SubagentRunMode::Foreground,
+        );
+
+        let final_state = self
+            .run_job(
+                handle,
+                SubagentJobRequest {
+                    parent_ctx: child_parent_ctx,
+                    execution,
+                    sub_session_id,
+                },
+                SubagentRunMode::Foreground,
+            )
+            .await;
+
+        match final_state {
+            SubagentJobState::Completed { result, .. } => Ok(result),
+            SubagentJobState::Failed {
+                error,
+                partial: None,
+                ..
+            } => Err(ToolError::ExecutionFailed(error)),
+            other => other.into_result().ok_or_else(|| {
+                ToolError::ExecutionFailed("Sub-agent ended without a result.".to_string())
+            }),
+        }
     }
 
     pub(crate) async fn spawn_job_with_limits(
@@ -319,27 +711,8 @@ impl SubagentRuntime {
             ));
         }
 
-        let unified_id = format!(
-            "sub_{}_{}",
-            parent_ctx.session_id,
-            uuid::Uuid::new_v4().simple()
-        );
-        let meta = SubagentJobMeta {
-            job_id: unified_id.clone(),
-            parent_session_id: parent_ctx.session_id.clone(),
-            parent_reply_to: parent_ctx.reply_to.clone(),
-            sub_session_id: unified_id.clone(),
-            goal: execution.display_goal.clone(),
-            context: execution.context.clone(),
-            skill_name: execution.skill_name.clone(),
-            created_at_unix_ms: unix_ms_now(),
-            transcript_path: crate::schema::StoragePaths::session_transcript_file(&unified_id)
-                .display()
-                .to_string(),
-            event_log_path: crate::schema::StoragePaths::events_file(&unified_id)
-                .display()
-                .to_string(),
-        };
+        let unified_id = new_subagent_id(&parent_ctx);
+        let meta = make_job_meta(&parent_ctx, &execution, unified_id.clone());
 
         let handle = Arc::new(SubagentJobHandle::new(meta));
         {
@@ -347,43 +720,12 @@ impl SubagentRuntime {
             jobs.insert(unified_id.clone(), handle.clone());
         }
 
-        let mut child_parent_ctx = parent_ctx.clone();
-        if let Some(trace) = parent_ctx.trace.clone() {
-            *handle.trace_context.lock().unwrap() = Some(trace.clone());
-            let subagent_ctx = TraceContext {
-                trace_id: trace.trace_id.clone(),
-                run_id: trace.run_id.clone(),
-                session_id: unified_id.clone(),
-                root_session_id: trace.root_session_id.clone(),
-                task_id: trace.task_id.clone(),
-                turn_id: trace.turn_id.clone(),
-                iteration: trace.iteration,
-                parent_span_id: trace.parent_span_id.clone(),
-            };
-            let subagent_span = shared_bus().start_span(
-                &subagent_ctx,
-                TraceActor::Subagent,
-                "subagent_spawned",
-                serde_json::json!({
-                    "job_id": unified_id,
-                    "parent_session_id": parent_ctx.session_id,
-                    "parent_reply_to": parent_ctx.reply_to,
-                    "sub_session_id": handle.meta.sub_session_id,
-                    "goal": handle.meta.goal,
-                    "context": handle.meta.context,
-                    "timeout_sec": execution.timeout_sec,
-                    "max_steps": execution.max_steps,
-                    "skill_name": handle.meta.skill_name,
-                    "transcript_path": handle.meta.transcript_path,
-                    "event_log_path": handle.meta.event_log_path,
-                }),
-            );
-            let subagent_span_id = subagent_span.span_id().to_string();
-            *handle.trace_span.lock().unwrap() = Some(subagent_span);
-            if let Some(child_trace) = child_parent_ctx.trace.as_mut() {
-                child_trace.parent_span_id = Some(subagent_span_id);
-            }
-        }
+        let child_parent_ctx = prepare_child_context_and_trace(
+            &handle,
+            &parent_ctx,
+            &execution,
+            SubagentRunMode::Background,
+        );
 
         let runtime = self.clone();
         let counter = self.inner.running_jobs.clone();
@@ -398,9 +740,10 @@ impl SubagentRuntime {
         );
         let join_handle = tokio::spawn(
             async move {
+                let runtime_for_run = runtime.clone();
                 let res = std::panic::AssertUnwindSafe(async {
                     let _guard = running_guard;
-                    runtime
+                    runtime_for_run
                         .run_job(
                             handle_for_task.clone(),
                             SubagentJobRequest {
@@ -408,6 +751,7 @@ impl SubagentRuntime {
                                 execution,
                                 sub_session_id: sub_session_id_for_task,
                             },
+                            SubagentRunMode::Background,
                         )
                         .await;
                 })
@@ -423,15 +767,21 @@ impl SubagentRuntime {
                         "Unknown panic".to_string()
                     };
                     tracing::error!(target: "subagent", "[Sub:{}] Task panicked: {}", handle_for_task.meta.job_id, msg);
-                    let mut state = handle_for_task.state.write().await;
-                    if !state.is_terminal() {
-                        *state = SubagentJobState::Failed {
+                    runtime
+                        .record_debug_error(&handle_for_task, "panic", &msg, None)
+                        .await;
+                    runtime
+                        .finish_job(
+                            &handle_for_task,
+                            SubagentJobState::Failed {
                             finished_at_unix_ms: unix_ms_now(),
                             error: format!("Subagent panicked: {}", msg),
                             partial: None,
-                        };
-                    }
-                    handle_for_task.completion_notify.notify_waiters();
+                            },
+                            TraceStatus::Error,
+                            SubagentRunMode::Background,
+                        )
+                        .await;
                 }
             }
             .instrument(span),
@@ -468,6 +818,30 @@ impl SubagentRuntime {
             consumed_at_unix_ms,
             debug,
         })
+    }
+
+    pub async fn wait_for_terminal(&self, job_id: &str, wait_sec: u64) {
+        let Some(handle) = self.get_job_handle(job_id).await else {
+            return;
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_sec);
+        loop {
+            let state = handle.state.read().await;
+            if state.is_terminal() {
+                break;
+            }
+            drop(state);
+
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+
+            tokio::select! {
+                _ = handle.completion_notify.notified() => {}
+                _ = tokio::time::sleep(remaining.min(Duration::from_secs(2))) => {}
+            }
+        }
     }
 
     pub async fn list_jobs(&self) -> Vec<SubagentJobSnapshot> {
@@ -576,7 +950,12 @@ impl SubagentRuntime {
         trace
     }
 
-    async fn run_job(&self, handle: Arc<SubagentJobHandle>, request: SubagentJobRequest) {
+    async fn run_job(
+        &self,
+        handle: Arc<SubagentJobHandle>,
+        request: SubagentJobRequest,
+        mode: SubagentRunMode,
+    ) -> SubagentJobState {
         {
             let mut state = handle.state.write().await;
             *state = SubagentJobState::Running {
@@ -610,11 +989,12 @@ impl SubagentRuntime {
                 serde_json::json!({
                     "job_id": handle.meta.job_id,
                     "state": "running",
+                    "background": mode.is_background(),
                 }),
             );
         }
 
-        let executed_state = match build_subagent_session(
+        let executed = match build_subagent_session(
             &parent_ctx,
             self.inner.llm.clone(),
             &self.inner.base_tools,
@@ -625,7 +1005,7 @@ impl SubagentRuntime {
                 energy_budget: execution.max_steps,
                 timeout_sec: execution.timeout_sec,
                 parent_context_text: execution.context.clone(),
-                skill_session_seed: execution.skill_session_seed.clone(),
+                delegation_seed: execution.delegation_seed.clone(),
                 debug: handle.debug.clone(),
                 cancelled: handle.cancelled.clone(),
                 cancel_notify: handle.cancel_notify.clone(),
@@ -639,25 +1019,47 @@ impl SubagentRuntime {
                 mut agent_loop,
                 collector,
             }) => {
-                self.execute_subagent(handle.clone(), execution, collector, &mut agent_loop)
-                    .await
+                let span = tracing::info_span!(
+                    "subagent_run",
+                    job_id = %handle.meta.job_id,
+                    parent_session_id = %parent_ctx.session_id,
+                    sub_session_id = %handle.meta.sub_session_id,
+                    goal = %handle.meta.goal,
+                    background = mode.is_background()
+                );
+                execute_subagent_session(
+                    execution,
+                    collector,
+                    &mut agent_loop,
+                    SubagentRunPaths {
+                        sub_session_id: handle.meta.sub_session_id.clone(),
+                        transcript_path: handle.meta.transcript_path.clone(),
+                        event_log_path: handle.meta.event_log_path.clone(),
+                    },
+                    handle.cancelled.clone(),
+                )
+                .instrument(span)
+                .await
             }
             Err(error) => {
                 self.record_debug_error(&handle, "build_subagent_session", &error, None)
                     .await;
-                SubagentJobState::Failed {
-                    finished_at_unix_ms: unix_ms_now(),
-                    error,
-                    partial: None,
+                SubagentRunOutcome {
+                    trace_status: TraceStatus::Error,
+                    state: SubagentJobState::Failed {
+                        finished_at_unix_ms: unix_ms_now(),
+                        error,
+                        partial: None,
+                    },
                 }
             }
         };
 
         // Override state to Cancelled if the cancel flag was set during execution,
         // regardless of what execute_subagent returned.
-        let final_state = if handle.cancelled.load(Ordering::SeqCst) {
-            match executed_state {
-                SubagentJobState::Cancelled { .. } => executed_state,
+        let (final_state, trace_status) = if handle.cancelled.load(Ordering::SeqCst) {
+            let state = match executed.state {
+                state @ SubagentJobState::Cancelled { .. } => state,
                 SubagentJobState::Completed {
                     finished_at_unix_ms,
                     result,
@@ -674,57 +1076,65 @@ impl SubagentRuntime {
                     finished_at_unix_ms: unix_ms_now(),
                     partial: None,
                 },
-            }
+            };
+            (state, TraceStatus::Cancelled)
         } else {
-            executed_state
+            (executed.state, executed.trace_status)
         };
 
+        self.finish_job(&handle, final_state, trace_status, mode)
+            .await
+    }
+
+    async fn finish_job(
+        &self,
+        handle: &Arc<SubagentJobHandle>,
+        final_state: SubagentJobState,
+        trace_status: TraceStatus,
+        mode: SubagentRunMode,
+    ) -> SubagentJobState {
         tracing::info!(
             target: "subagent",
-            "[Sub:{}] Background execution finished with state: {}",
-            handle.meta.job_id, final_state.finish_reason()
+            "[Sub:{}] {} execution finished with state: {}",
+            handle.meta.job_id,
+            if mode.is_background() { "Background" } else { "Sync" },
+            final_state.finish_reason()
         );
         if let Some(span) = handle.trace_span.lock().unwrap().take() {
-            let (status, summary) = match &final_state {
-                SubagentJobState::Completed { result, .. } => {
-                    (TraceStatus::Ok, Some(result.summary.clone()))
-                }
-                SubagentJobState::Failed { error, .. } => (TraceStatus::Error, Some(error.clone())),
-                SubagentJobState::Cancelled { partial, .. } => (
-                    TraceStatus::Cancelled,
-                    partial.as_ref().map(|result| result.summary.clone()),
-                ),
-                SubagentJobState::TimedOut { partial, .. } => (
-                    TraceStatus::TimedOut,
-                    partial.as_ref().map(|result| result.summary.clone()),
-                ),
-                SubagentJobState::Pending | SubagentJobState::Running { .. } => {
-                    (TraceStatus::Running, None)
-                }
-            };
             span.finish(
                 "subagent_finished",
-                status,
-                summary,
+                trace_status,
+                final_state.summary(),
                 serde_json::json!({
-                    "job_id": handle.meta.job_id,
+                    "job_id": if mode.is_background() {
+                        serde_json::Value::String(handle.meta.job_id.clone())
+                    } else {
+                        serde_json::Value::Null
+                    },
+                    "parent_session_id": handle.meta.parent_session_id,
+                    "parent_reply_to": handle.meta.parent_reply_to,
                     "sub_session_id": handle.meta.sub_session_id,
                     "status": final_state.finish_reason(),
+                    "skill_name": handle.meta.skill_name,
                     "transcript_path": handle.meta.transcript_path,
                     "event_log_path": handle.meta.event_log_path,
+                    "background": mode.is_background(),
                 }),
             );
         }
-        self.enqueue_notification(&handle.meta, &final_state).await;
+        if mode.is_background() {
+            self.enqueue_notification(&handle.meta, &final_state).await;
+        }
         // Only write state if cancel_job() hasn't already set a terminal state.
         let mut state = handle.state.write().await;
         if !state.is_terminal() {
-            *state = final_state;
+            *state = final_state.clone();
         }
         drop(state);
-        self.finalize_debug_state(&handle).await;
+        self.finalize_debug_state(handle).await;
         // Wake up any `subagent(action="status")` calls waiting via long polling.
         handle.completion_notify.notify_waiters();
+        final_state
     }
 
     async fn enqueue_notification(&self, meta: &SubagentJobMeta, final_state: &SubagentJobState) {
@@ -799,265 +1209,6 @@ impl SubagentRuntime {
             .entry(parent_session_id.to_string())
             .or_default()
             .push(notification);
-    }
-
-    async fn execute_subagent(
-        &self,
-        handle: Arc<SubagentJobHandle>,
-        execution: SubagentExecutionRequest,
-        collector: Arc<crate::session::factory::CollectorOutput>,
-        agent_loop: &mut crate::core::AgentLoop,
-    ) -> SubagentJobState {
-        let run_result = tokio::time::timeout(
-            Duration::from_secs(execution.timeout_sec),
-            agent_loop.step(execution.initial_input.clone()),
-        )
-        .await;
-
-        // Give any in-flight async tool outputs an extra 50ms to flush to the collector
-        // if we just timed out and cancelled their parent task.
-        if run_result.is_err() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        let collected_text = collector.take_text().await;
-        let tool_outputs = collector.take_tool_outputs().await;
-        let artifacts = collector.take_artifacts().await;
-        let finished_at_unix_ms = unix_ms_now();
-        let sub_session_id = Some(handle.meta.sub_session_id.clone());
-        let transcript_path = Some(handle.meta.transcript_path.clone());
-        let event_log_path = Some(handle.meta.event_log_path.clone());
-        let skill_name = execution.skill_name.clone();
-        let lineage = execution.lineage.clone();
-        let effective_tools = execution.effective_tools.clone();
-        let effective_max_steps = execution.effective_max_steps;
-        let effective_timeout_sec = execution.effective_timeout_sec;
-
-        match run_result {
-            Ok(Ok(exit)) => {
-                let ok = matches!(exit, crate::core::RunExit::Finished(_));
-                let summary = match exit {
-                    crate::core::RunExit::Finished(summary) => summary,
-                    crate::core::RunExit::YieldedToUser => {
-                        let message = if let Some(skill_name) = execution.skill_name.as_ref() {
-                            format!(
-                                "Delegated skill '{}' attempted to wait for user input, which is not allowed in subagents.",
-                                skill_name
-                            )
-                        } else if collected_text.trim().is_empty() {
-                            "Sub-agent yielded without visible output.".to_string()
-                        } else {
-                            format!("Sub-agent yielded with output: {}", collected_text.trim())
-                        };
-                        self.record_debug_error(&handle, "yielded_to_user", &message, None)
-                            .await;
-                        return SubagentJobState::Failed {
-                            finished_at_unix_ms,
-                            error: message.clone(),
-                            partial: Some(SubagentResult {
-                                ok: false,
-                                summary: message,
-                                findings: tool_outputs,
-                                artifacts,
-                                sub_session_id: sub_session_id.clone(),
-                                transcript_path: transcript_path.clone(),
-                                event_log_path: event_log_path.clone(),
-                                skill_name,
-                                lineage,
-                                effective_tools,
-                                effective_max_steps,
-                                effective_timeout_sec,
-                                failure: None,
-                            }),
-                        };
-                    }
-                    crate::core::RunExit::RecoverableFailed(message)
-                    | crate::core::RunExit::CriticallyFailed(message)
-                    | crate::core::RunExit::AutopilotStalled(message) => {
-                        self.record_debug_error(&handle, "finish", &message, None)
-                            .await;
-                        return SubagentJobState::Failed {
-                            finished_at_unix_ms,
-                            error: message.clone(),
-                            partial: Some(SubagentResult {
-                                ok: false,
-                                summary: message,
-                                findings: tool_outputs,
-                                artifacts,
-                                sub_session_id: sub_session_id.clone(),
-                                transcript_path: transcript_path.clone(),
-                                event_log_path: event_log_path.clone(),
-                                skill_name,
-                                lineage,
-                                effective_tools,
-                                effective_max_steps,
-                                effective_timeout_sec,
-                                failure: None,
-                            }),
-                        };
-                    }
-                    crate::core::RunExit::EnergyDepleted(summary) => {
-                        self.record_debug_error(
-                            &handle,
-                            "energy_depleted",
-                            "Sub-agent ran out of energy.",
-                            None,
-                        )
-                        .await;
-                        return SubagentJobState::Failed {
-                            finished_at_unix_ms,
-                            error: "Sub-agent ran out of energy (iteration limit reached)."
-                                .to_string(),
-                            partial: Some(SubagentResult {
-                                ok: false,
-                                summary,
-                                findings: tool_outputs,
-                                artifacts,
-                                sub_session_id: sub_session_id.clone(),
-                                transcript_path: transcript_path.clone(),
-                                event_log_path: event_log_path.clone(),
-                                skill_name,
-                                lineage,
-                                effective_tools,
-                                effective_max_steps,
-                                effective_timeout_sec,
-                                failure: None,
-                            }),
-                        };
-                    }
-                    crate::core::RunExit::StoppedByUser => {
-                        self.record_debug_error(
-                            &handle,
-                            "cancelled",
-                            "Sub-agent execution was interrupted.",
-                            None,
-                        )
-                        .await;
-                        return SubagentJobState::Cancelled {
-                            finished_at_unix_ms,
-                            partial: Some(SubagentResult {
-                                ok: false,
-                                summary: "Sub-agent execution was interrupted.".to_string(),
-                                findings: tool_outputs,
-                                artifacts,
-                                sub_session_id: sub_session_id.clone(),
-                                transcript_path: transcript_path.clone(),
-                                event_log_path: event_log_path.clone(),
-                                skill_name,
-                                lineage,
-                                effective_tools,
-                                effective_max_steps,
-                                effective_timeout_sec,
-                                failure: None,
-                            }),
-                        };
-                    }
-                };
-
-                SubagentJobState::Completed {
-                    finished_at_unix_ms,
-                    result: SubagentResult {
-                        ok,
-                        summary,
-                        findings: tool_outputs,
-                        artifacts,
-                        sub_session_id: sub_session_id.clone(),
-                        transcript_path: transcript_path.clone(),
-                        event_log_path: event_log_path.clone(),
-                        skill_name,
-                        lineage,
-                        effective_tools,
-                        effective_max_steps,
-                        effective_timeout_sec,
-                        failure: None,
-                    },
-                }
-            }
-            Ok(Err(error)) => {
-                self.record_debug_error(&handle, "llm_stream_read", &error.to_string(), None)
-                    .await;
-                SubagentJobState::Failed {
-                    finished_at_unix_ms,
-                    error: error.to_string(),
-                    partial: Some(SubagentResult {
-                        ok: false,
-                        summary: format!("Sub-agent error: {}", error),
-                        findings: tool_outputs,
-                        artifacts,
-                        sub_session_id: sub_session_id.clone(),
-                        transcript_path: transcript_path.clone(),
-                        event_log_path: event_log_path.clone(),
-                        skill_name,
-                        lineage,
-                        effective_tools,
-                        effective_max_steps,
-                        effective_timeout_sec,
-                        failure: None,
-                    }),
-                }
-            }
-            Err(_) => {
-                if handle.cancelled.load(Ordering::SeqCst) {
-                    self.record_debug_error(
-                        &handle,
-                        "cancelled",
-                        "Sub-agent execution was interrupted.",
-                        None,
-                    )
-                    .await;
-                    SubagentJobState::Cancelled {
-                        finished_at_unix_ms,
-                        partial: Some(SubagentResult {
-                            ok: false,
-                            summary: "Sub-agent execution was interrupted.".to_string(),
-                            findings: tool_outputs,
-                            artifacts,
-                            sub_session_id: sub_session_id.clone(),
-                            transcript_path: transcript_path.clone(),
-                            event_log_path: event_log_path.clone(),
-                            skill_name,
-                            lineage,
-                            effective_tools,
-                            effective_max_steps,
-                            effective_timeout_sec,
-                            failure: None,
-                        }),
-                    }
-                } else {
-                    self.record_debug_error(
-                        &handle,
-                        "timeout",
-                        &format!(
-                            "Sub-agent timed out after {}s while working on '{}'.",
-                            execution.timeout_sec, execution.display_goal
-                        ),
-                        None,
-                    )
-                    .await;
-                    SubagentJobState::TimedOut {
-                        finished_at_unix_ms,
-                        partial: Some(SubagentResult {
-                            ok: false,
-                            summary: format!(
-                                "Sub-agent timed out after {}s while working on '{}'.",
-                                execution.timeout_sec, execution.display_goal
-                            ),
-                            findings: tool_outputs,
-                            artifacts,
-                            sub_session_id,
-                            transcript_path,
-                            event_log_path,
-                            skill_name,
-                            lineage,
-                            effective_tools,
-                            effective_max_steps,
-                            effective_timeout_sec,
-                            failure: None,
-                        }),
-                    }
-                }
-            }
-        }
     }
 
     async fn set_debug_state_label(&self, handle: &SubagentJobHandle, label: &str) {
@@ -1424,7 +1575,6 @@ mod tests {
                     effective_tools: None,
                     effective_max_steps: None,
                     effective_timeout_sec: None,
-                    failure: None,
                 },
             };
         }
@@ -1463,7 +1613,6 @@ mod tests {
                     effective_tools: None,
                     effective_max_steps: None,
                     effective_timeout_sec: None,
-                    failure: None,
                 },
             };
         }
@@ -1504,16 +1653,20 @@ mod tests {
             snapshot.debug.last_tool_name.as_deref(),
             Some("finish_task")
         );
-        assert!(snapshot
-            .debug
-            .recent_events
-            .iter()
-            .any(|event| event.kind == "subagent_tool_start"));
-        assert!(snapshot
-            .debug
-            .recent_events
-            .iter()
-            .any(|event| event.kind == "subagent_tool_end"));
+        assert!(
+            snapshot
+                .debug
+                .recent_events
+                .iter()
+                .any(|event| event.kind == "subagent_tool_start")
+        );
+        assert!(
+            snapshot
+                .debug
+                .recent_events
+                .iter()
+                .any(|event| event.kind == "subagent_tool_end")
+        );
         assert!(std::path::Path::new(&snapshot.meta.transcript_path).exists());
         assert!(std::path::Path::new(&snapshot.meta.event_log_path).exists());
     }
@@ -1538,12 +1691,10 @@ mod tests {
                     allowed_tools: Vec::new(),
                     restrict_to_allowed_tools: false,
                     allow_subagent_tool: false,
-                    skill_name: None,
-                    lineage: None,
-                    effective_tools: None,
+                    origin: SubagentExecutionOrigin::Goal,
                     effective_max_steps: Some(4),
                     effective_timeout_sec: Some(1),
-                    skill_session_seed: SkillSessionSeed::default(),
+                    delegation_seed: DelegationSessionSeed::default(),
                 },
             )
             .await

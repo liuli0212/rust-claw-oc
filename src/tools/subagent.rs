@@ -1,29 +1,23 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use tracing::Instrument;
+use serde_json::{Value, json};
 
-use super::protocol::{clean_schema, StructuredToolOutput, Tool, ToolError};
+use super::protocol::{StructuredToolOutput, Tool, ToolError, clean_schema};
 use crate::delegation::{
-    effective_limits, resolve_skill_delegation, DelegationFailure, SkillDelegationRequest,
+    DelegationBudget, DelegationSessionSeed, MAX_DELEGATION_CALLS_PER_ROOT_REQUEST,
+    SkillDelegationRequest, effective_limits, resolve_skill_delegation,
 };
 use crate::skills::arguments::validate_json_args;
-use crate::skills::call_tree::{
-    SkillBudget, SkillSessionSeed, MAX_DELEGATION_CALLS_PER_ROOT_REQUEST,
-};
 use crate::skills::policy::SkillToolPolicy;
 use crate::skills::registry::SkillRegistry;
 use crate::subagent_runtime::{
-    SubagentExecutionRequest, SubagentRuntime, DEFAULT_SUBAGENT_MAX_STEPS,
-    DEFAULT_SUBAGENT_TIMEOUT_SEC,
+    DEFAULT_SUBAGENT_MAX_STEPS, DEFAULT_SUBAGENT_TIMEOUT_SEC, SubagentExecutionOrigin,
+    SubagentExecutionRequest, SubagentRuntime, SubagentSkillOrigin,
 };
-use crate::trace::{shared_bus, TraceActor, TraceContext, TraceSeed, TraceSpanHandle, TraceStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -78,28 +72,19 @@ pub struct SubagentResult {
     pub effective_tools: Option<Vec<String>>,
     pub effective_max_steps: Option<usize>,
     pub effective_timeout_sec: Option<u64>,
-    pub failure: Option<DelegationFailure>,
 }
 
 pub struct SubagentTool {
-    llm: Arc<dyn crate::llm_client::LlmClient>,
-    base_tools: Vec<Arc<dyn Tool>>,
     runtime: SubagentRuntime,
     registry: SkillRegistry,
     policy: SkillToolPolicy,
 }
 
 impl SubagentTool {
-    pub fn new(
-        llm: Arc<dyn crate::llm_client::LlmClient>,
-        base_tools: Vec<Arc<dyn Tool>>,
-        runtime: SubagentRuntime,
-    ) -> Self {
+    pub fn new(runtime: SubagentRuntime) -> Self {
         let mut registry = SkillRegistry::new();
         registry.discover(std::path::Path::new("skills"));
         Self {
-            llm,
-            base_tools,
             runtime,
             registry,
             policy: SkillToolPolicy::new(),
@@ -173,12 +158,8 @@ impl SubagentTool {
         )))
     }
 
-    fn base_tool_names(&self) -> Vec<String> {
-        self.base_tools.iter().map(|tool| tool.name()).collect()
-    }
-
     fn validate_nested_budget(&self, ctx: &super::protocol::ToolContext) -> Result<(), ToolError> {
-        let Some(call_context) = ctx.skill_call_context.as_ref() else {
+        let Some(call_context) = ctx.delegation_context.as_ref() else {
             return Ok(());
         };
 
@@ -202,7 +183,7 @@ impl SubagentTool {
     ) -> Result<SubagentExecutionRequest, ToolError> {
         self.validate_nested_budget(ctx)?;
         let (effective_max_steps, effective_timeout_sec) = effective_limits(
-            &ctx.skill_budget,
+            &ctx.delegation_budget,
             requested_max_steps,
             requested_timeout_sec,
             DEFAULT_SUBAGENT_MAX_STEPS,
@@ -218,14 +199,12 @@ impl SubagentTool {
             allowed_tools: Vec::new(),
             restrict_to_allowed_tools: false,
             allow_subagent_tool: false,
-            skill_name: None,
-            lineage: None,
-            effective_tools: None,
+            origin: SubagentExecutionOrigin::Goal,
             effective_max_steps: Some(effective_max_steps),
             effective_timeout_sec: Some(effective_timeout_sec),
-            skill_session_seed: SkillSessionSeed {
-                inherited_context: ctx.skill_call_context.clone(),
-                inherited_budget: SkillBudget {
+            delegation_seed: DelegationSessionSeed {
+                inherited_context: ctx.delegation_context.clone(),
+                inherited_budget: DelegationBudget {
                     remaining_steps: Some(effective_max_steps),
                     remaining_timeout_sec: Some(effective_timeout_sec),
                 },
@@ -247,7 +226,7 @@ impl SubagentTool {
             &self.registry,
             &self.policy,
             ctx,
-            &self.base_tool_names(),
+            &self.runtime.base_tool_names(),
             SkillDelegationRequest {
                 skill_name,
                 raw_args: None,
@@ -266,7 +245,7 @@ impl SubagentTool {
             .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
 
         Ok(SubagentExecutionRequest {
-            initial_input: resolved.launch_input,
+            initial_input: resolved.activation_command,
             display_goal: resolved.display_goal,
             context,
             timeout_sec: resolved.effective_timeout_sec,
@@ -274,296 +253,23 @@ impl SubagentTool {
             allowed_tools: resolved.effective_tools.clone(),
             restrict_to_allowed_tools: true,
             allow_subagent_tool: resolved.allow_subagent_tool,
-            skill_name: Some(resolved.skill.meta.name.clone()),
-            lineage: Some(resolved.lineage),
-            effective_tools: Some(resolved.effective_tools),
+            origin: SubagentExecutionOrigin::Skill(SubagentSkillOrigin {
+                name: resolved.skill.meta.name.clone(),
+                lineage: resolved.lineage,
+                effective_tools: resolved.effective_tools,
+            }),
             effective_max_steps: Some(resolved.effective_max_steps),
             effective_timeout_sec: Some(resolved.effective_timeout_sec),
-            skill_session_seed: resolved.skill_session_seed,
+            delegation_seed: resolved.delegation_seed,
         })
     }
 
     fn register_delegation_use(&self, ctx: &super::protocol::ToolContext) {
-        if let Some(call_context) = ctx.skill_call_context.as_ref() {
+        if let Some(call_context) = ctx.delegation_context.as_ref() {
             call_context
                 .total_delegations
                 .fetch_add(1, Ordering::SeqCst);
         }
-    }
-
-    fn start_sync_trace_span(
-        ctx: &super::protocol::ToolContext,
-        request: &SubagentExecutionRequest,
-        sub_session_id: &str,
-        transcript_path: &str,
-        event_log_path: &str,
-    ) -> Option<TraceSpanHandle> {
-        let trace = ctx.trace.as_ref()?;
-        let subagent_ctx = TraceContext {
-            trace_id: trace.trace_id.clone(),
-            run_id: trace.run_id.clone(),
-            session_id: sub_session_id.to_string(),
-            root_session_id: trace.root_session_id.clone(),
-            task_id: trace.task_id.clone(),
-            turn_id: trace.turn_id.clone(),
-            iteration: trace.iteration,
-            parent_span_id: trace.parent_span_id.clone(),
-        };
-        Some(shared_bus().start_span(
-            &subagent_ctx,
-            TraceActor::Subagent,
-            "subagent_spawned",
-            json!({
-                "job_id": Value::Null,
-                "parent_session_id": ctx.session_id,
-                "parent_reply_to": ctx.reply_to,
-                "sub_session_id": sub_session_id,
-                "goal": request.display_goal,
-                "context": request.context,
-                "timeout_sec": request.timeout_sec,
-                "max_steps": request.max_steps,
-                "skill_name": request.skill_name,
-                "transcript_path": transcript_path,
-                "event_log_path": event_log_path,
-                "background": false,
-            }),
-        ))
-    }
-
-    async fn execute_sync_request(
-        &self,
-        ctx: &super::protocol::ToolContext,
-        request: SubagentExecutionRequest,
-    ) -> Result<String, ToolError> {
-        tracing::info!(
-            "Dispatching sync subagent with goal: '{}', timeout: {}s, max_steps: {}",
-            request.display_goal,
-            request.timeout_sec,
-            request.max_steps
-        );
-
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel_notify = Arc::new(tokio::sync::Notify::new());
-        let built = crate::session::factory::build_subagent_session(
-            ctx,
-            self.llm.clone(),
-            &self.base_tools,
-            crate::session::factory::SubagentSessionConfig {
-                sub_session_id: None,
-                allowed_tools: request.allowed_tools.clone(),
-                restrict_to_allowed_tools: request.restrict_to_allowed_tools,
-                energy_budget: request.max_steps,
-                timeout_sec: request.timeout_sec,
-                parent_context_text: request.context.clone(),
-                skill_session_seed: request.skill_session_seed.clone(),
-                debug: std::sync::Arc::new(tokio::sync::RwLock::new(
-                    crate::subagent_runtime::SubagentDebugSnapshot::default(),
-                )),
-                cancelled,
-                cancel_notify,
-                allow_subagent_tool: request.allow_subagent_tool,
-            },
-        )
-        .map_err(ToolError::ExecutionFailed)?;
-        self.register_delegation_use(ctx);
-
-        let crate::session::factory::BuiltSubagentSession {
-            sub_session_id,
-            transcript_path,
-            event_log_path,
-            mut agent_loop,
-            collector,
-        } = built;
-        let sync_trace_span = Self::start_sync_trace_span(
-            ctx,
-            &request,
-            &sub_session_id,
-            &transcript_path,
-            &event_log_path,
-        );
-        if let (Some(trace), Some(span)) = (ctx.trace.as_ref(), sync_trace_span.as_ref()) {
-            agent_loop.set_trace_seed(TraceSeed {
-                trace_id: trace.trace_id.clone(),
-                run_id: trace.run_id.clone(),
-                root_session_id: trace.root_session_id.clone(),
-                task_id: trace.task_id.clone(),
-                parent_span_id: Some(span.span_id().to_string()),
-            });
-        }
-        let span = tracing::info_span!(
-            "subagent_run_sync",
-            parent_session_id = %ctx.session_id,
-            sub_session_id = %sub_session_id,
-            goal = %request.display_goal
-        );
-
-        let run_result =
-            tokio::time::timeout(Duration::from_secs(request.timeout_sec), async move {
-                agent_loop.step(request.initial_input.clone()).await
-            })
-            .instrument(span)
-            .await;
-
-        let collected_text = collector.take_text().await;
-        let tool_outputs = collector.take_tool_outputs().await;
-        let artifacts = collector.take_artifacts().await;
-
-        let (result, trace_status) = match run_result {
-            Ok(Ok(exit)) => match exit {
-                crate::core::RunExit::Finished(summary) => (
-                    SubagentResult {
-                        ok: true,
-                        summary,
-                        findings: tool_outputs,
-                        artifacts,
-                        sub_session_id: Some(sub_session_id),
-                        transcript_path: Some(transcript_path),
-                        event_log_path: Some(event_log_path),
-                        skill_name: request.skill_name.clone(),
-                        lineage: request.lineage.clone(),
-                        effective_tools: request.effective_tools.clone(),
-                        effective_max_steps: request.effective_max_steps,
-                        effective_timeout_sec: request.effective_timeout_sec,
-                        failure: None,
-                    },
-                    TraceStatus::Ok,
-                ),
-                crate::core::RunExit::YieldedToUser => (
-                    SubagentResult {
-                        ok: false,
-                        summary: if let Some(skill_name) = request.skill_name.as_ref() {
-                            format!(
-                            "Delegated skill '{}' attempted to wait for user input, which is not allowed in subagents.",
-                            skill_name
-                        )
-                        } else if collected_text.trim().is_empty() {
-                            "Sub-agent yielded without visible output.".to_string()
-                        } else {
-                            format!("Sub-agent yielded with output: {}", collected_text.trim())
-                        },
-                        findings: tool_outputs,
-                        artifacts,
-                        sub_session_id: Some(sub_session_id),
-                        transcript_path: Some(transcript_path),
-                        event_log_path: Some(event_log_path),
-                        skill_name: request.skill_name.clone(),
-                        lineage: request.lineage.clone(),
-                        effective_tools: request.effective_tools.clone(),
-                        effective_max_steps: request.effective_max_steps,
-                        effective_timeout_sec: request.effective_timeout_sec,
-                        failure: None,
-                    },
-                    TraceStatus::Yielded,
-                ),
-                crate::core::RunExit::RecoverableFailed(message)
-                | crate::core::RunExit::CriticallyFailed(message)
-                | crate::core::RunExit::AutopilotStalled(message)
-                | crate::core::RunExit::EnergyDepleted(message) => (
-                    SubagentResult {
-                        ok: false,
-                        summary: message,
-                        findings: tool_outputs,
-                        artifacts,
-                        sub_session_id: Some(sub_session_id),
-                        transcript_path: Some(transcript_path),
-                        event_log_path: Some(event_log_path),
-                        skill_name: request.skill_name.clone(),
-                        lineage: request.lineage.clone(),
-                        effective_tools: request.effective_tools.clone(),
-                        effective_max_steps: request.effective_max_steps,
-                        effective_timeout_sec: request.effective_timeout_sec,
-                        failure: None,
-                    },
-                    TraceStatus::Error,
-                ),
-                crate::core::RunExit::StoppedByUser => (
-                    SubagentResult {
-                        ok: false,
-                        summary: "Sub-agent execution was interrupted.".to_string(),
-                        findings: tool_outputs,
-                        artifacts,
-                        sub_session_id: Some(sub_session_id),
-                        transcript_path: Some(transcript_path),
-                        event_log_path: Some(event_log_path),
-                        skill_name: request.skill_name.clone(),
-                        lineage: request.lineage.clone(),
-                        effective_tools: request.effective_tools.clone(),
-                        effective_max_steps: request.effective_max_steps,
-                        effective_timeout_sec: request.effective_timeout_sec,
-                        failure: None,
-                    },
-                    TraceStatus::Cancelled,
-                ),
-            },
-            Ok(Err(error)) => (
-                SubagentResult {
-                    ok: false,
-                    summary: format!("Sub-agent error: {}", error),
-                    findings: tool_outputs,
-                    artifacts,
-                    sub_session_id: Some(sub_session_id),
-                    transcript_path: Some(transcript_path),
-                    event_log_path: Some(event_log_path),
-                    skill_name: request.skill_name.clone(),
-                    lineage: request.lineage.clone(),
-                    effective_tools: request.effective_tools.clone(),
-                    effective_max_steps: request.effective_max_steps,
-                    effective_timeout_sec: request.effective_timeout_sec,
-                    failure: None,
-                },
-                TraceStatus::Error,
-            ),
-            Err(_) => (
-                SubagentResult {
-                    ok: false,
-                    summary: format!(
-                        "Sub-agent timed out after {}s while working on '{}'.",
-                        request.timeout_sec, request.display_goal
-                    ),
-                    findings: tool_outputs,
-                    artifacts,
-                    sub_session_id: Some(sub_session_id),
-                    transcript_path: Some(transcript_path),
-                    event_log_path: Some(event_log_path),
-                    skill_name: request.skill_name.clone(),
-                    lineage: request.lineage.clone(),
-                    effective_tools: request.effective_tools.clone(),
-                    effective_max_steps: request.effective_max_steps,
-                    effective_timeout_sec: request.effective_timeout_sec,
-                    failure: None,
-                },
-                TraceStatus::TimedOut,
-            ),
-        };
-        if let Some(span) = sync_trace_span {
-            span.finish(
-                "subagent_finished",
-                trace_status,
-                Some(result.summary.clone()),
-                json!({
-                    "job_id": Value::Null,
-                    "parent_session_id": ctx.session_id,
-                    "parent_reply_to": ctx.reply_to,
-                    "sub_session_id": result.sub_session_id,
-                    "status": if result.ok { "finished" } else { "failed" },
-                    "skill_name": request.skill_name,
-                    "transcript_path": result.transcript_path,
-                    "event_log_path": result.event_log_path,
-                    "background": false,
-                }),
-            );
-        };
-
-        StructuredToolOutput::new(
-            "subagent",
-            result.ok,
-            serde_json::to_string_pretty(&result)
-                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
-            None,
-            None,
-            false,
-        )
-        .to_json_string()
     }
 }
 
@@ -623,33 +329,43 @@ impl Tool for SubagentTool {
                     (Some(_), Some(_)) => {
                         return Err(ToolError::InvalidArguments(
                             "`goal` and `skill_name` are mutually exclusive".to_string(),
-                        ))
+                        ));
                     }
                     (None, None) => {
                         return Err(ToolError::InvalidArguments(
                             "subagent(action=\"run\") requires either `goal` or `skill_name`"
                                 .to_string(),
-                        ))
+                        ));
                     }
                 };
+                self.register_delegation_use(ctx);
 
                 if background {
                     let spawned = self
                         .runtime
                         .spawn_job_with_limits(ctx.clone(), request.clone())
                         .await?;
-                    self.register_delegation_use(ctx);
                     Self::serialize_output(
                         "subagent",
                         json!({
                             "job_id": spawned.job_id,
                             "sub_session_id": spawned.sub_session_id,
                             "status": "spawned",
-                            "skill_name": request.skill_name,
+                            "skill_name": request.skill_name(),
                         }),
                     )
                 } else {
-                    self.execute_sync_request(ctx, request).await
+                    let result = self.runtime.run_sync(ctx, request).await?;
+                    StructuredToolOutput::new(
+                        "subagent",
+                        result.ok,
+                        serde_json::to_string_pretty(&result)
+                            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
+                        None,
+                        None,
+                        false,
+                    )
+                    .to_json_string()
                 }
             }
             SubagentArgs::Status {
@@ -658,28 +374,7 @@ impl Tool for SubagentTool {
                 consume,
             } => {
                 if let Some(wait_sec) = wait_sec {
-                    if let Some(handle) = self.runtime.get_job_handle(&job_id).await {
-                        let deadline =
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(wait_sec);
-                        loop {
-                            let state = handle.state.read().await;
-                            if state.is_terminal() {
-                                break;
-                            }
-                            drop(state);
-
-                            let remaining =
-                                deadline.saturating_duration_since(tokio::time::Instant::now());
-                            if remaining.is_zero() {
-                                break;
-                            }
-
-                            tokio::select! {
-                                _ = handle.completion_notify.notified() => {}
-                                _ = tokio::time::sleep(remaining.min(std::time::Duration::from_secs(2))) => {}
-                            }
-                        }
-                    }
+                    self.runtime.wait_for_terminal(&job_id, wait_sec).await;
                 }
 
                 let snapshot = self.runtime.get_job_snapshot(&job_id, consume).await?;
@@ -723,15 +418,18 @@ impl Tool for SubagentTool {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use serial_test::serial;
     use tokio::sync::mpsc;
 
     use crate::context::{FunctionCall, Message};
+    use crate::delegation::DelegationContext;
     use crate::llm_client::{LlmClient, LlmError, StreamEvent};
     use crate::schema::StoragePaths;
-    use crate::skills::call_tree::SkillCallContext;
     use crate::tools::protocol::{ToolContext, ToolExecutionEnvelope};
-    use crate::trace::{find_run_for_subsession, get_records, get_run, RecordQuery, RunSummary};
+    use crate::trace::{RecordQuery, RunSummary, find_run_for_subsession, get_records, get_run};
 
     fn make_ctx() -> ToolContext {
         ToolContext::new("parent", "cli")
@@ -743,12 +441,12 @@ mod tests {
         remaining_timeout_sec: u64,
     ) -> ToolContext {
         let mut ctx = make_ctx();
-        let call_context = SkillCallContext::new_root("root").append_frame("planner", None);
+        let call_context = DelegationContext::new_root("root").append_frame("planner", None);
         call_context
             .total_delegations
             .store(used_calls, Ordering::SeqCst);
-        ctx.skill_call_context = Some(call_context);
-        ctx.skill_budget = SkillBudget {
+        ctx.delegation_context = Some(call_context);
+        ctx.delegation_budget = DelegationBudget {
             remaining_steps: Some(remaining_steps),
             remaining_timeout_sec: Some(remaining_timeout_sec),
         };
@@ -878,20 +576,20 @@ mod tests {
     fn make_tool() -> SubagentTool {
         let llm: Arc<dyn LlmClient> = Arc::new(FinishImmediatelyLlm);
         let base_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool("read_file"))];
-        let runtime = SubagentRuntime::new(llm.clone(), base_tools.clone(), 2);
-        SubagentTool::new(llm, base_tools, runtime)
+        let runtime = SubagentRuntime::new(llm, base_tools, 2);
+        SubagentTool::new(runtime)
     }
 
     fn make_tool_with_llm(llm: Arc<dyn LlmClient>) -> SubagentTool {
         let base_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(MockTool("read_file"))];
-        let runtime = SubagentRuntime::new(llm.clone(), base_tools.clone(), 2);
-        SubagentTool::new(llm, base_tools, runtime)
+        let runtime = SubagentRuntime::new(llm, base_tools, 2);
+        SubagentTool::new(runtime)
     }
 
     fn make_tool_with_base_tools(base_tools: Vec<Arc<dyn Tool>>) -> SubagentTool {
         let llm: Arc<dyn LlmClient> = Arc::new(FinishImmediatelyLlm);
-        let runtime = SubagentRuntime::new(llm.clone(), base_tools.clone(), 2);
-        SubagentTool::new(llm, base_tools, runtime)
+        let runtime = SubagentRuntime::new(llm, base_tools, 2);
+        SubagentTool::new(runtime)
     }
 
     #[tokio::test]
@@ -1047,10 +745,12 @@ mod tests {
             .unwrap();
         let payload = parse_payload(&output);
         assert_eq!(payload["ok"], Value::Bool(false));
-        assert!(payload["summary"]
-            .as_str()
-            .unwrap()
-            .contains("timed out after 1s"));
+        assert!(
+            payload["summary"]
+                .as_str()
+                .unwrap()
+                .contains("timed out after 1s")
+        );
     }
 
     #[tokio::test]
@@ -1077,8 +777,8 @@ mod tests {
             Arc::new(MockTool("read_file")),
             Arc::new(MockTool("subagent")),
         ];
-        let runtime = SubagentRuntime::new(llm.clone(), base_tools.clone(), 2);
-        let mut tool = SubagentTool::new(llm, base_tools, runtime);
+        let runtime = SubagentRuntime::new(llm, base_tools, 2);
+        let mut tool = SubagentTool::new(runtime);
         let mut registry = SkillRegistry::new();
         registry.insert(crate::skills::definition::SkillDef {
             meta: crate::skills::definition::SkillMeta {
@@ -1198,9 +898,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Nested delegation budget exceeded"));
+        assert!(
+            error
+                .to_string()
+                .contains("Nested delegation budget exceeded")
+        );
     }
 
     #[tokio::test]

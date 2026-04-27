@@ -8,10 +8,11 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::context::AgentContext;
 use crate::core::{AgentLoop, AgentOutput};
+use crate::delegation::DelegationSessionSeed;
 use crate::event_log::{AgentEvent, EventLog};
 use crate::llm_client::LlmClient;
-use crate::skills::call_tree::SkillSessionSeed;
-use crate::subagent_runtime::{push_recent_debug_event, SubagentDebugEvent, SubagentDebugSnapshot};
+use crate::skills::policy::SkillToolPolicy;
+use crate::subagent_runtime::{SubagentDebugEvent, SubagentDebugSnapshot, push_recent_debug_event};
 use crate::tools::{Tool, ToolContext};
 
 pub struct BuiltSubagentSession {
@@ -29,7 +30,7 @@ pub struct SubagentSessionConfig {
     pub energy_budget: usize,
     pub timeout_sec: u64,
     pub parent_context_text: String,
-    pub skill_session_seed: SkillSessionSeed,
+    pub delegation_seed: DelegationSessionSeed,
     pub debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     pub cancel_notify: Arc<tokio::sync::Notify>,
@@ -76,6 +77,30 @@ impl CollectorOutput {
     pub async fn take_artifacts(&self) -> Vec<String> {
         let mut artifacts = self.artifacts.lock().await;
         std::mem::take(&mut *artifacts)
+    }
+
+    pub async fn record_failure_stage(
+        &self,
+        failure_stage: &str,
+        error: &str,
+        tool_name: Option<&str>,
+    ) {
+        let mut debug = self.debug.write().await;
+        debug.failure_stage = Some(failure_stage.to_string());
+        debug.last_error = Some(crate::subagent_runtime::truncate_debug_text(error, 500));
+        if let Some(tool_name) = tool_name {
+            debug.last_tool_name = Some(tool_name.to_string());
+        }
+        debug.updated_at_unix_ms = crate::subagent_runtime::unix_ms_now();
+        push_recent_debug_event(
+            &mut debug,
+            SubagentDebugEvent {
+                kind: "subagent_error".to_string(),
+                tool_name: tool_name.map(ToString::to_string),
+                text: crate::subagent_runtime::truncate_debug_text(error, 160),
+                at_unix_ms: crate::subagent_runtime::unix_ms_now(),
+            },
+        );
     }
 
     async fn append_event(
@@ -243,8 +268,8 @@ pub fn filter_subagent_tools(
     restrict_to_allowed_tools: bool,
     allow_subagent_tool: bool,
 ) -> Vec<Arc<dyn Tool>> {
-    let runtime_tools = ["finish_task", "task_plan"];
-    let code_mode_companion_allowed = allowed.iter().any(|tool| tool == "exec");
+    let policy = SkillToolPolicy::new();
+    let allowed = policy.canonicalize_tools(allowed);
     let mut accepted = Vec::new();
 
     for tool in base_tools {
@@ -256,11 +281,7 @@ pub fn filter_subagent_tools(
             continue;
         }
 
-        if !restrict_to_allowed_tools
-            || runtime_tools.contains(&name.as_str())
-            || allowed.contains(&name)
-            || (name == "wait" && code_mode_companion_allowed)
-        {
+        if !restrict_to_allowed_tools || policy.can_call_with_allowed_names(&allowed, &name) {
             accepted.push(tool.clone());
         }
     }
@@ -281,7 +302,7 @@ pub fn build_subagent_session(
         energy_budget,
         timeout_sec,
         parent_context_text,
-        skill_session_seed,
+        delegation_seed,
         debug,
         cancelled,
         cancel_notify,
@@ -375,9 +396,9 @@ pub fn build_subagent_session(
         });
     }
     agent_loop.add_extension(Arc::new(
-        crate::skills::runtime::SkillRuntime::with_session_seed(
+        crate::skills::runtime::SkillRuntime::with_delegation_seed(
             sub_session_id.clone(),
-            skill_session_seed,
+            delegation_seed,
         ),
     ));
     agent_loop.cancelled = cancelled;
@@ -422,10 +443,7 @@ pub fn build_agent_session(
         task_state_store: task_state_store.clone(),
     }));
     session_tools.push(Arc::new(crate::tools::AskUserQuestionTool::new()));
-    let subagent_base_tools = session_tools.clone();
     session_tools.push(Arc::new(crate::tools::SubagentTool::new(
-        llm.clone(),
-        subagent_base_tools.clone(),
         subagent_runtime.clone(),
     )));
 
@@ -657,7 +675,7 @@ mod tests {
                 energy_budget: 3,
                 timeout_sec: 3,
                 parent_context_text: "repo context".to_string(),
-                skill_session_seed: SkillSessionSeed::default(),
+                delegation_seed: DelegationSessionSeed::default(),
                 debug: Arc::new(tokio::sync::RwLock::new(SubagentDebugSnapshot::default())),
                 cancelled,
                 cancel_notify,

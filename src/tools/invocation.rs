@@ -221,8 +221,8 @@ impl UnifiedToolExecutor {
     ) -> ToolContext {
         let mut ctx = ToolContext::new(self.session_id.clone(), self.reply_to.clone());
         ctx.visible_tools = self.visible_tools.clone();
-        ctx.skill_budget.remaining_steps = Some(self.remaining_steps());
-        ctx.skill_budget.remaining_timeout_sec = self.remaining_session_timeout_sec();
+        ctx.delegation_budget.remaining_steps = Some(self.remaining_steps());
+        ctx.delegation_budget.remaining_timeout_sec = self.remaining_session_timeout_sec();
         if let Some(trace_ctx) = trace_ctx {
             ctx.trace = Some(crate::tools::protocol::ToolTraceContext {
                 trace_id: trace_ctx.trace_id.clone(),

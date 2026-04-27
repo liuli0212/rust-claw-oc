@@ -1,10 +1,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::skills::definition::SkillDef;
 use crate::skills::policy::SkillToolPolicy;
@@ -78,14 +78,14 @@ pub struct SkillDelegationRequest {
 #[derive(Debug, Clone)]
 pub struct ResolvedSkillDelegation {
     pub skill: SkillDef,
-    pub launch_input: String,
+    pub activation_command: String,
     pub display_goal: String,
     pub lineage: Vec<String>,
     pub effective_tools: Vec<String>,
     pub effective_max_steps: usize,
     pub effective_timeout_sec: u64,
     pub allow_subagent_tool: bool,
-    pub skill_session_seed: DelegationSessionSeed,
+    pub delegation_seed: DelegationSessionSeed,
 }
 
 impl DelegationContext {
@@ -143,17 +143,6 @@ pub fn args_digest(input: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-pub fn canonicalize_tools(policy: &SkillToolPolicy, tools: &[String]) -> Vec<String> {
-    let mut canonical = Vec::new();
-    for tool in tools {
-        let mapped = policy.canonical_name(tool);
-        if !canonical.contains(&mapped) {
-            canonical.push(mapped);
-        }
-    }
-    canonical
-}
-
 pub fn effective_limits(
     budget: &DelegationBudget,
     requested_max_steps: Option<usize>,
@@ -183,7 +172,7 @@ pub fn effective_limits(
     (effective_max_steps, effective_timeout_sec)
 }
 
-pub fn build_skill_launch_input(
+pub fn build_skill_activation_command(
     skill_name: &str,
     raw_args: Option<&str>,
     json_args: Option<&Value>,
@@ -198,7 +187,7 @@ pub fn build_skill_launch_input(
 }
 
 pub fn skill_is_interactive(skill: &SkillDef, policy: &SkillToolPolicy) -> bool {
-    let allowed_tools = canonicalize_tools(policy, &skill.meta.allowed_tools);
+    let allowed_tools = policy.canonicalize_tools(&skill.meta.allowed_tools);
     allowed_tools.iter().any(|tool| tool == "ask_user_question")
 }
 
@@ -218,7 +207,7 @@ pub fn resolve_skill_delegation(
         .map(Value::to_string)
         .or_else(|| request.raw_args.clone());
     let parent_context = tool_ctx
-        .skill_call_context
+        .delegation_context
         .clone()
         .unwrap_or_else(|| DelegationContext::new_root(tool_ctx.session_id.clone()));
     let child_context_preview = parent_context.append_frame(skill_name, serialized_args.as_deref());
@@ -336,11 +325,11 @@ pub fn resolve_skill_delegation(
         });
     }
 
-    let callee_declared_tools = canonicalize_tools(policy, &skill.meta.allowed_tools);
+    let callee_declared_tools = policy.canonicalize_tools(&skill.meta.allowed_tools);
     let runtime_available_tools = if tool_ctx.visible_tools.is_empty() {
-        canonicalize_tools(policy, runtime_available_tools)
+        policy.canonicalize_tools(runtime_available_tools)
     } else {
-        canonicalize_tools(policy, &tool_ctx.visible_tools)
+        policy.canonicalize_tools(&tool_ctx.visible_tools)
     };
     let missing_tools: Vec<String> = callee_declared_tools
         .iter()
@@ -374,7 +363,7 @@ pub fn resolve_skill_delegation(
         .cloned()
         .collect();
     let (effective_max_steps, effective_timeout_sec) = effective_limits(
-        &tool_ctx.skill_budget,
+        &tool_ctx.delegation_budget,
         request.requested_max_steps,
         request.requested_timeout_sec,
         default_max_steps,
@@ -391,7 +380,7 @@ pub fn resolve_skill_delegation(
 
     Ok(ResolvedSkillDelegation {
         skill,
-        launch_input: build_skill_launch_input(
+        activation_command: build_skill_activation_command(
             skill_name,
             request.raw_args.as_deref(),
             request.json_args.as_ref(),
@@ -402,7 +391,7 @@ pub fn resolve_skill_delegation(
         effective_tools,
         effective_max_steps,
         effective_timeout_sec,
-        skill_session_seed: DelegationSessionSeed {
+        delegation_seed: DelegationSessionSeed {
             inherited_context: Some(parent_context),
             inherited_budget: DelegationBudget {
                 remaining_steps: Some(effective_max_steps),
@@ -455,9 +444,9 @@ mod tests {
             for skill in lineage {
                 call_context = call_context.append_frame(skill, None);
             }
-            ctx.skill_call_context = Some(call_context);
+            ctx.delegation_context = Some(call_context);
         }
-        ctx.skill_budget = DelegationBudget {
+        ctx.delegation_budget = DelegationBudget {
             remaining_steps: Some(remaining_steps),
             remaining_timeout_sec: Some(remaining_timeout_sec),
         };
@@ -554,7 +543,7 @@ mod tests {
         assert!(resolved.allow_subagent_tool);
         assert!(resolved.effective_tools.contains(&"subagent".to_string()));
         assert_eq!(
-            resolved.skill_session_seed.delegated_context.as_deref(),
+            resolved.delegation_seed.delegated_context.as_deref(),
             Some("Focus on parser flow.")
         );
     }
@@ -585,8 +574,10 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error.kind, DelegationFailureKind::PolicyDenied));
-        assert!(error
-            .message
-            .contains("must declare explicit allowed_tools"));
+        assert!(
+            error
+                .message
+                .contains("must declare explicit allowed_tools")
+        );
     }
 }

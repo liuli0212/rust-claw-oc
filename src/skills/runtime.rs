@@ -7,27 +7,24 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::core::extensions::{ExecutionExtension, ExtensionDecision, FinishDecision, PromptDraft};
-use crate::delegation::{canonicalize_tools, DelegationContext};
-use crate::tools::protocol::ToolExecutionEnvelope;
+use crate::delegation::{DelegationContext, DelegationSessionSeed};
 use crate::tools::Tool;
+use crate::tools::protocol::ToolExecutionEnvelope;
 
 use super::arguments::{
     format_prompt_argument_sections, parse_invocation_args, validate_json_args,
 };
-use super::call_tree::SkillSessionSeed;
 use super::definition::{SkillDef, SkillTrigger};
 use super::policy::SkillToolPolicy;
 use super::registry::SkillRegistry;
 use super::state::{PendingInteraction, SkillInvocation, SkillInvocationState};
-
-const RUNTIME_TOOLS: &[&str] = &["finish_task", "task_plan"];
 
 pub struct SkillRuntime {
     session_id: String,
     invocation: RwLock<Option<SkillInvocation>>,
     policy: SkillToolPolicy,
     registry: SkillRegistry,
-    session_seed: SkillSessionSeed,
+    delegation_seed: DelegationSessionSeed,
 }
 
 impl SkillRuntime {
@@ -50,30 +47,34 @@ impl SkillRuntime {
         session_id: impl Into<String>,
         registry: SkillRegistry,
     ) -> Self {
-        Self::with_registry_and_seed(session_id, registry, SkillSessionSeed::default())
+        Self::with_registry_and_delegation_seed(
+            session_id,
+            registry,
+            DelegationSessionSeed::default(),
+        )
     }
 
-    pub fn with_session_seed(
+    pub fn with_delegation_seed(
         session_id: impl Into<String>,
-        session_seed: SkillSessionSeed,
+        delegation_seed: DelegationSessionSeed,
     ) -> Self {
         tracing::debug!("Initializing minimal SkillRuntime and discovering skills...");
         let mut registry = SkillRegistry::new();
         registry.discover(Path::new("skills"));
-        Self::with_registry_and_seed(session_id, registry, session_seed)
+        Self::with_registry_and_delegation_seed(session_id, registry, delegation_seed)
     }
 
-    pub fn with_registry_and_seed(
+    pub fn with_registry_and_delegation_seed(
         session_id: impl Into<String>,
         registry: SkillRegistry,
-        session_seed: SkillSessionSeed,
+        delegation_seed: DelegationSessionSeed,
     ) -> Self {
         Self {
             session_id: session_id.into(),
             invocation: RwLock::new(None),
             policy: SkillToolPolicy::new(),
             registry,
-            session_seed,
+            delegation_seed,
         }
     }
 
@@ -92,7 +93,7 @@ impl SkillRuntime {
         skill_name: &str,
         serialized_args: Option<&str>,
     ) -> DelegationContext {
-        self.session_seed
+        self.delegation_seed
             .inherited_context
             .clone()
             .unwrap_or_else(|| DelegationContext::new_root(self.session_id.clone()))
@@ -146,11 +147,11 @@ impl SkillRuntime {
             skill_name: def.meta.name.clone(),
             version: def.meta.version.clone(),
             instructions: def.instructions.clone(),
-            allowed_tools: canonicalize_tools(&self.policy, &def.meta.allowed_tools),
+            allowed_tools: self.policy.canonicalize_tools(&def.meta.allowed_tools),
             raw_args,
             json_args,
             delegated_context: self
-                .session_seed
+                .delegation_seed
                 .delegated_context
                 .clone()
                 .filter(|value| !value.trim().is_empty()),
@@ -363,13 +364,8 @@ impl ExecutionExtension for SkillRuntime {
             return tools;
         }
 
-        tools
-            .into_iter()
-            .filter(|tool| {
-                let name = tool.name();
-                RUNTIME_TOOLS.contains(&name.as_str()) || invocation.allowed_tools.contains(&name)
-            })
-            .collect()
+        self.policy
+            .filter_tools_by_allowed_names(tools, &invocation.allowed_tools)
     }
 
     async fn enrich_tool_context(
@@ -378,14 +374,14 @@ impl ExecutionExtension for SkillRuntime {
     ) -> crate::tools::ToolContext {
         if let Some(invocation) = self.invocation.read().await.as_ref() {
             ctx.active_skill_name = Some(invocation.skill_name.clone());
-            ctx.skill_call_context = Some(invocation.delegation_context.clone());
-        } else if let Some(inherited_context) = self.session_seed.inherited_context.as_ref() {
-            ctx.skill_call_context = Some(inherited_context.clone());
+            ctx.delegation_context = Some(invocation.delegation_context.clone());
+        } else if let Some(inherited_context) = self.delegation_seed.inherited_context.as_ref() {
+            ctx.delegation_context = Some(inherited_context.clone());
         }
 
-        if let Some(inherited_steps) = self.session_seed.inherited_budget.remaining_steps {
-            ctx.skill_budget.remaining_steps = Some(
-                ctx.skill_budget
+        if let Some(inherited_steps) = self.delegation_seed.inherited_budget.remaining_steps {
+            ctx.delegation_budget.remaining_steps = Some(
+                ctx.delegation_budget
                     .remaining_steps
                     .unwrap_or(inherited_steps)
                     .min(inherited_steps)
@@ -393,10 +389,10 @@ impl ExecutionExtension for SkillRuntime {
             );
         }
         if let Some(inherited_timeout_sec) =
-            self.session_seed.inherited_budget.remaining_timeout_sec
+            self.delegation_seed.inherited_budget.remaining_timeout_sec
         {
-            ctx.skill_budget.remaining_timeout_sec = Some(
-                ctx.skill_budget
+            ctx.delegation_budget.remaining_timeout_sec = Some(
+                ctx.delegation_budget
                     .remaining_timeout_sec
                     .unwrap_or(inherited_timeout_sec)
                     .min(inherited_timeout_sec)
@@ -439,7 +435,7 @@ impl ExecutionExtension for SkillRuntime {
 mod tests {
     use super::*;
     use crate::core::extensions::{ExecutionExtension, PromptDraft};
-    use crate::skills::call_tree::SkillBudget;
+    use crate::delegation::{DelegationBudget, DelegationSessionSeed};
     use crate::skills::definition::{ArtifactKind, OutputMode, SkillConstraints, SkillMeta};
     use std::sync::atomic::Ordering;
 
@@ -630,12 +626,12 @@ mod tests {
         inherited_context
             .total_delegations
             .store(2, Ordering::SeqCst);
-        let rt = SkillRuntime::with_registry_and_seed(
+        let rt = SkillRuntime::with_registry_and_delegation_seed(
             "seeded-session",
             SkillRegistry::new(),
-            SkillSessionSeed {
+            DelegationSessionSeed {
                 inherited_context: Some(inherited_context.clone()),
-                inherited_budget: SkillBudget {
+                inherited_budget: DelegationBudget {
                     remaining_steps: Some(3),
                     remaining_timeout_sec: Some(7),
                 },
@@ -644,21 +640,21 @@ mod tests {
         );
 
         let mut ctx = crate::tools::ToolContext::new("seeded-session", "cli");
-        ctx.skill_budget = SkillBudget {
+        ctx.delegation_budget = DelegationBudget {
             remaining_steps: Some(9),
             remaining_timeout_sec: Some(15),
         };
 
         let enriched = rt.enrich_tool_context(ctx).await;
         let propagated = enriched
-            .skill_call_context
+            .delegation_context
             .expect("inherited call context should be present");
 
         assert!(enriched.active_skill_name.is_none());
         assert_eq!(propagated.lineage_names(), vec!["planner".to_string()]);
         assert_eq!(propagated.root_session_id, "root");
-        assert_eq!(enriched.skill_budget.remaining_steps, Some(3));
-        assert_eq!(enriched.skill_budget.remaining_timeout_sec, Some(7));
+        assert_eq!(enriched.delegation_budget.remaining_steps, Some(3));
+        assert_eq!(enriched.delegation_budget.remaining_timeout_sec, Some(7));
 
         propagated.total_delegations.fetch_add(1, Ordering::SeqCst);
         assert_eq!(inherited_context.total_delegations_used(), 3);

@@ -14,7 +14,7 @@ pub struct SkillToolPolicy {
 }
 
 /// Tools that are always available during skill execution, regardless of whitelist.
-const RUNTIME_TOOLS: &[&str] = &["finish_task", "task_plan"];
+pub const RUNTIME_TOOLS: &[&str] = &["finish_task", "task_plan"];
 
 impl SkillToolPolicy {
     pub fn new() -> Self {
@@ -48,6 +48,42 @@ impl SkillToolPolicy {
             .unwrap_or_else(|| name.to_string())
     }
 
+    pub fn canonicalize_tools(&self, tools: &[String]) -> Vec<String> {
+        let mut canonical = Vec::new();
+        for tool in tools {
+            let mapped = self.canonical_name(tool);
+            if !canonical.contains(&mapped) {
+                canonical.push(mapped);
+            }
+        }
+        canonical
+    }
+
+    pub fn is_runtime_tool(tool_name: &str) -> bool {
+        RUNTIME_TOOLS.contains(&tool_name)
+    }
+
+    pub fn can_call_with_allowed_names(&self, allowed: &[String], tool_name: &str) -> bool {
+        Self::is_runtime_tool(tool_name)
+            || allowed.contains(&tool_name.to_string())
+            || (tool_name == "wait" && allowed.iter().any(|name| name == "exec"))
+    }
+
+    pub fn filter_tools_by_allowed_names(
+        &self,
+        base_tools: Vec<Arc<dyn Tool>>,
+        allowed: &[String],
+    ) -> Vec<Arc<dyn Tool>> {
+        if allowed.is_empty() {
+            return base_tools;
+        }
+
+        base_tools
+            .into_iter()
+            .filter(|tool| self.can_call_with_allowed_names(allowed, &tool.name()))
+            .collect()
+    }
+
     /// Filter the base tool set according to a skill's `allowed_tools` whitelist.
     ///
     /// If `allowed_tools` is empty, all tools are allowed (no restriction).
@@ -60,25 +96,8 @@ impl SkillToolPolicy {
             return base_tools;
         }
 
-        let allowed: Vec<String> = skill
-            .meta
-            .allowed_tools
-            .iter()
-            .map(|n| self.canonical_name(n))
-            .collect();
-        let code_mode_companion_allowed = allowed.iter().any(|name| name == "exec");
-
-        base_tools
-            .into_iter()
-            .filter(|tool| {
-                let name = tool.name();
-                // Always allow runtime-essential tools
-                if RUNTIME_TOOLS.contains(&name.as_str()) {
-                    return true;
-                }
-                allowed.contains(&name) || (name == "wait" && code_mode_companion_allowed)
-            })
-            .collect()
+        let allowed = self.canonicalize_tools(&skill.meta.allowed_tools);
+        self.filter_tools_by_allowed_names(base_tools, &allowed)
     }
 
     /// Check if a specific tool is allowed.
@@ -87,17 +106,8 @@ impl SkillToolPolicy {
         if skill.meta.allowed_tools.is_empty() {
             return true;
         }
-        if RUNTIME_TOOLS.contains(&tool_name) {
-            return true;
-        }
-        let allowed: Vec<String> = skill
-            .meta
-            .allowed_tools
-            .iter()
-            .map(|n| self.canonical_name(n))
-            .collect();
-        allowed.contains(&tool_name.to_string())
-            || (tool_name == "wait" && allowed.iter().any(|name| name == "exec"))
+        let allowed = self.canonicalize_tools(&skill.meta.allowed_tools);
+        self.can_call_with_allowed_names(&allowed, tool_name)
     }
 }
 

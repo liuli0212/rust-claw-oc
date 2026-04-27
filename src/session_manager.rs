@@ -979,17 +979,13 @@ mod tests {
         let spawned_job_id = runtime.list_jobs().await[0].meta.job_id.clone();
 
         let start = Instant::now();
-        let cancel_result = crate::tools::SubagentTool::new(
-            Arc::new(AsyncSubagentScenarioLlm),
-            vec![],
-            runtime.clone(),
-        )
-        .execute(
-            json!({ "action": "cancel", "job_id": spawned_job_id }),
-            &tool_ctx,
-        )
-        .await
-        .unwrap();
+        let cancel_result = crate::tools::SubagentTool::new(runtime.clone())
+            .execute(
+                json!({ "action": "cancel", "job_id": spawned_job_id }),
+                &tool_ctx,
+            )
+            .await
+            .unwrap();
         let cancel_envelope = ToolExecutionEnvelope::from_json_str(&cancel_result).unwrap();
         assert_eq!(cancel_envelope.result.tool_name, "subagent");
         assert!(cancel_envelope.result.ok);
