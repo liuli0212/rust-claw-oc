@@ -474,16 +474,6 @@ impl Tool for TaskPlanTool {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-pub struct FinishTaskArgs {
-    /// A summary of what was accomplished and the final answer to the user
-    pub summary: String,
-}
-
-pub struct FinishTaskTool {
-    pub task_state_store: std::sync::Arc<crate::task_state::TaskStateStore>,
-}
-
-#[derive(Serialize, Deserialize, JsonSchema)]
 pub struct SendFileArgs {
     /// Explain what file you are sending and why
     pub thought: Option<String>,
@@ -535,52 +525,6 @@ impl Tool for SendFileTool {
     }
 }
 
-#[async_trait]
-impl Tool for FinishTaskTool {
-    fn name(&self) -> String {
-        "finish_task".to_string()
-    }
-
-    fn description(&self) -> String {
-        "Call this tool ONLY when you have fully completed the user's request and have nothing else to do. This will end your execution loop.".to_string()
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        clean_schema(serde_json::to_value(schema_for!(FinishTaskArgs)).unwrap())
-    }
-
-    fn has_side_effects(&self) -> bool {
-        false
-    }
-
-    async fn execute(
-        &self,
-        args: serde_json::Value,
-        _ctx: &crate::tools::ToolContext,
-    ) -> Result<String, crate::tools::ToolError> {
-        let parsed: FinishTaskArgs =
-            serde_json::from_value(args).map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
-
-        if let Ok(mut state) = self.task_state_store.load() {
-            if state.status == "in_progress" {
-                state.status = "completed".to_string();
-                let _ = self.task_state_store.save(&state);
-            }
-        }
-
-        StructuredToolOutput::new(
-            "finish_task",
-            true,
-            format!("Task marked as finished. Summary: {}", parsed.summary),
-            Some(0),
-            None,
-            false,
-        )
-        .with_finish_task_summary(parsed.summary)
-        .to_json_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,11 +532,6 @@ mod tests {
     use crate::tools::sandbox::{SandboxEnforcer, SandboxLevel, SandboxPolicy};
     use std::sync::Arc;
     use tempfile::tempdir;
-
-    fn cleanup_session(session_id: &str) {
-        let session_dir = crate::schema::StoragePaths::session_dir(session_id);
-        let _ = std::fs::remove_dir_all(session_dir);
-    }
 
     #[tokio::test]
     async fn test_patch_file_tool() {
@@ -708,44 +647,5 @@ mod tests {
 
         assert!(matches!(err, ToolError::ExecutionFailed(_)));
         assert!(err.to_string().contains("Sandbox Violation"));
-    }
-
-    #[tokio::test]
-    async fn test_finish_task_tool_marks_in_progress_state_completed() {
-        let session_id = "test-finish-task-tool";
-        cleanup_session(session_id);
-        let store = std::sync::Arc::new(crate::task_state::TaskStateStore::new(session_id));
-        store
-            .save(&crate::task_state::TaskStateSnapshot {
-                status: "in_progress".to_string(),
-                goal: Some("Ship refactor".to_string()),
-                ..crate::task_state::TaskStateSnapshot::empty()
-            })
-            .unwrap();
-
-        let tool = FinishTaskTool {
-            task_state_store: store.clone(),
-        };
-
-        let result = tool
-            .execute(
-                serde_json::json!({
-                    "summary": "Refactor complete"
-                }),
-                &crate::tools::ToolContext::new("test", "test"),
-            )
-            .await
-            .unwrap();
-        let updated = store.load().unwrap();
-
-        let envelope: ToolExecutionEnvelope = serde_json::from_str(&result).unwrap();
-        assert!(envelope.result.ok);
-        assert_eq!(
-            envelope.effects.finish_task_summary.as_deref(),
-            Some("Refactor complete")
-        );
-        assert_eq!(updated.status, "completed");
-        assert_eq!(updated.goal.as_deref(), Some("Ship refactor"));
-        cleanup_session(session_id);
     }
 }

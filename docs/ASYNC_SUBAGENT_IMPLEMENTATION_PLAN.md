@@ -78,7 +78,7 @@
 | 创建 AgentContext | ✓ | ✓ |
 | 创建 TelemetryExporter | ✓ | ✓ |
 | 创建 TaskStateStore | ✓ | ✓ |
-| 注入 TaskPlanTool / FinishTaskTool | ✓ | ✓ |
+| 注入 TaskPlanTool / final-text completion semantics | ✓ | ✓ |
 | 加载 MEMORY.md / AGENTS.md | ✓ (手动) | 通过 AgentContext |
 | 注入 AskUserQuestionTool | ✗ | ✓ |
 | 注入 DispatchSubagentTool | ✗ (禁递归) | ✓ |
@@ -134,7 +134,7 @@ v3 明确依赖注入链路，避免实现时出现循环依赖：
 
 1. `app/bootstrap.rs` 继续负责创建“基础工具集（base tools）”，这里不包含：
    - `TaskPlanTool`
-   - `FinishTaskTool`
+   - final-text completion semantics
    - `AskUserQuestionTool`
    - `DispatchSubagentTool`
    - 新增异步 subagent 工具组
@@ -147,7 +147,7 @@ v3 明确依赖注入链路，避免实现时出现循环依赖：
    - `base_tools`
 4. `session/factory.rs` 在构建正式 session 时注入：
    - runtime 级工具：`spawn_subagent` / `get_subagent_result` / `cancel_subagent` / `list_subagent_jobs`
-   - session 级工具：`TaskPlanTool` / `FinishTaskTool` / `AskUserQuestionTool`
+   - session 级工具：`TaskPlanTool` / final-text completion semantics / `AskUserQuestionTool`
    - 同步兼容工具：`dispatch_subagent`
 
 关键约束：
@@ -323,7 +323,7 @@ pub fn build_subagent_session(
 4. 创建 telemetry
 5. 创建 `TaskStateStore`
 6. 按 `mode` 过滤 allowed tools
-7. 注入 `TaskPlanTool` / `FinishTaskTool`
+7. 注入 `TaskPlanTool` / final-text completion semantics
 8. 创建 `CollectorOutput`
 9. 创建 `AgentLoop` 并设置 energy budget + cancel token
 10. **不注入** `AskUserQuestionTool`（后台任务不支持交互）

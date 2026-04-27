@@ -20,7 +20,7 @@ use super::policy::SkillToolPolicy;
 use super::registry::SkillRegistry;
 use super::state::{PendingInteraction, SkillInvocation, SkillInvocationState};
 
-const RUNTIME_TOOLS: &[&str] = &["finish_task", "task_plan"];
+const RUNTIME_TOOLS: &[&str] = &["task_plan"];
 
 pub struct SkillRuntime {
     session_id: String,
@@ -103,7 +103,7 @@ impl SkillRuntime {
         let mut notes = Vec::new();
         if def.meta.output_mode.is_some() {
             notes.push(
-                "Legacy `output_mode` is ignored at runtime; rely on instructions and finish_task."
+                "Legacy `output_mode` is ignored at runtime; rely on instructions and a final text response."
                     .to_string(),
             );
         }
@@ -583,14 +583,14 @@ mod tests {
             Arc::new(MockTool("read_file".to_string())),
             Arc::new(MockTool("write_file".to_string())),
             Arc::new(MockTool("ask_user_question".to_string())),
-            Arc::new(MockTool("finish_task".to_string())),
+            Arc::new(MockTool("task_plan".to_string())),
         ];
 
         let filtered = rt.before_tool_resolution(tools).await;
         let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"ask_user_question".to_string()));
-        assert!(names.contains(&"finish_task".to_string()));
+        assert!(names.contains(&"task_plan".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
     }
 

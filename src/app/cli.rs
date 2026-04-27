@@ -379,8 +379,7 @@ async fn run_cli_agent_step(
             RunExit::YieldedToUser => {
                 println!();
             }
-            RunExit::Finished(ref summary) => {
-                println!("\n{}", style(summary).green().bold());
+            RunExit::Finished(_) => {
                 println!(
                     "  {} {}",
                     style("✔").green().bold(),
@@ -402,7 +401,9 @@ async fn run_cli_agent_step(
                         style("Autopilot Paused").yellow().bold(),
                         style("任务已安全暂停。").yellow()
                     );
-                    println!("  👉 您可以直接输入指导意见来纠偏并自动继续，或者输入 /manual 彻底退出自动驾驶。");
+                    println!(
+                        "  👉 您可以直接输入指导意见来纠偏并自动继续，或者输入 /manual 彻底退出自动驾驶。"
+                    );
                 }
             }
             RunExit::RecoverableFailed(ref msg) => {
@@ -414,7 +415,9 @@ async fn run_cli_agent_step(
             }
             RunExit::AutopilotStalled(ref msg) => {
                 println!("\n  {} Autopilot 停滞: {}", style("⚠").yellow(), msg);
-                println!("  👉 Autopilot 未检测到有效进展，已暂停。您可以直接输入指导意见并继续，或输入 /manual 退出自动驾驶。");
+                println!(
+                    "  👉 Autopilot 未检测到有效进展，已暂停。您可以直接输入指导意见并继续，或输入 /manual 退出自动驾驶。"
+                );
             }
             RunExit::EnergyDepleted(ref summary) => {
                 println!(

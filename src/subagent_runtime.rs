@@ -1142,7 +1142,7 @@ mod tests {
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    use crate::context::{FunctionCall, Message};
+    use crate::context::Message;
     use crate::llm_client::{LlmCapabilities, LlmError, StreamEvent};
 
     struct FinishImmediatelyLlm;
@@ -1173,14 +1173,7 @@ mod tests {
             _tools: Vec<Arc<dyn Tool>>,
         ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
             let (tx, rx) = mpsc::channel(4);
-            let _ = tx.try_send(StreamEvent::ToolCall(
-                FunctionCall {
-                    name: "finish_task".to_string(),
-                    args: json!({ "summary": "done" }),
-                    id: Some("tc_1".to_string()),
-                },
-                None,
-            ));
+            let _ = tx.try_send(StreamEvent::Text("done".to_string()));
             let _ = tx.try_send(StreamEvent::Done);
             Ok(rx)
         }
@@ -1500,16 +1493,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(snapshot.debug.state_label, "finished");
-        assert_eq!(
-            snapshot.debug.last_tool_name.as_deref(),
-            Some("finish_task")
-        );
-        assert!(snapshot
+        assert_eq!(snapshot.debug.last_tool_name.as_deref(), None);
+        assert!(!snapshot
             .debug
             .recent_events
             .iter()
             .any(|event| event.kind == "subagent_tool_start"));
-        assert!(snapshot
+        assert!(!snapshot
             .debug
             .recent_events
             .iter()

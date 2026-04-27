@@ -18,9 +18,7 @@ async fn test_single_turn_tool_call_and_finish() {
 
     // Setup mock tools
     let mock_tool = Arc::new(MockTool::new("mock_tool", Ok("mock_result".to_string())));
-    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
-
-    let tools: Vec<Arc<dyn Tool>> = vec![mock_tool.clone(), finish_tool.clone()];
+    let tools: Vec<Arc<dyn Tool>> = vec![mock_tool.clone()];
 
     // Setup scenario LLM
     let llm = Arc::new(ScenarioLlm::new(vec![
@@ -38,17 +36,7 @@ async fn test_single_turn_tool_call_and_finish() {
             ],
         },
         ScenarioTurn {
-            events: vec![
-                ScenarioEvent::Text("Now I will finish.".to_string()),
-                ScenarioEvent::ToolCall(
-                    FunctionCall {
-                        name: "finish_task".to_string(),
-                        args: serde_json::json!({"summary": "done"}),
-                        id: Some("call_2".to_string()),
-                    },
-                    Some("call_2".to_string()),
-                ),
-            ],
+            events: vec![ScenarioEvent::Text("Now I am finished.".to_string())],
         },
     ]));
 
@@ -75,7 +63,7 @@ async fn test_single_turn_tool_call_and_finish() {
     assert!(texts
         .iter()
         .any(|t| t.contains("I will call the mock tool.")));
-    assert!(texts.iter().any(|t| t.contains("Now I will finish.")));
+    assert!(texts.iter().any(|t| t.contains("Now I am finished.")));
 
     let calls = mock_tool.calls.lock().await;
     assert_eq!(calls.len(), 1);
@@ -91,9 +79,7 @@ async fn test_read_then_write_file() {
     // Setup real tools
     let read_tool = Arc::new(rusty_claw::tools::files::ReadFileTool);
     let write_tool = Arc::new(rusty_claw::tools::files::WriteFileTool);
-    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
-
-    let tools: Vec<Arc<dyn Tool>> = vec![read_tool, write_tool, finish_tool];
+    let tools: Vec<Arc<dyn Tool>> = vec![read_tool, write_tool];
 
     // Pre-create input file
     let input_path = workspace.path().join("input.txt");
@@ -129,17 +115,7 @@ async fn test_read_then_write_file() {
             ],
         },
         ScenarioTurn {
-            events: vec![
-                ScenarioEvent::Text("Now I will finish.".to_string()),
-                ScenarioEvent::ToolCall(
-                    FunctionCall {
-                        name: "finish_task".to_string(),
-                        args: serde_json::json!({"summary": "done"}),
-                        id: Some("call_3".to_string()),
-                    },
-                    Some("call_3".to_string()),
-                ),
-            ],
+            events: vec![ScenarioEvent::Text("Done writing the file.".to_string())],
         },
     ]));
 
@@ -184,9 +160,7 @@ async fn test_tool_failure_and_recovery() {
             Ok("Success on second try".to_string()),
         ],
     ));
-    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
-
-    let tools: Vec<Arc<dyn Tool>> = vec![flaky_tool.clone(), finish_tool.clone()];
+    let tools: Vec<Arc<dyn Tool>> = vec![flaky_tool.clone()];
 
     // Setup scenario LLM
     let llm = Arc::new(ScenarioLlm::new(vec![
@@ -217,17 +191,9 @@ async fn test_tool_failure_and_recovery() {
             ],
         },
         ScenarioTurn {
-            events: vec![
-                ScenarioEvent::Text("It succeeded, now I will finish.".to_string()),
-                ScenarioEvent::ToolCall(
-                    FunctionCall {
-                        name: "finish_task".to_string(),
-                        args: serde_json::json!({"summary": "done"}),
-                        id: Some("call_3".to_string()),
-                    },
-                    Some("call_3".to_string()),
-                ),
-            ],
+            events: vec![ScenarioEvent::Text(
+                "It succeeded; the task is complete.".to_string(),
+            )],
         },
     ]));
 
@@ -265,22 +231,11 @@ async fn test_session_recovery() {
     let _workspace = TempWorkspace::new();
     let session_id = format!("test_session_{}", uuid::Uuid::new_v4().simple());
 
-    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
-    let tools: Vec<Arc<dyn Tool>> = vec![finish_tool.clone()];
+    let tools: Vec<Arc<dyn Tool>> = vec![];
 
     // Setup scenario LLM for turn 1
     let llm_turn1 = Arc::new(ScenarioLlm::new(vec![ScenarioTurn {
-        events: vec![
-            ScenarioEvent::Text("I am doing turn 1.".to_string()),
-            ScenarioEvent::ToolCall(
-                FunctionCall {
-                    name: "finish_task".to_string(),
-                    args: serde_json::json!({"summary": "done turn 1"}),
-                    id: Some("call_1".to_string()),
-                },
-                Some("call_1".to_string()),
-            ),
-        ],
+        events: vec![ScenarioEvent::Text("I am doing turn 1.".to_string())],
     }]));
 
     let output = Arc::new(CaptureOutput::new());
@@ -300,17 +255,9 @@ async fn test_session_recovery() {
 
     // Setup scenario LLM for turn 2
     let llm_turn2 = Arc::new(ScenarioLlm::new(vec![ScenarioTurn {
-        events: vec![
-            ScenarioEvent::Text("I remember turn 1. Now doing turn 2.".to_string()),
-            ScenarioEvent::ToolCall(
-                FunctionCall {
-                    name: "finish_task".to_string(),
-                    args: serde_json::json!({"summary": "done turn 2"}),
-                    id: Some("call_2".to_string()),
-                },
-                Some("call_2".to_string()),
-            ),
-        ],
+        events: vec![ScenarioEvent::Text(
+            "I remember turn 1. Now doing turn 2.".to_string(),
+        )],
     }]));
 
     // Turn 2 with a new SessionManager (simulating restart)
@@ -349,9 +296,7 @@ async fn test_large_output_compression() {
 
     // Setup mock tools
     let large_tool = Arc::new(MockTool::new("large_tool", Ok(large_string)));
-    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
-
-    let tools: Vec<Arc<dyn Tool>> = vec![large_tool.clone(), finish_tool.clone()];
+    let tools: Vec<Arc<dyn Tool>> = vec![large_tool.clone()];
 
     // Setup scenario LLM
     let llm = Arc::new(ScenarioLlm::new(vec![
@@ -370,21 +315,8 @@ async fn test_large_output_compression() {
         },
         ScenarioTurn {
             events: vec![ScenarioEvent::Text(
-                "I got the large output, now I will yield.".to_string(),
+                "I got the large output; the task is complete.".to_string(),
             )],
-        },
-        ScenarioTurn {
-            events: vec![
-                ScenarioEvent::Text("Now I will finish.".to_string()),
-                ScenarioEvent::ToolCall(
-                    FunctionCall {
-                        name: "finish_task".to_string(),
-                        args: serde_json::json!({"summary": "done"}),
-                        id: Some("call_2".to_string()),
-                    },
-                    Some("call_2".to_string()),
-                ),
-            ],
         },
     ]));
 
@@ -407,17 +339,31 @@ async fn test_large_output_compression() {
         task_state_store,
     );
 
-    // Turn 1: Call large tool and yield
+    // Turn 1: Call large tool and finish with final text.
     let result1 = agent.step("Do the large task".to_string()).await.unwrap();
-    assert!(matches!(result1, RunExit::YieldedToUser));
+    assert!(matches!(result1, RunExit::Finished(_)));
 
-    // Turn 2: Finish task (this will trigger compaction at the start)
-    let result2 = agent.step("Continue".to_string()).await.unwrap();
-    assert!(matches!(result2, RunExit::Finished(_)));
-
-    // Verify that compression happened (the system message should indicate it)
+    // Verify that the final answer was displayed and the large tool payload was
+    // compacted before being retained in history.
     let texts = output.texts.lock().await;
-    assert!(texts.iter().any(|t| t.contains("[System]")));
+    assert!(texts
+        .iter()
+        .any(|t| t.contains("I got the large output; the task is complete.")));
+    let large_results: Vec<&str> = agent
+        .context
+        .dialogue_history
+        .iter()
+        .flat_map(|turn| turn.messages.iter())
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| part.function_response.as_ref())
+        .filter(|response| response.name == "large_tool")
+        .filter_map(|response| response.response["result"].as_str())
+        .collect();
+    assert_eq!(large_results.len(), 1);
+    assert!(
+        large_results[0].contains("stripped") || large_results[0].len() < 50_000,
+        "large tool response was not compacted"
+    );
     support::temp_workspace::cleanup_session(&session_id);
 }
 

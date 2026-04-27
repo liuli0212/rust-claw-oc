@@ -88,11 +88,9 @@ impl CommandOutput for TelegramCommandOutput {
                 status_msg.push_str(&format!(
                     "🎯 *Active Plan*: {}%\n\
                     *Goal*: {}\nProgress: {} / {} steps\n",
-                    if total_steps > 0 {
-                        completed_steps * 100 / total_steps
-                    } else {
-                        0
-                    },
+                    (completed_steps * 100)
+                        .checked_div(total_steps)
+                        .unwrap_or(0),
                     Self::escape(&state.goal.unwrap_or_else(|| "Unknown".to_string())),
                     completed_steps,
                     total_steps

@@ -243,7 +243,7 @@ pub fn filter_subagent_tools(
     restrict_to_allowed_tools: bool,
     allow_subagent_tool: bool,
 ) -> Vec<Arc<dyn Tool>> {
-    let runtime_tools = ["finish_task", "task_plan"];
+    let runtime_tools = ["task_plan"];
     let code_mode_companion_allowed = allowed.iter().any(|tool| tool == "exec");
     let mut accepted = Vec::new();
 
@@ -310,7 +310,7 @@ pub fn build_subagent_session(
     let mut context = AgentContext::new().with_transcript_path(transcript_path);
     context.max_history_tokens = llm.context_window();
 
-    let mut prompt = "You are a delegated sub-agent. Complete the assigned goal with the available tools, then call `finish_task`.".to_string();
+    let mut prompt = "You are a delegated sub-agent. Complete the assigned goal with the available tools, then provide the final answer as plain text without calling another tool.".to_string();
     if !parent_context_text.trim().is_empty() {
         prompt.push_str(&format!(
             "\nParent context:\n{}",
@@ -346,12 +346,6 @@ pub fn build_subagent_session(
             task_state_store.clone(),
         )));
     }
-    if !tools.iter().any(|tool| tool.name() == "finish_task") {
-        tools.push(Arc::new(crate::tools::FinishTaskTool {
-            task_state_store: task_state_store.clone(),
-        }));
-    }
-
     let mut agent_loop = AgentLoop::new(
         sub_session_id.clone(),
         llm,
@@ -418,9 +412,6 @@ pub fn build_agent_session(
         session_id.to_string(),
         task_state_store.clone(),
     )));
-    session_tools.push(Arc::new(crate::tools::FinishTaskTool {
-        task_state_store: task_state_store.clone(),
-    }));
     session_tools.push(Arc::new(crate::tools::AskUserQuestionTool::new()));
     let subagent_base_tools = session_tools.clone();
     session_tools.push(Arc::new(crate::tools::SubagentTool::new(
@@ -618,7 +609,10 @@ mod tests {
 
         let mut agent = agent.lock().await;
         let exit = agent.step("/check_git_status".to_string()).await.unwrap();
-        assert_eq!(exit, crate::core::RunExit::YieldedToUser);
+        assert_eq!(
+            exit,
+            crate::core::RunExit::Finished("skill ready".to_string())
+        );
 
         let system = llm.last_system.lock().unwrap().clone().unwrap_or_default();
         assert!(system.contains("[ACTIVE SKILL CONTRACT]"));
@@ -730,7 +724,6 @@ mod tests {
             Arc::new(MockTool("execute_bash")),
             Arc::new(MockTool("ask_user_question")),
             Arc::new(MockTool("subagent")),
-            Arc::new(MockTool("finish_task")),
         ];
 
         let filtered = filter_subagent_tools(&tools, &[], false, false);
@@ -739,7 +732,6 @@ mod tests {
         assert!(names.contains(&"web_fetch".to_string()));
         assert!(names.contains(&"write_file".to_string()));
         assert!(names.contains(&"execute_bash".to_string()));
-        assert!(names.contains(&"finish_task".to_string()));
         assert!(!names.contains(&"ask_user_question".to_string()));
         assert!(!names.contains(&"subagent".to_string()));
     }
@@ -749,13 +741,11 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MockTool("read_file")),
             Arc::new(MockTool("write_file")),
-            Arc::new(MockTool("finish_task")),
         ];
 
         let filtered = filter_subagent_tools(&tools, &["write_file".to_string()], true, false);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"write_file".to_string()));
-        assert!(names.contains(&"finish_task".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
     }
 
@@ -779,14 +769,12 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MockTool("read_file")),
             Arc::new(MockTool("subagent")),
-            Arc::new(MockTool("finish_task")),
             Arc::new(MockTool("task_plan")),
         ];
 
         let filtered = filter_subagent_tools(&tools, &["subagent".to_string()], true, true);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"subagent".to_string()));
-        assert!(names.contains(&"finish_task".to_string()));
         assert!(names.contains(&"task_plan".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
     }
@@ -796,13 +784,11 @@ mod tests {
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MockTool("read_file")),
             Arc::new(MockTool("subagent")),
-            Arc::new(MockTool("finish_task")),
         ];
 
         let filtered = filter_subagent_tools(&tools, &["subagent".to_string()], true, true);
         let names: Vec<String> = filtered.into_iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"subagent".to_string()));
-        assert!(names.contains(&"finish_task".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
     }
 }

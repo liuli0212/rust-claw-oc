@@ -488,11 +488,7 @@ mod tests {
                     "parent_spawn_1",
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "spawned background job" }),
-                    "parent_finish_1",
-                )]
+                vec![make_final_text("spawned background job")]
             }
         } else if user_text.contains("collect one background job") {
             if collected_count < job_ids.len() {
@@ -503,11 +499,7 @@ mod tests {
                     &format!("parent_get_{}", collected_count + 1),
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "collected background job" }),
-                    "parent_finish_2",
-                )]
+                vec![make_final_text("collected background job")]
             }
         } else if user_text.contains("spawn failing background job") {
             if spawned_count == 0 {
@@ -525,11 +517,7 @@ mod tests {
                     "mixed_spawn_1",
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "spawned failing job" }),
-                    "mixed_finish_1",
-                )]
+                vec![make_final_text("spawned failing job")]
             }
         } else if user_text.contains("collect failing background job") {
             if collected_count < job_ids.len() {
@@ -540,11 +528,7 @@ mod tests {
                     &format!("mixed_get_{}", collected_count + 1),
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "collected failing job" }),
-                    "mixed_finish_2",
-                )]
+                vec![make_final_text("collected failing job")]
             }
         } else if user_text.contains("spawn two background jobs") {
             if spawned_count == 0 {
@@ -576,11 +560,7 @@ mod tests {
                     "parent_spawn_2",
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "spawned background jobs" }),
-                    "parent_finish_1",
-                )]
+                vec![make_final_text("spawned background jobs")]
             }
         } else if user_text.contains("collect two background jobs") {
             if listed_count == 0 {
@@ -597,11 +577,7 @@ mod tests {
                     &format!("parent_get_{}", collected_count + 1),
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "collected background jobs" }),
-                    "parent_finish_2",
-                )]
+                vec![make_final_text("collected background jobs")]
             }
         } else if user_text.contains("spawn success and fail jobs") {
             if spawned_count == 0 {
@@ -633,11 +609,7 @@ mod tests {
                     "mixed_spawn_2",
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "spawned mixed jobs" }),
-                    "mixed_finish_1",
-                )]
+                vec![make_final_text("spawned mixed jobs")]
             }
         } else if user_text.contains("collect mixed job results") {
             if collected_count < job_ids.len() {
@@ -648,11 +620,7 @@ mod tests {
                     &format!("mixed_get_{}", collected_count + 1),
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "collected mixed jobs" }),
-                    "mixed_finish_2",
-                )]
+                vec![make_final_text("collected mixed jobs")]
             }
         } else if user_text.contains("spawn hanging job") {
             if spawned_count == 0 {
@@ -670,11 +638,7 @@ mod tests {
                     "hang_spawn",
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "spawned hanging job" }),
-                    "hang_finish_1",
-                )]
+                vec![make_final_text("spawned hanging job")]
             }
         } else if user_text.contains("cancel hanging job") {
             let first_job = job_ids.first().cloned().unwrap_or_default();
@@ -685,35 +649,19 @@ mod tests {
                     "hang_cancel",
                 )]
             } else {
-                vec![make_tool_call(
-                    "finish_task",
-                    json!({ "summary": "cancelled hanging job" }),
-                    "hang_finish_2",
-                )]
+                vec![make_final_text("cancelled hanging job")]
             }
         } else if user_text.contains("continue after cancellation") {
-            vec![make_tool_call(
-                "finish_task",
-                json!({ "summary": "continued after cancellation" }),
-                "hang_finish_3",
-            )]
+            vec![make_final_text("continued after cancellation")]
         } else if user_text.contains("continue after background work") {
             let summary = if system_text.contains("Background subagent updates are available") {
                 "noticed background update"
             } else {
                 "missed background update"
             };
-            vec![make_tool_call(
-                "finish_task",
-                json!({ "summary": summary }),
-                "notice_finish",
-            )]
+            vec![make_final_text(summary)]
         } else {
-            vec![make_tool_call(
-                "finish_task",
-                json!({ "summary": "no-op" }),
-                "parent_default_finish",
-            )]
+            vec![make_final_text("no-op")]
         };
 
         for event in events {
@@ -740,15 +688,13 @@ mod tests {
             return Ok(rx);
         }
 
-        let _ = tx.try_send(make_tool_call(
-            "finish_task",
-            json!({
-                "summary": format!("completed {}", user_text)
-            }),
-            "subagent_finish",
-        ));
+        let _ = tx.try_send(make_final_text(&format!("completed {}", user_text)));
         let _ = tx.try_send(StreamEvent::Done);
         Ok(rx)
+    }
+
+    fn make_final_text(summary: &str) -> StreamEvent {
+        StreamEvent::Text(summary.to_string())
     }
 
     fn make_tool_call(name: &str, args: Value, id: &str) -> StreamEvent {

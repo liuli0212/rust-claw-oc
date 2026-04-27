@@ -726,7 +726,7 @@ mod tests {
     use serial_test::serial;
     use tokio::sync::mpsc;
 
-    use crate::context::{FunctionCall, Message};
+    use crate::context::Message;
     use crate::llm_client::{LlmClient, LlmError, StreamEvent};
     use crate::schema::StoragePaths;
     use crate::skills::call_tree::SkillCallContext;
@@ -805,14 +805,7 @@ mod tests {
             _tools: Vec<Arc<dyn Tool>>,
         ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
             let (tx, rx) = mpsc::channel(4);
-            let _ = tx.try_send(StreamEvent::ToolCall(
-                FunctionCall {
-                    name: "finish_task".to_string(),
-                    args: json!({ "summary": "done" }),
-                    id: Some("tc_1".to_string()),
-                },
-                None,
-            ));
+            let _ = tx.try_send(StreamEvent::Text("done".to_string()));
             let _ = tx.try_send(StreamEvent::Done);
             Ok(rx)
         }

@@ -36,10 +36,8 @@ async fn test_code_mode_full_flow_exec_flush_wait_complete() {
     let exec_tool = Arc::new(rusty_claw::tools::ExecTool);
     let wait_tool = Arc::new(rusty_claw::tools::WaitTool);
     let echo_tool = Arc::new(MockTool::new("echo_tool", Ok("echo_result".to_string())));
-    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
 
-    let tools: Vec<Arc<dyn Tool>> =
-        vec![exec_tool, wait_tool, echo_tool.clone(), finish_tool.clone()];
+    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool, echo_tool.clone()];
 
     // 2. Setup scenario LLM
     // Turn 1: Model calls exec. Code calls echo_tool then flushes.
@@ -78,17 +76,9 @@ async fn test_code_mode_full_flow_exec_flush_wait_complete() {
             ],
         },
         ScenarioTurn {
-            events: vec![
-                ScenarioEvent::Text("Done, finishing task.".to_string()),
-                ScenarioEvent::ToolCall(
-                    FunctionCall {
-                        name: "finish_task".to_string(),
-                        args: serde_json::json!({ "summary": "Code mode finished successfully" }),
-                        id: Some("call_finish_1".to_string()),
-                    },
-                    Some("call_finish_1".to_string()),
-                ),
-            ],
+            events: vec![ScenarioEvent::Text(
+                "Code mode finished successfully".to_string(),
+            )],
         },
     ]));
 
@@ -109,7 +99,7 @@ async fn test_code_mode_full_flow_exec_flush_wait_complete() {
     );
 
     // flush no longer pauses for user input; the agent continues through the
-    // scripted wait and finish turns in the same step.
+    // scripted wait and final text turn in the same step.
     let result = agent.step("Run code mode".to_string()).await.unwrap();
     assert!(
         matches!(result, RunExit::Finished(_)),
@@ -145,9 +135,8 @@ async fn test_code_mode_wait_timeout() {
 
     let exec_tool = Arc::new(rusty_claw::tools::ExecTool);
     let wait_tool = Arc::new(rusty_claw::tools::WaitTool);
-    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
 
-    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool, finish_tool];
+    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool];
 
     // Code that uses a timer. The environment will flush at the end of execution
     // because it sees a pending timer.
@@ -176,13 +165,8 @@ async fn test_code_mode_wait_timeout() {
             events: scripted_wait_turn("c2", "cell-0", 100).events,
         },
         ScenarioTurn {
-            events: vec![ScenarioEvent::ToolCall(
-                FunctionCall {
-                    name: "finish_task".to_string(),
-                    args: serde_json::json!({ "summary": "Observed wait timeout snapshot" }),
-                    id: Some("c3".to_string()),
-                },
-                Some("c3".to_string()),
+            events: vec![ScenarioEvent::Text(
+                "Observed wait timeout snapshot".to_string(),
             )],
         },
     ]));
@@ -200,13 +184,13 @@ async fn test_code_mode_wait_timeout() {
     );
 
     // The auto-flush progress update is displayed, but it no longer forces a
-    // YieldedToUser boundary; the scripted wait and finish turns can continue
+    // YieldedToUser boundary; the scripted wait and final text turn can continue
     // inside the same step.
     let result = agent.step("Start".to_string()).await.unwrap();
 
     assert!(
         matches!(result, RunExit::Finished(_)),
-        "Expected the scripted finish_task turn to complete, got: {:?}",
+        "Expected the scripted final text turn to complete, got: {:?}",
         result
     );
 
@@ -422,8 +406,7 @@ async fn test_code_mode_timer_completion() {
 
     let exec_tool = Arc::new(rusty_claw::tools::ExecTool);
     let wait_tool = Arc::new(rusty_claw::tools::WaitTool);
-    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("finished".to_string())));
-    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool, finish_tool];
+    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool];
 
     // Register a short timer and let the host auto-publish progress while it
     // is pending before a subsequent wait observes the completion.
@@ -450,14 +433,7 @@ async fn test_code_mode_timer_completion() {
         },
         scripted_wait_turn("c2", "cell-0", 300),
         ScenarioTurn {
-            events: vec![ScenarioEvent::ToolCall(
-                FunctionCall {
-                    name: "finish_task".to_string(),
-                    args: serde_json::json!({ "summary": "Observed timer completion" }),
-                    id: Some("c3".to_string()),
-                },
-                Some("c3".to_string()),
-            )],
+            events: vec![ScenarioEvent::Text("Observed timer completion".to_string())],
         },
     ]));
 
@@ -477,7 +453,7 @@ async fn test_code_mode_timer_completion() {
     let exit = agent.step("Start".to_string()).await.unwrap();
     assert!(
         matches!(exit, RunExit::Finished(_)),
-        "Expected exec, wait, and finish_task to complete in one step, got: {:?}",
+        "Expected exec, wait, and final text to complete in one step, got: {:?}",
         exit
     );
 
@@ -506,8 +482,7 @@ async fn test_code_mode_cancel_clears_active_cell_for_next_exec() {
 
     let exec_tool = Arc::new(rusty_claw::tools::ExecTool);
     let blocking_tool = Arc::new(BlockingTool::new("blocker"));
-    let finish_tool = Arc::new(MockTool::new("finish_task", Ok("done".to_string())));
-    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, blocking_tool, finish_tool];
+    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, blocking_tool];
 
     let llm = Arc::new(ScenarioLlm::new(vec![
         ScenarioTurn {
@@ -533,14 +508,7 @@ async fn test_code_mode_cancel_clears_active_cell_for_next_exec() {
             )],
         },
         ScenarioTurn {
-            events: vec![ScenarioEvent::ToolCall(
-                FunctionCall {
-                    name: "finish_task".to_string(),
-                    args: serde_json::json!({ "summary": "Recovered after cancel" }),
-                    id: Some("finish_recovery".to_string()),
-                },
-                Some("finish_recovery".to_string()),
-            )],
+            events: vec![ScenarioEvent::Text("Recovered after cancel".to_string())],
         },
     ]));
 

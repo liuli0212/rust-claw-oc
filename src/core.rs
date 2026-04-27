@@ -947,13 +947,18 @@ impl AgentLoop {
             }
 
             if let Some(exit) = self
-                .record_model_turn_and_maybe_yield(&full_text, &tool_calls_accumulated)
+                .record_model_turn_and_maybe_yield(&full_text, &tool_calls_accumulated, &mut state)
                 .await
             {
                 if let Some(span) = iteration_span.take() {
+                    let status = match &exit {
+                        RunExit::Finished(_) => TraceStatus::Ok,
+                        RunExit::YieldedToUser => TraceStatus::Yielded,
+                        _ => TraceStatus::Error,
+                    };
                     span.finish(
                         "iteration_finished",
-                        TraceStatus::Yielded,
+                        status,
                         Some(exit.label().to_string()),
                         serde_json::json!({
                             "tool_calls": tool_calls_accumulated.len(),
@@ -969,7 +974,6 @@ impl AgentLoop {
                     tool_calls_accumulated,
                     &current_tools,
                     iteration_child_ctx.clone(),
-                    &mut state,
                     task_state.energy_points,
                 )
                 .await;
@@ -995,25 +999,12 @@ impl AgentLoop {
             }
 
             if state.status == "finished" {
-                // Extension hook: before_finish — let extensions validate completion
-                let mut allow_finish = true;
-                for ext in &self.extensions {
-                    if let crate::core::extensions::FinishDecision::Deny { reason } =
-                        ext.before_finish().await
-                    {
-                        tracing::warn!("Extension denied finish: {}", reason);
-                        self.output.on_text(&format!("[System] {}", reason)).await;
-                        allow_finish = false;
-                        state.status = "in_progress".to_string();
-                        let _ = self.task_state_store.save(&state);
-                        break;
-                    }
-                }
-                if allow_finish {
-                    let summary = state.summary();
-                    for ext in &self.extensions {
-                        ext.on_finish_committed(&summary).await;
-                    }
+                let summary = state.summary();
+                if let Err(reason) = self.prepare_finished_run(&summary, &mut state).await {
+                    self.output.on_text(&format!("[System] {}", reason)).await;
+                    state.status = "in_progress".to_string();
+                    let _ = self.task_state_store.save(&state);
+                } else {
                     if let Some(span) = iteration_span.take() {
                         span.finish(
                             "iteration_finished",

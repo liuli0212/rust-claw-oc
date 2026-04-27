@@ -71,7 +71,6 @@ Rusty-Claw comes equipped with a comprehensive suite of engineering tools:
 | Category | Tool | Description |
 |----------|------|-------------|
 | **System** | `execute_bash` | Execute shell commands in a secure PTY environment. |
-| | `finish_task` | Signal completion of the user's request. |
 | **File I/O** | `read_file` | Read file contents with automatic large-file handling. |
 | | `write_file` | Create or overwrite files with precision. |
 | **Browser** | `browser` | Full browser automation: `start`, `stop`, `navigate`, `snapshot` (DOM extraction), `act` (click/type). |

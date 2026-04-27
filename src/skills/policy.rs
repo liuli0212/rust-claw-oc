@@ -14,7 +14,7 @@ pub struct SkillToolPolicy {
 }
 
 /// Tools that are always available during skill execution, regardless of whitelist.
-const RUNTIME_TOOLS: &[&str] = &["finish_task", "task_plan"];
+const RUNTIME_TOOLS: &[&str] = &["task_plan"];
 
 impl SkillToolPolicy {
     pub fn new() -> Self {
@@ -158,7 +158,6 @@ mod tests {
     fn test_runtime_tools_always_allowed() {
         let policy = SkillToolPolicy::new();
         let skill = make_skill(vec!["read_file"]);
-        assert!(policy.can_call("finish_task", &skill));
         assert!(policy.can_call("task_plan", &skill));
     }
 

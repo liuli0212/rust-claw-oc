@@ -16,9 +16,7 @@ pub mod web;
 pub use ask_user::AskUserQuestionTool;
 pub use bash::BashTool;
 pub use code_mode::{ExecTool, WaitTool};
-pub use files::{
-    FinishTaskTool, PatchFileTool, ReadFileTool, SendFileTool, TaskPlanTool, WriteFileTool,
-};
+pub use files::{PatchFileTool, ReadFileTool, SendFileTool, TaskPlanTool, WriteFileTool};
 pub use integrations::SendTelegramMessageTool;
 pub use lsp::{
     LspFindReferencesTool, LspGetDiagnosticsTool, LspGetSymbolsTool, LspGotoDefinitionTool,

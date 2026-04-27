@@ -369,10 +369,6 @@ impl AgentLoop {
         crate::tools::protocol::ToolExecutionEnvelope::from_json_str(result)
     }
 
-    pub(super) fn extract_finish_task_summary_from_result(result: &str) -> Option<String> {
-        Self::parse_tool_envelope(result).and_then(|envelope| envelope.effects.finish_task_summary)
-    }
-
     pub(super) fn build_function_response_part(
         name: String,
         id: Option<String>,
@@ -418,6 +414,7 @@ impl AgentLoop {
         &mut self,
         full_text: &str,
         tool_calls_accumulated: &[ToolCallRecord],
+        state: &mut crate::task_state::TaskStateSnapshot,
     ) -> Option<RunExit> {
         // ── Canary check BEFORE history insertion ──
         // If the LLM leaked the canary, we must prevent the leaked text from
@@ -427,9 +424,9 @@ impl AgentLoop {
         let text_without_think = Self::strip_think_blocks(full_text);
         let trimmed_clean = text_without_think.trim();
 
-        let args_leak = tool_calls_accumulated.iter().any(|(tc, _)| {
-            crate::security::check_canary_leak(&tc.args.to_string())
-        });
+        let args_leak = tool_calls_accumulated
+            .iter()
+            .any(|(tc, _)| crate::security::check_canary_leak(&tc.args.to_string()));
 
         if crate::security::check_canary_leak(full_text) || args_leak {
             tracing::warn!("Canary token leaked in LLM output — possible prompt extraction attack");
@@ -487,28 +484,88 @@ impl AgentLoop {
             parts,
         });
 
+        if tool_calls_accumulated.is_empty() {
+            if trimmed_clean.is_empty() {
+                self.record_trace_event(
+                    TraceActor::System,
+                    "yielded_to_user",
+                    TraceStatus::Yielded,
+                    Some("No visible text or tool call was emitted".to_string()),
+                    serde_json::json!({}),
+                    self.turn_span_id(),
+                    None,
+                );
+                self.output.flush().await;
+                self.context.end_turn();
+                self.telemetry.end_span("agent_step");
+                return Some(RunExit::YieldedToUser);
+            }
+
+            let final_answer = trimmed_clean.to_string();
+            if let Err(reason) = self.prepare_finished_run(&final_answer, state).await {
+                self.output.on_text(&format!("[System] {}\n", reason)).await;
+                self.context.add_message_to_current_turn(Message {
+                    role: "user".to_string(),
+                    parts: vec![Part {
+                        text: Some(format!(
+                            "[System] Completion was denied: {reason}. Continue working."
+                        )),
+                        function_call: None,
+                        function_response: None,
+                        thought_signature: None,
+                        file_data: None,
+                    }],
+                });
+                return None;
+            }
+
+            self.output.on_text(&final_answer).await;
+            self.output.on_text("\n").await;
+            return Some(self.finalize_finished_run(final_answer).await);
+        }
+
         if !trimmed_clean.is_empty() {
             self.output.on_text(trimmed_clean).await;
             self.output.on_text("\n").await;
         }
 
-        if tool_calls_accumulated.is_empty() {
-            self.record_trace_event(
-                TraceActor::System,
-                "yielded_to_user",
-                TraceStatus::Yielded,
-                Some("No tool call was emitted".to_string()),
-                serde_json::json!({}),
-                self.turn_span_id(),
-                None,
+        None
+    }
+
+    pub(super) async fn prepare_finished_run(
+        &mut self,
+        summary: &str,
+        state: &mut crate::task_state::TaskStateSnapshot,
+    ) -> Result<(), String> {
+        if self.is_autopilot && self.has_uncompleted_todos() {
+            return Err(
+                "Action Denied. Autopilot 模式下必须完成 TODOS.md 中的所有任务才能结束。"
+                    .to_string(),
             );
-            self.output.flush().await;
-            self.context.end_turn();
-            self.telemetry.end_span("agent_step");
-            return Some(RunExit::YieldedToUser);
         }
 
-        None
+        for ext in &self.extensions {
+            if let crate::core::extensions::FinishDecision::Deny { reason } =
+                ext.before_finish().await
+            {
+                tracing::warn!("Extension denied finish: {}", reason);
+                return Err(reason);
+            }
+        }
+
+        state.status = "finished".to_string();
+        state.finish_summary = Some(summary.to_string());
+        for step in &mut state.plan_steps {
+            step.status = "completed".to_string();
+        }
+        state.current_step = None;
+        let _ = self.task_state_store.save(state);
+
+        for ext in &self.extensions {
+            ext.on_finish_committed(summary).await;
+        }
+
+        Ok(())
     }
 
     pub(super) async fn finalize_exit(&mut self, exit: RunExit, end_span: bool) -> RunExit {
@@ -541,6 +598,7 @@ impl AgentLoop {
     }
 
     pub(super) async fn finalize_finished_run(&mut self, summary: String) -> RunExit {
+        self.output.flush().await;
         self.context.end_turn();
         self.telemetry.end_span("agent_step");
         self.finish_active_trace("run_finished", TraceStatus::Ok, Some(summary.clone()));
@@ -973,7 +1031,6 @@ impl AgentLoop {
         tool_calls_accumulated: Vec<ToolCallRecord>,
         current_tools: &[Arc<dyn Tool>],
         iteration_trace_ctx: Option<crate::trace::TraceContext>,
-        state: &mut crate::task_state::TaskStateSnapshot,
         remaining_steps: usize,
     ) -> (Vec<Part>, bool) {
         let mut skip_remaining = false;
@@ -1073,27 +1130,6 @@ impl AgentLoop {
                             .on_text(&format!("{}\n", Self::format_user_prompt(&prompt)))
                             .await;
                     }
-                }
-
-                if let Some(summary) = Self::extract_finish_task_summary_from_result(&result) {
-                    if self.is_autopilot && self.has_uncompleted_todos() {
-                        response_parts.push(Self::build_function_response_part(
-                            call.name.clone(),
-                            call.id.clone(),
-                            serde_json::json!({ "result": "[System Error] Action Denied. Autopilot 模式下必须完成 TODOS.md 中的所有任务才能结束。" }),
-                            thought_sig.clone(),
-                        ));
-                        continue;
-                    }
-                    state.status = "finished".to_string();
-                    state.finish_summary = Some(summary.clone());
-                    // Mark all steps as completed when finishing
-                    for step in &mut state.plan_steps {
-                        step.status = "completed".to_string();
-                    }
-                    state.current_step = None;
-                    let _ = self.task_state_store.save(state);
-                    self.output.on_task_finish(&summary).await;
                 }
             }
 

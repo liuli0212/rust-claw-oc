@@ -327,7 +327,7 @@ Nested code-mode tools must exclude runtime and lifecycle tools:
 
 - `exec`
 - `wait`
-- `finish_task`
+- final visible text response
 - `ask_user_question`
 - `subagent`
 - `task_plan`

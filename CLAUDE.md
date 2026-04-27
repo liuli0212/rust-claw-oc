@@ -47,7 +47,7 @@ Handles streaming + single-shot generation with exponential backoff retries.
 
 ### Tool System (tools.rs)
 
-All agent capabilities implement an async `Tool` trait. Tools: `execute_bash`, `read_file`, `write_file`, `browser`, `web_search`, `web_fetch`, `task_plan`, `rag_search`, `rag_insert`, `finish_task`. Bash execution uses `portable-pty` for secure PTY sandboxing with ANSI stripping and timeouts.
+All agent capabilities implement an async `Tool` trait. Tools: `execute_bash`, `read_file`, `write_file`, `browser`, `web_search`, `web_fetch`, `task_plan`, `rag_search`, `rag_insert`. Completion is signaled by a final visible text response with no tool calls. Bash execution uses `portable-pty` for secure PTY sandboxing with ANSI stripping and timeouts.
 
 ### RAG Memory (rag.rs)
 

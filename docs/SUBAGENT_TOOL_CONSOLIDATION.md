@@ -72,7 +72,7 @@ No other execution knobs are part of the public contract anymore. Deprecated fie
 ## Tool Visibility Rules
 
 - Skills still treat frontmatter `allowed_tools` as a hard limit.
-- Runtime-essential tools such as `finish_task` and `task_plan` are always added.
+- Runtime-essential tools such as `task_plan` are always added; completion is handled by a final visible text response.
 - Ordinary subagents default to the full non-recursive toolset.
 - Skill-owned subagent sessions may opt into the `subagent` tool only when the skill contract explicitly allows it.
 

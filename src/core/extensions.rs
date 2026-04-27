@@ -30,11 +30,11 @@ pub trait ExecutionExtension: Send + Sync {
     /// Extensions may update internal state based on the result.
     async fn after_tool_result(&self, result: &ToolExecutionEnvelope);
 
-    /// Called before `finish_task` is honoured.
+    /// Called before a final text response is committed.
     /// Extensions may deny completion if artifact contracts are unmet.
     async fn before_finish(&self) -> FinishDecision;
 
-    /// Called after `finish_task` has been accepted by all extensions and the
+    /// Called after the final text response has been accepted by all extensions and the
     /// run is about to commit its finished state.
     async fn on_finish_committed(&self, _summary: &str) {}
 }
