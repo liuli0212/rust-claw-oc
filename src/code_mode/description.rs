@@ -32,6 +32,14 @@ impl std::str::FromStr for CodeModeFormat {
 pub fn execution_notice(available_tools: &[String], format: CodeModeFormat) -> String {
     let tools_list = available_tools.join(", ");
     let tools_notice = format!("- `tools`: An object to call any available host tool asynchronously (e.g., `let res = await tools.read_file({{ path: '...' }});`). Let the host handle filesystem, shell, and network access through these tools. Available tools: [{}]", tools_list);
+    let wait_instruction = match format {
+        CodeModeFormat::FunctionTool => {
+            "If an `exec` result says the cell is still running, call `wait` to poll or sync that same cell. `wait` does not resume timers; it only syncs current state. Without `wait_timeout_ms`, `wait` blocks until the next update, completion, cancellation, or the cell runtime deadline."
+        }
+        CodeModeFormat::TextCommand => {
+            "In text command mode, the `// rusty-claw: exec` marker starts the code cell. If the synthesized `exec` result says the cell is still running, call the `wait` tool to poll or sync that same cell. `wait` does not resume timers; it only syncs current state. Without `wait_timeout_ms`, `wait` blocks until the next update, completion, cancellation, or the cell runtime deadline."
+        }
+    };
 
     let mut lines = vec![
         "Code Mode is enabled for this provider.",
@@ -64,7 +72,7 @@ pub fn execution_notice(available_tools: &[String], format: CodeModeFormat) -> S
                 "  const res = await tools.read_file({ path: \"src/main.rs\" });",
                 "  text(res);",
                 "Rules:",
-                "Do not call the `exec` function tool in text command mode.",
+                "The marker starts the code cell; do not emit `exec({...})` JSON, tool-call wrappers, or prose.",
                 "Do not write explanation text before or after the JavaScript.",
                 "Do not wrap the JavaScript in markdown fences.",
                 "If you are not using Code Mode, do not output the marker.",
@@ -86,7 +94,7 @@ pub fn execution_notice(available_tools: &[String], format: CodeModeFormat) -> S
         "When a cell uses `setTimeout`, polling, retries, long tool chains, or other background work that may outlive the first response, usually set `auto_flush_ms` so progress can surface without pausing JavaScript.",
         "Prefer `flush(value)` for meaningful milestones you want to publish immediately. Prefer `auto_flush_ms` for heartbeat-style progress during long-running work. You may use both together.",
         "Timer boundaries are internal runtime details, not user-visible progress events. Do not rely on timers alone to report progress.",
-        "If an `exec` result says the cell is still running, call `wait` to poll or sync that same cell. `wait` does not resume timers; it only syncs current state. Without `wait_timeout_ms`, `wait` blocks until the next update, completion, cancellation, or the cell runtime deadline.",
+        wait_instruction,
         "Use direct tools for trivial one-shot actions.",
         "",
         "Inside the `exec` JavaScript environment, you have access to the following globals:",

@@ -106,6 +106,87 @@ text(`text-mode: ${res.output}`);
 }
 
 #[tokio::test]
+async fn test_code_mode_text_command_form_can_wait_for_async_cell() {
+    let _workspace = TempWorkspace::new();
+    let session_id = format!(
+        "test_code_mode_text_async_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+
+    let exec_tool = Arc::new(rusty_claw::tools::ExecTool);
+    let wait_tool = Arc::new(rusty_claw::tools::WaitTool);
+    let finish_tool = Arc::new(MockTool::new(
+        "finish_task",
+        Ok("text command async finished".to_string()),
+    ));
+
+    let tools: Vec<Arc<dyn Tool>> = vec![exec_tool, wait_tool, finish_tool];
+
+    let llm = Arc::new(ScenarioLlm::new(vec![
+        ScenarioTurn {
+            events: vec![ScenarioEvent::Text(
+                r#"// rusty-claw: exec
+// auto_flush_ms=50
+text("Started");
+setTimeout(() => {
+    text("Async done");
+}, 150);
+"#
+                .to_string(),
+            )],
+        },
+        scripted_wait_turn("wait_text_async", "cell-0", 300),
+        ScenarioTurn {
+            events: vec![ScenarioEvent::ToolCall(
+                FunctionCall {
+                    name: "finish_task".to_string(),
+                    args: serde_json::json!({ "summary": "Text command async code mode finished" }),
+                    id: Some("finish_text_async".to_string()),
+                },
+                Some("finish_text_async".to_string()),
+            )],
+        },
+    ]));
+
+    let output = Arc::new(CaptureOutput::new());
+    let mut agent = AgentLoop::new(
+        session_id.clone(),
+        llm,
+        "cli".to_string(),
+        tools,
+        AgentContext::new(),
+        output.clone(),
+        Arc::new(TelemetryExporter::new().0),
+        Arc::new(TaskStateStore::new(&session_id)),
+    );
+    agent.set_code_mode_format(CodeModeFormat::TextCommand);
+
+    let result = agent
+        .step("Run async text command code mode".to_string())
+        .await
+        .unwrap();
+    assert!(
+        matches!(result, RunExit::Finished(_)),
+        "Expected Finished, got {:?}",
+        result
+    );
+
+    let tool_ends = output.tool_ends.lock().await;
+    assert!(
+        tool_ends.iter().any(|item| item.contains("Started")),
+        "Expected initial text-command output, got: {:?}",
+        *tool_ends
+    );
+    assert!(
+        tool_ends.iter().any(|item| item.contains("Async done")),
+        "Expected wait to observe async completion, got: {:?}",
+        *tool_ends
+    );
+
+    support::temp_workspace::cleanup_session(&session_id);
+}
+
+#[tokio::test]
 async fn test_code_mode_full_flow_exec_flush_wait_complete() {
     let _workspace = TempWorkspace::new();
     let session_id = format!("test_code_mode_full_{}", uuid::Uuid::new_v4().simple());

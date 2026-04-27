@@ -590,6 +590,47 @@ async fn test_code_mode_notice_is_added_when_exec_is_visible() {
 }
 
 #[tokio::test]
+async fn test_code_mode_text_command_notice_explains_marker_and_wait() {
+    let llm = Arc::new(PromptCapturingLlm::new(vec![StreamEvent::Text(
+        "Ready".to_string(),
+    )]));
+    let output = Arc::new(TestOutput::new());
+    let session_id = "test-code-mode-text-command-notice";
+    cleanup_session(session_id);
+
+    let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
+    let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(session_id));
+    let mut agent = AgentLoop::new(
+        session_id.to_string(),
+        llm.clone(),
+        "test_cli".to_string(),
+        vec![
+            Arc::new(crate::tools::ExecTool),
+            Arc::new(crate::tools::WaitTool),
+        ],
+        AgentContext::new(),
+        output,
+        Arc::new(telemetry),
+        task_state_store,
+    );
+    agent.set_code_mode_format(crate::code_mode::description::CodeModeFormat::TextCommand);
+
+    let exit = agent
+        .step("Use text command code mode".to_string())
+        .await
+        .unwrap();
+    assert_eq!(exit, RunExit::YieldedToUser);
+
+    let system_text = llm.last_system_text().unwrap_or_default();
+    assert!(system_text.contains("Code Mode Text Format:"));
+    assert!(system_text.contains("The marker starts the code cell"));
+    assert!(system_text.contains("call the `wait` tool"));
+    assert!(!system_text.contains("Do not call the `exec` function tool"));
+
+    cleanup_session(session_id);
+}
+
+#[tokio::test]
 async fn test_code_mode_notice_is_omitted_when_provider_disables_it() {
     let llm = Arc::new(PromptCapturingLlm::new_with_capabilities(
         vec![StreamEvent::Text("Ready".to_string())],

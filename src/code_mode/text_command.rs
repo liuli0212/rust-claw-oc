@@ -18,7 +18,7 @@ pub fn parse_text_exec_command(input: &str) -> Option<TextExecCommand> {
 
     for segment in trimmed.split_inclusive('\n') {
         let line = segment.trim_end_matches(['\r', '\n']);
-        let directive = parse_directive(line.trim())?;
+        let directive = parse_directive(line.trim());
 
         match directive {
             Directive::ExecMarker if !saw_marker => {
@@ -72,32 +72,32 @@ enum Directive {
     Code,
 }
 
-fn parse_directive(line: &str) -> Option<Directive> {
+fn parse_directive(line: &str) -> Directive {
     if line.is_empty() {
-        return Some(Directive::Blank);
+        return Directive::Blank;
     }
 
     let Some(comment) = line.strip_prefix("//").map(str::trim) else {
-        return Some(Directive::Code);
+        return Directive::Code;
     };
 
     if comment == "rusty-claw: exec" {
-        return Some(Directive::ExecMarker);
+        return Directive::ExecMarker;
     }
 
     if let Some(value) = parse_u64_directive(comment, "auto_flush_ms")
         .or_else(|| parse_u64_directive(comment, "auto-flush-ms"))
     {
-        return Some(Directive::AutoFlushMs(value));
+        return Directive::AutoFlushMs(value);
     }
 
     if let Some(value) = parse_u64_directive(comment, "cell_timeout_ms")
         .or_else(|| parse_u64_directive(comment, "cell-timeout-ms"))
     {
-        return Some(Directive::CellTimeoutMs(value));
+        return Directive::CellTimeoutMs(value);
     }
 
-    Some(Directive::Code)
+    Directive::Code
 }
 
 fn parse_u64_directive(comment: &str, key: &str) -> Option<u64> {
