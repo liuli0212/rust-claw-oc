@@ -405,27 +405,31 @@ pub fn build_subagent_session(
     })
 }
 
+pub struct AgentSessionConfig {
+    pub session_id: String,
+    pub reply_to: String,
+    pub llm: Arc<dyn LlmClient>,
+    pub tools: Vec<Arc<dyn Tool>>,
+    pub subagent_runtime: crate::subagent_runtime::SubagentRuntime,
+    pub transcript_path: PathBuf,
+    pub output: Arc<dyn AgentOutput>,
+    pub code_mode_format: crate::code_mode::description::CodeModeFormat,
+}
+
 pub fn build_agent_session(
-    session_id: &str,
-    reply_to: &str,
-    llm: Arc<dyn LlmClient>,
-    tools: Vec<Arc<dyn Tool>>,
-    subagent_runtime: crate::subagent_runtime::SubagentRuntime,
-    transcript_path: PathBuf,
-    output: Arc<dyn AgentOutput>,
-    code_mode_format: crate::code_mode::description::CodeModeFormat,
+    config: AgentSessionConfig,
 ) -> Result<Arc<AsyncMutex<AgentLoop>>, String> {
-    let mut context = AgentContext::new().with_transcript_path(transcript_path);
-    context.max_history_tokens = llm.context_window();
+    let mut context = AgentContext::new().with_transcript_path(config.transcript_path);
+    context.max_history_tokens = config.llm.context_window();
     let _ = context.load_transcript().map_err(|e| e.to_string())?;
 
     let (telemetry, _telemetry_handle) = crate::telemetry::TelemetryExporter::new();
     let telemetry = Arc::new(telemetry);
-    let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(session_id));
+    let task_state_store = Arc::new(crate::task_state::TaskStateStore::new(&config.session_id));
 
-    let mut session_tools = tools;
+    let mut session_tools = config.tools;
     session_tools.push(Arc::new(crate::tools::TaskPlanTool::new(
-        session_id.to_string(),
+        config.session_id.clone(),
         task_state_store.clone(),
     )));
     session_tools.push(Arc::new(crate::tools::FinishTaskTool {
@@ -433,27 +437,27 @@ pub fn build_agent_session(
     }));
     session_tools.push(Arc::new(crate::tools::AskUserQuestionTool::new()));
     session_tools.push(Arc::new(crate::tools::SubagentTool::new(
-        subagent_runtime.clone(),
+        config.subagent_runtime.clone(),
     )));
 
     let mut agent_loop = AgentLoop::new(
-        session_id.to_string(),
-        llm,
-        reply_to.to_string(),
+        config.session_id.clone(),
+        config.llm,
+        config.reply_to.clone(),
         session_tools,
         context,
-        output,
+        config.output,
         telemetry,
         task_state_store,
     );
-    agent_loop.set_code_mode_format(code_mode_format);
+    agent_loop.set_code_mode_format(config.code_mode_format);
     agent_loop.add_extension(Arc::new(
-        crate::skills::runtime::SkillRuntime::new_for_session(session_id.to_string()),
+        crate::skills::runtime::SkillRuntime::new_for_session(config.session_id.clone()),
     ));
     agent_loop.add_extension(Arc::new(
         crate::subagent_notification::SubagentNotificationExtension::new(
-            session_id,
-            subagent_runtime.clone(),
+            &config.session_id,
+            config.subagent_runtime.clone(),
         ),
     ));
 
@@ -612,14 +616,16 @@ mod tests {
         });
         let output = Arc::new(CaptureOutput);
         let agent = build_agent_session(
-            session_id,
-            "cli",
-            llm.clone(),
-            Vec::new(),
-            crate::subagent_runtime::SubagentRuntime::new(llm.clone(), Vec::new(), 2),
-            transcript_path,
-            output,
-            crate::code_mode::description::CodeModeFormat::default(),
+            AgentSessionConfig {
+                session_id: session_id.to_string(),
+                reply_to: "cli".to_string(),
+                llm: llm.clone(),
+                tools: Vec::new(),
+                subagent_runtime: crate::subagent_runtime::SubagentRuntime::new(llm.clone(), Vec::new(), 2),
+                transcript_path,
+                output,
+                code_mode_format: crate::code_mode::description::CodeModeFormat::default(),
+            }
         )
         .unwrap();
 
@@ -714,14 +720,16 @@ mod tests {
         });
         let output = Arc::new(CaptureOutput);
         let agent = build_agent_session(
-            session_id,
-            "cli",
-            llm.clone(),
-            Vec::new(),
-            crate::subagent_runtime::SubagentRuntime::new(llm.clone(), Vec::new(), 2),
-            transcript_path,
-            output,
-            crate::code_mode::description::CodeModeFormat::default(),
+            AgentSessionConfig {
+                session_id: session_id.to_string(),
+                reply_to: "cli".to_string(),
+                llm: llm.clone(),
+                tools: Vec::new(),
+                subagent_runtime: crate::subagent_runtime::SubagentRuntime::new(llm.clone(), Vec::new(), 2),
+                transcript_path,
+                output,
+                code_mode_format: crate::code_mode::description::CodeModeFormat::default(),
+            }
         )
         .unwrap();
 
