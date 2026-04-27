@@ -7,3 +7,4 @@ pub mod protocol;
 pub mod response;
 pub mod runtime;
 pub mod service;
+pub mod text_command;

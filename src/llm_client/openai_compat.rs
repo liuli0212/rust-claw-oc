@@ -233,8 +233,12 @@ impl LlmClient for OpenAiCompatClient {
 
         if !tools.is_empty() {
             let mut openai_tools = Vec::new();
+            let mut has_exec_tool = false;
             for tool in tools {
                 let definition = tool.definition();
+                if definition.name == "exec" {
+                    has_exec_tool = true;
+                }
                 openai_tools.push(serde_json::json!({
                     "type": "function",
                     "function": {
@@ -246,13 +250,13 @@ impl LlmClient for OpenAiCompatClient {
             }
             if !openai_tools.is_empty() {
                 body_map["tools"] = serde_json::json!(openai_tools);
-                body_map["tool_choice"] = serde_json::Value::String("required".to_string());
-
-                openai_messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": "CRITICAL FINAL REMINDER: You MUST output a tool call now unless the task is completely finished. Do NOT output conversational text asking for permission to continue."
-                }));
-
+                if has_exec_tool {
+                    body_map["tool_choice"] = serde_json::Value::String("required".to_string());
+                    openai_messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": "CRITICAL FINAL REMINDER: You MUST output a tool call now unless the task is completely finished. Do NOT output conversational text asking for permission to continue."
+                    }));
+                }
                 body_map["messages"] = serde_json::json!(openai_messages);
             }
         }

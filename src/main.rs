@@ -73,6 +73,9 @@ struct CliArgs {
     /// Execute a single command and exit (headless mode)
     #[arg(long, short = 'c')]
     command: Option<String>,
+    /// Code mode prompt/dispatch format: function or text
+    #[arg(long, default_value = "function", value_parser = ["function", "text"])]
+    code_mode_format: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -103,6 +106,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = config::AppConfig::load();
     let _guards = logging::init_logging(&config);
+    let code_mode_format = args
+        .code_mode_format
+        .parse::<rusty_claw::code_mode::description::CodeModeFormat>()
+        .expect("clap validates code_mode_format");
 
     let llm_opt = match llm_client::create_llm_client(
         &args.provider,
@@ -131,7 +138,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap = app::bootstrap::build_app_bootstrap()?;
     let telegram_token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
 
-    let session_manager = Arc::new(SessionManager::new(llm_opt, bootstrap.tools.clone()));
+    let session_manager = Arc::new(SessionManager::new_with_code_mode_format(
+        llm_opt,
+        bootstrap.tools.clone(),
+        code_mode_format,
+    ));
     session_manager.add_output_router(Arc::new(TuiOutputRouter));
     let output = Arc::new(TuiOutput::new());
 

@@ -262,6 +262,7 @@ pub struct AgentLoop {
     trace_seed: Option<TraceSeed>,
     active_trace: Option<ActiveTrace>,
     code_mode_service: crate::code_mode::service::CodeModeService,
+    code_mode_format: crate::code_mode::description::CodeModeFormat,
 }
 
 impl AgentLoop {
@@ -303,6 +304,7 @@ impl AgentLoop {
             trace_seed: None,
             active_trace: None,
             code_mode_service: crate::code_mode::service::CodeModeService::default(),
+            code_mode_format: crate::code_mode::description::CodeModeFormat::default(),
         }
     }
 
@@ -317,6 +319,10 @@ impl AgentLoop {
 
     pub fn set_session_timeout(&mut self, timeout: Duration) {
         self.session_deadline = Some(Instant::now() + timeout);
+    }
+
+    pub fn set_code_mode_format(&mut self, format: crate::code_mode::description::CodeModeFormat) {
+        self.code_mode_format = format;
     }
 
     pub fn set_trace_seed(&mut self, trace_seed: TraceSeed) {
@@ -895,7 +901,7 @@ impl AgentLoop {
                 .map(TraceSpanHandle::child_context)
                 .or_else(|| iteration_ctx.clone());
 
-            let (full_text, tool_calls_accumulated) = match self
+            let (mut full_text, mut tool_calls_accumulated) = match self
                 .collect_iteration_response(&state, &current_tools, iteration_child_ctx.clone())
                 .await?
             {
@@ -915,6 +921,13 @@ impl AgentLoop {
                     return Ok(exit);
                 }
             };
+
+            if let Some((synthetic_text, synthetic_tool_calls)) =
+                self.synthesize_text_exec_tool_call(&full_text, &tool_calls_accumulated)
+            {
+                full_text = synthetic_text;
+                tool_calls_accumulated = synthetic_tool_calls;
+            }
 
             if let Some(exit) = self
                 .handle_empty_iteration_response(
