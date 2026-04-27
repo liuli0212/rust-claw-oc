@@ -662,7 +662,7 @@ pub struct SkillInvocation {
 - [x] 让 skill 模式走统一 delegation 校验链，普通模式保持现有行为
 - [x] 扩展 `SubagentResult`，支持 skill 模式结构化结果
 - [x] interactive skill 若被 `subagent(skill)` 调用则直接拒绝
-- [x] 验证 delegation context 与 `SkillSessionSeed` 在嵌套 skill delegation 中正确继承
+- [x] 验证 delegation context 与 `DelegationSessionSeed` 在嵌套 skill delegation 中正确继承
 
 完成标志：
 
