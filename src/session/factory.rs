@@ -12,7 +12,7 @@ use crate::delegation::DelegationSessionSeed;
 use crate::event_log::{AgentEvent, EventLog};
 use crate::llm_client::LlmClient;
 use crate::skills::policy::SkillToolPolicy;
-use crate::subagent_runtime::{SubagentDebugEvent, SubagentDebugSnapshot, push_recent_debug_event};
+use crate::subagent_runtime::{push_recent_debug_event, SubagentDebugEvent, SubagentDebugSnapshot};
 use crate::tools::{Tool, ToolContext};
 
 pub struct BuiltSubagentSession {
@@ -328,28 +328,16 @@ pub fn build_subagent_session(
     let session_dir = crate::schema::StoragePaths::session_dir(&sub_session_id);
     let _ = std::fs::create_dir_all(&session_dir);
     let transcript_path = session_dir.join("transcript.json");
-    let mut context = AgentContext::new().with_transcript_path(transcript_path);
+    let mut context = AgentContext::new_subagent().with_transcript_path(transcript_path);
     context.max_history_tokens = llm.context_window();
 
-    let mut prompt = "You are a delegated sub-agent. Complete the assigned goal with the available tools, then call `finish_task`.".to_string();
+    let mut prompt = String::new();
     if !parent_context_text.trim().is_empty() {
-        prompt.push_str(&format!(
-            "\nParent context:\n{}",
-            parent_context_text.trim()
-        ));
+        prompt.push_str(&format!("Parent context:\n{}", parent_context_text.trim()));
     }
-    prompt.push_str(
-        "\n\nDelegated sub-agents must not ask the user questions directly.\nBe concise.",
-    );
-
-    if let Ok(memory) = std::fs::read_to_string("MEMORY.md") {
-        prompt.push_str(&format!("\n\nWorkspace Memory:\n{}", memory));
+    if !prompt.is_empty() {
+        context.system_prompts.push(prompt);
     }
-    if let Ok(agents_md) = std::fs::read_to_string("AGENTS.md") {
-        prompt.push_str(&format!("\n\nAgent Guidelines:\n{}", agents_md));
-    }
-
-    context.system_prompts.push(prompt);
 
     let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
     let telemetry = Arc::new(telemetry);
@@ -687,6 +675,13 @@ mod tests {
 
         let mut agent = built.agent_loop;
         let _ = agent.step("inspect".to_string()).await.unwrap();
+
+        let system = llm.last_system.lock().unwrap().clone().unwrap_or_default();
+        assert!(system.contains("delegated sub-agent"));
+        assert!(system.contains("repo context"));
+        assert!(system.contains("### AGENTS.md"));
+        assert!(!system.contains("elite, industrial-grade Senior Software Engineer"));
+        assert!(!system.contains("Autonomy Protocol"));
 
         let tool_names = llm.last_tools.lock().unwrap().clone();
         assert!(tool_names.contains(&"read_file".to_string()));
