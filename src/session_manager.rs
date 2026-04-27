@@ -182,14 +182,16 @@ impl SessionManager {
                 .clone()
         };
         let agent = crate::session::factory::build_agent_session(
-            session_id,
-            reply_to,
-            llm,
-            tools,
-            subagent_runtime,
-            transcript_path.clone(),
-            output,
-            self.code_mode_format,
+            crate::session::factory::AgentSessionConfig {
+                session_id: session_id.to_string(),
+                reply_to: reply_to.to_string(),
+                llm,
+                tools,
+                subagent_runtime,
+                transcript_path: transcript_path.clone(),
+                output,
+                code_mode_format: self.code_mode_format,
+            }
         )?;
         let loaded_turns = agent.lock().await.context.dialogue_history.len();
         self.registry
@@ -889,7 +891,7 @@ mod tests {
 
         let tool_results = output.tool_results();
         let result_payloads = extract_tool_payloads(&tool_results, "subagent");
-        assert!(result_payloads.len() >= 1);
+        assert!(!result_payloads.is_empty());
         assert!(
             result_payloads
                 .iter()
@@ -949,7 +951,7 @@ mod tests {
 
         let tool_results = output.tool_results();
         let result_payloads = extract_tool_payloads(&tool_results, "subagent");
-        assert!(result_payloads.len() >= 1);
+        assert!(!result_payloads.is_empty());
         assert!(result_payloads
             .iter()
             .any(|p| p.get("status").and_then(Value::as_str) == Some("failed")));

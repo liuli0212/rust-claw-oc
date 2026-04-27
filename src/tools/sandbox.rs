@@ -338,6 +338,7 @@ impl OsSandbox {
         None
     }
 
+    #[cfg(target_os = "macos")]
     fn find_sandbox_exec() -> Option<PathBuf> {
         let p = PathBuf::from("/usr/bin/sandbox-exec");
         p.exists().then_some(p)
