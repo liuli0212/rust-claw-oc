@@ -32,6 +32,11 @@ pub struct PromptReport {
     pub detailed_stats: DetailedContextStats,
 }
 
+struct WorkspacePromptParts {
+    project_context: String,
+    durable_memory: Option<String>,
+}
+
 pub(crate) fn build_prompt_sections(ctx: &AgentContext) -> (String, DetailedContextStats) {
     let bpe = AgentContext::get_bpe();
     let mut stats = DetailedContextStats::default();
@@ -66,21 +71,8 @@ pub(crate) fn build_prompt_sections(ctx: &AgentContext) -> (String, DetailedCont
         }
     }
 
-    let mut project_context = String::new();
-    if stats.system_task_plan == 0 {
-        project_context.push_str("### Task Planning\n");
-        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n\n");
-    }
-    if let Ok(content) = fs::read_to_string("AGENTS.md") {
-        project_context.push_str("### AGENTS.md\n");
-        project_context.push_str(&AgentContext::truncate_chars(&content, 3_000));
-        project_context.push_str("\n\n");
-    }
-    if let Ok(content) = fs::read_to_string("MEMORY.md") {
-        project_context.push_str("### MEMORY.md\n");
-        project_context.push_str(&AgentContext::truncate_chars(&content, 1_500));
-        project_context.push_str("\n\n");
-    }
+    let workspace = build_workspace_prompt_parts(stats.system_task_plan == 0);
+    let project_context = workspace.project_context_with_inline_memory();
     if let Some(section) = build_prompt_section("Project Context", project_context, 7_000) {
         stats.system_project = bpe.encode_with_special_tokens(&section).len();
         sections.push(section);
@@ -161,6 +153,38 @@ fn build_prompt_section(title: &str, content: String, max_chars: usize) -> Optio
     Some(format!("## {title}\n{truncated}\n"))
 }
 
+fn build_workspace_prompt_parts(include_task_planning: bool) -> WorkspacePromptParts {
+    let mut project_context = String::new();
+
+    if include_task_planning {
+        project_context.push_str("### Task Planning\n");
+        project_context.push_str("If the user request is complex (e.g. multi-step refactoring, new feature implementation), you MUST use the `task_plan` tool immediately to create a structured plan (action='add').\n\n");
+    }
+
+    if let Ok(content) = fs::read_to_string("AGENTS.md") {
+        project_context.push_str("### AGENTS.md\n");
+        project_context.push_str(&AgentContext::truncate_chars(&content, 3_000));
+        project_context.push_str("\n\n");
+    }
+
+    WorkspacePromptParts {
+        project_context,
+        durable_memory: fs::read_to_string("MEMORY.md").ok(),
+    }
+}
+
+impl WorkspacePromptParts {
+    fn project_context_with_inline_memory(&self) -> String {
+        let mut project_context = self.project_context.clone();
+        if let Some(content) = &self.durable_memory {
+            project_context.push_str("### MEMORY.md\n");
+            project_context.push_str(&AgentContext::truncate_chars(content, 1_500));
+            project_context.push_str("\n\n");
+        }
+        project_context
+    }
+}
+
 pub(crate) fn build_llm_payload(
     ctx: &AgentContext,
     task_state: &crate::task_state::TaskStateSnapshot,
@@ -198,60 +222,24 @@ pub(crate) fn build_llm_payload(
     }
 
     let mut system_static = Vec::new();
-    system_static.push(ctx.system_prompts.join(
-        "
-
-",
-    ));
+    system_static.push(ctx.system_prompts.join("\n\n"));
 
     let mut runtime = format!(
-        "OS: {}
-Architecture: {}
-",
+        "OS: {}\nArchitecture: {}\n",
         std::env::consts::OS,
         std::env::consts::ARCH
     );
     if let Ok(dir) = std::env::current_dir() {
-        runtime.push_str(&format!(
-            "Current Directory: {}
-",
-            dir.display()
-        ));
+        runtime.push_str(&format!("Current Directory: {}\n", dir.display()));
     }
-    system_static.push(format!(
-        "## Runtime Environment
-{}",
-        runtime
-    ));
+    system_static.push(format!("## Runtime Environment\n{}", runtime));
 
     if let Ok(custom) = fs::read_to_string(".claw_prompt.md") {
-        system_static.push(format!(
-            "## Custom Instructions
-{}",
-            custom
-        ));
+        system_static.push(format!("## Custom Instructions\n{}", custom));
     }
 
-    let mut project_context = String::new();
-    if let Ok(content) = fs::read_to_string("AGENTS.md") {
-        project_context.push_str(
-            "### AGENTS.md
-",
-        );
-        project_context.push_str(&AgentContext::truncate_chars(&content, 3_000));
-        project_context.push_str(
-            "
-
-",
-        );
-    }
-    system_static.push(format!(
-        "## Project Context
-{}",
-        project_context
-    ));
-
-    let durable_memory = fs::read_to_string("MEMORY.md").ok();
+    let workspace = build_workspace_prompt_parts(false);
+    system_static.push(format!("## Project Context\n{}", workspace.project_context));
 
     let mut active_evidence = ctx.active_evidence.clone();
     if let Some(mem) = &ctx.retrieved_memory {
@@ -273,13 +261,9 @@ Architecture: {}
         ));
     let system_assembler = crate::context_assembler::ContextAssembler::new(system_budget);
     let (assembled_system_text, report_data) = system_assembler.assemble_prompt(
-        &system_static.join(
-            "
-
-",
-        ),
+        &system_static.join("\n\n"),
         "",
-        durable_memory.as_deref(),
+        workspace.durable_memory.as_deref(),
         ctx.skill_contract.as_deref(),
         ctx.skill_instructions.as_deref(),
         ctx.skill_state_summary.as_deref(),
