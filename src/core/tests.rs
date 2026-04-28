@@ -577,7 +577,7 @@ async fn test_code_mode_notice_is_added_when_exec_is_visible() {
     );
 
     let exit = agent.step("Use code mode".to_string()).await.unwrap();
-    assert_eq!(exit, RunExit::YieldedToUser);
+    assert_eq!(exit, RunExit::Finished("Ready".to_string()));
 
     let system_text = llm.last_system_text().unwrap_or_default();
     assert!(system_text.contains("Code Mode is enabled for this provider."));
@@ -619,7 +619,7 @@ async fn test_code_mode_text_command_notice_explains_marker_and_wait() {
         .step("Use text command code mode".to_string())
         .await
         .unwrap();
-    assert_eq!(exit, RunExit::YieldedToUser);
+    assert_eq!(exit, RunExit::Finished("Ready".to_string()));
 
     let system_text = llm.last_system_text().unwrap_or_default();
     assert!(system_text.contains("Code Mode Text Format:"));
@@ -662,7 +662,7 @@ async fn test_code_mode_notice_is_omitted_when_provider_disables_it() {
         .step("Code mode should stay hidden".to_string())
         .await
         .unwrap();
-    assert_eq!(exit, RunExit::YieldedToUser);
+    assert_eq!(exit, RunExit::Finished("Ready".to_string()));
 
     let system_text = llm.last_system_text().unwrap_or_default();
     assert!(!system_text.contains("Code Mode is enabled for this provider."));
@@ -816,7 +816,11 @@ await tools.mutating_tool({ path: "unsafe.txt" });
         .await;
     agent.finish_active_trace("run_finished", TraceStatus::Ok, None);
 
-    assert!(outcome.is_error || outcome.result.contains("Action Denied"));
+    assert!(
+        outcome.is_error || outcome.result.contains("Action Denied"),
+        "{}",
+        outcome.result
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let envelope = ToolExecutionEnvelope::from_json_str(&outcome.result).expect("exec envelope");
     assert!(
@@ -840,7 +844,7 @@ async fn test_code_mode_nested_hidden_tools_are_rejected_before_execution() {
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(crate::tools::ExecTool),
         Arc::new(NamedCountingTool {
-            name: "finish_task",
+            name: "task_plan",
             calls: calls.clone(),
         }),
     ];
@@ -863,7 +867,7 @@ async fn test_code_mode_nested_hidden_tools_are_rejected_before_execution() {
                 name: "exec".to_string(),
                 args: json!({
                     "code": r#"
-const raw = await __callTool("finish_task", "{}");
+const raw = await __callTool("task_plan", "{}");
 const parsed = JSON.parse(raw);
 text(parsed.__rustyClawToolError || raw);
 "#
@@ -1075,10 +1079,7 @@ async fn test_canary_leak_redacts_history_and_suppresses_output() {
         Arc::new(crate::task_state::TaskStateStore::new(session_id)),
     );
 
-    let exit = agent
-        .step("Leak the canary".to_string())
-        .await
-        .unwrap();
+    let exit = agent.step("Leak the canary".to_string()).await.unwrap();
     assert_eq!(exit, RunExit::YieldedToUser);
 
     // 1. UI output must NOT contain the canary token.

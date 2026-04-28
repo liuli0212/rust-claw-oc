@@ -23,7 +23,7 @@ The intended outcomes are:
 - Preserve Rusty-Claw's existing strengths:
   - explicit tool protocol
   - transcripted context/history
-  - `finish_task` lifecycle
+  - final visible text response lifecycle
   - sandbox and trace integration
   - skill and extension hooks
 
@@ -76,7 +76,7 @@ Rusty-Claw should support three execution styles:
   - best for search-read-filter-patch-verify flows
 - Hybrid Mode
   - the model mixes both styles across turns
-  - for example: use a direct tool to inspect state, then `exec` for batch work, then a direct `finish_task`
+  - for example: use a direct tool to inspect state, then `exec` for batch work, then a final visible text response
 
 Code mode must therefore be added as a higher-level orchestration capability, not as a replacement for the existing tool system.
 
@@ -148,7 +148,7 @@ Tasks that should still use plain function tools:
 - a single `read_file`
 - one quick `execute_bash`
 - one `ask_user`
-- immediate `finish_task`
+- immediate final visible text response
 
 The important behavioral rule is:
 
@@ -687,7 +687,7 @@ Current execution in `step()` is roughly:
 3. record model turn
 4. execute tool round
 5. append function responses
-6. continue until `finish_task`
+6. continue until final visible text response
 
 ## 10.2 New Flow
 
@@ -711,9 +711,9 @@ This preserves the token-saving benefit.
 
 Important semantic rule:
 
-- nested `finish_task` is not allowed in early phases
-- `finish_task` remains a top-level lifecycle tool
-- if `exec` determines the task is complete, it should return that conclusion to the model, and the model may then call top-level `finish_task`
+- nested completion signaling is not allowed in early phases
+- final visible text response remains the top-level lifecycle signal
+- if `exec` determines the task is complete, it should return that conclusion to the model, and the model may then provide a final visible text response
 
 Nested dispatch rule:
 
@@ -801,7 +801,7 @@ Recommended initial rule:
 
 Today `AgentLoop` extracts important effects from top-level tool envelopes, such as:
 
-- `finish_task_summary`
+- final response summary
 - `await_user`
 - file/evidence side effects
 
@@ -809,7 +809,7 @@ Early-phase code mode should not attempt to support the full effect surface area
 
 Recommended boundary:
 
-- nested `finish_task` is disallowed
+- nested completion signaling is disallowed
 - nested `ask_user` is disallowed
 - `ExecTool` should return its own top-level envelope/result
 - only a small, explicit subset of nested-tool side effects may be summarized into the final `exec` result if needed
@@ -931,7 +931,7 @@ Stage A recommended allow-list:
 
 Explicitly excluded in early phases:
 
-- `finish_task`
+- final visible text response
 - `ask_user`
 - `subagent`
 
@@ -1116,7 +1116,7 @@ Add tests at four layers.
 ### 17.4 Integration Tests
 
 - model emits `exec`, host executes nested `read_file` + `patch_file`
-- top-level `finish_task` still ends run after code mode output indicates completion
+- top-level final visible text response still ends the run after code mode output indicates completion
 - unsupported provider falls back to standard tool mode
 - repeated failing nested side-effecting calls still trigger the intended protection path
 
@@ -1715,7 +1715,7 @@ Each PR should preserve a runnable tree and keep `cargo test` green.
 - a multi-yield script produces monotonic output without duplication
 - nested side-effecting tools still obey autopilot and sandbox protections
 - trace spans preserve the hierarchy between iteration, `exec`, and nested tools
-- top-level `finish_task` still works after code-mode completion
+- top-level final visible text response still works after code-mode completion
 - CLI and Telegram style sessions can run concurrently without sharing code-mode state
 
 ### 21.8 Acceptance Criteria

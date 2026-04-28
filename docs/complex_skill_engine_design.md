@@ -677,7 +677,7 @@ pub trait ToolPolicy: Send + Sync {
 
 复杂 skill 的 `allowed_tools` 只对白名单内工具开放，并额外允许少数 runtime 必备工具：
 
-- `finish_task` 或其 skill completion 等价机制
+- final visible text response 或其 skill completion 等价机制
 - `ask_user_question`
 - `dispatch_subagent`，仅当 skill constraints 允许
 
@@ -894,7 +894,7 @@ pub struct SkillConstraints {
 当 skill 处于 `DesignDocOnly` 模式时：
 
 1. 禁止暴露写代码相关工具（`write_file`、`patch_file`），或将其限制到设计文档路径
-2. `finish_task` 前必须存在有效 artifact
+2. final visible text response 前必须存在有效 artifact
 3. 若模型尝试进入实现路径，则返回 system denial
 
 ## 13. 目录与模块建议

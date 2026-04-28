@@ -1,10 +1,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::skills::definition::SkillDef;
 use crate::skills::policy::SkillToolPolicy;
@@ -574,10 +574,8 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error.kind, DelegationFailureKind::PolicyDenied));
-        assert!(
-            error
-                .message
-                .contains("must declare explicit allowed_tools")
-        );
+        assert!(error
+            .message
+            .contains("must declare explicit allowed_tools"));
     }
 }

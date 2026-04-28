@@ -144,7 +144,6 @@ pub struct ToolEffects {
     pub evidence_summary: Option<String>,
     pub payload_kind: Option<String>,
     pub invalidate_diagnostic_evidence: bool,
-    pub finish_task_summary: Option<String>,
     /// If set, the tool is requesting that execution pause for user input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub await_user: Option<UserPromptRequest>,
@@ -196,7 +195,6 @@ impl ToolExecutionEnvelope {
                 payload_kind: get_string(obj, "payload_kind"),
                 invalidate_diagnostic_evidence: get_bool(obj, "invalidate_diagnostic_evidence")
                     .unwrap_or(false),
-                finish_task_summary: get_string(obj, "finish_task_summary"),
                 await_user: obj
                     .get("await_user")
                     .cloned()
@@ -272,11 +270,6 @@ impl StructuredToolOutput {
 
     pub fn with_payload_kind(mut self, kind: impl Into<String>) -> Self {
         self.effects.payload_kind = Some(kind.into());
-        self
-    }
-
-    pub fn with_finish_task_summary(mut self, summary: impl Into<String>) -> Self {
-        self.effects.finish_task_summary = Some(summary.into());
         self
     }
 
@@ -400,6 +393,5 @@ mod tests {
         assert_eq!(envelope.effects.evidence_source_path, None);
         assert_eq!(envelope.effects.evidence_summary, None);
         assert!(!envelope.effects.invalidate_diagnostic_evidence);
-        assert_eq!(envelope.effects.finish_task_summary, None);
     }
 }

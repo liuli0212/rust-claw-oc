@@ -145,9 +145,7 @@ pub async fn run_headless_command(
 
     match agent_guard.step(command).await {
         Ok(exit) => match exit {
-            RunExit::Finished(summary) => {
-                println!("\n{}", style(summary).green().bold());
-            }
+            RunExit::Finished(_) => {}
             RunExit::RecoverableFailed(msg) => {
                 eprintln!("\n  {} Error: {}", style("⚠️").yellow(), msg);
                 std::process::exit(1);
@@ -379,8 +377,7 @@ async fn run_cli_agent_step(
             RunExit::YieldedToUser => {
                 println!();
             }
-            RunExit::Finished(ref summary) => {
-                println!("\n{}", style(summary).green().bold());
+            RunExit::Finished(_) => {
                 println!(
                     "  {} {}",
                     style("✔").green().bold(),

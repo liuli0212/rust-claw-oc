@@ -60,7 +60,9 @@ const FORM_FIELD_ROLES: &[&str] = &[
 ];
 
 /// Extract the string value from an `AxValue`, if present.
-fn ax_value_str(val: &Option<chromiumoxide::cdp::browser_protocol::accessibility::AxValue>) -> String {
+fn ax_value_str(
+    val: &Option<chromiumoxide::cdp::browser_protocol::accessibility::AxValue>,
+) -> String {
     val.as_ref()
         .and_then(|v| v.value.as_ref())
         .and_then(|v| v.as_str())
@@ -127,7 +129,10 @@ pub(crate) fn build_snapshot(
         for el in &mut elements {
             let el_text = format!("{} {} {}", el.role, el.name, el.value).to_lowercase();
             let el_tokens = tokenize(&el_text);
-            el.score = el_tokens.iter().filter(|t| hint_tokens.contains(*t)).count();
+            el.score = el_tokens
+                .iter()
+                .filter(|t| hint_tokens.contains(*t))
+                .count();
             // Form fields get a bonus so they're never filtered out.
             if el.is_form_field {
                 el.score += 100;
@@ -152,7 +157,12 @@ pub(crate) fn build_snapshot(
             if el.name.is_empty() {
                 format!("[{}] {}", display_id, el.role)
             } else {
-                format!("[{}] {} \"{}\"", display_id, el.role, truncate_name(&el.name, 80))
+                format!(
+                    "[{}] {} \"{}\"",
+                    display_id,
+                    el.role,
+                    truncate_name(&el.name, 80)
+                )
             }
         } else {
             format!(
@@ -170,11 +180,14 @@ pub(crate) fn build_snapshot(
 
         char_count += line.len() + 1; // +1 for newline
         lines.push(line);
-        node_map.insert(display_id, ElementRef {
-            backend_node_id: el.backend_node_id,
-            role: el.role.clone(),
-            name: el.name.clone(),
-        });
+        node_map.insert(
+            display_id,
+            ElementRef {
+                backend_node_id: el.backend_node_id,
+                role: el.role.clone(),
+                name: el.name.clone(),
+            },
+        );
         included += 1;
     }
 
@@ -295,7 +308,13 @@ mod tests {
     #[test]
     fn respects_max_chars_limit() {
         let nodes: Vec<AxNode> = (0..200)
-            .map(|i| make_node("link", &format!("A very long link name number {}", i), i as i64 + 1))
+            .map(|i| {
+                make_node(
+                    "link",
+                    &format!("A very long link name number {}", i),
+                    i as i64 + 1,
+                )
+            })
             .collect();
 
         let result = build_snapshot(&nodes, None, 200, 500);

@@ -103,10 +103,6 @@ impl TuiOutput {
         }
     }
 
-    fn print_markdown(&self, text: &str) {
-        self.skin.print_text(text);
-    }
-
     fn flush_line_buffer(&self) {
         let mut buffer_guard = self.line_buffer.lock().unwrap();
         if !buffer_guard.is_empty() {
@@ -531,20 +527,13 @@ impl AgentOutput for TuiOutput {
         self.render_dashboard();
     }
 
-    async fn on_task_finish(&self, summary: &str) {
+    async fn on_task_finish(&self, _summary: &str) {
         self.stop_spinner();
         {
             let mut guard = self.task_state.lock().unwrap();
             *guard = None;
         }
         self.flush_line_buffer();
-        println!(
-            "\n{} {}\n",
-            Emoji("🎉", "*"),
-            style("Task Completed!").green().bold()
-        );
-        self.print_markdown(summary);
-        println!();
     }
 }
 

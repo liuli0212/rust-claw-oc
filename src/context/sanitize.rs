@@ -131,10 +131,8 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
         }
         (Some("browser_snapshot"), _) | (_, "browser") => {
             let element_count = envelope.result.output.lines().count();
-            envelope.result.output = format!(
-                "[browser snapshot stripped - {} elements]",
-                element_count
-            );
+            envelope.result.output =
+                format!("[browser snapshot stripped - {} elements]", element_count);
         }
         (Some("skill"), _) | (_, "skill" | "use_skill") => {
             envelope.result.output = "Skill loaded.".to_string();
@@ -181,15 +179,14 @@ mod tests {
     #[test]
     fn strip_response_payload_uses_envelope_metadata() {
         let mut response = FunctionResponse {
-            name: "finish_task".to_string(),
+            name: "read_file".to_string(),
             id: None,
             response: serde_json::json!({
                 "result": serde_json::json!({
                     "ok": true,
                     "tool_name": "read_file",
                     "output": "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11",
-                    "evidence_kind": "file",
-                    "finish_task_summary": "done"
+                    "evidence_kind": "file"
                 }).to_string()
             }),
         };
@@ -199,7 +196,6 @@ mod tests {
         let result = response.response["result"].as_str().unwrap();
         assert!(result.contains("line1"));
         assert!(result.contains("stripped 11 lines"));
-        assert!(result.contains("\"finish_task_summary\":\"done\""));
     }
 
     #[test]

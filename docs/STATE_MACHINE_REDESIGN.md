@@ -15,9 +15,9 @@ The control over the execution loop is handed over entirely to the LLM via its J
 
 ### Core Architecture Changes
 
-1. **Introduction of `finish_task` Tool**:
-   - A new native tool `finish_task(reason: String)` is injected into the context.
-   - The LLM is explicitly instructed in the System Prompt: *"You must call `finish_task` when you are absolutely done with the request."*
+1. **Final visible text response as the completion signal**:
+   - No native completion tool is injected into the context.
+   - The LLM is explicitly instructed in the System Prompt: *"When you are absolutely done with the request, stop calling tools and provide the final answer as visible text."*
 
 2. **Removal of Heuristics**:
    - `is_complex_task` and `is_task_complete` text-parsing functions are completely removed.
@@ -25,19 +25,18 @@ The control over the execution loop is handed over entirely to the LLM via its J
 
 3. **Deterministic Exit Conditions**:
    The `AgentLoop::step` loop will **ONLY** exit under three strict conditions:
-   - **Success**: The LLM explicitly calls the `finish_task` tool.
+   - **Success**: The LLM emits a final visible text response with no tool calls.
    - **Timeout/Limits**: The loop reaches the hardcoded maximum iteration limit (e.g., 15 iterations) to prevent infinite loops.
    - **Error**: A fatal API or network error occurs.
 
 4. **Handling "Talk-Only" Iterations (The Safety Net)**:
-   If the LLM outputs text but fails to call *any* tools (neither working tools nor `finish_task`), the system will **NOT** exit. Instead, it will automatically inject a synthetic user prompt:
-   > *"You did not call any tools. If the task is incomplete, please proceed with your next tool call. If the task is fully completed, you MUST call the `finish_task` tool to exit."*
+   If the LLM outputs no visible text and calls no tools, the system yields to the user instead of guessing completion. A non-empty visible text response with no tool calls is treated as the final answer.
    
    This ensures the LLM has the freedom to dedicate an entire iteration just to explaining complex concepts to the user, without fear of the system abruptly shutting down.
 
 ## Implementation Steps
-1. Add `FinishTaskTool` to `src/tools.rs`.
-2. Register `FinishTaskTool` in `src/main.rs` alongside other native tools.
-3. Update `SystemPrompt` in `src/context.rs` to enforce the usage of `finish_task`.
+1. Remove the native completion tool from the tool registry.
+2. Update `AgentLoop::step` so a non-empty visible text response with no tool calls completes the run.
+3. Update `SystemPrompt` in `src/context.rs` to document final visible text completion.
 4. Gut the heuristic exit logic from `src/core.rs` (`is_complex_task`, `progress_decision_summary`, etc.).
-5. Simplify the `AgentLoop::step` `while` loop to only break upon encountering the `finish_task` tool name.
+5. Simplify the `AgentLoop::step` `while` loop to break on the final visible text completion path.

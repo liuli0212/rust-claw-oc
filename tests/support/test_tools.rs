@@ -62,11 +62,8 @@ impl Tool for MockTool {
 
         match result {
             Ok(res) => {
-                let mut output =
+                let output =
                     StructuredToolOutput::new(&self.name, true, res.clone(), Some(0), None, false);
-                if self.name == "finish_task" {
-                    output = output.with_finish_task_summary(res);
-                }
                 Ok(output.to_json_string().unwrap())
             }
             Err(err) => Err(ToolError::ExecutionFailed(err)),

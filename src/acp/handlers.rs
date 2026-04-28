@@ -102,9 +102,11 @@ pub(super) async fn handle_run(
                 agent.update_output(output);
                 match agent.step(task).await {
                     Ok(exit) => {
+                        if matches!(exit, crate::core::RunExit::Finished(_)) {
+                            return;
+                        }
                         let _ = tx_for_run.send(AcpEvent::Finish {
                             summary: match &exit {
-                                crate::core::RunExit::Finished(s) => s.clone(),
                                 crate::core::RunExit::YieldedToUser => {
                                     "Agent is waiting for your input.".to_string()
                                 }

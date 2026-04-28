@@ -10,6 +10,7 @@ pub struct CaptureOutput {
     pub tool_starts: Arc<Mutex<Vec<(String, String)>>>,
     pub tool_ends: Arc<Mutex<Vec<String>>>,
     pub errors: Arc<Mutex<Vec<String>>>,
+    pub task_finishes: Arc<Mutex<Vec<String>>>,
 }
 
 impl CaptureOutput {
@@ -37,5 +38,9 @@ impl AgentOutput for CaptureOutput {
     }
     async fn on_error(&self, error: &str) {
         self.errors.lock().await.push(error.to_string());
+    }
+
+    async fn on_task_finish(&self, summary: &str) {
+        self.task_finishes.lock().await.push(summary.to_string());
     }
 }

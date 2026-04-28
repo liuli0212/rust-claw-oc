@@ -8,8 +8,8 @@ use tokio::sync::RwLock;
 
 use crate::core::extensions::{ExecutionExtension, ExtensionDecision, FinishDecision, PromptDraft};
 use crate::delegation::{DelegationContext, DelegationSessionSeed};
-use crate::tools::Tool;
 use crate::tools::protocol::ToolExecutionEnvelope;
+use crate::tools::Tool;
 
 use super::arguments::{
     format_prompt_argument_sections, parse_invocation_args, validate_json_args,
@@ -104,7 +104,7 @@ impl SkillRuntime {
         let mut notes = Vec::new();
         if def.meta.output_mode.is_some() {
             notes.push(
-                "Legacy `output_mode` is ignored at runtime; rely on instructions and finish_task."
+                "Legacy `output_mode` is ignored at runtime; rely on instructions and a final text response."
                     .to_string(),
             );
         }
@@ -579,14 +579,14 @@ mod tests {
             Arc::new(MockTool("read_file".to_string())),
             Arc::new(MockTool("write_file".to_string())),
             Arc::new(MockTool("ask_user_question".to_string())),
-            Arc::new(MockTool("finish_task".to_string())),
+            Arc::new(MockTool("task_plan".to_string())),
         ];
 
         let filtered = rt.before_tool_resolution(tools).await;
         let names: Vec<String> = filtered.iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"ask_user_question".to_string()));
-        assert!(names.contains(&"finish_task".to_string()));
+        assert!(names.contains(&"task_plan".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
     }
 

@@ -2,21 +2,21 @@ use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
-use schemars::{JsonSchema, schema_for};
+use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use super::protocol::{StructuredToolOutput, Tool, ToolError, clean_schema};
+use super::protocol::{clean_schema, StructuredToolOutput, Tool, ToolError};
 use crate::delegation::{
-    DelegationBudget, DelegationSessionSeed, MAX_DELEGATION_CALLS_PER_ROOT_REQUEST,
-    SkillDelegationRequest, effective_limits, resolve_skill_delegation,
+    effective_limits, resolve_skill_delegation, DelegationBudget, DelegationSessionSeed,
+    SkillDelegationRequest, MAX_DELEGATION_CALLS_PER_ROOT_REQUEST,
 };
 use crate::skills::arguments::validate_json_args;
 use crate::skills::policy::SkillToolPolicy;
 use crate::skills::registry::SkillRegistry;
 use crate::subagent_runtime::{
-    DEFAULT_SUBAGENT_MAX_STEPS, DEFAULT_SUBAGENT_TIMEOUT_SEC, SubagentExecutionOrigin,
-    SubagentExecutionRequest, SubagentRuntime, SubagentSkillOrigin,
+    SubagentExecutionOrigin, SubagentExecutionRequest, SubagentRuntime, SubagentSkillOrigin,
+    DEFAULT_SUBAGENT_MAX_STEPS, DEFAULT_SUBAGENT_TIMEOUT_SEC,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -424,12 +424,12 @@ mod tests {
     use serial_test::serial;
     use tokio::sync::mpsc;
 
-    use crate::context::{FunctionCall, Message};
+    use crate::context::Message;
     use crate::delegation::DelegationContext;
     use crate::llm_client::{LlmClient, LlmError, StreamEvent};
     use crate::schema::StoragePaths;
     use crate::tools::protocol::{ToolContext, ToolExecutionEnvelope};
-    use crate::trace::{RecordQuery, RunSummary, find_run_for_subsession, get_records, get_run};
+    use crate::trace::{find_run_for_subsession, get_records, get_run, RecordQuery, RunSummary};
 
     fn make_ctx() -> ToolContext {
         ToolContext::new("parent", "cli")
@@ -503,14 +503,7 @@ mod tests {
             _tools: Vec<Arc<dyn Tool>>,
         ) -> Result<mpsc::Receiver<StreamEvent>, LlmError> {
             let (tx, rx) = mpsc::channel(4);
-            let _ = tx.try_send(StreamEvent::ToolCall(
-                FunctionCall {
-                    name: "finish_task".to_string(),
-                    args: json!({ "summary": "done" }),
-                    id: Some("tc_1".to_string()),
-                },
-                None,
-            ));
+            let _ = tx.try_send(StreamEvent::Text("done".to_string()));
             let _ = tx.try_send(StreamEvent::Done);
             Ok(rx)
         }
@@ -745,12 +738,10 @@ mod tests {
             .unwrap();
         let payload = parse_payload(&output);
         assert_eq!(payload["ok"], Value::Bool(false));
-        assert!(
-            payload["summary"]
-                .as_str()
-                .unwrap()
-                .contains("timed out after 1s")
-        );
+        assert!(payload["summary"]
+            .as_str()
+            .unwrap()
+            .contains("timed out after 1s"));
     }
 
     #[tokio::test]
@@ -898,11 +889,9 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("Nested delegation budget exceeded")
-        );
+        assert!(error
+            .to_string()
+            .contains("Nested delegation budget exceeded"));
     }
 
     #[tokio::test]

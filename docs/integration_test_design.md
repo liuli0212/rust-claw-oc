@@ -153,7 +153,7 @@
 每个测试场景由固定脚本描述，例如：
 
 1. 第一轮请求到来时，调用 `write_file`
-2. 收到 `write_file` 工具结果后，调用 `finish_task`
+2. 收到 `write_file` 工具结果后，输出最终可见文本
 
 这样可以把真实缺陷快速沉淀为稳定的回放场景。
 
@@ -164,7 +164,7 @@
 1. 单轮工具调用成功
 2. 多轮工具调用
 3. 工具调用失败后恢复
-4. `finish_task` 正常结束
+4. final visible text response 正常结束
 5. transcript/session 恢复
 6. 取消当前任务
 7. 背景 subagent 的创建、收集、取消
@@ -191,7 +191,7 @@
 - `write_file`
 - `patch_file`
 - `execute_bash`
-- `finish_task`
+- final visible text response
 - `send_telegram_message`
 - `task_plan`
 - subagent 相关工具
@@ -263,7 +263,7 @@ Telegram 第一阶段不做完整 Bot API mock。
   - 注册真实 `WriteFileTool`
 - LLM 脚本：
   - 第一步调用 `write_file`
-  - 第二步调用 `finish_task`
+  - 第二步输出最终可见文本
 - Assert：
   - 文件存在
   - 文件内容正确
@@ -277,7 +277,7 @@ Telegram 第一阶段不做完整 Bot API mock。
 - LLM 脚本：
   - 第一步调用 `read_file`
   - 第二步调用 `write_file`
-  - 第三步调用 `finish_task`
+  - 第三步输出最终可见文本
 - Assert：
   - 输出文件内容符合预期
   - 历史里包含工具往返
@@ -289,7 +289,7 @@ Telegram 第一阶段不做完整 Bot API mock。
 - LLM 脚本：
   - 第一步调用失败工具
   - 第二步根据错误改用正确工具
-  - 第三步 `finish_task`
+  - 第三步输出最终可见文本
 - Assert：
   - 中间错误被记录
   - 最终任务仍能成功结束
@@ -312,7 +312,7 @@ Telegram 第一阶段不做完整 Bot API mock。
   - 注册返回超大字符串的测试工具
 - LLM 脚本：
   - 先调用大输出工具
-  - 再基于其结果调用 `finish_task`
+  - 再基于其结果输出最终可见文本
 - Assert：
   - 当前 turn 被压缩/截断
   - agent 没有因历史过大而崩溃

@@ -446,17 +446,10 @@ impl AgentOutput for TelegramOutput {
         }
     }
 
-    async fn on_task_finish(&self, summary: &str) {
+    async fn on_task_finish(&self, _summary: &str) {
         self.flush().await;
 
-        let lines = [
-            "🎉 *Task Completed*".to_string(),
-            String::new(),
-            Self::escape_markdown_v2(summary),
-        ];
-
-        let text = lines.join("\n");
-        self.send_long_message(&text, Some(ParseMode::MarkdownV2))
+        self.send_long_message("✅ *Task Completed*", Some(ParseMode::MarkdownV2))
             .await;
 
         let mut active_msg_id = self.active_plan_message_id.lock().await;

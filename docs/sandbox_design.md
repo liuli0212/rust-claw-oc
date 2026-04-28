@@ -164,7 +164,7 @@ pub trait Tool: Send + Sync {
     fn has_side_effects(&self) -> bool { true }
 
     /// 声明该工具需要的沙箱策略。
-    /// 返回 None 表示该工具不需要沙箱（如 task_plan, finish_task）。
+    /// 返回 None 表示该工具不需要沙箱（如 task_plan）。
     fn sandbox_policy(&self) -> Option<SandboxPolicy> {
         None  // 默认不要求沙箱，保持向后兼容
     }
@@ -726,7 +726,7 @@ async fn test_bash_tool_can_write_to_workdir_in_sandbox() {
 | `write_memory` | P2 | 路径级 | Unrestricted | check_path_access（限定 sessions/ 下） |
 | `rag_insert` | P2 | 路径级 | Unrestricted | check_path_access |
 | `task_plan` | - | 无 | - | 纯内存操作，无需沙箱 |
-| `finish_task` | - | 无 | - | 纯内存操作，无需沙箱 |
+| final visible text completion | - | 无 | - | 纯内存状态更新，无需沙箱 |
 | `ask_user` | - | 无 | - | 仅 UI 交互，无需沙箱 |
 | `dispatch_subagent` | P2 | 继承 | 从父级继承 | 策略透传 + 收紧 |
 | `spawn_subagent` | P2 | 继承 | 从父级继承 | 策略透传 + 收紧 |

@@ -56,7 +56,7 @@ if !state.constraints.allow_subagents {
 
 ---
 
-### [BUG-3] Skill 在 `finish_task` 后从不被 deactivate
+### [BUG-3] Skill 在 final visible text response 后从不被 deactivate
 
 **文件**: `src/skills/runtime.rs:74-85`, `src/core.rs:674-691`
 
