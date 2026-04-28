@@ -232,8 +232,9 @@ pub(crate) async fn dispatch_tool_call(
                 summary.truncated,
             )
             .with_payload_kind("code_mode_exec")
+            .with_untrusted_output("code_mode_exec")
             .to_json_string()
-            .unwrap_or_else(|err| format!("Tool error: {}", err));
+            .expect("code-mode tool envelope serialization should not fail");
 
             ToolDispatchOutcome {
                 result,
@@ -295,8 +296,9 @@ pub(crate) async fn dispatch_tool_call(
                 false,
             )
             .with_payload_kind("code_mode_exec")
+            .with_untrusted_output("code_mode_exec")
             .to_json_string()
-            .unwrap_or_else(|serialize_err| format!("Tool error: {}", serialize_err));
+            .expect("code-mode error envelope serialization should not fail");
 
             ToolDispatchOutcome {
                 result,
@@ -439,12 +441,7 @@ fn invalid_argument_outcome(
     )
     .with_payload_kind("code_mode_exec")
     .to_json_string()
-    .unwrap_or_else(|serialize_err| {
-        format!(
-            "Tool error: failed to serialize {} error envelope: {serialize_err}",
-            tool_name
-        )
-    });
+    .expect("code-mode invalid-argument envelope serialization should not fail");
 
     ToolDispatchOutcome {
         result,

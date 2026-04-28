@@ -20,6 +20,12 @@
     return result;
   }
 
+  function stringifyHostValue(value) {
+    const normalized = value === undefined ? null : value;
+    const serialized = JSON.stringify(normalized);
+    return serialized === undefined ? "null" : serialized;
+  }
+
   function enqueueDueTimers(timerIds) {
     for (const timerId of timerIds) {
       if (timerCallbacks.has(timerId) && !dueTimerIds.includes(timerId)) {
@@ -86,7 +92,7 @@
   globalThis.text = (value) => __text(String(value));
   globalThis.notify = (value) => __notify(String(value));
   globalThis.store = (key, value) =>
-    __store(String(key), JSON.stringify(value === undefined ? null : value));
+    __store(String(key), stringifyHostValue(value));
   globalThis.load = (key) => {
     const raw = __load(String(key));
     return raw == null ? undefined : JSON.parse(raw);
@@ -95,7 +101,7 @@
     throw { __rustyClawExit: true, value };
   };
   globalThis.flush = (value) => {
-    __flush(JSON.stringify(value));
+    __flush(stringifyHostValue(value));
   };
   globalThis.setTimeout = (callback, delayMs = 0) => {
     if (typeof callback !== "function") {

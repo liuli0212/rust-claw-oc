@@ -156,18 +156,20 @@ impl Tool for WebFetchTool {
         if !status.is_success() {
             let body_preview: String = raw_body.chars().take(max_chars).collect();
             let truncated = raw_body.chars().count() > max_chars;
-            let fenced = crate::security::fence_untrusted("web_fetch", &body_preview);
-            return serialize_tool_envelope(
+            return StructuredToolOutput::new(
                 "web_fetch",
                 false,
                 format!(
                     "Failed to fetch URL. HTTP: {} | URL: {} | Body: {}",
-                    status, url, fenced
+                    status, url, body_preview
                 ),
                 Some(1),
                 Some(start.elapsed().as_millis()),
                 truncated,
-            );
+            )
+            .mark_untrusted()
+            .with_payload_kind("web_content")
+            .to_json_string();
         }
 
         let is_html =
@@ -213,15 +215,15 @@ impl Tool for WebFetchTool {
             (rendered, false)
         };
 
-        let content = crate::security::fence_untrusted("web_fetch", &raw_content);
         StructuredToolOutput::new(
             "web_fetch",
             true,
-            content,
+            raw_content,
             Some(0),
             Some(start.elapsed().as_millis()),
             truncated,
         )
+        .mark_untrusted()
         .with_payload_kind("web_content")
         .to_json_string()
     }
@@ -320,15 +322,15 @@ impl Tool for TavilySearchTool {
             );
         }
 
-        let fenced = crate::security::fence_untrusted("web_search", &json.to_string());
         StructuredToolOutput::new(
             "web_search",
             true,
-            fenced,
+            json.to_string(),
             Some(0),
             Some(start.elapsed().as_millis()),
             false,
         )
+        .mark_untrusted()
         .with_payload_kind("web_search")
         .to_json_string()
     }

@@ -9,10 +9,6 @@ impl CodeModeFormat {
     pub fn accepts_text_command(self) -> bool {
         matches!(self, Self::TextCommand)
     }
-
-    pub fn exposes_function_exec(self) -> bool {
-        matches!(self, Self::FunctionTool)
-    }
 }
 
 impl std::str::FromStr for CodeModeFormat {
@@ -37,7 +33,7 @@ pub fn execution_notice(available_tools: &[String], format: CodeModeFormat) -> S
             "If an `exec` result says the cell is still running, call `wait` to poll or sync that same cell. `wait` does not resume timers; it only syncs current state. Without `wait_timeout_ms`, `wait` blocks until the next update, completion, cancellation, or the cell runtime deadline."
         }
         CodeModeFormat::TextCommand => {
-            "In text command mode, the `// rusty-claw: exec` marker starts the code cell. If the synthesized `exec` result says the cell is still running, call the `wait` tool to poll or sync that same cell. `wait` does not resume timers; it only syncs current state. Without `wait_timeout_ms`, `wait` blocks until the next update, completion, cancellation, or the cell runtime deadline."
+            "In text command mode, the visible assistant text is the JavaScript source, but execution starts only when the same model turn also makes a real `exec` tool call with `code` set exactly to `__RUSTY_CLAW_TEXT_COMMAND__`. If the `exec` result says the cell is still running, call the `wait` tool to poll or sync that same cell. `wait` does not resume timers; it only syncs current state. Without `wait_timeout_ms`, `wait` blocks until the next update, completion, cancellation, or the cell runtime deadline."
         }
     };
 
@@ -59,30 +55,24 @@ pub fn execution_notice(available_tools: &[String], format: CodeModeFormat) -> S
         CodeModeFormat::TextCommand => {
             lines.extend([
                 "Code Mode Text Format:",
-                "When you choose Code Mode, your entire visible assistant message MUST be raw JavaScript.",
-                "The first non-empty visible line MUST be exactly:",
-                "  // rusty-claw: exec",
-                "Optional metadata comments may follow immediately after the marker:",
-                "  // auto_flush_ms=<milliseconds>",
-                "  // cell_timeout_ms=<milliseconds>",
-                "Then write normal JavaScript.",
+                "When you choose Code Mode, your visible assistant message MUST be raw JavaScript and the same model turn MUST also include a real `exec` tool call.",
+                "In that same model turn, call the real `exec` tool with this exact sentinel argument:",
+                "  {\"code\":\"__RUSTY_CLAW_TEXT_COMMAND__\"}",
+                "Do not put the JavaScript source in the `exec` arguments. The host reads the source from the visible assistant text.",
+                "Put optional execution settings such as `auto_flush_ms` and `cell_timeout_ms` in the sentinel `exec` tool arguments.",
                 "Valid example:",
-                "  // rusty-claw: exec",
-                "  // auto_flush_ms=1000",
                 "  const res = await tools.read_file({ path: \"src/main.rs\" });",
                 "  text(res);",
+                "  [and in the same model response, call exec({\"code\":\"__RUSTY_CLAW_TEXT_COMMAND__\",\"auto_flush_ms\":1000})]",
                 "Rules:",
-                "The marker starts the code cell; do not emit `exec({...})` JSON, tool-call wrappers, or prose.",
+                "The real `exec` tool call with the sentinel authorizes execution.",
+                "Never call `exec` with the JavaScript source in text mode.",
                 "Do not write explanation text before or after the JavaScript.",
                 "Do not wrap the JavaScript in markdown fences.",
-                "If you are not using Code Mode, do not output the marker.",
                 "Use direct tools or normal text for trivial one-shot work.",
                 "Invalid examples:",
                 "  Here is the code:",
-                "  // rusty-claw: exec",
-                "  ...",
                 "  ```js",
-                "  // rusty-claw: exec",
                 "  ...",
                 "  ```",
                 "`cell_timeout_ms` defaults to 120000ms and the system hard-caps it at 300000ms; when the deadline is reached, the system cancels the cell and wakes any `wait` call.",

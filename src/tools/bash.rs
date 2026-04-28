@@ -306,15 +306,15 @@ impl Tool for BashTool {
                 } else {
                     format!("{}\n{}", result.stdout, result.stderr)
                 };
-                let output = crate::security::fence_untrusted("execute_bash", &raw_output);
                 let mut structured = StructuredToolOutput::new(
                     "execute_bash",
                     result.ok,
-                    output,
+                    raw_output,
                     Some(result.exit_code),
                     Some(result.duration_ms),
                     result.truncated,
-                );
+                )
+                .mark_untrusted();
                 if let Some((kind, source_path, summary)) = Self::classify_command_effect(&cmd_str)
                 {
                     structured = structured.with_evidence(kind, source_path, summary);

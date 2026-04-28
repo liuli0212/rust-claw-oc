@@ -250,15 +250,15 @@ impl Tool for ReadFileTool {
             Ok(content) => {
                 let truncated_content = crate::utils::truncate_tool_output(&content);
                 let truncated = truncated_content.len() != content.len();
-                let fenced = crate::security::fence_verbatim("read_file", &truncated_content);
                 StructuredToolOutput::new(
                     "read_file",
                     true,
-                    fenced,
+                    truncated_content,
                     None,
                     Some(start.elapsed().as_millis()),
                     truncated,
                 )
+                .mark_verbatim()
                 .with_evidence(
                     "file",
                     parsed.path.clone(),

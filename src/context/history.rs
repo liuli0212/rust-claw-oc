@@ -507,6 +507,20 @@ pub(crate) fn sanitize_turn(turn: &Turn) -> Option<Turn> {
     })
 }
 
+pub(crate) fn prepare_turn_for_llm(mut turn: Turn) -> Turn {
+    for msg in &mut turn.messages {
+        if msg.role != "function" {
+            continue;
+        }
+        for part in &mut msg.parts {
+            if let Some(fr) = &mut part.function_response {
+                super::sanitize::prepare_function_response_for_llm(fr);
+            }
+        }
+    }
+    turn
+}
+
 pub(crate) fn build_history_with_budget(
     ctx: &AgentContext,
 ) -> (Vec<super::model::Message>, usize, usize, usize) {
@@ -548,6 +562,7 @@ pub(crate) fn build_history_with_token_budget(
         } else {
             truncate_old_tool_results(&sanitized)
         };
+        let turn = prepare_turn_for_llm(turn);
         total_truncated_chars += truncated;
         protect_next_turn = user_asks_for_context;
 
@@ -749,24 +764,26 @@ fn truncate_code_mode_result_value(tool_name: &str, val: &mut serde_json::Value)
 /// Browser snapshots become stale as soon as an action is performed or the page navigates.
 /// Strip them aggressively in all history turns — only the current turn's snapshot matters.
 fn strip_browser_snapshot(fr: &mut super::model::FunctionResponse) -> Option<usize> {
-    // Fast path: check tool name first.
-    let is_browser_tool = fr.name == "browser";
-    if !is_browser_tool {
-        // Also check envelope payload_kind for dynamically-named tools.
-        let result_str = fr.response.get("result").and_then(|v| v.as_str())?;
-        let envelope = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(result_str)?;
-        if envelope.effects.payload_kind.as_deref() != Some("browser_snapshot") {
-            return None;
-        }
+    let result_val = fr.response.get("result").and_then(|v| v.as_str())?;
+    let parsed_envelope = crate::tools::protocol::ToolExecutionEnvelope::from_json_str(result_val);
+    let is_browser_snapshot = parsed_envelope
+        .as_ref()
+        .and_then(|envelope| envelope.effects.payload_kind.as_deref())
+        == Some("browser_snapshot");
+    if fr.name != "browser" && !is_browser_snapshot {
+        return None;
     }
 
-    let result_val = fr.response.get("result").and_then(|v| v.as_str())?;
-    let original_chars = result_val.chars().count();
+    let snapshot_text = parsed_envelope
+        .as_ref()
+        .map(|envelope| envelope.result.output.as_str())
+        .unwrap_or(result_val);
+    let original_chars = snapshot_text.chars().count();
     if original_chars <= 100 {
         return None; // Already tiny (e.g. "Browser stopped" or error), skip.
     }
 
-    let element_count = result_val.lines().count();
+    let element_count = snapshot_text.lines().count();
     let replacement = format!("[browser snapshot stripped - {} elements]", element_count);
     let hidden = original_chars.saturating_sub(replacement.len());
 

@@ -423,6 +423,10 @@ impl AgentLoop {
         // exfiltrate the canary through FunctionCall.args.
         let text_without_think = Self::strip_think_blocks(full_text);
         let trimmed_clean = text_without_think.trim();
+        let suppress_text_command_source = self.code_mode_format.accepts_text_command()
+            && tool_calls_accumulated
+                .iter()
+                .any(|(call, _)| call.name == "exec");
 
         let args_leak = tool_calls_accumulated
             .iter()
@@ -524,7 +528,7 @@ impl AgentLoop {
             return Some(self.finalize_finished_run(final_answer).await);
         }
 
-        if !trimmed_clean.is_empty() {
+        if !trimmed_clean.is_empty() && !suppress_text_command_source {
             self.output.on_text(trimmed_clean).await;
             self.output.on_text("\n").await;
         }
@@ -727,25 +731,13 @@ impl AgentLoop {
         let max_tokens = self.context.max_history_tokens;
         let assembler = crate::context_assembler::ContextAssembler::new(max_tokens);
         let (messages, system, _) = self.context.build_llm_payload(state, &assembler);
-        let llm_tools = self.llm_visible_tools_for_code_mode(current_tools);
-
-        self.collect_stream_response(messages, system, llm_tools, iteration_trace_ctx)
-            .await
-    }
-
-    pub(super) fn llm_visible_tools_for_code_mode(
-        &self,
-        current_tools: &[Arc<dyn Tool>],
-    ) -> Vec<Arc<dyn Tool>> {
-        if self.code_mode_format.exposes_function_exec() {
-            return current_tools.to_vec();
-        }
-
-        current_tools
-            .iter()
-            .filter(|tool| tool.name() != "exec")
-            .cloned()
-            .collect()
+        self.collect_stream_response(
+            messages,
+            system,
+            current_tools.to_vec(),
+            iteration_trace_ctx,
+        )
+        .await
     }
 
     pub(super) async fn handle_empty_iteration_response(
@@ -774,43 +766,88 @@ impl AgentLoop {
         None
     }
 
-    pub(super) fn synthesize_text_exec_tool_call(
+    fn is_text_command_exec_sentinel(call: &crate::context::FunctionCall) -> bool {
+        call.name == "exec"
+            && call.args.get("code").and_then(|value| value.as_str())
+                == Some(crate::code_mode::TEXT_COMMAND_EXEC_SENTINEL)
+    }
+
+    fn text_command_protocol_error_parts(
+        tool_calls: &[ToolCallRecord],
+        message: &str,
+    ) -> Vec<Part> {
+        tool_calls
+            .iter()
+            .map(|(call, thought_sig)| {
+                Self::build_function_response_part(
+                    call.name.clone(),
+                    call.id.clone(),
+                    serde_json::json!({ "result": message }),
+                    thought_sig.clone(),
+                )
+            })
+            .collect()
+    }
+
+    pub(super) fn resolve_text_command_tool_calls(
         &self,
         full_text: &str,
         tool_calls_accumulated: &[ToolCallRecord],
-    ) -> Option<(String, Vec<ToolCallRecord>)> {
-        if !self.code_mode_format.accepts_text_command() || !tool_calls_accumulated.is_empty() {
-            return None;
+    ) -> Result<Vec<ToolCallRecord>, Vec<Part>> {
+        if !self.code_mode_format.accepts_text_command() {
+            return Ok(tool_calls_accumulated.to_vec());
         }
 
         let visible_text = Self::strip_think_blocks(full_text);
-        let parsed = crate::code_mode::text_command::parse_text_exec_command(&visible_text)?;
-        if parsed.code.trim().is_empty() {
-            return None;
-        }
+        let visible_code = visible_text.trim();
+        let exec_call_count = tool_calls_accumulated
+            .iter()
+            .filter(|(call, _)| call.name == "exec")
+            .count();
+        let sentinel_call_count = tool_calls_accumulated
+            .iter()
+            .filter(|(call, _)| Self::is_text_command_exec_sentinel(call))
+            .count();
 
-        let mut args = serde_json::Map::new();
-        args.insert("code".to_string(), serde_json::Value::String(parsed.code));
-        if let Some(auto_flush_ms) = parsed.auto_flush_ms {
+        if sentinel_call_count > 0 {
+            if tool_calls_accumulated.len() != 1 || sentinel_call_count != 1 {
+                return Err(Self::text_command_protocol_error_parts(
+                        tool_calls_accumulated,
+                        "Text code mode protocol error: text mode must pair the visible JavaScript source with exactly one real `exec` tool call using `code` equal to `__RUSTY_CLAW_TEXT_COMMAND__`, and no other top-level tool calls.",
+                    ));
+            }
+
+            if visible_code.is_empty() {
+                return Err(Self::text_command_protocol_error_parts(
+                        tool_calls_accumulated,
+                        "Text code mode protocol error: sentinel `exec` requires the visible assistant text to contain the JavaScript source.",
+                    ));
+            }
+
+            let mut execution_tool_calls = tool_calls_accumulated.to_vec();
+            let (call, _) = &mut execution_tool_calls[0];
+            let mut args = call
+                .args
+                .as_object()
+                .cloned()
+                .expect("sentinel exec arguments must be a JSON object");
             args.insert(
-                "auto_flush_ms".to_string(),
-                serde_json::Value::Number(auto_flush_ms.into()),
+                "code".to_string(),
+                serde_json::Value::String(visible_code.to_string()),
             );
-        }
-        if let Some(cell_timeout_ms) = parsed.cell_timeout_ms {
-            args.insert(
-                "cell_timeout_ms".to_string(),
-                serde_json::Value::Number(cell_timeout_ms.into()),
-            );
+            call.args = serde_json::Value::Object(args);
+
+            return Ok(execution_tool_calls);
         }
 
-        let call = crate::context::FunctionCall {
-            name: "exec".to_string(),
-            args: serde_json::Value::Object(args),
-            id: Some(format!("text_exec_{}", uuid::Uuid::new_v4().simple())),
-        };
+        if exec_call_count > 0 {
+            return Err(Self::text_command_protocol_error_parts(
+                    tool_calls_accumulated,
+                    "Text code mode protocol error: in text mode, `exec.code` must be exactly `__RUSTY_CLAW_TEXT_COMMAND__`; put the JavaScript source in the visible assistant text instead of the tool arguments.",
+                ));
+        }
 
-        Some((String::new(), vec![(call, None)]))
+        Ok(tool_calls_accumulated.to_vec())
     }
 
     fn build_tool_executor_with_budget(

@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Map;
 use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
@@ -133,7 +132,15 @@ pub struct ToolResultData {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputSecurity {
+    Untrusted,
+    Verbatim,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ToolEffects {
     pub recovery_attempted: bool,
     pub recovery_output: Option<String>,
@@ -143,6 +150,10 @@ pub struct ToolEffects {
     pub evidence_source_path: Option<String>,
     pub evidence_summary: Option<String>,
     pub payload_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_security: Option<ToolOutputSecurity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_source: Option<String>,
     pub invalidate_diagnostic_evidence: bool,
     /// If set, the tool is requesting that execution pause for user input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,61 +178,39 @@ pub struct ToolExecutionEnvelope {
 
 impl ToolExecutionEnvelope {
     pub fn from_json_str(input: &str) -> Option<Self> {
-        serde_json::from_str(input)
-            .ok()
-            .or_else(|| Self::from_legacy_value(serde_json::from_str(input).ok()?))
+        serde_json::from_str(input).ok()
     }
 
-    fn from_legacy_value(value: Value) -> Option<Self> {
-        let obj = value.as_object()?;
+    pub fn into_llm_context(mut self) -> Self {
+        let source = self
+            .effects
+            .output_source
+            .as_deref()
+            .filter(|source| !source.trim().is_empty())
+            .unwrap_or_else(|| {
+                if self.result.tool_name.trim().is_empty() {
+                    "tool"
+                } else {
+                    self.result.tool_name.as_str()
+                }
+            });
 
-        Some(Self {
-            result: ToolResultData {
-                ok: get_bool(obj, "ok").unwrap_or(false),
-                tool_name: get_string(obj, "tool_name").unwrap_or_default(),
-                output: get_string(obj, "output").unwrap_or_default(),
-                exit_code: get_i32(obj, "exit_code"),
-                duration_ms: get_u64(obj, "duration_ms"),
-                truncated: get_bool(obj, "truncated").unwrap_or(false),
-            },
-            effects: ToolEffects {
-                recovery_attempted: get_bool(obj, "recovery_attempted").unwrap_or(false),
-                recovery_output: get_string(obj, "recovery_output"),
-                recovery_rule: get_string(obj, "recovery_rule"),
-                file_path: get_string(obj, "file_path"),
-                evidence_kind: get_string(obj, "evidence_kind"),
-                evidence_source_path: get_string(obj, "evidence_source_path"),
-                evidence_summary: get_string(obj, "evidence_summary"),
-                payload_kind: get_string(obj, "payload_kind"),
-                invalidate_diagnostic_evidence: get_bool(obj, "invalidate_diagnostic_evidence")
-                    .unwrap_or(false),
-                await_user: obj
-                    .get("await_user")
-                    .cloned()
-                    .and_then(|value| serde_json::from_value(value).ok()),
-            },
-        })
+        self.result.output = match self.effects.output_security {
+            Some(ToolOutputSecurity::Untrusted) => {
+                crate::security::fence_untrusted(source, &self.result.output)
+            }
+            Some(ToolOutputSecurity::Verbatim) => {
+                crate::security::fence_verbatim(source, &self.result.output)
+            }
+            None => self.result.output,
+        };
+
+        self
     }
-}
 
-fn get_string(obj: &Map<String, Value>, key: &str) -> Option<String> {
-    obj.get(key)
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-}
-
-fn get_bool(obj: &Map<String, Value>, key: &str) -> Option<bool> {
-    obj.get(key).and_then(|value| value.as_bool())
-}
-
-fn get_u64(obj: &Map<String, Value>, key: &str) -> Option<u64> {
-    obj.get(key).and_then(|value| value.as_u64())
-}
-
-fn get_i32(obj: &Map<String, Value>, key: &str) -> Option<i32> {
-    obj.get(key)
-        .and_then(|value| value.as_i64())
-        .and_then(|value| i32::try_from(value).ok())
+    pub fn to_json_string(&self) -> Result<String, ToolError> {
+        serde_json::to_string(self).map_err(|e| ToolError::ExecutionFailed(e.to_string()))
+    }
 }
 
 impl StructuredToolOutput {
@@ -273,22 +262,35 @@ impl StructuredToolOutput {
         self
     }
 
+    pub fn mark_untrusted(self) -> Self {
+        let source = self.result.tool_name.clone();
+        self.with_untrusted_output(source)
+    }
+
+    pub fn with_untrusted_output(mut self, source: impl Into<String>) -> Self {
+        self.effects.output_security = Some(ToolOutputSecurity::Untrusted);
+        self.effects.output_source = Some(source.into());
+        self
+    }
+
+    pub fn mark_verbatim(self) -> Self {
+        let source = self.result.tool_name.clone();
+        self.with_verbatim_output(source)
+    }
+
+    pub fn with_verbatim_output(mut self, source: impl Into<String>) -> Self {
+        self.effects.output_security = Some(ToolOutputSecurity::Verbatim);
+        self.effects.output_source = Some(source.into());
+        self
+    }
+
     pub fn with_await_user(mut self, request: UserPromptRequest) -> Self {
         self.effects.await_user = Some(request);
         self
     }
 
-    pub fn into_envelope(self) -> ToolExecutionEnvelope {
-        ToolExecutionEnvelope {
-            result: self.result,
-            effects: self.effects,
-        }
-    }
-
-    #[allow(clippy::wrong_self_convention)]
-    pub fn to_json_string(self) -> Result<String, ToolError> {
-        serde_json::to_string(&self.into_envelope())
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))
+    pub fn to_json_string(&self) -> Result<String, ToolError> {
+        serde_json::to_string(self).map_err(|e| ToolError::ExecutionFailed(e.to_string()))
     }
 }
 

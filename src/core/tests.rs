@@ -590,7 +590,7 @@ async fn test_code_mode_notice_is_added_when_exec_is_visible() {
 }
 
 #[tokio::test]
-async fn test_code_mode_text_command_notice_explains_marker_and_wait() {
+async fn test_code_mode_text_command_notice_explains_sentinel_and_wait() {
     let llm = Arc::new(PromptCapturingLlm::new(vec![StreamEvent::Text(
         "Ready".to_string(),
     )]));
@@ -623,8 +623,12 @@ async fn test_code_mode_text_command_notice_explains_marker_and_wait() {
 
     let system_text = llm.last_system_text().unwrap_or_default();
     assert!(system_text.contains("Code Mode Text Format:"));
-    assert!(system_text.contains("The marker starts the code cell"));
+    assert!(system_text.contains("visible assistant message MUST be raw JavaScript"));
+    assert!(system_text.contains("__RUSTY_CLAW_TEXT_COMMAND__"));
+    assert!(system_text.contains("same model turn"));
+    assert!(system_text.contains("auto_flush_ms"));
     assert!(system_text.contains("call the `wait` tool"));
+    assert!(!system_text.contains("rusty-claw: exec"));
     assert!(!system_text.contains("Do not call the `exec` function tool"));
 
     cleanup_session(session_id);
@@ -779,6 +783,7 @@ async fn test_code_mode_nested_tool_respects_autopilot_denials() {
     let calls = Arc::new(AtomicUsize::new(0));
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(crate::tools::ExecTool),
+        Arc::new(crate::tools::WaitTool),
         Arc::new(MutatingTool {
             calls: calls.clone(),
         }),
@@ -798,7 +803,7 @@ async fn test_code_mode_nested_tool_respects_autopilot_denials() {
     agent.enable_autopilot();
     agent.begin_trace_run("autopilot code mode", None);
 
-    let outcome = agent
+    let mut outcome = agent
         .dispatch_tool_call(
             &crate::context::FunctionCall {
                 name: "exec".to_string(),
@@ -814,6 +819,29 @@ await tools.mutating_tool({ path: "unsafe.txt" });
             agent.trace_context_with_parent(agent.turn_span_id(), Some(1)),
         )
         .await;
+
+    if ToolExecutionEnvelope::from_json_str(&outcome.result).is_some_and(|envelope| {
+        envelope
+            .result
+            .output
+            .contains("processing nested tool request")
+    }) {
+        outcome = agent
+            .dispatch_tool_call(
+                &crate::context::FunctionCall {
+                    name: "wait".to_string(),
+                    args: json!({
+                        "cell_id": "cell-0",
+                        "wait_timeout_ms": 1_000
+                    }),
+                    id: Some("call_wait_autopilot".to_string()),
+                },
+                &tools,
+                5,
+                agent.trace_context_with_parent(agent.turn_span_id(), Some(1)),
+            )
+            .await;
+    }
     agent.finish_active_trace("run_finished", TraceStatus::Ok, None);
 
     assert!(
@@ -822,13 +850,10 @@ await tools.mutating_tool({ path: "unsafe.txt" });
         outcome.result
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    let envelope = ToolExecutionEnvelope::from_json_str(&outcome.result).expect("exec envelope");
-    assert!(
-        envelope.result.output.contains("Action Denied")
-            || outcome.result.contains("Action Denied"),
-        "{}",
-        outcome.result
-    );
+    let output_text = ToolExecutionEnvelope::from_json_str(&outcome.result)
+        .map(|envelope| envelope.result.output)
+        .unwrap_or_else(|| outcome.result.clone());
+    assert!(output_text.contains("Action Denied"), "{}", outcome.result);
 
     cleanup_session(session_id);
 }
@@ -906,7 +931,11 @@ async fn test_code_mode_nested_step_budget_exhaustion_is_reported() {
     let echo_tool = Arc::new(ContextCapturingTool {
         contexts: captured_contexts.clone(),
     });
-    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::ExecTool), echo_tool];
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(crate::tools::ExecTool),
+        Arc::new(crate::tools::WaitTool),
+        echo_tool,
+    ];
 
     let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
     let mut agent = AgentLoop::new(
@@ -985,7 +1014,7 @@ async fn test_code_mode_trace_events_include_exec_metadata() {
     agent.begin_trace_run("trace code mode", None);
     let mut trace_rx = crate::trace::shared_bus().subscribe();
 
-    let outcome = agent
+    let mut outcome = agent
         .dispatch_tool_call(
             &crate::context::FunctionCall {
                 name: "exec".to_string(),
@@ -1002,6 +1031,29 @@ text(response.value);
             agent.trace_context_with_parent(agent.turn_span_id(), Some(1)),
         )
         .await;
+
+    if ToolExecutionEnvelope::from_json_str(&outcome.result).is_some_and(|envelope| {
+        envelope
+            .result
+            .output
+            .contains("processing nested tool request")
+    }) {
+        outcome = agent
+            .dispatch_tool_call(
+                &crate::context::FunctionCall {
+                    name: "wait".to_string(),
+                    args: json!({
+                        "cell_id": "cell-0",
+                        "wait_timeout_ms": 1_000
+                    }),
+                    id: Some("call_wait_trace".to_string()),
+                },
+                &tools,
+                5,
+                agent.trace_context_with_parent(agent.turn_span_id(), Some(1)),
+            )
+            .await;
+    }
     agent.finish_active_trace("run_finished", TraceStatus::Ok, None);
 
     assert!(!outcome.is_error, "{}", outcome.result);

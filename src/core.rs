@@ -902,7 +902,7 @@ impl AgentLoop {
                 .map(TraceSpanHandle::child_context)
                 .or_else(|| iteration_ctx.clone());
 
-            let (mut full_text, mut tool_calls_accumulated) = match self
+            let (full_text, tool_calls_accumulated) = match self
                 .collect_iteration_response(&state, &current_tools, iteration_child_ctx.clone())
                 .await?
             {
@@ -923,12 +923,11 @@ impl AgentLoop {
                 }
             };
 
-            if let Some((synthetic_text, synthetic_tool_calls)) =
-                self.synthesize_text_exec_tool_call(&full_text, &tool_calls_accumulated)
-            {
-                full_text = synthetic_text;
-                tool_calls_accumulated = synthetic_tool_calls;
-            }
+            let (tool_calls_for_execution, protocol_error_parts) =
+                match self.resolve_text_command_tool_calls(&full_text, &tool_calls_accumulated) {
+                    Ok(execution_tool_calls) => (execution_tool_calls, None),
+                    Err(parts) => (Vec::new(), Some(parts)),
+                };
 
             if let Some(exit) = self
                 .handle_empty_iteration_response(
@@ -982,10 +981,31 @@ impl AgentLoop {
                 return Ok(exit);
             }
 
+            if let Some(response_parts) = protocol_error_parts {
+                let response_parts_len = response_parts.len();
+                if !response_parts.is_empty() {
+                    self.context.add_message_to_current_turn(Message {
+                        role: "function".to_string(),
+                        parts: response_parts,
+                    });
+                }
+                if let Some(span) = iteration_span.take() {
+                    span.finish(
+                        "iteration_finished",
+                        TraceStatus::Retrying,
+                        Some("text code mode protocol error".to_string()),
+                        serde_json::json!({
+                            "tool_responses": response_parts_len,
+                        }),
+                    );
+                }
+                continue;
+            }
+
             let state_before_tools = state.clone();
             let (response_parts, should_yield_to_user) = self
                 .execute_tool_round(
-                    tool_calls_accumulated,
+                    tool_calls_for_execution,
                     &current_tools,
                     iteration_child_ctx.clone(),
                     task_state.energy_points,

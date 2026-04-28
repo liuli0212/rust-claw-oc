@@ -171,6 +171,27 @@ pub(crate) fn strip_response_payload(fr: &mut FunctionResponse) {
     }
 }
 
+pub(crate) fn prepare_function_response_for_llm(fr: &mut FunctionResponse) {
+    let Some(obj) = fr.response.as_object_mut() else {
+        return;
+    };
+    let Some(result_val) = obj.get_mut("result") else {
+        return;
+    };
+    let Some(result_str) = result_val.as_str() else {
+        return;
+    };
+    let Some(envelope) = ToolExecutionEnvelope::from_json_str(result_str) else {
+        return;
+    };
+
+    let context_envelope = envelope.into_llm_context();
+    let serialized = context_envelope
+        .to_json_string()
+        .expect("tool envelope serialization should not fail");
+    *result_val = serde_json::Value::String(serialized);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +309,32 @@ mod tests {
         assert!(envelope.result.output.contains("stripped"));
         assert!(!stripped.contains("\"duration_ms\""));
         assert!(!stripped.contains("\"truncated\""));
+    }
+
+    #[test]
+    fn prepare_function_response_for_llm_fences_marked_tool_output() {
+        let raw = crate::tools::protocol::StructuredToolOutput::new(
+            "execute_bash",
+            true,
+            "hello from shell".to_string(),
+            Some(0),
+            None,
+            false,
+        )
+        .with_untrusted_output("execute_bash")
+        .to_json_string()
+        .unwrap();
+        let mut response = FunctionResponse {
+            name: "execute_bash".to_string(),
+            id: None,
+            response: serde_json::json!({ "result": raw }),
+        };
+
+        prepare_function_response_for_llm(&mut response);
+
+        let result = response.response["result"].as_str().unwrap();
+        let envelope = ToolExecutionEnvelope::from_json_str(result).expect("tool envelope");
+        assert!(envelope.result.output.contains("UNTRUSTED_CONTENT"));
+        assert!(envelope.result.output.contains("hello from shell"));
     }
 }

@@ -199,6 +199,7 @@ pub(crate) fn build_llm_payload(
     let mut current_turn_tokens = 0;
     if let Some(turn) = &ctx.current_turn {
         if let Some(sanitized_turn) = super::history::sanitize_turn(turn) {
+            let sanitized_turn = super::history::prepare_turn_for_llm(sanitized_turn);
             let separator = super::model::Message {
                 role: "user".to_string(),
                 parts: vec![super::model::Part {

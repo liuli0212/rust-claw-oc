@@ -14,6 +14,7 @@ use chromiumoxide::cdp::browser_protocol::accessibility::GetFullAxTreeParams;
 use chromiumoxide::Page;
 use futures::StreamExt;
 
+use crate::tools::protocol::StructuredToolOutput;
 use crate::tools::{clean_schema, Tool, ToolError};
 
 mod snapshot;
@@ -373,10 +374,10 @@ WARNING: chrome mode shares cookies/login sessions with the user's profile."
                     }
                     output.push(']');
                 }
-                Ok(crate::security::fence_untrusted(
-                    "browser_snapshot",
-                    &output,
-                ))
+                StructuredToolOutput::new("browser", true, output, Some(0), None, false)
+                    .with_payload_kind("browser_snapshot")
+                    .with_untrusted_output("browser_snapshot")
+                    .to_json_string()
             }
             "act" => {
                 let state = self.state.read().await;

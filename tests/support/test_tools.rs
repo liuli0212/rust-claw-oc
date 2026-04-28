@@ -9,6 +9,7 @@ pub struct MockTool {
     pub name: String,
     pub results: Arc<Mutex<Vec<Result<String, String>>>>,
     pub calls: Arc<Mutex<Vec<Value>>>,
+    pub untrusted_source: Option<String>,
 }
 
 impl MockTool {
@@ -17,6 +18,16 @@ impl MockTool {
             name: name.to_string(),
             results: Arc::new(Mutex::new(vec![result])),
             calls: Arc::new(Mutex::new(Vec::new())),
+            untrusted_source: None,
+        }
+    }
+
+    pub fn new_untrusted(name: &str, result: Result<String, String>, source: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            results: Arc::new(Mutex::new(vec![result])),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            untrusted_source: Some(source.to_string()),
         }
     }
 
@@ -25,6 +36,7 @@ impl MockTool {
             name: name.to_string(),
             results: Arc::new(Mutex::new(results)),
             calls: Arc::new(Mutex::new(Vec::new())),
+            untrusted_source: None,
         }
     }
 }
@@ -62,8 +74,11 @@ impl Tool for MockTool {
 
         match result {
             Ok(res) => {
-                let output =
+                let mut output =
                     StructuredToolOutput::new(&self.name, true, res.clone(), Some(0), None, false);
+                if let Some(source) = &self.untrusted_source {
+                    output = output.with_untrusted_output(source.clone());
+                }
                 Ok(output.to_json_string().unwrap())
             }
             Err(err) => Err(ToolError::ExecutionFailed(err)),
