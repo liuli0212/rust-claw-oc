@@ -139,7 +139,7 @@ pub(crate) fn build_snapshot(
             }
         }
         // Stable sort: higher score first, preserve original order for ties.
-        elements.sort_by(|a, b| b.score.cmp(&a.score));
+        elements.sort_by_key(|element| std::cmp::Reverse(element.score));
     }
 
     // 3. Apply max_elements limit.

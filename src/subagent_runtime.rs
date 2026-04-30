@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tracing::Instrument;
 
-use crate::delegation::DelegationSessionSeed;
+use crate::call_chain::CallChainSeed;
 use crate::llm_client::LlmClient;
 use crate::session::factory::{build_subagent_session, BuiltSubagentSession};
 use crate::tools::protocol::ToolError;
@@ -39,7 +39,7 @@ pub struct SubagentExecutionRequest {
     pub origin: SubagentExecutionOrigin,
     pub effective_max_steps: Option<usize>,
     pub effective_timeout_sec: Option<u64>,
-    pub delegation_seed: DelegationSessionSeed,
+    pub call_chain_seed: CallChainSeed,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,7 +53,7 @@ pub enum SubagentExecutionOrigin {
 pub struct SubagentSkillOrigin {
     pub name: String,
     pub lineage: Vec<String>,
-    pub effective_tools: Vec<String>,
+    pub effective_tools: Option<Vec<String>>,
 }
 
 impl SubagentExecutionRequest {
@@ -74,7 +74,7 @@ impl SubagentExecutionRequest {
     pub fn effective_tools(&self) -> Option<&[String]> {
         match &self.origin {
             SubagentExecutionOrigin::Goal => None,
-            SubagentExecutionOrigin::Skill(origin) => Some(origin.effective_tools.as_slice()),
+            SubagentExecutionOrigin::Skill(origin) => origin.effective_tools.as_deref(),
         }
     }
 
@@ -637,7 +637,7 @@ impl SubagentRuntime {
                 origin: SubagentExecutionOrigin::Goal,
                 effective_max_steps: None,
                 effective_timeout_sec: None,
-                delegation_seed: DelegationSessionSeed::default(),
+                call_chain_seed: CallChainSeed::default(),
             },
         )
         .await
@@ -1005,7 +1005,7 @@ impl SubagentRuntime {
                 energy_budget: execution.max_steps,
                 timeout_sec: execution.timeout_sec,
                 parent_context_text: execution.context.clone(),
-                delegation_seed: execution.delegation_seed.clone(),
+                call_chain_seed: execution.call_chain_seed.clone(),
                 debug: handle.debug.clone(),
                 cancelled: handle.cancelled.clone(),
                 cancel_notify: handle.cancel_notify.clone(),
@@ -1680,7 +1680,7 @@ mod tests {
                     origin: SubagentExecutionOrigin::Goal,
                     effective_max_steps: Some(4),
                     effective_timeout_sec: Some(1),
-                    delegation_seed: DelegationSessionSeed::default(),
+                    call_chain_seed: CallChainSeed::default(),
                 },
             )
             .await

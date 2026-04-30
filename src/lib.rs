@@ -2,12 +2,12 @@
 pub mod acp;
 pub mod app;
 pub mod browser;
+pub mod call_chain;
 pub mod code_mode;
 pub mod config;
 pub mod context;
 pub mod context_assembler;
 pub mod core;
-pub mod delegation;
 pub mod discord;
 pub mod event_log;
 pub mod evidence;

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
+use crate::call_chain::{CallChainContext, CallChainSeed, MAX_CALL_CHAIN_DEPTH};
 use crate::core::extensions::{ExecutionExtension, ExtensionDecision, FinishDecision, PromptDraft};
-use crate::delegation::{DelegationContext, DelegationSessionSeed};
 use crate::tools::protocol::ToolExecutionEnvelope;
 use crate::tools::Tool;
 
@@ -24,7 +24,7 @@ pub struct SkillRuntime {
     invocation: RwLock<Option<SkillInvocation>>,
     policy: SkillToolPolicy,
     registry: SkillRegistry,
-    delegation_seed: DelegationSessionSeed,
+    call_chain_seed: CallChainSeed,
 }
 
 impl SkillRuntime {
@@ -47,34 +47,30 @@ impl SkillRuntime {
         session_id: impl Into<String>,
         registry: SkillRegistry,
     ) -> Self {
-        Self::with_registry_and_delegation_seed(
-            session_id,
-            registry,
-            DelegationSessionSeed::default(),
-        )
+        Self::with_registry_and_call_chain_seed(session_id, registry, CallChainSeed::default())
     }
 
-    pub fn with_delegation_seed(
+    pub fn with_call_chain_seed(
         session_id: impl Into<String>,
-        delegation_seed: DelegationSessionSeed,
+        call_chain_seed: CallChainSeed,
     ) -> Self {
         tracing::debug!("Initializing minimal SkillRuntime and discovering skills...");
         let mut registry = SkillRegistry::new();
         registry.discover(Path::new("skills"));
-        Self::with_registry_and_delegation_seed(session_id, registry, delegation_seed)
+        Self::with_registry_and_call_chain_seed(session_id, registry, call_chain_seed)
     }
 
-    pub fn with_registry_and_delegation_seed(
+    pub fn with_registry_and_call_chain_seed(
         session_id: impl Into<String>,
         registry: SkillRegistry,
-        delegation_seed: DelegationSessionSeed,
+        call_chain_seed: CallChainSeed,
     ) -> Self {
         Self {
             session_id: session_id.into(),
             invocation: RwLock::new(None),
             policy: SkillToolPolicy::new(),
             registry,
-            delegation_seed,
+            call_chain_seed,
         }
     }
 
@@ -86,18 +82,6 @@ impl SkillRuntime {
         } else {
             truncated
         }
-    }
-
-    fn derive_call_context(
-        &self,
-        skill_name: &str,
-        serialized_args: Option<&str>,
-    ) -> DelegationContext {
-        self.delegation_seed
-            .inherited_context
-            .clone()
-            .unwrap_or_else(|| DelegationContext::new_root(self.session_id.clone()))
-            .append_frame(skill_name, serialized_args)
     }
 
     fn compatibility_notes(def: &SkillDef) -> Vec<String> {
@@ -138,27 +122,58 @@ impl SkillRuntime {
             .as_ref()
             .map(serde_json::Value::to_string)
             .or_else(|| raw_args.clone());
+        let parent_context = self
+            .call_chain_seed
+            .inherited_context
+            .clone()
+            .unwrap_or_else(|| CallChainContext::new_root(self.session_id.clone()));
+        if parent_context.contains_skill(&def.meta.name) {
+            let lineage = parent_context
+                .append_frame(&def.meta.name, serialized_args.as_deref())
+                .lineage_names()
+                .join(" -> ");
+            return Err(format!(
+                "Denied delegated skill run: cycle detected: {lineage}"
+            ));
+        }
+        let call_chain_context =
+            parent_context.append_frame(&def.meta.name, serialized_args.as_deref());
+        if call_chain_context.current_depth() > MAX_CALL_CHAIN_DEPTH {
+            return Err(format!(
+                "Denied delegated skill run: max call chain depth exceeded ({})",
+                MAX_CALL_CHAIN_DEPTH
+            ));
+        }
+
         let compatibility_notes = Self::compatibility_notes(def);
         for note in &compatibility_notes {
             tracing::warn!(skill = %def.meta.name, "{note}");
+        }
+        let allowed_tools = self.policy.canonicalize_tools(&def.meta.allowed_tools);
+        if self.call_chain_seed.inherited_context.is_some()
+            && allowed_tools.iter().any(|tool| tool == "ask_user_question")
+        {
+            return Err(format!(
+                "Denied delegated skill run: skill '{}' is interactive and can only run at the top level.",
+                def.meta.name
+            ));
         }
 
         let invocation = SkillInvocation {
             skill_name: def.meta.name.clone(),
             version: def.meta.version.clone(),
             instructions: def.instructions.clone(),
-            allowed_tools: self.policy.canonicalize_tools(&def.meta.allowed_tools),
+            allowed_tools,
             raw_args,
             json_args,
-            delegated_context: self
-                .delegation_seed
-                .delegated_context
+            handoff_context: self
+                .call_chain_seed
+                .handoff_context
                 .clone()
                 .filter(|value| !value.trim().is_empty()),
             pending_interaction: None,
             state: SkillInvocationState::Running,
-            delegation_context: self
-                .derive_call_context(&def.meta.name, serialized_args.as_deref()),
+            call_chain_context,
             compatibility_notes,
         };
 
@@ -338,14 +353,14 @@ impl ExecutionExtension for SkillRuntime {
             ) {
                 blocks.push(args_section);
             }
-            if let Some(delegated_context) = invocation
-                .delegated_context
+            if let Some(handoff_context) = invocation
+                .handoff_context
                 .as_ref()
                 .filter(|value| !value.trim().is_empty())
             {
                 blocks.push(format!(
-                    "## Skill Delegation Context\n{}",
-                    Self::truncate_for_prompt(delegated_context, 2_000)
+                    "## Skill Handoff Context\n{}",
+                    Self::truncate_for_prompt(handoff_context, 2_000)
                 ));
             }
             draft.skill_instructions = Some(blocks.join("\n\n"));
@@ -374,14 +389,14 @@ impl ExecutionExtension for SkillRuntime {
     ) -> crate::tools::ToolContext {
         if let Some(invocation) = self.invocation.read().await.as_ref() {
             ctx.active_skill_name = Some(invocation.skill_name.clone());
-            ctx.delegation_context = Some(invocation.delegation_context.clone());
-        } else if let Some(inherited_context) = self.delegation_seed.inherited_context.as_ref() {
-            ctx.delegation_context = Some(inherited_context.clone());
+            ctx.call_chain_context = Some(invocation.call_chain_context.clone());
+        } else if let Some(inherited_context) = self.call_chain_seed.inherited_context.as_ref() {
+            ctx.call_chain_context = Some(inherited_context.clone());
         }
 
-        if let Some(inherited_steps) = self.delegation_seed.inherited_budget.remaining_steps {
-            ctx.delegation_budget.remaining_steps = Some(
-                ctx.delegation_budget
+        if let Some(inherited_steps) = self.call_chain_seed.inherited_budget.remaining_steps {
+            ctx.call_chain_budget.remaining_steps = Some(
+                ctx.call_chain_budget
                     .remaining_steps
                     .unwrap_or(inherited_steps)
                     .min(inherited_steps)
@@ -389,10 +404,10 @@ impl ExecutionExtension for SkillRuntime {
             );
         }
         if let Some(inherited_timeout_sec) =
-            self.delegation_seed.inherited_budget.remaining_timeout_sec
+            self.call_chain_seed.inherited_budget.remaining_timeout_sec
         {
-            ctx.delegation_budget.remaining_timeout_sec = Some(
-                ctx.delegation_budget
+            ctx.call_chain_budget.remaining_timeout_sec = Some(
+                ctx.call_chain_budget
                     .remaining_timeout_sec
                     .unwrap_or(inherited_timeout_sec)
                     .min(inherited_timeout_sec)
@@ -434,8 +449,8 @@ impl ExecutionExtension for SkillRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::call_chain::{CallChainBudget, CallChainSeed};
     use crate::core::extensions::{ExecutionExtension, PromptDraft};
-    use crate::delegation::{DelegationBudget, DelegationSessionSeed};
     use crate::skills::definition::{ArtifactKind, OutputMode, SkillConstraints, SkillMeta};
     use std::sync::atomic::Ordering;
 
@@ -622,42 +637,40 @@ mod tests {
 
     #[tokio::test]
     async fn test_enrich_tool_context_inherits_seeded_context_and_budget() {
-        let inherited_context = DelegationContext::new_root("root").append_frame("planner", None);
-        inherited_context
-            .total_delegations
-            .store(2, Ordering::SeqCst);
-        let rt = SkillRuntime::with_registry_and_delegation_seed(
+        let inherited_context = CallChainContext::new_root("root").append_frame("planner", None);
+        inherited_context.total_calls.store(2, Ordering::SeqCst);
+        let rt = SkillRuntime::with_registry_and_call_chain_seed(
             "seeded-session",
             SkillRegistry::new(),
-            DelegationSessionSeed {
+            CallChainSeed {
                 inherited_context: Some(inherited_context.clone()),
-                inherited_budget: DelegationBudget {
+                inherited_budget: CallChainBudget {
                     remaining_steps: Some(3),
                     remaining_timeout_sec: Some(7),
                 },
-                delegated_context: Some("Inspect parser flow.".to_string()),
+                handoff_context: Some("Inspect parser flow.".to_string()),
             },
         );
 
         let mut ctx = crate::tools::ToolContext::new("seeded-session", "cli");
-        ctx.delegation_budget = DelegationBudget {
+        ctx.call_chain_budget = CallChainBudget {
             remaining_steps: Some(9),
             remaining_timeout_sec: Some(15),
         };
 
         let enriched = rt.enrich_tool_context(ctx).await;
         let propagated = enriched
-            .delegation_context
+            .call_chain_context
             .expect("inherited call context should be present");
 
         assert!(enriched.active_skill_name.is_none());
         assert_eq!(propagated.lineage_names(), vec!["planner".to_string()]);
         assert_eq!(propagated.root_session_id, "root");
-        assert_eq!(enriched.delegation_budget.remaining_steps, Some(3));
-        assert_eq!(enriched.delegation_budget.remaining_timeout_sec, Some(7));
+        assert_eq!(enriched.call_chain_budget.remaining_steps, Some(3));
+        assert_eq!(enriched.call_chain_budget.remaining_timeout_sec, Some(7));
 
-        propagated.total_delegations.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(inherited_context.total_delegations_used(), 3);
+        propagated.total_calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(inherited_context.total_calls_used(), 3);
     }
 
     #[tokio::test]
@@ -704,6 +717,32 @@ mod tests {
 
         let decision = rt.before_turn_start(r#"/test_skill {"path":42}"#).await;
         assert!(matches!(decision, ExtensionDecision::Halt { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_delegated_skill_rejects_interactive_allowed_tools() {
+        let mut registry = SkillRegistry::new();
+        let mut skill = make_test_skill(&["ask_user_question"]);
+        skill.meta.name = "interactive".to_string();
+        registry.insert(skill);
+        let rt = SkillRuntime::with_registry_and_call_chain_seed(
+            "sub-session",
+            registry,
+            CallChainSeed {
+                inherited_context: Some(CallChainContext::new_root("parent")),
+                inherited_budget: CallChainBudget::default(),
+                handoff_context: None,
+            },
+        );
+
+        let decision = rt.before_turn_start("/interactive").await;
+        match decision {
+            ExtensionDecision::Halt { message } => {
+                assert!(message.contains("interactive"));
+                assert!(message.contains("top level"));
+            }
+            other => panic!("expected halt, got {:?}", other),
+        }
     }
 
     #[tokio::test]

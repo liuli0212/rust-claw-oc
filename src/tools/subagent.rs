@@ -7,13 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::protocol::{clean_schema, StructuredToolOutput, Tool, ToolError};
-use crate::delegation::{
-    effective_limits, resolve_skill_delegation, DelegationBudget, DelegationSessionSeed,
-    SkillDelegationRequest, MAX_DELEGATION_CALLS_PER_ROOT_REQUEST,
+use crate::call_chain::{
+    build_skill_activation_command, effective_limits, CallChainBudget, CallChainContext,
+    CallChainSeed, MAX_CALL_CHAIN_CALLS_PER_ROOT_REQUEST,
 };
-use crate::skills::arguments::validate_json_args;
-use crate::skills::policy::SkillToolPolicy;
-use crate::skills::registry::SkillRegistry;
 use crate::subagent_runtime::{
     SubagentExecutionOrigin, SubagentExecutionRequest, SubagentRuntime, SubagentSkillOrigin,
     DEFAULT_SUBAGENT_MAX_STEPS, DEFAULT_SUBAGENT_TIMEOUT_SEC,
@@ -76,19 +73,11 @@ pub struct SubagentResult {
 
 pub struct SubagentTool {
     runtime: SubagentRuntime,
-    registry: SkillRegistry,
-    policy: SkillToolPolicy,
 }
 
 impl SubagentTool {
     pub fn new(runtime: SubagentRuntime) -> Self {
-        let mut registry = SkillRegistry::new();
-        registry.discover(std::path::Path::new("skills"));
-        Self {
-            runtime,
-            registry,
-            policy: SkillToolPolicy::new(),
-        }
+        Self { runtime }
     }
 
     fn serialize_output(tool_name: &str, payload: Value) -> Result<String, ToolError> {
@@ -159,14 +148,14 @@ impl SubagentTool {
     }
 
     fn validate_nested_budget(&self, ctx: &super::protocol::ToolContext) -> Result<(), ToolError> {
-        let Some(call_context) = ctx.delegation_context.as_ref() else {
+        let Some(call_context) = ctx.call_chain_context.as_ref() else {
             return Ok(());
         };
 
-        if call_context.total_delegations_used() >= MAX_DELEGATION_CALLS_PER_ROOT_REQUEST {
+        if call_context.total_calls_used() >= MAX_CALL_CHAIN_CALLS_PER_ROOT_REQUEST {
             return Err(ToolError::ExecutionFailed(format!(
-                "Nested delegation budget exceeded ({}). Finish existing delegated work before spawning more subagents.",
-                MAX_DELEGATION_CALLS_PER_ROOT_REQUEST
+                "Nested call chain budget exceeded ({}). Finish existing delegated work before spawning more subagents.",
+                MAX_CALL_CHAIN_CALLS_PER_ROOT_REQUEST
             )));
         }
 
@@ -183,7 +172,7 @@ impl SubagentTool {
     ) -> Result<SubagentExecutionRequest, ToolError> {
         self.validate_nested_budget(ctx)?;
         let (effective_max_steps, effective_timeout_sec) = effective_limits(
-            &ctx.delegation_budget,
+            &ctx.call_chain_budget,
             requested_max_steps,
             requested_timeout_sec,
             DEFAULT_SUBAGENT_MAX_STEPS,
@@ -202,13 +191,13 @@ impl SubagentTool {
             origin: SubagentExecutionOrigin::Goal,
             effective_max_steps: Some(effective_max_steps),
             effective_timeout_sec: Some(effective_timeout_sec),
-            delegation_seed: DelegationSessionSeed {
-                inherited_context: ctx.delegation_context.clone(),
-                inherited_budget: DelegationBudget {
+            call_chain_seed: CallChainSeed {
+                inherited_context: ctx.call_chain_context.clone(),
+                inherited_budget: CallChainBudget {
                     remaining_steps: Some(effective_max_steps),
                     remaining_timeout_sec: Some(effective_timeout_sec),
                 },
-                delegated_context: None,
+                handoff_context: None,
             },
         })
     }
@@ -222,53 +211,65 @@ impl SubagentTool {
         requested_timeout_sec: Option<u64>,
         requested_max_steps: Option<usize>,
     ) -> Result<SubagentExecutionRequest, ToolError> {
-        let resolved = resolve_skill_delegation(
-            &self.registry,
-            &self.policy,
-            ctx,
-            &self.runtime.base_tool_names(),
-            SkillDelegationRequest {
-                skill_name,
-                raw_args: None,
-                json_args: skill_args.clone(),
-                context: context.clone(),
-                requested_timeout_sec,
-                requested_max_steps,
-            },
+        self.validate_nested_budget(ctx)?;
+        let skill_name = skill_name.trim().to_string();
+        if skill_name.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "`skill_name` must not be empty".to_string(),
+            ));
+        }
+
+        let (effective_max_steps, effective_timeout_sec) = effective_limits(
+            &ctx.call_chain_budget,
+            requested_max_steps,
+            requested_timeout_sec,
             DEFAULT_SUBAGENT_MAX_STEPS,
             DEFAULT_SUBAGENT_TIMEOUT_SEC,
-        )
-        .map_err(|failure| ToolError::ExecutionFailed(failure.message.clone()))?;
-
-        let args_to_validate = skill_args.unwrap_or_else(|| json!({}));
-        validate_json_args(resolved.skill.parameters.as_ref(), &args_to_validate)
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        );
+        let parent_context = ctx
+            .call_chain_context
+            .clone()
+            .unwrap_or_else(|| CallChainContext::new_root(ctx.session_id.clone()));
+        let serialized_args = skill_args.as_ref().map(Value::to_string);
+        let lineage = parent_context
+            .append_frame(&skill_name, serialized_args.as_deref())
+            .lineage_names();
+        let handoff_context = if context.trim().is_empty() {
+            None
+        } else {
+            Some(context.trim().to_string())
+        };
 
         Ok(SubagentExecutionRequest {
-            initial_input: resolved.activation_command,
-            display_goal: resolved.display_goal,
+            initial_input: build_skill_activation_command(&skill_name, None, skill_args.as_ref()),
+            display_goal: format!("delegated skill '{}'", skill_name),
             context,
-            timeout_sec: resolved.effective_timeout_sec,
-            max_steps: resolved.effective_max_steps,
-            allowed_tools: resolved.effective_tools.clone(),
-            restrict_to_allowed_tools: true,
-            allow_subagent_tool: resolved.allow_subagent_tool,
+            timeout_sec: effective_timeout_sec,
+            max_steps: effective_max_steps,
+            allowed_tools: Vec::new(),
+            restrict_to_allowed_tools: false,
+            allow_subagent_tool: true,
             origin: SubagentExecutionOrigin::Skill(SubagentSkillOrigin {
-                name: resolved.skill.meta.name.clone(),
-                lineage: resolved.lineage,
-                effective_tools: resolved.effective_tools,
+                name: skill_name,
+                lineage,
+                effective_tools: None,
             }),
-            effective_max_steps: Some(resolved.effective_max_steps),
-            effective_timeout_sec: Some(resolved.effective_timeout_sec),
-            delegation_seed: resolved.delegation_seed,
+            effective_max_steps: Some(effective_max_steps),
+            effective_timeout_sec: Some(effective_timeout_sec),
+            call_chain_seed: CallChainSeed {
+                inherited_context: Some(parent_context),
+                inherited_budget: CallChainBudget {
+                    remaining_steps: Some(effective_max_steps),
+                    remaining_timeout_sec: Some(effective_timeout_sec),
+                },
+                handoff_context,
+            },
         })
     }
 
-    fn register_delegation_use(&self, ctx: &super::protocol::ToolContext) {
-        if let Some(call_context) = ctx.delegation_context.as_ref() {
-            call_context
-                .total_delegations
-                .fetch_add(1, Ordering::SeqCst);
+    fn register_call_chain_use(&self, ctx: &super::protocol::ToolContext) {
+        if let Some(call_context) = ctx.call_chain_context.as_ref() {
+            call_context.total_calls.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -338,7 +339,7 @@ impl Tool for SubagentTool {
                         ));
                     }
                 };
-                self.register_delegation_use(ctx);
+                self.register_call_chain_use(ctx);
 
                 if background {
                     let spawned = self
@@ -424,8 +425,8 @@ mod tests {
     use serial_test::serial;
     use tokio::sync::mpsc;
 
+    use crate::call_chain::CallChainContext;
     use crate::context::Message;
-    use crate::delegation::DelegationContext;
     use crate::llm_client::{LlmClient, LlmError, StreamEvent};
     use crate::schema::StoragePaths;
     use crate::tools::protocol::{ToolContext, ToolExecutionEnvelope};
@@ -441,12 +442,10 @@ mod tests {
         remaining_timeout_sec: u64,
     ) -> ToolContext {
         let mut ctx = make_ctx();
-        let call_context = DelegationContext::new_root("root").append_frame("planner", None);
-        call_context
-            .total_delegations
-            .store(used_calls, Ordering::SeqCst);
-        ctx.delegation_context = Some(call_context);
-        ctx.delegation_budget = DelegationBudget {
+        let call_context = CallChainContext::new_root("root").append_frame("planner", None);
+        call_context.total_calls.store(used_calls, Ordering::SeqCst);
+        ctx.call_chain_context = Some(call_context);
+        ctx.call_chain_budget = CallChainBudget {
             remaining_steps: Some(remaining_steps),
             remaining_timeout_sec: Some(remaining_timeout_sec),
         };
@@ -762,44 +761,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_subagent_skill_mode_rejects_interactive_skill() {
-        let llm: Arc<dyn LlmClient> = Arc::new(FinishImmediatelyLlm);
-        let base_tools: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(MockTool("read_file")),
-            Arc::new(MockTool("subagent")),
-        ];
-        let runtime = SubagentRuntime::new(llm, base_tools, 2);
-        let mut tool = SubagentTool::new(runtime);
-        let mut registry = SkillRegistry::new();
-        registry.insert(crate::skills::definition::SkillDef {
-            meta: crate::skills::definition::SkillMeta {
-                name: "interactive".to_string(),
-                version: "1.0".to_string(),
-                description: "interactive".to_string(),
-                trigger: crate::skills::definition::SkillTrigger::ManualOnly,
-                allowed_tools: vec!["ask_user_question".to_string()],
-                output_mode: None,
-            },
-            instructions: "test".to_string(),
-            parameters: None,
-            constraints: crate::skills::definition::SkillConstraints::default(),
-        });
-        tool.registry = registry;
-
-        let error = tool
-            .execute(
-                json!({
-                    "action": "run",
-                    "skill_name": "interactive"
-                }),
-                &make_ctx(),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("interactive"));
-    }
-
-    #[tokio::test]
     async fn test_subagent_skill_mode_sync_returns_skill_metadata() {
         let tool = make_tool_with_base_tools(vec![Arc::new(MockTool("execute_bash"))]);
         let output = tool
@@ -822,10 +783,7 @@ mod tests {
             payload["skill_name"],
             Value::String("check_git_status".to_string())
         );
-        assert_eq!(
-            payload["effective_tools"],
-            Value::Array(vec![Value::String("execute_bash".to_string())])
-        );
+        assert!(payload["effective_tools"].is_null());
         assert_eq!(payload["effective_max_steps"], Value::Number(6.into()));
         assert_eq!(payload["effective_timeout_sec"], Value::Number(30.into()));
     }
@@ -885,13 +843,13 @@ mod tests {
                     "action": "run",
                     "goal": "inspect parser"
                 }),
-                &make_skill_ctx(MAX_DELEGATION_CALLS_PER_ROOT_REQUEST, 8, 20),
+                &make_skill_ctx(MAX_CALL_CHAIN_CALLS_PER_ROOT_REQUEST, 8, 20),
             )
             .await
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("Nested delegation budget exceeded"));
+            .contains("Nested call chain budget exceeded"));
     }
 
     #[tokio::test]

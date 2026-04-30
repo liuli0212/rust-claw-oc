@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use thiserror::Error;
 
-use crate::delegation::{DelegationBudget, DelegationContext};
+use crate::call_chain::{CallChainBudget, CallChainContext};
 
 pub fn clean_schema(mut schema_val: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = schema_val.as_object_mut() {
@@ -64,8 +64,8 @@ pub struct ToolContext {
     pub reply_to: String,
     pub visible_tools: Vec<String>,
     pub active_skill_name: Option<String>,
-    pub delegation_context: Option<DelegationContext>,
-    pub delegation_budget: DelegationBudget,
+    pub call_chain_context: Option<CallChainContext>,
+    pub call_chain_budget: CallChainBudget,
     pub trace: Option<ToolTraceContext>,
     /// Sandbox enforcer for OS-level and application-level isolation.
     /// `None` means sandbox is disabled (backward compatible).
@@ -79,8 +79,8 @@ impl ToolContext {
             reply_to: reply_to.into(),
             visible_tools: Vec::new(),
             active_skill_name: None,
-            delegation_context: None,
-            delegation_budget: DelegationBudget::default(),
+            call_chain_context: None,
+            call_chain_budget: CallChainBudget::default(),
             trace: None,
             sandbox: None,
         }

@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::call_chain::CallChainSeed;
 use crate::context::AgentContext;
 use crate::core::{AgentLoop, AgentOutput};
-use crate::delegation::DelegationSessionSeed;
 use crate::event_log::{AgentEvent, EventLog};
 use crate::llm_client::LlmClient;
 use crate::skills::policy::SkillToolPolicy;
@@ -30,7 +30,7 @@ pub struct SubagentSessionConfig {
     pub energy_budget: usize,
     pub timeout_sec: u64,
     pub parent_context_text: String,
-    pub delegation_seed: DelegationSessionSeed,
+    pub call_chain_seed: CallChainSeed,
     pub debug: Arc<tokio::sync::RwLock<SubagentDebugSnapshot>>,
     pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     pub cancel_notify: Arc<tokio::sync::Notify>,
@@ -302,7 +302,7 @@ pub fn build_subagent_session(
         energy_budget,
         timeout_sec,
         parent_context_text,
-        delegation_seed,
+        call_chain_seed,
         debug,
         cancelled,
         cancel_notify,
@@ -379,9 +379,9 @@ pub fn build_subagent_session(
         });
     }
     agent_loop.add_extension(Arc::new(
-        crate::skills::runtime::SkillRuntime::with_delegation_seed(
+        crate::skills::runtime::SkillRuntime::with_call_chain_seed(
             sub_session_id.clone(),
-            delegation_seed,
+            call_chain_seed,
         ),
     ));
     agent_loop.cancelled = cancelled;
@@ -662,7 +662,7 @@ mod tests {
                 energy_budget: 3,
                 timeout_sec: 3,
                 parent_context_text: "repo context".to_string(),
-                delegation_seed: DelegationSessionSeed::default(),
+                call_chain_seed: CallChainSeed::default(),
                 debug: Arc::new(tokio::sync::RwLock::new(SubagentDebugSnapshot::default())),
                 cancelled,
                 cancel_notify,

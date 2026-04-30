@@ -96,7 +96,7 @@ impl SessionRegistryStore {
             .iter()
             .map(|(id, entry)| (id.clone(), entry.updated_at_unix, entry.loaded_turns))
             .collect();
-        list.sort_by(|a, b| b.1.cmp(&a.1));
+        list.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         list
     }
 
