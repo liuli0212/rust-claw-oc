@@ -835,7 +835,7 @@ mod tests {
 
         let tool_results = output.tool_results();
         let result_payloads = extract_tool_payloads(&tool_results, "subagent");
-        assert!(result_payloads.len() >= 1);
+        assert!(!result_payloads.is_empty());
         assert!(
             result_payloads
                 .iter()
@@ -895,7 +895,7 @@ mod tests {
 
         let tool_results = output.tool_results();
         let result_payloads = extract_tool_payloads(&tool_results, "subagent");
-        assert!(result_payloads.len() >= 1);
+        assert!(!result_payloads.is_empty());
         assert!(result_payloads
             .iter()
             .any(|p| p.get("status").and_then(Value::as_str) == Some("failed")));
