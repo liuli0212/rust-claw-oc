@@ -685,7 +685,11 @@ async fn test_code_mode_nested_tool_context_is_enriched_by_extensions() {
     let echo_tool = Arc::new(ContextCapturingTool {
         contexts: captured_contexts.clone(),
     });
-    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::ExecTool), echo_tool];
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(crate::tools::ExecTool),
+        Arc::new(crate::tools::WaitTool),
+        echo_tool,
+    ];
 
     let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
     let mut agent = AgentLoop::new(
@@ -998,7 +1002,11 @@ async fn test_code_mode_trace_events_include_exec_metadata() {
     let echo_tool = Arc::new(ContextCapturingTool {
         contexts: captured_contexts,
     });
-    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(crate::tools::ExecTool), echo_tool];
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(crate::tools::ExecTool),
+        Arc::new(crate::tools::WaitTool),
+        echo_tool,
+    ];
 
     let (telemetry, _handle) = crate::telemetry::TelemetryExporter::new();
     let mut agent = AgentLoop::new(
