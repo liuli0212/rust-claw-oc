@@ -82,10 +82,10 @@ pub(crate) fn run_cell(
             globals
                 .set(
                     "__text".to_string(),
-                    Func::from(move |text: String| -> rquickjs::Result<()> {
+                    Func::from(move |text: Option<String>| -> rquickjs::Result<()> {
                         host_for_text.emit_event(crate::code_mode::protocol::RuntimeEvent::Text {
                             seq: next_seq_for_text.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-                            text,
+                            text: text.unwrap_or_default(),
                         });
                         Ok(())
                     }),
@@ -97,10 +97,10 @@ pub(crate) fn run_cell(
             globals
                 .set(
                     "__notify".to_string(),
-                    Func::from(move |message: String| -> rquickjs::Result<()> {
+                    Func::from(move |message: Option<String>| -> rquickjs::Result<()> {
                         host_for_notify.emit_event(crate::code_mode::protocol::RuntimeEvent::Notification {
                             seq: next_seq_for_notify.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-                            message,
+                            message: message.unwrap_or_default(),
                         });
                         Ok(())
                     }),
@@ -112,7 +112,8 @@ pub(crate) fn run_cell(
             globals
                 .set(
                     "__flush",
-                    Func::from(move |value_json: String| -> rquickjs::Result<()> {
+                    Func::from(move |value_json: Option<String>| -> rquickjs::Result<()> {
+                        let value_json = value_json.unwrap_or_default();
                         let flush_value = if value_json.is_empty() || value_json == "null" {
                             None
                         } else {
@@ -148,7 +149,9 @@ pub(crate) fn run_cell(
             globals
                 .set(
                     "__store".to_string(),
-                    Func::from(move |key: String, value_json: String| -> rquickjs::Result<()> {
+                    Func::from(move |key: Option<String>, value_json: Option<String>| -> rquickjs::Result<()> {
+                        let key = key.unwrap_or_default();
+                        let value_json = value_json.unwrap_or_else(|| "null".to_string());
                         let value = serde_json::from_str::<serde_json::Value>(&value_json).map_err(
                             |err| Error::new_from_js_message("string", "json", err.to_string()),
                         )?;
@@ -162,11 +165,11 @@ pub(crate) fn run_cell(
             globals
                 .set(
                     "__load".to_string(),
-                    Func::from(move |key: String| -> rquickjs::Result<Option<String>> {
+                    Func::from(move |key: Option<String>| -> rquickjs::Result<Option<String>> {
                         Ok(load_ref
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .get(&key)
+                            .get(&key.unwrap_or_default())
                             .map(serde_json::Value::to_string))
                     }),
                 )
@@ -235,9 +238,9 @@ pub(crate) fn run_cell(
             globals
                 .set(
                     "__clearTimeout",
-                    Func::from(move |timer_id: String| -> rquickjs::Result<()> {
+                    Func::from(move |timer_id: Option<String>| -> rquickjs::Result<()> {
                         let mut timer_calls = timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner());
-                        self::timers::clear_timeout(&mut timer_calls, &timer_id);
+                        self::timers::clear_timeout(&mut timer_calls, &timer_id.unwrap_or_default());
                         Ok(())
                     }),
                 )
@@ -247,9 +250,9 @@ pub(crate) fn run_cell(
             globals
                 .set(
                     "__markTimeoutComplete",
-                    Func::from(move |timer_id: String| -> rquickjs::Result<()> {
+                    Func::from(move |timer_id: Option<String>| -> rquickjs::Result<()> {
                         let mut timer_calls = timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner());
-                        self::timers::mark_timeout_completed(&mut timer_calls, &timer_id);
+                        self::timers::mark_timeout_completed(&mut timer_calls, &timer_id.unwrap_or_default());
                         Ok(())
                     }),
                 )
