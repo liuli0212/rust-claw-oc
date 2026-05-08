@@ -275,30 +275,47 @@ pub(crate) fn run_cell(
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            // Register __wait_for_timer: blocks the worker thread for the specified duration
-            // while checking for cancellation from the driver.
+            // Register __wait_for_timer as an async bridge so the JS timer pump
+            // can run while user code is awaiting a timer-backed Promise.
             let cancel_rx_for_timer = cancel_rx.clone();
-            globals
-                .set(
-                    "__wait_for_timer",
-                    Func::from(move |ms: f64| -> rquickjs::Result<String> {
-                        let rx = cancel_rx_for_timer.lock().unwrap_or_else(|e| e.into_inner());
+            let wait_for_timer = Function::new(
+                ctx.clone(),
+                Async(move |ms: f64| {
+                    let cancel_rx = cancel_rx_for_timer.clone();
+                    async move {
                         let wait_dur = std::time::Duration::from_millis(ms as u64);
-                        match rx.recv_timeout(wait_dur) {
-                            Ok(reason) => Ok(serde_json::json!({
-                                "cancelled": true,
-                                "reason": reason,
+                        tokio::task::spawn_blocking(move || {
+                            let rx = cancel_rx.lock().unwrap_or_else(|e| e.into_inner());
+                            match rx.recv_timeout(wait_dur) {
+                                Ok(reason) => serde_json::json!({
+                                    "cancelled": true,
+                                    "reason": reason,
+                                })
+                                .to_string(),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    r#"{"continued":true}"#.to_string()
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    r#"{"disconnected":true}"#.to_string()
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|err| {
+                            serde_json::json!({
+                                "disconnected": true,
+                                "reason": err.to_string(),
                             })
-                            .to_string()),
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                Ok(r#"{"continued":true}"#.to_string())
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                Ok(r#"{"disconnected":true}"#.to_string())
-                            }
-                        }
-                    }),
-                )
+                            .to_string()
+                        })
+                    }
+                }),
+            )
+            .map_err(js_error_to_tool_error)?
+            .with_name("__wait_for_timer")
+            .map_err(js_error_to_tool_error)?;
+            globals
+                .set("__wait_for_timer", wait_for_timer)
                 .map_err(js_error_to_tool_error)?;
 
             let promise: Promise = ctx

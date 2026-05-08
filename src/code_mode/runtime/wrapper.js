@@ -2,6 +2,13 @@
   const allTools = JSON.parse(__allToolsJson);
   const timerCallbacks = new Map();
   const dueTimerIds = [];
+  // Keep long waits interruptible so later, shorter timers are not delayed.
+  const TIMER_POLL_SLICE_MS = 25;
+  let timerPumpPromise = null;
+  let rejectTimerFailure = null;
+  const timerFailurePromise = new Promise((_, reject) => {
+    rejectTimerFailure = reject;
+  });
 
   function formatRuntimeError(err) {
     const message =
@@ -51,7 +58,14 @@
     }
   }
 
-  async function waitForPendingTimers() {
+  function timerCancellation(reason) {
+    return {
+      __rustyClawTimerCancellation: true,
+      reason: reason || "Code mode timer loop was cancelled.",
+    };
+  }
+
+  async function runTimerPump() {
     while (true) {
       const timerState = JSON.parse(__timerStateJson());
       enqueueDueTimers(timerState.due_timer_ids || []);
@@ -68,14 +82,38 @@
       const resumeAfterMs = timerState.resume_after_ms ?? 100;
       __waiting_for_timer(resumeAfterMs);
 
-      const waitResult = JSON.parse(__wait_for_timer(resumeAfterMs));
+      const waitForMs = Math.min(resumeAfterMs, TIMER_POLL_SLICE_MS);
+      const waitResult = JSON.parse(await __wait_for_timer(waitForMs));
       if (waitResult && waitResult.cancelled) {
-        return waitResult.reason || "Code mode timer loop was cancelled.";
+        throw timerCancellation(waitResult.reason);
       }
       if (waitResult && waitResult.disconnected) {
-        return "Code mode timer loop lost its host connection.";
+        throw timerCancellation("Code mode timer loop lost its host connection.");
       }
     }
+  }
+
+  function ensureTimerPump() {
+    if (timerPumpPromise) {
+      return;
+    }
+
+    timerPumpPromise = runTimerPump()
+      .catch((err) => {
+        rejectTimerFailure(err);
+        throw err;
+      })
+      .finally(() => {
+        timerPumpPromise = null;
+      });
+  }
+
+  async function waitForPendingTimers() {
+    if (timerPumpPromise) {
+      await timerPumpPromise;
+    }
+
+    await runTimerPump();
   }
 
   const tools = {};
@@ -114,6 +152,7 @@
     if (registration.run_immediately) {
       dueTimerIds.push(registration.timer_id);
     }
+    ensureTimerPump();
     return registration.timer_id;
   };
   globalThis.clearTimeout = (timerId) => {
@@ -134,14 +173,15 @@
   };
 
   try {
-    const result = await (async () => {
+    const userCodePromise = (async () => {
 /*__RUSTY_CLAW_USER_CODE__*/
     })();
 
-    const cancellationReason = await waitForPendingTimers();
-    if (cancellationReason) {
-      return JSON.stringify({ cancellationReason });
-    }
+    // User code may be awaiting a Promise that only a timer callback can settle.
+    // Race only timer failures/cancellations; normal completion still comes
+    // from user code, then we drain any remaining unawaited timers.
+    const result = await Promise.race([userCodePromise, timerFailurePromise]);
+    await waitForPendingTimers();
 
     return JSON.stringify({
       returnValue: result === undefined ? null : result,
@@ -151,6 +191,10 @@
       return JSON.stringify({
         returnValue: err.value === undefined ? null : err.value,
       });
+    }
+
+    if (err && err.__rustyClawTimerCancellation) {
+      return JSON.stringify({ cancellationReason: err.reason });
     }
 
     return JSON.stringify({ runtimeError: formatRuntimeError(err) });

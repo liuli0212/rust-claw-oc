@@ -25,8 +25,6 @@ type SharedCellHost = Arc<CellHostHandle>;
 type InitialSummaryTx = Option<oneshot::Sender<Result<ExecRunResult, crate::tools::ToolError>>>;
 type CellTraceFinish = (TraceStatus, Option<String>, serde_json::Value);
 
-const INITIAL_NESTED_TOOL_PUBLICATION_DELAY: Duration = Duration::from_millis(150);
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CellRuntimeBudget {
     pub timeout_ms: u64,
@@ -444,7 +442,6 @@ impl CodeModeService {
         initial_summary_tx: &mut InitialSummaryTx,
     ) -> CellTraceFinish {
         let mut publication_tracker = PublicationTracker::new(options.auto_flush_ms);
-        let mut pending_initial_tool_summary: Option<(ExecRunResult, Instant)> = None;
 
         loop {
             let mut idle_timeout = publication_tracker.next_idle_timeout();
@@ -465,13 +462,6 @@ impl CodeModeService {
                 Some(existing) => existing.min(until_cell_deadline),
                 None => until_cell_deadline,
             });
-            if let Some((_, publish_at)) = pending_initial_tool_summary.as_ref() {
-                let until_initial_publish = publish_at.saturating_duration_since(Instant::now());
-                idle_timeout = Some(match idle_timeout {
-                    Some(existing) => existing.min(until_initial_publish),
-                    None => until_initial_publish,
-                });
-            }
 
             let driver_update = {
                 let mut driver = host_handle.driver_handle.lock().await;
@@ -494,26 +484,6 @@ impl CodeModeService {
             };
 
             if matches!(update.status, CellStatus::Idle) {
-                if let Some((summary, publish_at)) = pending_initial_tool_summary.as_ref() {
-                    if initial_summary_tx.is_some() && Instant::now() >= *publish_at {
-                        let summary = summary.clone();
-                        pending_initial_tool_summary = None;
-                        if let Err(err) = self
-                            .publish_summary_and_unblock_initial(
-                                session_id,
-                                cell_id,
-                                host_handle,
-                                initial_summary_tx,
-                                &summary,
-                            )
-                            .await
-                        {
-                            return Self::fail_and_exit(cell_id, initial_summary_tx, err);
-                        }
-                        continue;
-                    }
-                }
-
                 if !publication_tracker.should_auto_flush_now() {
                     continue;
                 }
@@ -568,7 +538,6 @@ impl CodeModeService {
                     };
 
                     if let Some(summary) = publication {
-                        pending_initial_tool_summary = None;
                         if let Err(err) = self
                             .publish_summary_and_unblock_initial(
                                 session_id,
@@ -598,12 +567,6 @@ impl CodeModeService {
                         .await
                     {
                         return Self::fail_and_exit(cell_id, initial_summary_tx, err);
-                    }
-                    if initial_summary_tx.is_some() {
-                        pending_initial_tool_summary = Some((
-                            current_summary,
-                            Instant::now() + INITIAL_NESTED_TOOL_PUBLICATION_DELAY,
-                        ));
                     }
                 }
                 CellStatus::Terminal(_) => {
@@ -1257,13 +1220,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_surfaces_waiting_on_tool_for_long_nested_calls() {
+    async fn wait_surfaces_waiting_on_tool_for_long_nested_calls_after_flush() {
         let service = CodeModeService::default();
 
         let summary = service
             .execute(
                 "session-pending-tool",
                 r#"
+                    flush({ stage: "before_tool" });
                     const response = await tools.echo_tool({ value: "done" });
                     text(response.value);
                 "#,
@@ -1275,21 +1239,27 @@ mod tests {
                 None,
             )
             .await
-            .expect("exec should publish the waiting-on-tool snapshot");
+            .expect("exec should publish the explicit flush");
 
+        assert!(summary.flushed);
         assert_eq!(&summary.lifecycle, &ExecLifecycle::Running);
+
+        let pending_summary = service
+            .wait_with_request("session-pending-tool", Some(&summary.cell_id), Some(100))
+            .await
+            .expect("wait should observe the waiting-on-tool snapshot");
+
+        assert_eq!(&pending_summary.lifecycle, &ExecLifecycle::Running);
         assert_eq!(
-            summary.waiting_on_tool_request_id.as_deref(),
-            Some("echo_tool-1")
+            pending_summary.waiting_on_tool_request_id.as_deref(),
+            Some("echo_tool-2")
         );
-        assert!(summary
+        assert!(pending_summary
             .render_output()
             .contains("processing nested tool request"));
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
         let final_summary = service
-            .wait_with_request("session-pending-tool", Some(&summary.cell_id), Some(0))
+            .wait_with_request("session-pending-tool", Some(&summary.cell_id), Some(500))
             .await
             .expect("wait should observe the terminal summary");
 
@@ -1319,6 +1289,48 @@ mod tests {
         assert!(!summary.flushed);
         assert_eq!(&summary.lifecycle, &ExecLifecycle::Completed);
         assert_eq!(summary.output_text, "timer done");
+    }
+
+    #[tokio::test]
+    async fn awaited_timer_promise_progresses_after_flush() {
+        let service = CodeModeService::default();
+
+        let summary = service
+            .execute(
+                "session-awaited-timer-promise",
+                r#"
+                    text("Testing flush with empty string argument...\n");
+                    flush("");
+                    await new Promise((resolve) => setTimeout(resolve, 20));
+                    text("It works perfectly without throwing the undefined error!\n");
+                "#,
+                host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(None),
+                None,
+            )
+            .await
+            .expect("exec should publish the explicit flush before the awaited timer");
+
+        assert!(summary.flushed);
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Running);
+
+        let final_summary = service
+            .wait_with_request(
+                "session-awaited-timer-promise",
+                Some(&summary.cell_id),
+                Some(500),
+            )
+            .await
+            .expect("wait should observe completion after the awaited timer fires");
+
+        assert_eq!(&final_summary.lifecycle, &ExecLifecycle::Completed);
+        assert!(
+            final_summary
+                .output_text
+                .contains("It works perfectly without throwing the undefined error!"),
+            "unexpected output: {:?}",
+            final_summary.output_text
+        );
     }
 
     #[tokio::test]
