@@ -1,4 +1,8 @@
+use std::sync::Mutex;
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecordedTimerCall {
@@ -14,7 +18,6 @@ pub struct RecordedTimerCall {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TimerRegistration {
     pub timer_id: String,
-    pub run_immediately: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,6 +34,60 @@ impl PendingTimerState {
     }
 }
 
+pub struct TimerRegistry {
+    timer_calls: Mutex<Vec<RecordedTimerCall>>,
+    clock_start: Instant,
+    notify: Notify,
+}
+
+impl TimerRegistry {
+    pub fn new(clock_start: Instant) -> Self {
+        Self {
+            timer_calls: Mutex::new(Vec::new()),
+            clock_start,
+            notify: Notify::new(),
+        }
+    }
+
+    pub fn register_timeout(&self, delay_ms: u64) -> TimerRegistration {
+        let registration = {
+            let mut timer_calls = self.timer_calls.lock().unwrap_or_else(|e| e.into_inner());
+            register_timeout(
+                &mut timer_calls,
+                delay_ms,
+                monotonic_elapsed_ms(&self.clock_start),
+            )
+        };
+        self.notify.notify_one();
+        registration
+    }
+
+    pub fn clear_timeout(&self, timer_id: &str) {
+        {
+            let mut timer_calls = self.timer_calls.lock().unwrap_or_else(|e| e.into_inner());
+            clear_timeout(&mut timer_calls, timer_id);
+        }
+        self.notify.notify_one();
+    }
+
+    pub fn mark_timeout_completed(&self, timer_id: &str) {
+        {
+            let mut timer_calls = self.timer_calls.lock().unwrap_or_else(|e| e.into_inner());
+            mark_timeout_completed(&mut timer_calls, timer_id);
+        }
+        self.notify.notify_one();
+    }
+
+    pub fn pending_state(&self) -> PendingTimerState {
+        let timer_calls = self.timer_calls.lock().unwrap_or_else(|e| e.into_inner());
+        pending_timer_state(&timer_calls, monotonic_elapsed_ms(&self.clock_start))
+    }
+
+    pub async fn wait_for_change(&self) {
+        self.notify.notified().await;
+    }
+}
+
 pub fn register_timeout(
     timer_calls: &mut Vec<RecordedTimerCall>,
     delay_ms: u64,
@@ -38,7 +95,6 @@ pub fn register_timeout(
 ) -> TimerRegistration {
     let timer_id = format!("timer_{}", timer_calls.len() + 1);
     let due_at_ms = now_ms.saturating_add(delay_ms);
-    let run_immediately = delay_ms == 0;
 
     timer_calls.push(RecordedTimerCall {
         timer_id: timer_id.clone(),
@@ -48,10 +104,7 @@ pub fn register_timeout(
         cleared: false,
     });
 
-    TimerRegistration {
-        timer_id,
-        run_immediately,
-    }
+    TimerRegistration { timer_id }
 }
 
 pub fn clear_timeout(timer_calls: &mut [RecordedTimerCall], timer_id: &str) {
@@ -105,6 +158,10 @@ pub fn pending_timer_state(timer_calls: &[RecordedTimerCall], now_ms: u64) -> Pe
     }
 }
 
+fn monotonic_elapsed_ms(start: &Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,7 +171,6 @@ mod tests {
         let mut calls = Vec::new();
         let first = register_timeout(&mut calls, 25, 1_000);
         assert_eq!(first.timer_id, "timer_1");
-        assert!(!first.run_immediately);
 
         let pending = pending_timer_state(&calls, 1_010);
         assert!(pending.has_pending_timers());
@@ -128,12 +184,10 @@ mod tests {
     fn clear_and_complete_remove_timers_from_pending_state() {
         let mut calls = Vec::new();
         let first = register_timeout(&mut calls, 0, 1_000);
-        assert!(first.run_immediately);
         mark_timeout_completed(&mut calls, &first.timer_id);
         assert!(!pending_timer_state(&calls, 1_000).has_pending_timers());
 
         let second = register_timeout(&mut calls, 50, 1_000);
-        assert!(!second.run_immediately);
         clear_timeout(&mut calls, &second.timer_id);
         assert!(!pending_timer_state(&calls, 1_010).has_pending_timers());
     }

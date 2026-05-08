@@ -14,15 +14,15 @@ pub struct CellDriver {
 
 #[derive(Clone)]
 pub struct CellDriverControl {
-    /// Channel for interrupting timer waits in the worker thread.
-    cancel_tx: std::sync::mpsc::Sender<String>,
+    /// Notifies async runtime waits that the cell should stop cooperatively.
+    cancel_tx: tokio::sync::watch::Sender<Option<String>>,
     cancel_flag: Arc<AtomicBool>,
 }
 
 impl CellDriverControl {
     pub fn request_cancel(&self, reason: &str) {
         self.cancel_flag.store(true, Ordering::Release);
-        let _ = self.cancel_tx.send(reason.to_string());
+        let _ = self.cancel_tx.send(Some(reason.to_string()));
     }
 }
 
@@ -68,7 +68,7 @@ impl CellDriver {
         event_rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
         cancel_flag: Arc<AtomicBool>,
     ) -> Self {
-        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<String>();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(None::<String>);
 
         let cancel_flag_for_worker = cancel_flag.clone();
         let event_tx_captured = event_tx.clone();
@@ -107,7 +107,7 @@ impl CellDriver {
         if let Some(worker) = self.worker.take() {
             // abort() on a spawn_blocking handle only detaches the JoinHandle —
             // it does NOT terminate the OS thread. The cancel_flag interrupt handler
-            // and timer cancel command are what actually stop cooperative runtime work.
+            // and cancel notification are what actually stop cooperative runtime work.
             worker.abort();
         }
     }

@@ -1334,6 +1334,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shorter_timer_registered_later_runs_before_existing_long_timer() {
+        let service = CodeModeService::default();
+
+        let summary = service
+            .execute(
+                "session-shorter-timer",
+                r#"
+                    setTimeout(() => {
+                        text("long");
+                    }, 80);
+                    setTimeout(() => {
+                        text("short");
+                    }, 10);
+                "#,
+                host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(None),
+                None,
+            )
+            .await
+            .expect("exec should complete both timers");
+
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Completed);
+        assert_eq!(summary.output_text, "short\nlong");
+    }
+
+    #[tokio::test]
+    async fn clear_timeout_wakes_timer_pump_for_remaining_timer() {
+        let service = CodeModeService::default();
+
+        let summary = service
+            .execute(
+                "session-clear-timeout",
+                r#"
+                    const cancelled = setTimeout(() => {
+                        text("cancelled");
+                    }, 60);
+                    setTimeout(() => {
+                        clearTimeout(cancelled);
+                        text("cleared");
+                    }, 10);
+                    setTimeout(() => {
+                        text("done");
+                    }, 20);
+                "#,
+                host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(None),
+                None,
+            )
+            .await
+            .expect("exec should complete remaining timers after clearTimeout");
+
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Completed);
+        assert_eq!(summary.output_text, "cleared\ndone");
+    }
+
+    #[tokio::test]
+    async fn timer_callback_can_register_followup_timer() {
+        let service = CodeModeService::default();
+
+        let summary = service
+            .execute(
+                "session-followup-timer",
+                r#"
+                    setTimeout(() => {
+                        text("first");
+                        setTimeout(() => {
+                            text("second");
+                        }, 10);
+                    }, 10);
+                "#,
+                host_factory(Vec::new(), Vec::new()),
+                default_test_cell_options(None),
+                None,
+            )
+            .await
+            .expect("exec should complete the timer registered from a timer callback");
+
+        assert_eq!(&summary.lifecycle, &ExecLifecycle::Completed);
+        assert_eq!(summary.output_text, "first\nsecond");
+    }
+
+    #[tokio::test]
     async fn auto_flush_publishes_progress_while_timer_runs() {
         let service = CodeModeService::default();
 

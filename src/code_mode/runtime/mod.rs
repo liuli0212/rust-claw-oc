@@ -8,7 +8,7 @@ use rquickjs::prelude::{Func, Promise};
 use rquickjs::{AsyncContext, AsyncRuntime, Error, Function};
 use serde::Deserialize;
 
-use self::timers::RecordedTimerCall;
+use self::timers::TimerRegistry;
 use self::value::StoredValue;
 use super::protocol::{RuntimeTerminalResult, ToolCallRequest};
 
@@ -22,7 +22,7 @@ pub(crate) struct RunCellRequest {
     pub(crate) code: String,
     pub(crate) stored_values: HashMap<String, StoredValue>,
     pub(crate) host: Arc<dyn crate::code_mode::host::CellRuntimeHost>,
-    pub(crate) cancel_rx: std::sync::mpsc::Receiver<String>,
+    pub(crate) cancel_rx: tokio::sync::watch::Receiver<Option<String>>,
     pub(crate) cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -63,15 +63,13 @@ pub(crate) fn run_cell(
         let next_seq_for_script = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let stored_values = Arc::new(Mutex::new(stored_values));
-        let timer_calls = Arc::new(Mutex::new(Vec::<RecordedTimerCall>::new()));
+        let timers = Arc::new(TimerRegistry::new(Instant::now()));
         let visible_tools_json = serde_json::to_string(&host.visible_tool_names())
             .map_err(|err| crate::tools::ToolError::ExecutionFailed(err.to_string()))?;
-        let cancel_rx = Arc::new(Mutex::new(cancel_rx));
-        let timer_clock_start = Arc::new(Instant::now());
 
         let next_seq_for_script_captured = next_seq_for_script.clone();
         let stored_values_for_script = stored_values.clone();
-        let timer_calls_for_script = timer_calls.clone();
+        let timers_for_script = timers.clone();
         let host_for_script = host.clone();
 
         let return_payload = async_with!(context => |ctx| {
@@ -124,21 +122,6 @@ pub(crate) fn run_cell(
                         host_for_flush.emit_event(crate::code_mode::protocol::RuntimeEvent::Flush {
                             seq: next_seq_for_flush.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                             value: flush_value,
-                        });
-                        Ok(())
-                    }),
-                )
-                .map_err(js_error_to_tool_error)?;
-
-            let host_for_timer_wait = host_for_script.clone();
-            let next_seq_for_timer_wait = next_seq_for_script_captured.clone();
-            globals
-                .set(
-                    "__waiting_for_timer",
-                    Func::from(move |resume_after_ms: Option<u64>| -> rquickjs::Result<()> {
-                        host_for_timer_wait.emit_event(crate::code_mode::protocol::RuntimeEvent::WaitingForTimer {
-                            seq: next_seq_for_timer_wait.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-                            resume_after_ms,
                         });
                         Ok(())
                     }),
@@ -214,19 +197,13 @@ pub(crate) fn run_cell(
                 .set("__allToolsJson", visible_tools_json.clone())
                 .map_err(js_error_to_tool_error)?;
 
-            let timer_calls_ref = timer_calls_for_script.clone();
-            let timer_clock_for_register = timer_clock_start.clone();
+            let timers_ref = timers_for_script.clone();
             globals
                 .set(
                     "__setTimeout",
                     Func::from(move |delay_ms: i32| -> rquickjs::Result<String> {
                         let delay_ms = u64::try_from(delay_ms).unwrap_or_default();
-                        let mut timer_calls = timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner());
-                        let registration = self::timers::register_timeout(
-                            &mut timer_calls,
-                            delay_ms,
-                            monotonic_elapsed_ms(timer_clock_for_register.as_ref()),
-                        );
+                        let registration = timers_ref.register_timeout(delay_ms);
                         serde_json::to_string(&registration).map_err(|err| {
                             Error::new_from_js_message("timer", "json", err.to_string())
                         })
@@ -234,88 +211,49 @@ pub(crate) fn run_cell(
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            let timer_calls_ref = timer_calls_for_script.clone();
+            let timers_ref = timers_for_script.clone();
             globals
                 .set(
                     "__clearTimeout",
                     Func::from(move |timer_id: Option<String>| -> rquickjs::Result<()> {
-                        let mut timer_calls = timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner());
-                        self::timers::clear_timeout(&mut timer_calls, &timer_id.unwrap_or_default());
+                        timers_ref.clear_timeout(&timer_id.unwrap_or_default());
                         Ok(())
                     }),
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            let timer_calls_ref = timer_calls_for_script.clone();
+            let timers_ref = timers_for_script.clone();
             globals
                 .set(
                     "__markTimeoutComplete",
                     Func::from(move |timer_id: Option<String>| -> rquickjs::Result<()> {
-                        let mut timer_calls = timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner());
-                        self::timers::mark_timeout_completed(&mut timer_calls, &timer_id.unwrap_or_default());
+                        timers_ref.mark_timeout_completed(&timer_id.unwrap_or_default());
                         Ok(())
                     }),
                 )
                 .map_err(js_error_to_tool_error)?;
 
-            let timer_calls_ref = timer_calls_for_script.clone();
-            let timer_clock_for_pending = timer_clock_start.clone();
-            globals
-                .set(
-                    "__timerStateJson",
-                    Func::from(move || -> rquickjs::Result<String> {
-                        let pending = self::timers::pending_timer_state(
-                            &timer_calls_ref.lock().unwrap_or_else(|e| e.into_inner()),
-                            monotonic_elapsed_ms(timer_clock_for_pending.as_ref()),
-                        );
-                        serde_json::to_string(&pending).map_err(|err| {
-                            Error::new_from_js_message("timer", "json", err.to_string())
-                        })
-                    }),
-                )
-                .map_err(js_error_to_tool_error)?;
-
-            // Register __wait_for_timer as an async bridge so the JS timer pump
-            // can run while user code is awaiting a timer-backed Promise.
+            let timers_ref = timers_for_script.clone();
+            let host_for_timer = host_for_script.clone();
+            let next_seq_for_timer = next_seq_for_script_captured.clone();
             let cancel_rx_for_timer = cancel_rx.clone();
-            let wait_for_timer = Function::new(
+            let next_timer_event = Function::new(
                 ctx.clone(),
-                Async(move |ms: f64| {
+                Async(move || {
+                    let timers = timers_ref.clone();
+                    let host = host_for_timer.clone();
+                    let next_seq = next_seq_for_timer.clone();
                     let cancel_rx = cancel_rx_for_timer.clone();
                     async move {
-                        let wait_dur = std::time::Duration::from_millis(ms as u64);
-                        tokio::task::spawn_blocking(move || {
-                            let rx = cancel_rx.lock().unwrap_or_else(|e| e.into_inner());
-                            match rx.recv_timeout(wait_dur) {
-                                Ok(reason) => serde_json::json!({
-                                    "cancelled": true,
-                                    "reason": reason,
-                                })
-                                .to_string(),
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                    r#"{"continued":true}"#.to_string()
-                                }
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                    r#"{"disconnected":true}"#.to_string()
-                                }
-                            }
-                        })
-                        .await
-                        .unwrap_or_else(|err| {
-                            serde_json::json!({
-                                "disconnected": true,
-                                "reason": err.to_string(),
-                            })
-                            .to_string()
-                        })
+                        next_timer_event_json(timers, host, next_seq, cancel_rx).await
                     }
                 }),
             )
             .map_err(js_error_to_tool_error)?
-            .with_name("__wait_for_timer")
+            .with_name("__next_timer_event")
             .map_err(js_error_to_tool_error)?;
             globals
-                .set("__wait_for_timer", wait_for_timer)
+                .set("__next_timer_event", next_timer_event)
                 .map_err(js_error_to_tool_error)?;
 
             let promise: Promise = ctx
@@ -344,8 +282,50 @@ pub(crate) fn run_cell(
     })
 }
 
-fn monotonic_elapsed_ms(start: &Instant) -> u64 {
-    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+async fn next_timer_event_json(
+    timers: Arc<TimerRegistry>,
+    host: Arc<dyn crate::code_mode::host::CellRuntimeHost>,
+    next_seq: Arc<std::sync::atomic::AtomicU64>,
+    mut cancel_rx: tokio::sync::watch::Receiver<Option<String>>,
+) -> String {
+    loop {
+        if let Some(reason) = cancel_rx.borrow().clone() {
+            return serde_json::json!({
+                "cancelled": true,
+                "reason": reason,
+            })
+            .to_string();
+        }
+
+        let pending = timers.pending_state();
+        if let Some(timer_id) = pending.due_timer_ids.first() {
+            return serde_json::json!({
+                "timer_id": timer_id,
+            })
+            .to_string();
+        }
+
+        if !pending.has_pending_timers() {
+            return r#"{"idle":true}"#.to_string();
+        }
+
+        host.emit_event(crate::code_mode::protocol::RuntimeEvent::WaitingForTimer {
+            seq: next_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            resume_after_ms: pending.resume_after_ms,
+        });
+
+        let wait_duration =
+            std::time::Duration::from_millis(pending.resume_after_ms.unwrap_or_default());
+        tokio::select! {
+            _ = tokio::time::sleep(wait_duration) => {}
+            _ = timers.wait_for_change() => {}
+            changed = cancel_rx.changed() => {
+                if changed.is_err() {
+                    return r#"{"disconnected":true}"#.to_string();
+                }
+            }
+        }
+    }
 }
 
 fn build_wrapper_script(code: &str) -> String {

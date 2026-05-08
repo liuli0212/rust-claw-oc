@@ -1,10 +1,8 @@
 (async () => {
   const allTools = JSON.parse(__allToolsJson);
   const timerCallbacks = new Map();
-  const dueTimerIds = [];
-  // Keep long waits interruptible so later, shorter timers are not delayed.
-  const TIMER_POLL_SLICE_MS = 25;
   let timerPumpPromise = null;
+  let timerPumpFailure = null;
   let rejectTimerFailure = null;
   const timerFailurePromise = new Promise((_, reject) => {
     rejectTimerFailure = reject;
@@ -33,31 +31,6 @@
     return serialized === undefined ? "null" : serialized;
   }
 
-  function enqueueDueTimers(timerIds) {
-    for (const timerId of timerIds) {
-      if (timerCallbacks.has(timerId) && !dueTimerIds.includes(timerId)) {
-        dueTimerIds.push(timerId);
-      }
-    }
-  }
-
-  async function drainDueTimers() {
-    while (dueTimerIds.length > 0) {
-      const timerId = dueTimerIds.shift();
-      const callback = timerCallbacks.get(timerId);
-      if (!callback) {
-        continue;
-      }
-
-      timerCallbacks.delete(timerId);
-      try {
-        await callback();
-      } finally {
-        __markTimeoutComplete(timerId);
-      }
-    }
-  }
-
   function timerCancellation(reason) {
     return {
       __rustyClawTimerCancellation: true,
@@ -65,30 +38,35 @@
     };
   }
 
+  async function runTimerCallback(timerId) {
+    const callback = timerCallbacks.get(timerId);
+    if (!callback) {
+      __markTimeoutComplete(timerId);
+      return;
+    }
+
+    timerCallbacks.delete(timerId);
+    try {
+      await callback();
+    } finally {
+      __markTimeoutComplete(timerId);
+    }
+  }
+
   async function runTimerPump() {
-    while (true) {
-      const timerState = JSON.parse(__timerStateJson());
-      enqueueDueTimers(timerState.due_timer_ids || []);
-
-      if (dueTimerIds.length > 0) {
-        await drainDueTimers();
-        continue;
-      }
-
-      if ((timerState.pending_timers || 0) === 0) {
+    while (timerCallbacks.size > 0) {
+      const timerEvent = JSON.parse(await __next_timer_event());
+      if (timerEvent && timerEvent.idle) {
         return null;
       }
-
-      const resumeAfterMs = timerState.resume_after_ms ?? 100;
-      __waiting_for_timer(resumeAfterMs);
-
-      const waitForMs = Math.min(resumeAfterMs, TIMER_POLL_SLICE_MS);
-      const waitResult = JSON.parse(await __wait_for_timer(waitForMs));
-      if (waitResult && waitResult.cancelled) {
-        throw timerCancellation(waitResult.reason);
+      if (timerEvent && timerEvent.cancelled) {
+        throw timerCancellation(timerEvent.reason);
       }
-      if (waitResult && waitResult.disconnected) {
+      if (timerEvent && timerEvent.disconnected) {
         throw timerCancellation("Code mode timer loop lost its host connection.");
+      }
+      if (timerEvent && timerEvent.timer_id) {
+        await runTimerCallback(timerEvent.timer_id);
       }
     }
   }
@@ -100,8 +78,8 @@
 
     timerPumpPromise = runTimerPump()
       .catch((err) => {
+        timerPumpFailure = err;
         rejectTimerFailure(err);
-        throw err;
       })
       .finally(() => {
         timerPumpPromise = null;
@@ -111,6 +89,9 @@
   async function waitForPendingTimers() {
     if (timerPumpPromise) {
       await timerPumpPromise;
+    }
+    if (timerPumpFailure) {
+      throw timerPumpFailure;
     }
 
     await runTimerPump();
@@ -149,9 +130,6 @@
     const normalizedDelay = Math.max(0, Math.trunc(Number(delayMs ?? 0) || 0));
     const registration = JSON.parse(__setTimeout(normalizedDelay));
     timerCallbacks.set(registration.timer_id, callback);
-    if (registration.run_immediately) {
-      dueTimerIds.push(registration.timer_id);
-    }
     ensureTimerPump();
     return registration.timer_id;
   };
@@ -163,11 +141,6 @@
     const normalizedId = String(timerId);
     timerCallbacks.delete(normalizedId);
     __clearTimeout(normalizedId);
-
-    const queueIndex = dueTimerIds.indexOf(normalizedId);
-    if (queueIndex >= 0) {
-      dueTimerIds.splice(queueIndex, 1);
-    }
 
     return undefined;
   };
