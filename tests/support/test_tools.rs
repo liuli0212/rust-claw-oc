@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use async_trait::async_trait;
 use rusty_claw::tools::protocol::{StructuredToolOutput, Tool, ToolContext, ToolError};
 use serde_json::Value;
