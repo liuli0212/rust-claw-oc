@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
+#[allow(dead_code)]
 pub struct MockTool {
     pub name: String,
     pub results: Arc<Mutex<Vec<Result<String, String>>>>,
@@ -12,6 +13,7 @@ pub struct MockTool {
     pub untrusted_source: Option<String>,
 }
 
+#[allow(dead_code)]
 impl MockTool {
     pub fn new(name: &str, result: Result<String, String>) -> Self {
         Self {
@@ -86,10 +88,12 @@ impl Tool for MockTool {
     }
 }
 
+#[allow(dead_code)]
 pub struct BlockingTool {
     pub name: String,
 }
 
+#[allow(dead_code)]
 impl BlockingTool {
     pub fn new(name: &str) -> Self {
         Self {

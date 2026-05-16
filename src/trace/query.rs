@@ -564,6 +564,7 @@ mod tests {
         std::fs::write(path, format!("{body}\n")).unwrap();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         run_id: &str,
         session_id: &str,
