@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum ScenarioEvent {
     Text(String),
