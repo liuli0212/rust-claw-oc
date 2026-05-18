@@ -4,6 +4,7 @@ use crate::tools::Tool;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::sync::CancellationToken;
 
 type SessionEntryMap = AsyncMutex<
     HashMap<
@@ -16,6 +17,55 @@ type SessionEntryMap = AsyncMutex<
     >,
 >;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundTaskKind {
+    Agent,
+    Shell,
+}
+
+impl ForegroundTaskKind {
+    fn label(self) -> &'static str {
+        match self {
+            ForegroundTaskKind::Agent => "agent task",
+            ForegroundTaskKind::Shell => "shell command",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ForegroundTaskState {
+    id: uuid::Uuid,
+    kind: ForegroundTaskKind,
+    cancel_token: CancellationToken,
+}
+
+type ForegroundTaskMap = Arc<std::sync::Mutex<HashMap<String, ForegroundTaskState>>>;
+
+pub struct ForegroundGuard {
+    session_id: String,
+    task_id: uuid::Uuid,
+    tasks: ForegroundTaskMap,
+    cancel_token: CancellationToken,
+}
+
+impl ForegroundGuard {
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
+}
+
+impl Drop for ForegroundGuard {
+    fn drop(&mut self) {
+        let mut tasks = self.tasks.lock().unwrap();
+        if tasks
+            .get(&self.session_id)
+            .is_some_and(|task| task.id == self.task_id)
+        {
+            tasks.remove(&self.session_id);
+        }
+    }
+}
+
 pub struct SessionManager {
     scheduler: std::sync::RwLock<Option<Arc<crate::scheduler::Scheduler>>>,
 
@@ -25,6 +75,7 @@ pub struct SessionManager {
     subagent_runtime: Arc<RwLock<Option<crate::subagent_runtime::SubagentRuntime>>>,
     routers: RwLock<Vec<Arc<dyn OutputRouter>>>,
     sessions: SessionEntryMap,
+    foreground_tasks: ForegroundTaskMap,
     registry: crate::session::repository::SessionRegistryStore,
 }
 
@@ -52,6 +103,7 @@ impl SessionManager {
             subagent_runtime: Arc::new(RwLock::new(runtime)),
             routers: RwLock::new(Vec::new()),
             sessions: AsyncMutex::new(HashMap::new()),
+            foreground_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             scheduler: std::sync::RwLock::new(None),
             registry: crate::session::repository::SessionRegistryStore::new(
                 std::path::PathBuf::from("rusty_claw"),
@@ -99,6 +151,8 @@ impl SessionManager {
     }
 
     pub async fn reset_session(&self, session_id: &str) {
+        self.cancel_session(session_id).await;
+
         let mut sessions = self.sessions.lock().await;
 
         // Remove from memory
@@ -108,6 +162,18 @@ impl SessionManager {
     }
 
     pub async fn cancel_session(&self, session_id: &str) {
+        if let Some(task) = {
+            let tasks = self.foreground_tasks.lock().unwrap();
+            tasks.get(session_id).cloned()
+        } {
+            task.cancel_token.cancel();
+            tracing::info!(
+                "Cancel requested for foreground {} in session: {}",
+                task.kind.label(),
+                session_id
+            );
+        }
+
         let session_entry = {
             let sessions = self.sessions.lock().await;
             sessions.get(session_id).map(|(agent, notify, cancelled)| {
@@ -137,6 +203,38 @@ impl SessionManager {
                 }
             }
         }
+    }
+
+    pub fn try_acquire_foreground(
+        &self,
+        session_id: &str,
+        kind: ForegroundTaskKind,
+    ) -> Result<ForegroundGuard, String> {
+        let mut tasks = self.foreground_tasks.lock().unwrap();
+        if let Some(existing) = tasks.get(session_id) {
+            return Err(format!(
+                "A {} is still running for this session. Please wait for it to finish or cancel it first.",
+                existing.kind.label()
+            ));
+        }
+
+        let task_id = uuid::Uuid::new_v4();
+        let cancel_token = CancellationToken::new();
+        tasks.insert(
+            session_id.to_string(),
+            ForegroundTaskState {
+                id: task_id,
+                kind,
+                cancel_token: cancel_token.clone(),
+            },
+        );
+
+        Ok(ForegroundGuard {
+            session_id: session_id.to_string(),
+            task_id,
+            tasks: self.foreground_tasks.clone(),
+            cancel_token,
+        })
     }
 
     pub async fn get_or_create_session(
@@ -353,6 +451,39 @@ mod tests {
             )
             .to_json_string()
         }
+    }
+
+    #[tokio::test]
+    async fn test_foreground_guard_blocks_and_releases() {
+        let manager = SessionManager::new(None, vec![]);
+        let guard = manager
+            .try_acquire_foreground("foreground_test", ForegroundTaskKind::Shell)
+            .unwrap();
+
+        let err = match manager.try_acquire_foreground("foreground_test", ForegroundTaskKind::Agent)
+        {
+            Ok(_) => panic!("foreground acquisition should have been blocked"),
+            Err(err) => err,
+        };
+        assert!(err.contains("shell command"));
+
+        drop(guard);
+        assert!(manager
+            .try_acquire_foreground("foreground_test", ForegroundTaskKind::Agent)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_session_cancels_foreground_token() {
+        let manager = SessionManager::new(None, vec![]);
+        let guard = manager
+            .try_acquire_foreground("foreground_cancel_test", ForegroundTaskKind::Shell)
+            .unwrap();
+        let token = guard.cancel_token();
+
+        manager.cancel_session("foreground_cancel_test").await;
+
+        assert!(token.is_cancelled());
     }
 
     struct AsyncSubagentScenarioLlm;

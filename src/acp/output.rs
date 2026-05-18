@@ -1,6 +1,8 @@
 #[cfg(feature = "acp")]
 use crate::core::AgentOutput;
 #[cfg(feature = "acp")]
+use crate::session_manager::SessionManager;
+#[cfg(feature = "acp")]
 use serde::Serialize;
 #[cfg(feature = "acp")]
 use std::sync::Arc;
@@ -66,17 +68,18 @@ impl AgentOutput for AcpOutput {
 
 #[cfg(feature = "acp")]
 pub(super) struct CancelGuard {
-    pub agent: Arc<tokio::sync::Mutex<crate::core::AgentLoop>>,
+    pub session_manager: Arc<SessionManager>,
+    pub session_id: String,
 }
 
 #[cfg(feature = "acp")]
 impl Drop for CancelGuard {
     fn drop(&mut self) {
-        let agent = self.agent.clone();
+        let session_manager = self.session_manager.clone();
+        let session_id = self.session_id.clone();
         tokio::spawn(async move {
-            let agent = agent.lock().await;
-            agent.request_cancel();
-            tracing::info!("ACP client disconnected, requested agent cancellation");
+            session_manager.cancel_session(&session_id).await;
+            tracing::info!("ACP client disconnected, requested cancellation");
         });
     }
 }

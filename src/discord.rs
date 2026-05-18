@@ -1,6 +1,9 @@
 use crate::app::commands::{Command, CommandExecutor, CommandOutput, StatusData};
 use crate::core::AgentOutput;
-use crate::session_manager::SessionManager;
+use crate::session_manager::{ForegroundTaskKind, SessionManager};
+use crate::shell_escape::{
+    parse_shell_escape, run_shell_escape_command, ShellEscapeEntrypoint, ShellOutputMode,
+};
 use serenity::async_trait;
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
@@ -116,6 +119,14 @@ impl AgentOutput for DiscordOutput {
             self.text_buffer.lock().await.push_str(text);
             self.maybe_update_live_message(false).await;
         }
+    }
+
+    async fn on_text_replace(&self, text: &str) {
+        {
+            let mut buf = self.text_buffer.lock().await;
+            *buf = text.to_string();
+        }
+        self.maybe_update_live_message(true).await;
     }
 
     async fn on_thinking(&self, text: &str) {
@@ -395,7 +406,44 @@ fn dispatch_agent_step(
     output: Arc<DiscordOutput>,
     content: String,
 ) {
+    if let Some(shell_command) = parse_shell_escape(&content) {
+        let shell_command = match shell_command {
+            Ok(shell_command) => shell_command.to_string(),
+            Err(e) => {
+                tokio::spawn(async move {
+                    output.on_error(&e.to_string()).await;
+                });
+                return;
+            }
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = run_shell_escape_command(
+                session_manager,
+                &session_id,
+                ShellEscapeEntrypoint::Discord,
+                output.clone(),
+                &shell_command,
+                ShellOutputMode::discord_window(),
+            )
+            .await
+            {
+                output.on_error(&e).await;
+            }
+        });
+        return;
+    }
+
     tokio::spawn(async move {
+        let _foreground =
+            match session_manager.try_acquire_foreground(&session_id, ForegroundTaskKind::Agent) {
+                Ok(guard) => guard,
+                Err(e) => {
+                    let _ = channel_id.say(&http, format!("❌ Error: {}", e)).await;
+                    return;
+                }
+            };
+
         let agent = match session_manager
             .get_or_create_session(&session_id, &session_id, output.clone())
             .await

@@ -4,6 +4,12 @@ use super::{
     AcpCapabilitiesResponse, AcpCapability, AcpRunRequest, AcpServer,
 };
 #[cfg(feature = "acp")]
+use crate::session_manager::ForegroundTaskKind;
+#[cfg(feature = "acp")]
+use crate::shell_escape::{
+    parse_shell_escape, run_shell_escape_command, ShellEscapeEntrypoint, ShellOutputMode,
+};
+#[cfg(feature = "acp")]
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -85,19 +91,89 @@ pub(super) async fn handle_run(
     let (tx, rx) = mpsc::unbounded_channel();
     let output = Arc::new(AcpOutput { tx: tx.clone() });
 
-    let agent_res = server
-        .session_manager
-        .get_or_create_session(&session_id, &session_id, output.clone())
-        .await;
+    let guard = CancelGuard {
+        session_manager: server.session_manager.clone(),
+        session_id: session_id.clone(),
+    };
 
-    let _guard = match agent_res {
-        Ok(agent_mutex) => {
-            let agent_mutex_for_run = agent_mutex.clone();
-            let tx_for_run = tx.clone();
-            let task = req.task.clone();
+    let task = req.task.clone();
+    if let Some(shell_command) = parse_shell_escape(&task) {
+        match shell_command {
+            Ok(shell_command) => {
+                let shell_command = shell_command.to_string();
+                let session_manager = server.session_manager.clone();
+                let session_id_for_run = session_id.clone();
+                let output_for_run = output.clone();
+                let tx_for_run = tx.clone();
 
-            tokio::spawn(async move {
-                let mut agent = agent_mutex_for_run.lock().await;
+                tokio::spawn(async move {
+                    match run_shell_escape_command(
+                        session_manager,
+                        &session_id_for_run,
+                        ShellEscapeEntrypoint::Acp,
+                        output_for_run,
+                        &shell_command,
+                        ShellOutputMode::live_window(),
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            let _ = tx_for_run.send(AcpEvent::Finish {
+                                summary: format!(
+                                    "Shell command finished with exit {}.",
+                                    summary
+                                        .exit_code
+                                        .map(|code| code.to_string())
+                                        .unwrap_or_else(|| "signal".to_string())
+                                ),
+                                status: if summary.is_success() {
+                                    "finished".to_string()
+                                } else {
+                                    "failed".to_string()
+                                },
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx_for_run.send(AcpEvent::Error(e));
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(AcpEvent::Error(e.to_string()));
+            }
+        }
+    } else {
+        let session_manager = server.session_manager.clone();
+        let session_id_for_run = session_id.clone();
+        let tx_for_run = tx.clone();
+        let task = req.task.clone();
+
+        tokio::spawn(async move {
+            let _foreground = match session_manager
+                .try_acquire_foreground(&session_id_for_run, ForegroundTaskKind::Agent)
+            {
+                Ok(guard) => guard,
+                Err(e) => {
+                    let _ = tx_for_run.send(AcpEvent::Error(e));
+                    return;
+                }
+            };
+
+            let agent_mutex = match session_manager
+                .get_or_create_session(&session_id_for_run, &session_id_for_run, output.clone())
+                .await
+            {
+                Ok(agent_mutex) => agent_mutex,
+                Err(e) => {
+                    let _ =
+                        tx_for_run.send(AcpEvent::Error(format!("Session creation failed: {}", e)));
+                    return;
+                }
+            };
+
+            {
+                let mut agent = agent_mutex.lock().await;
                 agent.flush_output().await;
                 agent.update_output(output);
                 match agent.step(task).await {
@@ -119,18 +195,12 @@ pub(super) async fn handle_run(
                         let _ = tx_for_run.send(AcpEvent::Error(e.to_string()));
                     }
                 }
-            });
-
-            Some(CancelGuard { agent: agent_mutex })
-        }
-        Err(e) => {
-            let _ = tx.send(AcpEvent::Error(format!("Session creation failed: {}", e)));
-            None
-        }
-    };
+            }
+        });
+    }
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(move |event| {
-        let _ = &_guard;
+        let _ = &guard;
         Ok::<_, std::convert::Infallible>(
             Event::default().data(serde_json::to_string(&event).unwrap()),
         )

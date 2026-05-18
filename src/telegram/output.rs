@@ -235,6 +235,16 @@ impl AgentOutput for TelegramOutput {
         }
     }
 
+    async fn on_text_replace(&self, text: &str) {
+        let clean = Self::strip_ansi(text);
+        let clean = clean.replace("<final>", "").replace("</final>", "");
+        {
+            let mut buf = self.text_buffer.lock().await;
+            *buf = clean;
+        }
+        self.maybe_update_live_message(true).await;
+    }
+
     async fn on_thinking(&self, text: &str) {
         let clean = Self::strip_ansi(text);
         if !clean.is_empty() {

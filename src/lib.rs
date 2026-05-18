@@ -22,6 +22,7 @@ pub mod schema;
 pub mod security;
 pub mod session;
 pub mod session_manager;
+pub mod shell_escape;
 pub mod skills;
 pub mod subagent_notification;
 pub mod subagent_runtime;

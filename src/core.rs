@@ -37,6 +37,9 @@ pub trait AgentOutput: Send + Sync {
     async fn on_waiting(&self, _message: &str) {}
     fn clear_waiting(&self) {}
     async fn on_text(&self, text: &str);
+    async fn on_text_replace(&self, text: &str) {
+        self.on_text(text).await;
+    }
     async fn on_thinking(&self, text: &str) {
         // Default: treat thinking as regular text (backward compat)
         self.on_text(text).await;
@@ -86,6 +89,9 @@ impl AgentOutput for SilentOutputWrapper {
     }
     async fn on_text(&self, text: &str) {
         self.inner.on_text(text).await;
+    }
+    async fn on_text_replace(&self, text: &str) {
+        self.inner.on_text_replace(text).await;
     }
     async fn on_thinking(&self, _text: &str) {}
     async fn on_tool_start(&self, _name: &str, _args: &str) {}

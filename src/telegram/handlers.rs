@@ -2,7 +2,10 @@ use super::output::TelegramOutput;
 use super::Command as TgCommand;
 use crate::app::commands::{Command, CommandExecutor, CommandOutput, StatusData};
 use crate::core::{AgentOutput, RunExit};
-use crate::session_manager::SessionManager;
+use crate::session_manager::{ForegroundTaskKind, SessionManager};
+use crate::shell_escape::{
+    parse_shell_escape, run_shell_escape_command, ShellEscapeEntrypoint, ShellOutputMode,
+};
 use std::sync::Arc;
 use teloxide::{net::Download, prelude::*, types::ParseMode, utils::command::BotCommands};
 
@@ -326,19 +329,59 @@ async fn dispatch_agent_step(
     let session_id = format!("telegram:{}", chat_id);
     let output = Arc::new(TelegramOutput::new(bot.clone(), chat_id));
 
-    let agent = match session_manager
-        .get_or_create_session(&session_id, &session_id, output.clone())
-        .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            let _ = bot.send_message(chat_id, format!("❌ Error: {}", e)).await;
-            return;
-        }
-    };
+    if let Some(shell_command) = parse_shell_escape(&text) {
+        let shell_command = match shell_command {
+            Ok(shell_command) => shell_command.to_string(),
+            Err(e) => {
+                output.on_error(&e.to_string()).await;
+                return;
+            }
+        };
+        let session_manager = session_manager.clone();
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_shell_escape_command(
+                session_manager,
+                &session_id,
+                ShellEscapeEntrypoint::Telegram,
+                output.clone(),
+                &shell_command,
+                ShellOutputMode::live_window(),
+            )
+            .await
+            {
+                output.on_error(&e).await;
+            }
+        });
+        return;
+    }
 
     let bot_clone = bot.clone();
     tokio::spawn(async move {
+        let _foreground =
+            match session_manager.try_acquire_foreground(&session_id, ForegroundTaskKind::Agent) {
+                Ok(guard) => guard,
+                Err(e) => {
+                    let _ = bot_clone
+                        .send_message(chat_id, format!("❌ Error: {}", e))
+                        .await;
+                    return;
+                }
+            };
+
+        let agent = match session_manager
+            .get_or_create_session(&session_id, &session_id, output.clone())
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = bot_clone
+                    .send_message(chat_id, format!("❌ Error: {}", e))
+                    .await;
+                return;
+            }
+        };
+
         let mut agent_guard = match tokio::time::timeout(
             std::time::Duration::from_secs(3),
             agent.lock(),

@@ -1,6 +1,9 @@
 use crate::app::commands::{Command, CommandExecutor, CommandOutput, StatusData};
 use crate::core::{AgentOutput, RunExit};
-use crate::session_manager::SessionManager;
+use crate::session_manager::{ForegroundTaskKind, SessionManager};
+use crate::shell_escape::{
+    parse_shell_escape, run_shell_escape_command, ShellEscapeEntrypoint, ShellOutputMode,
+};
 use console::style;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
@@ -136,6 +139,38 @@ pub async fn run_headless_command(
     command: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let session_id = format!("cli_headless_{}", uuid::Uuid::new_v4().simple());
+    if let Some(shell_command) = parse_shell_escape(&command) {
+        let shell_command = match shell_command {
+            Ok(shell_command) => shell_command,
+            Err(e) => {
+                output.on_error(&e.to_string()).await;
+                std::process::exit(1);
+            }
+        };
+
+        match run_shell_escape_command(
+            session_manager.clone(),
+            &session_id,
+            ShellEscapeEntrypoint::Headless,
+            output.clone(),
+            shell_command,
+            ShellOutputMode::cli_stream(),
+        )
+        .await
+        {
+            Ok(summary) => {
+                if !summary.is_success() {
+                    std::process::exit(summary.process_exit_code());
+                }
+            }
+            Err(e) => {
+                output.on_error(&e).await;
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
+    }
+
     let agent = session_manager
         .get_or_create_session(&session_id, "cli", output.clone())
         .await?;
@@ -303,6 +338,27 @@ pub async fn run_cli_repl(
             continue;
         }
 
+        if let Some(shell_command) = parse_shell_escape(&line) {
+            match shell_command {
+                Ok(shell_command) => {
+                    if let Err(e) = run_shell_escape_command(
+                        session_manager.clone(),
+                        "cli",
+                        ShellEscapeEntrypoint::Cli,
+                        output.clone(),
+                        shell_command,
+                        ShellOutputMode::cli_stream(),
+                    )
+                    .await
+                    {
+                        output.on_error(&e).await;
+                    }
+                }
+                Err(e) => output.on_error(&e.to_string()).await,
+            }
+            continue;
+        }
+
         run_cli_agent_step(session_manager.clone(), output.clone(), line).await;
     }
 
@@ -358,6 +414,15 @@ async fn run_cli_agent_step(
     output: Arc<dyn AgentOutput>,
     line: String,
 ) {
+    let _foreground = match session_manager.try_acquire_foreground("cli", ForegroundTaskKind::Agent)
+    {
+        Ok(guard) => guard,
+        Err(e) => {
+            println!("  {} Error: {}", style("❌").red(), e);
+            return;
+        }
+    };
+
     let agent = match session_manager
         .get_or_create_session("cli", "cli", output.clone())
         .await
